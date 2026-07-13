@@ -56,3 +56,7 @@ apps/mobile/web-build/
 # Local secrets
 *.pem
 secrets/
+.env.*
+*.env
+credentials.json
+.credentials
