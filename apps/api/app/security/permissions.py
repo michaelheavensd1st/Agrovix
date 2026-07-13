@@ -50,6 +50,25 @@ ALL_PERMISSIONS: tuple[PermissionDef, ...] = (
     PermissionDef("invitation.create", "Create invitations"),
     PermissionDef("invitation.revoke", "Revoke invitations"),
     PermissionDef("invitation.list", "List invitations"),
+    # --- Production Engine (Sprint 2) --- #
+    PermissionDef("production_site.read", "Read production sites"),
+    PermissionDef("production_site.create", "Create production sites"),
+    PermissionDef("production_site.update", "Update production sites"),
+    PermissionDef("production_site.delete", "Soft-delete production sites"),
+    PermissionDef("production_site.restore", "Restore soft-deleted sites"),
+    PermissionDef("production_unit_type.read", "Read production unit types"),
+    PermissionDef("production_unit_type.create", "Create custom production unit types"),
+    PermissionDef("production_unit_type.delete", "Delete custom production unit types"),
+    PermissionDef("production_unit.read", "Read production units"),
+    PermissionDef("production_unit.create", "Create production units"),
+    PermissionDef("production_unit.update", "Update production units"),
+    PermissionDef("production_unit.delete", "Soft-delete production units"),
+    PermissionDef("production_batch.read", "Read production batches"),
+    PermissionDef("production_batch.create", "Create production batches"),
+    PermissionDef("production_batch.update", "Update production batches"),
+    PermissionDef("production_batch.transition", "Change production batch lifecycle state"),
+    PermissionDef("production_event.read", "Read production events"),
+    PermissionDef("production_event.create", "Create production events"),
 )
 
 
@@ -74,6 +93,13 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "farm.member.assign",
             "audit.read",
             "invitation.create", "invitation.revoke", "invitation.list",
+            # Production Engine — owners can do everything.
+            "production_site.read", "production_site.create", "production_site.update",
+            "production_site.delete", "production_site.restore",
+            "production_unit_type.read", "production_unit_type.create", "production_unit_type.delete",
+            "production_unit.read", "production_unit.create", "production_unit.update", "production_unit.delete",
+            "production_batch.read", "production_batch.create", "production_batch.update", "production_batch.transition",
+            "production_event.read", "production_event.create",
         ),
     ),
     RoleDef(
@@ -85,6 +111,11 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "farm.member.assign",
             "audit.read",
             "invitation.create", "invitation.list",
+            "production_site.read", "production_site.create", "production_site.update",
+            "production_unit_type.read",
+            "production_unit.read", "production_unit.create", "production_unit.update",
+            "production_batch.read", "production_batch.create", "production_batch.update", "production_batch.transition",
+            "production_event.read", "production_event.create",
         ),
     ),
     RoleDef(
@@ -94,36 +125,65 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "organization.read", "farm.read", "farm.update",
             "farm.member.assign",
             "invitation.create", "invitation.list",
+            "production_site.read", "production_site.update",
+            "production_unit_type.read",
+            "production_unit.read", "production_unit.create", "production_unit.update",
+            "production_batch.read", "production_batch.create", "production_batch.update", "production_batch.transition",
+            "production_event.read", "production_event.create",
         ),
     ),
     RoleDef(
         "supervisor", RoleScope.FARM,
         "Supervises daily operations at a farm",
-        _codes("organization.read", "farm.read"),
+        _codes(
+            "organization.read", "farm.read",
+            "production_site.read", "production_unit.read", "production_unit_type.read",
+            "production_batch.read", "production_event.read", "production_event.create",
+        ),
     ),
     RoleDef(
         "storekeeper", RoleScope.FARM,
         "Manages farm inventory and stores",
-        _codes("organization.read", "farm.read"),
+        _codes(
+            "organization.read", "farm.read",
+            "production_site.read", "production_unit.read", "production_batch.read",
+            "production_event.read", "production_event.create",
+        ),
     ),
     RoleDef(
         "veterinarian", RoleScope.FARM,
         "Farm veterinarian",
-        _codes("organization.read", "farm.read"),
+        _codes(
+            "organization.read", "farm.read",
+            "production_site.read", "production_unit.read", "production_batch.read",
+            "production_event.read", "production_event.create",
+        ),
     ),
     RoleDef(
         "accountant", RoleScope.ORGANIZATION,
         "Handles finances across the organization",
-        _codes("organization.read", "farm.read", "audit.read"),
+        _codes(
+            "organization.read", "farm.read", "audit.read",
+            "production_site.read", "production_unit.read", "production_batch.read",
+            "production_event.read",
+        ),
     ),
     RoleDef(
         "worker", RoleScope.FARM,
         "General farm worker",
-        _codes("farm.read"),
+        _codes(
+            "farm.read",
+            "production_unit.read", "production_batch.read",
+            "production_event.read", "production_event.create",
+        ),
     ),
     RoleDef(
         "viewer", RoleScope.ORGANIZATION,
         "Read-only observer",
-        _codes("organization.read", "farm.read"),
+        _codes(
+            "organization.read", "farm.read",
+            "production_site.read", "production_unit.read", "production_unit_type.read",
+            "production_batch.read", "production_event.read",
+        ),
     ),
 )

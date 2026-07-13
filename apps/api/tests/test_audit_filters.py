@@ -89,8 +89,9 @@ async def test_filter_by_farm(client: AsyncClient) -> None:
     )
     assert r.status_code == 200
     body = r.json()
-    # farm_a: create + delete + restore = 3
-    assert body["total"] == 3
+    # farm_a events: farm.create + production_site.create (auto Main Site)
+    # + farm.delete + farm.restore = 4
+    assert body["total"] == 4
     assert all(i["farm_id"] == s["farm_a"] for i in body["items"])
 
 

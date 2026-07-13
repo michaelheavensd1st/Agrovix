@@ -92,6 +92,24 @@ class FarmService:
         farm = await self.farm_repo.create(organization_id=organization_id, **data)
         # Creator gets explicit farm membership.
         await self.farm_mem_repo.upsert_active(user_id=actor.id, farm_id=farm.id)
+        # Auto-create the default ProductionSite per Sprint 2 spec —
+        # every farm ships with one "Main Site" that can be renamed but
+        # never leaves the farm site-less.
+        from app.models.production import ProductionSite, ProductionSiteStatus
+        default_site = ProductionSite(
+            farm_id=farm.id, name="Main Site", code="MAIN",
+            description="Default site created automatically with the farm.",
+            status=ProductionSiteStatus.ACTIVE, is_default=True,
+        )
+        self.farm_repo.session.add(default_site)
+        await self.farm_repo.session.flush()
+        await self.audit_repo.record(
+            actor_id=actor.id, action="production_site.create",
+            entity_type="production_site", entity_id=str(default_site.id),
+            organization_id=organization_id, farm_id=farm.id,
+            metadata={"auto_created": True, "is_default": True},
+            **request_ctx,
+        )
         await self.audit_repo.record(
             actor_id=actor.id, action="farm.create",
             entity_type="farm", entity_id=str(farm.id),
