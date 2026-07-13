@@ -24,7 +24,6 @@ Adding a new event type:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Type
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -195,7 +194,10 @@ CATALOG.register(
     "HARVEST", HarvestEventSchema, version=1,
     display_name="Harvest", category="lifecycle",
     triggers_transition_to="harvested",
-    metadata={"description": "Harvest — with is_final=true the batch closes."},
+    metadata={
+        "description": "Harvest event. Batch transitions to HARVESTED only when is_final=true.",
+        "transition_conditional_on": "is_final == true",
+    },
 )
 CATALOG.register("INSPECTION", InspectionEventSchema, display_name="Inspection")
 
@@ -213,6 +215,5 @@ __all__ = [
     "TransferEventSchema",
     "HarvestEventSchema",
     "InspectionEventSchema",
-    "ValidationError",
-    "datetime",
+    "ValidationError",  # re-exported for callers that catch validation failures
 ]

@@ -18,7 +18,7 @@ lives together. Sub-routers by resource keep the URL surface tidy:
     /api/v1/batches/{batch_id}/transitions   POST | GET
     /api/v1/batches/{batch_id}/events        POST | GET
 
-    /api/v1/production-events/catalog        GET (public — reference data)
+    /api/v1/production-events/catalog        GET (authenticated — reference data)
     /api/v1/events/{event_id}                GET
 """
 
@@ -276,6 +276,10 @@ async def update_site(
     if site.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
     changed = payload.model_dump(exclude_unset=True)
+    # Defence-in-depth: tenancy-critical fields cannot be reassigned via
+    # PATCH regardless of what the update schema might grow to accept.
+    for reserved in ("farm_id", "is_default", "deleted_at"):
+        changed.pop(reserved, None)
     for k, v in changed.items():
         setattr(site, k, v)
     await session.flush()
@@ -412,6 +416,11 @@ async def update_unit(
 ) -> ProductionUnitPublic:
     unit, _, _ = await _load_unit(unit_id, user, session)
     changed = payload.model_dump(exclude_unset=True)
+    # Defence-in-depth: never allow a PATCH to relocate a unit across
+    # sites or change its type — those are lifecycle events, not
+    # updates.
+    for reserved in ("site_id", "unit_type_id", "deleted_at"):
+        changed.pop(reserved, None)
     for k, v in changed.items():
         setattr(unit, k, v)
     await session.flush()
@@ -472,8 +481,13 @@ async def update_batch(
     user: CurrentUser, session: DBSession,
 ) -> ProductionBatchPublic:
     batch, _, _, _ = await _load_batch(batch_id, user, session)
-    # State changes MUST go through /transitions — see the state machine.
     changed = payload.model_dump(exclude_unset=True)
+    # Defence-in-depth: state changes MUST go through /transitions —
+    # never allow a PATCH to touch state / lifecycle timestamps even if
+    # the schema is misconfigured in a future PR (see Sprint 2 code
+    # review action item).
+    for reserved in ("state", "stocked_at", "harvested_at", "closed_at"):
+        changed.pop(reserved, None)
     for k, v in changed.items():
         setattr(batch, k, v)
     await session.flush()
