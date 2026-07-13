@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 
 from app.core.config import get_settings
+from app.core.rate_limit import RateLimiter
 from app.core.security import create_token
 from app.email.base import EmailMessage, EmailSender
 from app.models.invitation import Invitation, InvitationStatus
@@ -44,6 +45,7 @@ class InvitationService:
         farm_mem_repo: FarmMembershipRepository,
         audit_repo: AuditRepository,
         email_sender: EmailSender,
+        rate_limiter: RateLimiter,
     ) -> None:
         self.invitation_repo = invitation_repo
         self.role_repo = role_repo
@@ -55,6 +57,7 @@ class InvitationService:
         self.farm_mem_repo = farm_mem_repo
         self.audit_repo = audit_repo
         self.email_sender = email_sender
+        self.rate_limiter = rate_limiter
         self.settings = get_settings()
 
     async def create(
@@ -152,6 +155,14 @@ class InvitationService:
         )
 
     async def accept(self, *, actor: User, token: str, request_ctx: dict) -> Invitation:
+        # Throttle acceptance attempts to defeat brute-force token guessing
+        # (per actor + per IP). Errors from the limiter surface as HTTP 429
+        # with a ``Retry-After`` header so clients can back off politely.
+        await self._enforce_accept_rate_limit(
+            actor_id=str(actor.id),
+            ip_address=request_ctx.get("ip_address"),
+        )
+
         token_hash = _hash_token(token)
         invitation = await self.invitation_repo.get_by_token_hash(token_hash)
         if invitation is None:
@@ -186,6 +197,34 @@ class InvitationService:
             **request_ctx,
         )
         return invitation
+
+    async def _enforce_accept_rate_limit(
+        self, *, actor_id: str, ip_address: str | None
+    ) -> None:
+        window = self.settings.invitation_accept_window_seconds
+        allowed, retry = await self.rate_limiter.hit(
+            key=f"invite-accept:user:{actor_id}",
+            limit=self.settings.invitation_accept_max_per_user_hour,
+            window_seconds=window,
+        )
+        if not allowed:
+            raise self._too_many_accepts(retry)
+        if ip_address:
+            allowed, retry = await self.rate_limiter.hit(
+                key=f"invite-accept:ip:{ip_address}",
+                limit=self.settings.invitation_accept_max_per_ip_hour,
+                window_seconds=window,
+            )
+            if not allowed:
+                raise self._too_many_accepts(retry)
+
+    @staticmethod
+    def _too_many_accepts(retry_after: int) -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many invitation attempts. Please try again later.",
+            headers={"Retry-After": str(max(retry_after, 1))},
+        )
 
 
 class RoleAssignmentService:

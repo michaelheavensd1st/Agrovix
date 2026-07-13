@@ -2,13 +2,24 @@
 
 Sprint 1 policy:
 * Only one active email-verification token exists per user at any time
-  (older ones are invalidated when a new one is issued).
+  (older ones are invalidated when a new one is issued). A Postgres
+  partial unique index (see migration
+  ``0003_verification_active_unique_index``) enforces the invariant at
+  the database level so concurrent resends cannot bypass it.
 * Verification tokens expire — default 24 h, tunable via
   ``VERIFICATION_TOKEN_EXPIRE_HOURS``.
 * Successful verification invalidates the used token AND any residual
   outstanding tokens for that user (belt-and-suspenders).
-* ``resend_verification`` is rate-limited per-email and per-IP through
-  the :class:`RateLimiter` abstraction so tests / dev do not need Redis.
+* Sensitive endpoints (``resend_verification`` and ``login``) are
+  rate-limited per-email and per-IP through the :class:`RateLimiter`
+  abstraction so tests / dev do not need Redis.
+
+Note on tokens: this service issues **signed, structured JWTs** (not
+"opaque" tokens). Each access/refresh/verify token is a signed JWT that
+also has a server-side counterpart — refresh and verification tokens
+are additionally persisted as SHA-256 **hashed records** so they can be
+revoked, single-use-enforced, and audited independently of client-side
+JWT validity.
 """
 
 from __future__ import annotations
@@ -175,12 +186,45 @@ class AuthService:
             if not allowed:
                 raise self._too_many_requests(retry)
 
+    async def _enforce_login_rate_limit(self, *, email: str, ip_address: str | None) -> None:
+        """Rate-limit login attempts to defeat brute-force + enumeration.
+
+        Keyed by BOTH the normalized email address (blunts credential
+        stuffing against a specific account) and the client IP (blunts
+        broad scanning). Error messages remain deliberately generic so
+        that attackers cannot distinguish "wrong password" from "rate
+        limited" from a valid response.
+        """
+        window = self.settings.login_window_seconds
+        # Per-email throttle.
+        allowed, retry = await self.rate_limiter.hit(
+            key=f"login:email:{email.strip().lower()}",
+            limit=self.settings.login_max_per_email_hour,
+            window_seconds=window,
+        )
+        if not allowed:
+            raise self._too_many_login_attempts(retry)
+        # Per-IP throttle.
+        if ip_address:
+            allowed, retry = await self.rate_limiter.hit(
+                key=f"login:ip:{ip_address}",
+                limit=self.settings.login_max_per_ip_hour,
+                window_seconds=window,
+            )
+            if not allowed:
+                raise self._too_many_login_attempts(retry)
+
     # ------------------------------------------------------------------ #
     # Login / refresh / logout
     # ------------------------------------------------------------------ #
     async def login(
         self, *, email: str, password: str, user_agent: str | None = None, ip_address: str | None = None,
     ) -> tuple[User, TokenPair]:
+        # Enforce rate limits BEFORE the account lookup so that both
+        # brute-force password guessing and account enumeration are throttled
+        # identically for existing and non-existent emails.
+        await self._enforce_login_rate_limit(email=email, ip_address=ip_address)
+
         user = await self.user_repo.get_by_email(email)
         if user is None or user.hashed_password is None:
             raise self._invalid_credentials()
@@ -283,5 +327,15 @@ class AuthService:
         return HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many verification-resend requests. Please try again later.",
+            headers={"Retry-After": str(max(retry_after, 1))},
+        )
+
+    @staticmethod
+    def _too_many_login_attempts(retry_after: int) -> HTTPException:
+        # Deliberately generic — do not confirm whether the account exists
+        # or hint at whether credentials would have been valid.
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many sign-in attempts. Please try again later.",
             headers={"Retry-After": str(max(retry_after, 1))},
         )

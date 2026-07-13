@@ -1,4 +1,17 @@
-"""Email verification token (hashed at rest, single-use, expiring)."""
+"""Email verification token (hashed at rest, single-use, expiring).
+
+Invariant: at most one active (``is_used = false``) token exists per
+user at a time. This is enforced in three layers:
+
+1. Application layer — :class:`AuthService` invalidates residual tokens
+   before issuing a new one and again after a successful verify.
+2. Database (Postgres) — a **partial unique index** on
+   ``(user_id) WHERE is_used = false`` (migration
+   ``0003_verification_active_unique_index``) protects the invariant
+   against concurrent ``resend-verification`` requests.
+3. Rate limiting — :class:`RateLimiter` throttles ``resend-verification``
+   per email + per IP so an attacker cannot spin up new tokens rapidly.
+"""
 
 from __future__ import annotations
 

@@ -73,10 +73,28 @@ class Settings(BaseSettings):
     # --- Auth policy ---
     allow_unverified_login: bool = Field(default=False)  # dev override
 
-    # --- Rate limiting (resend-verification abuse guard) ---
+    # --- Rate limiting: transport policy ---
+    # In production, the process-wide limiter MUST be Redis-backed so that
+    # limits are shared across API workers. Silent fallback to the in-memory
+    # limiter is a security downgrade and is disabled by default. Set
+    # ``RATE_LIMIT_ALLOW_INMEMORY=true`` only when you understand the risk
+    # (e.g. single-process staging).
+    rate_limit_allow_inmemory: bool = Field(default=False)
+
+    # --- Rate limiting: resend-verification abuse guard ---
     resend_verification_max_per_email_hour: int = Field(default=3)
     resend_verification_max_per_ip_hour: int = Field(default=10)
     resend_verification_window_seconds: int = Field(default=3600)
+
+    # --- Rate limiting: login (brute-force + enumeration guard) ---
+    login_max_per_email_hour: int = Field(default=10)
+    login_max_per_ip_hour: int = Field(default=30)
+    login_window_seconds: int = Field(default=3600)
+
+    # --- Rate limiting: invitation acceptance ---
+    invitation_accept_max_per_user_hour: int = Field(default=20)
+    invitation_accept_max_per_ip_hour: int = Field(default=60)
+    invitation_accept_window_seconds: int = Field(default=3600)
 
     @field_validator("api_cors_origins")
     @classmethod

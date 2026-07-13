@@ -18,7 +18,11 @@ async def test_root(client: AsyncClient) -> None:
 async def test_health(client: AsyncClient) -> None:
     r = await client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    body = r.json()
+    assert body["status"] == "ok"
+    # Rate-limiter health block should be reported alongside overall status.
+    assert body["rate_limiter"]["healthy"] is True
+    assert "backend" in body["rate_limiter"]
 
 
 @pytest.mark.asyncio

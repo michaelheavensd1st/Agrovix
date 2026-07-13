@@ -113,7 +113,10 @@ def _hash_token(raw: str) -> str:
 
 
 def _make_token() -> str:
-    # Opaque token — the real API issues JWTs; the shim keeps things simple.
+    # High-entropy random string — the canonical API issues **signed,
+    # structured JWTs backed by a server-side hashed record**; this pod
+    # shim uses a simple random URL-safe token instead to avoid dragging
+    # JWT signing config into the preview path.
     return secrets.token_urlsafe(48)
 
 

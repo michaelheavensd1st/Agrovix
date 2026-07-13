@@ -14,6 +14,11 @@ from app.api.v1.router import api_v1_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.middleware import RequestContextMiddleware
+from app.core.rate_limit_factory import (
+    RateLimiterUnavailableError,
+    check_rate_limiter_health,
+    get_rate_limiter,
+)
 from app.db.session import dispose_engine
 
 configure_logging()
@@ -27,6 +32,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "app.start",
         extra={"app": settings.app_name, "version": settings.app_version, "env": settings.app_env},
     )
+    # Fail fast in production if the rate-limiter backend is misconfigured.
+    # ``get_rate_limiter`` itself raises when Redis is required but missing;
+    # here we additionally verify reachability (PING) so that a stale/dead
+    # Redis is caught before we start serving traffic.
+    try:
+        get_rate_limiter()
+        healthy, backend = await check_rate_limiter_health()
+        if not healthy and settings.is_production and not settings.rate_limit_allow_inmemory:
+            raise RuntimeError(
+                f"Rate limiter backend unhealthy in production: {backend}",
+            )
+        logger.info("rate_limit.ready", extra={"backend": backend, "healthy": healthy})
+    except RateLimiterUnavailableError as exc:
+        logger.error("rate_limit.unavailable", extra={"error": str(exc)})
+        raise
     try:
         yield
     finally:
@@ -67,7 +87,20 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["meta"], summary="Liveness probe")
     async def health() -> JSONResponse:
-        return JSONResponse({"status": "ok"})
+        # ``/health`` also checks the rate-limiter backend so that
+        # orchestrators can gate traffic when Redis is down (in production).
+        rl_healthy, rl_backend = await check_rate_limiter_health()
+        overall_ok = rl_healthy or (
+            not settings.is_production or settings.rate_limit_allow_inmemory
+        )
+        status_code = 200 if overall_ok else 503
+        return JSONResponse(
+            {
+                "status": "ok" if overall_ok else "degraded",
+                "rate_limiter": {"healthy": rl_healthy, "backend": rl_backend},
+            },
+            status_code=status_code,
+        )
 
     @app.get("/version", tags=["meta"], summary="Version information")
     async def version() -> dict[str, str]:

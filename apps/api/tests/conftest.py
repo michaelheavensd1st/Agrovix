@@ -43,6 +43,26 @@ rate_limit_factory.get_rate_limiter.cache_clear()
 _test_rate_limiter = InMemoryRateLimiter()
 rate_limit_factory.get_rate_limiter = lambda: _test_rate_limiter  # type: ignore[assignment]
 
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_rate_limiter():
+    """Reset the shared in-memory limiter between tests.
+
+    Individual tests that need cumulative rate-limit behavior install
+    their own fresh limiter (see ``test_verification.py`` and
+    ``test_login_security.py``). This fixture keeps other tests hermetic
+    so that ``login``/``refresh``/``logout`` don't burn cross-test quota
+    and flake randomly.
+    """
+    try:
+        _test_rate_limiter._counters.clear()  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    yield
+
 # Patch the JSONB column used in AuditEvent → JSON on SQLite.
 from sqlalchemy import JSON  # noqa: E402
 from sqlalchemy.dialects.postgresql import JSONB  # noqa: E402

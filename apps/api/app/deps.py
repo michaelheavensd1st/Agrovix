@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.logging import organization_id_var, user_id_var
 from app.core.rate_limit import RateLimiter
-from app.core.rate_limit_factory import get_rate_limiter
+from app.core import rate_limit_factory
 from app.core.security import TokenExpiredError, TokenInvalidError, decode_token
 from app.db.session import get_db_session
 from app.email.base import EmailSender
@@ -111,7 +111,10 @@ def get_email_sender_dep() -> EmailSender:
 
 
 def get_rate_limiter_dep() -> RateLimiter:
-    return get_rate_limiter()
+    # Resolve the process-wide limiter through the module attribute so
+    # tests can swap ``rate_limit_factory.get_rate_limiter`` at runtime
+    # (see ``tests/conftest.py`` and ``tests/test_login_security.py``).
+    return rate_limit_factory.get_rate_limiter()
 
 
 # --------------------------------------------------------------------- #
@@ -165,12 +168,14 @@ def get_invitation_service(
     farm_mem_repo: Annotated[FarmMembershipRepository, Depends(get_farm_membership_repository)],
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
     email_sender: Annotated[EmailSender, Depends(get_email_sender_dep)],
+    rate_limiter: Annotated[RateLimiter, Depends(get_rate_limiter_dep)],
 ) -> InvitationService:
     return InvitationService(
         invitation_repo=invitation_repo, role_repo=role_repo, role_assign_repo=role_assign_repo,
         user_repo=user_repo, org_repo=org_repo, org_mem_repo=org_mem_repo,
         farm_repo=farm_repo, farm_mem_repo=farm_mem_repo,
         audit_repo=audit_repo, email_sender=email_sender,
+        rate_limiter=rate_limiter,
     )
 
 

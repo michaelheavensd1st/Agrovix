@@ -1,0 +1,35 @@
+{
+  "summary": "Sprint 1 auth-hardening pass fully verified. All 27 pytest tests in /app/apps/api PASS (test_auth 3, test_auth_flows 6, test_health 3, test_login_security 5, test_tenancy 3, test_verification 5, test_version 2) in ~12s. Ad-hoc verification confirms (a) strict prod behavior of get_rate_limiter: raises RateLimiterUnavailableError when APP_ENV=production + REDIS_URL='' + RATE_LIMIT_ALLOW_INMEMORY unset, and falls back to InMemoryRateLimiter with an explicit opt-in warning; (b) InvitationService.accept() calls the rate limiter (per-user then per-IP) BEFORE invitation_repo.get_by_token_hash — verified with a MagicMock rate-limiter that (i) allows -> 2 hits then repo lookup, (ii) denies -> 429 with Retry-After header and repo NOT invoked, (iii) per-user denial short-circuits per-IP check; (c) alembic heads == 0003_verification_active_unique_index and migration DDL creates the partial unique index uq_email_verification_active_per_user on (user_id) WHERE is_used=false, with a defensive UPDATE that collapses any pre-existing duplicates. Lint clean on all 11 changed files.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/apps/api/tests/test_login_security.py",
+    "/app/apps/api/tests/test_health.py",
+    "/app/apps/api/tests/test_verification.py",
+    "/app/apps/api/tests/conftest.py"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "config.py:44 — Settings.redis_url has a default of 'redis://localhost:6379/0'. This means the strict-prod check `if not settings.redis_url` will NEVER trip via missing env alone; production must explicitly set REDIS_URL='' to bail out, otherwise the factory will attempt to construct a redis client pointing at localhost. Recommend defaulting redis_url to None (or '') so 'missing' is the true absence signal. Currently only a passive risk because prod deploys will set REDIS_URL to a real cluster, but it undermines the fail-fast promise if someone forgets to override.",
+    "main.py:88-103 — /health computes overall_ok = rl_healthy OR (not is_production or allow_inmemory). This is correct, but the 200/degraded response body always returns status='ok' when overall_ok is true even if rl_healthy=False in dev. Consider surfacing status='degraded' whenever rl_healthy is false, regardless of env, so ops dashboards see the signal in staging too.",
+    "rate_limit_factory.py:107-111 — check_rate_limiter_health() touches limiter._client directly (`await limiter._client.ping()`). Preferring a public `ping()`/`health()` method on the RateLimiter protocol would avoid reaching into private attributes and would make it easier to plug alternative backends (memcached, upstash) without patching the factory.",
+    "invitation_service.py:157-165 — Rate-limit key uses `str(actor.id)` and `request_ctx.get('ip_address')`. If actor.id is a UUID it will hash consistently; if the IP comes through as an X-Forwarded-For chain (e.g. 'a, b, c') the key will be dirty. Recommend documenting the expected shape of request_ctx['ip_address'] (client-parsed, single IP) or normalizing inside _enforce_accept_rate_limit.",
+    "conftest.py:44 — Monkey-patching `rate_limit_factory.get_rate_limiter = lambda: _test_rate_limiter` bypasses lru_cache but leaves cache_clear() a no-op for anyone who later calls rate_limit_factory.get_rate_limiter.cache_clear() (attribute is now a plain function). Not blocking (only relevant to tests that swap and restore), but worth a comment."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (27/27 pytest + 3/3 ad-hoc strict-prod + 3/3 ad-hoc invitation)", "frontend": "N/A (backend-only run)"},
+  "test_credentials": "N/A — hermetic pytest suite creates its own users per-test with UUID-suffixed emails.",
+  "seed_data_creation": "None persisted. Tests use SQLite in-memory engine; ad-hoc /tmp scripts were removed after verification.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "The canonical FastAPI backend is /app/apps/api, not /app/backend (which is the CRA-era shim). Run tests with `cd /app/apps/api && python -m pytest -v`. Test suite forces APP_ENV=test, DATABASE_URL=sqlite+aiosqlite:///:memory:, and swaps rate_limit_factory.get_rate_limiter with a fresh InMemoryRateLimiter (see conftest.py). To exercise strict-prod behavior, use a subprocess with APP_ENV=production and REDIS_URL='' (redis_url has a default of localhost:6379 in Settings, so an empty env var is needed to fake 'unset'). Alembic migrations are Postgres-only — do NOT run `alembic upgrade` against the SQLite test DB. Current alembic head: 0003_verification_active_unique_index.",
+  "rca_of_the_issue": "N/A — no bugs observed. All 5 Sprint-1 auth-hardening items implemented as described: (1) partial unique index migration in 0003, (2) strict prod fallback in rate_limit_factory raises RateLimiterUnavailableError, (3) login rate limits (per-email 10/hr + per-IP 30/hr) via _enforce_login_rate_limit called before user lookup, (4) 5 new login-security tests all passing, (5) invitation accept throttling (per-user 20/hr + per-IP 60/hr) via _enforce_accept_rate_limit called before invitation lookup. Verification single-active-token invariant enforced at app layer (VerificationTokenRepository) and DB layer (partial unique index on Postgres)."
+}
