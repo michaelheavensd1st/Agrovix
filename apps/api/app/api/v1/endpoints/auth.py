@@ -60,9 +60,11 @@ async def verify(
 @router.post("/resend-verification", response_model=MessageResponse)
 async def resend_verification(
     payload: ResendVerificationRequest,
+    request: Request,
     service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> MessageResponse:
-    await service.resend_verification(email=payload.email)
+    ip = request.client.host if request.client else None
+    await service.resend_verification(email=payload.email, ip_address=ip)
     # Always OK to avoid leaking account existence.
     return MessageResponse(message="If the account exists, a verification email was sent.")
 

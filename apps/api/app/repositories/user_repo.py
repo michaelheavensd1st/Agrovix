@@ -46,6 +46,7 @@ class UserRepository:
         user.verified_at = datetime.now(timezone.utc)
         self.session.add(user)
         await self.session.flush()
+        await self.session.refresh(user)
         return user
 
     async def soft_delete(self, user: User) -> None:

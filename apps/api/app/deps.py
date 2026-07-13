@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.logging import organization_id_var, user_id_var
+from app.core.rate_limit import RateLimiter
+from app.core.rate_limit_factory import get_rate_limiter
 from app.core.security import TokenExpiredError, TokenInvalidError, decode_token
 from app.db.session import get_db_session
 from app.email.base import EmailSender
@@ -108,6 +110,10 @@ def get_email_sender_dep() -> EmailSender:
     return get_email_sender()
 
 
+def get_rate_limiter_dep() -> RateLimiter:
+    return get_rate_limiter()
+
+
 # --------------------------------------------------------------------- #
 # Services
 # --------------------------------------------------------------------- #
@@ -116,12 +122,14 @@ def get_auth_service(
     refresh_repo: Annotated[RefreshTokenRepository, Depends(get_refresh_token_repository)],
     verification_repo: Annotated[VerificationTokenRepository, Depends(get_verification_repository)],
     email_sender: Annotated[EmailSender, Depends(get_email_sender_dep)],
+    rate_limiter: Annotated[RateLimiter, Depends(get_rate_limiter_dep)],
 ) -> AuthService:
     return AuthService(
         user_repo=user_repo,
         refresh_repo=refresh_repo,
         verification_repo=verification_repo,
         email_sender=email_sender,
+        rate_limiter=rate_limiter,
     )
 
 

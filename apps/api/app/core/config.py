@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     # --- Auth policy ---
     allow_unverified_login: bool = Field(default=False)  # dev override
 
+    # --- Rate limiting (resend-verification abuse guard) ---
+    resend_verification_max_per_email_hour: int = Field(default=3)
+    resend_verification_max_per_ip_hour: int = Field(default=10)
+    resend_verification_window_seconds: int = Field(default=3600)
+
     @field_validator("api_cors_origins")
     @classmethod
     def _strip_cors(cls, value: str) -> str:

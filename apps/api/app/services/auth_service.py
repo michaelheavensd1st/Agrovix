@@ -1,4 +1,15 @@
-"""Authentication + verification service."""
+"""Authentication + verification service.
+
+Sprint 1 policy:
+* Only one active email-verification token exists per user at any time
+  (older ones are invalidated when a new one is issued).
+* Verification tokens expire — default 24 h, tunable via
+  ``VERIFICATION_TOKEN_EXPIRE_HOURS``.
+* Successful verification invalidates the used token AND any residual
+  outstanding tokens for that user (belt-and-suspenders).
+* ``resend_verification`` is rate-limited per-email and per-IP through
+  the :class:`RateLimiter` abstraction so tests / dev do not need Redis.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +21,7 @@ from uuid import UUID
 from fastapi import HTTPException, status
 
 from app.core.config import get_settings
+from app.core.rate_limit import RateLimiter
 from app.core.security import (
     TokenExpiredError,
     TokenInvalidError,
@@ -38,11 +50,13 @@ class AuthService:
         refresh_repo: RefreshTokenRepository,
         verification_repo: VerificationTokenRepository,
         email_sender: EmailSender,
+        rate_limiter: RateLimiter,
     ) -> None:
         self.user_repo = user_repo
         self.refresh_repo = refresh_repo
         self.verification_repo = verification_repo
         self.email_sender = email_sender
+        self.rate_limiter = rate_limiter
         self.settings = get_settings()
 
     # ------------------------------------------------------------------ #
@@ -60,12 +74,19 @@ class AuthService:
         await self._issue_verification_email(user)
         return user
 
-    async def resend_verification(self, *, email: str) -> None:
+    async def resend_verification(
+        self, *, email: str, ip_address: str | None = None
+    ) -> None:
+        # Rate-limit BEFORE any account lookup so brute-force enumeration
+        # cannot bypass the throttle.
+        await self._enforce_resend_rate_limit(email=email, ip_address=ip_address)
+
         user = await self.user_repo.get_by_email(email)
-        # Do not leak account existence — silently no-op if user not found.
+        # Do not leak account existence — silently no-op if user not found
+        # or already verified.
         if user is None or user.is_verified:
             return
-        await self.verification_repo.invalidate_all_for_user(user.id)
+
         await self._issue_verification_email(user)
 
     async def verify_email(self, *, token: str) -> User:
@@ -76,24 +97,46 @@ class AuthService:
 
         token_hash = _hash_token(token)
         row = await self.verification_repo.get_by_hash(token_hash)
-        if row is None or row.is_used or row.expires_at < datetime.now(timezone.utc):
+        if row is None or row.is_used:
+            raise self._bad_token()
+
+        # Column may be naive on SQLite tests; normalise to UTC-aware.
+        exp = row.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp < datetime.now(timezone.utc):
             raise self._bad_token()
 
         try:
             user_id = UUID(payload["sub"])
         except (KeyError, ValueError) as exc:
             raise self._bad_token() from exc
+        if row.user_id != user_id:
+            raise self._bad_token()
 
         user = await self.user_repo.get_by_id(user_id)
         if user is None:
             raise self._bad_token()
 
+        # Consume the used token AND invalidate every other outstanding
+        # token for this user in one shot — enforces the "at most one
+        # active verification token" invariant even against races.
         await self.verification_repo.mark_used(row)
+        await self.verification_repo.invalidate_all_for_user(user.id)
+
         user = await self.user_repo.mark_verified(user)
         return user
 
     async def _issue_verification_email(self, user: User) -> None:
-        token, expires_at = create_token(subject=user.id, token_type="verify")
+        # Enforce single-active-token: invalidate any existing tokens
+        # BEFORE issuing a new one.
+        await self.verification_repo.invalidate_all_for_user(user.id)
+
+        token, expires_at = create_token(
+            subject=user.id,
+            token_type="verify",
+            extra_claims={"jti": secrets.token_urlsafe(16)},
+        )
         await self.verification_repo.create(
             user_id=user.id, token_hash=_hash_token(token), expires_at=expires_at
         )
@@ -111,6 +154,26 @@ class AuthService:
                 context={"verify_url": verify_url, "user_email": user.email},
             )
         )
+
+    async def _enforce_resend_rate_limit(self, *, email: str, ip_address: str | None) -> None:
+        window = self.settings.resend_verification_window_seconds
+        # Per-email throttle (prevents mailbox bombing).
+        allowed, retry = await self.rate_limiter.hit(
+            key=f"resend-verify:email:{email.lower()}",
+            limit=self.settings.resend_verification_max_per_email_hour,
+            window_seconds=window,
+        )
+        if not allowed:
+            raise self._too_many_requests(retry)
+        # Per-IP throttle (prevents distributed enumeration).
+        if ip_address:
+            allowed, retry = await self.rate_limiter.hit(
+                key=f"resend-verify:ip:{ip_address}",
+                limit=self.settings.resend_verification_max_per_ip_hour,
+                window_seconds=window,
+            )
+            if not allowed:
+                raise self._too_many_requests(retry)
 
     # ------------------------------------------------------------------ #
     # Login / refresh / logout
@@ -186,7 +249,6 @@ class AuthService:
             expires_in=max(expires_in, 0),
         )
 
-    # Convenience for cookie handlers
     def token_lifetimes(self) -> tuple[timedelta, timedelta]:
         return (
             timedelta(minutes=self.settings.jwt_access_token_expire_minutes),
@@ -214,4 +276,12 @@ class AuthService:
         return HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired verification token.",
+        )
+
+    @staticmethod
+    def _too_many_requests(retry_after: int) -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many verification-resend requests. Please try again later.",
+            headers={"Retry-After": str(max(retry_after, 1))},
         )

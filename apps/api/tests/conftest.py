@@ -35,6 +35,14 @@ from sqlalchemy.pool import StaticPool  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 get_settings.cache_clear()
 
+# Force the process-wide rate limiter to be in-memory during tests —
+# Redis is not available in the hermetic suite.
+from app.core.rate_limit import InMemoryRateLimiter  # noqa: E402
+from app.core import rate_limit_factory  # noqa: E402
+rate_limit_factory.get_rate_limiter.cache_clear()
+_test_rate_limiter = InMemoryRateLimiter()
+rate_limit_factory.get_rate_limiter = lambda: _test_rate_limiter  # type: ignore[assignment]
+
 # Patch the JSONB column used in AuditEvent → JSON on SQLite.
 from sqlalchemy import JSON  # noqa: E402
 from sqlalchemy.dialects.postgresql import JSONB  # noqa: E402
