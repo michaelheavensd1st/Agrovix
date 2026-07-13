@@ -200,6 +200,7 @@ class ProductionBatchTransitionPublic(BaseModel):
 # --------------------------------------------------------------------- #
 class ProductionEventCreate(BaseModel):
     event_type: str = Field(min_length=1, max_length=64)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
     performed_at: datetime | None = None
     data: dict[str, Any]
     attachments: list[dict] | None = None
@@ -217,6 +218,7 @@ class ProductionEventPublic(BaseModel):
     batch_id: UUID
     event_type: str
     event_type_version: int
+    idempotency_key: str | None
     performed_by_id: UUID | None
     performed_at: datetime
     data: dict

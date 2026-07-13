@@ -10,7 +10,6 @@ Shared setup uses the ``tests._helpers`` module from Sprint 1.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -39,7 +38,9 @@ async def _new_owner_org_farm(client: AsyncClient) -> dict:
     sites = r.json()
     assert len(sites) == 1
     return {
-        "owner": email, "org_id": org_id, "farm_id": farm_id,
+        "owner": email,
+        "org_id": org_id,
+        "farm_id": farm_id,
         "site_id": sites[0]["id"],
     }
 
@@ -123,11 +124,18 @@ async def test_site_delete_and_restore_lifecycle(client: AsyncClient) -> None:
 # ===================================================================== #
 @pytest.mark.asyncio
 async def test_system_unit_types_are_seeded(client: AsyncClient) -> None:
-    ctx = await _new_owner_org_farm(client)
+    await _new_owner_org_farm(client)
     r = await client.get("/api/v1/production-unit-types")
     body = r.json()
     codes = {t["code"] for t in body if t["is_system"]}
-    for expected in ("HATCHERY_TANK", "NURSERY_TANK", "GROW_OUT_POND", "CAGE", "RACEWAY", "BIOFLOC_TANK"):
+    for expected in (
+        "HATCHERY_TANK",
+        "NURSERY_TANK",
+        "GROW_OUT_POND",
+        "CAGE",
+        "RACEWAY",
+        "BIOFLOC_TANK",
+    ):
         assert expected in codes
 
 
@@ -313,12 +321,21 @@ async def test_concurrent_transitions_only_one_wins(client: AsyncClient) -> None
 # ===================================================================== #
 @pytest.mark.asyncio
 async def test_event_catalog_returns_all_types(client: AsyncClient) -> None:
-    ctx = await _new_owner_org_farm(client)
+    await _new_owner_org_farm(client)
     r = await client.get("/api/v1/production-events/catalog")
     assert r.status_code == 200, r.text
     codes = {e["code"] for e in r.json()["entries"]}
-    assert {"STOCKING", "FEEDING", "MORTALITY", "SAMPLING", "WATER_QUALITY",
-            "MEDICATION", "TRANSFER", "HARVEST", "INSPECTION"}.issubset(codes)
+    assert {
+        "STOCKING",
+        "FEEDING",
+        "MORTALITY",
+        "SAMPLING",
+        "WATER_QUALITY",
+        "MEDICATION",
+        "TRANSFER",
+        "HARVEST",
+        "INSPECTION",
+    }.issubset(codes)
 
 
 @pytest.mark.asyncio
@@ -453,3 +470,50 @@ async def test_cross_tenant_access_returns_404(client: AsyncClient) -> None:
     ):
         r = await client.get(url)
         assert r.status_code == 404, (url, r.status_code, r.text)
+
+
+@pytest.mark.asyncio
+async def test_custom_unit_types_are_not_visible_cross_tenant(client: AsyncClient) -> None:
+    owner_ctx = await _new_owner_org_farm(client)
+    r = await client.post(
+        f"/api/v1/organizations/{owner_ctx['org_id']}/production-unit-types",
+        json={"code": f"SECRET_{uuid4().hex[:6]}", "name": "Tenant Secret"},
+    )
+    assert r.status_code == 201, r.text
+
+    outsider = f"unit-type-outside-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(outsider)
+    await switch_user(client, outsider)
+    await create_org(client, slug=f"uto-{uuid4().hex[:6]}")
+
+    r = await client.get(
+        "/api/v1/production-unit-types",
+        params={"organization_id": owner_ctx["org_id"]},
+    )
+    assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_event_idempotency_key_prevents_duplicate_event_and_transition(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    batch_id = await _create_batch(client, unit_id)
+
+    payload = {
+        "event_type": "STOCKING",
+        "idempotency_key": f"stock-{uuid4().hex}",
+        "data": {"quantity": 100},
+    }
+    first = await client.post(f"/api/v1/batches/{batch_id}/events", json=payload)
+    assert first.status_code == 201, first.text
+    second = await client.post(f"/api/v1/batches/{batch_id}/events", json=payload)
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] == first.json()["id"]
+
+    r = await client.get(f"/api/v1/batches/{batch_id}/events")
+    assert [e["event_type"] for e in r.json()["items"]].count("STOCKING") == 1
+    r = await client.get(f"/api/v1/batches/{batch_id}/transitions")
+    assert len(r.json()) == 2

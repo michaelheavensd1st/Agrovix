@@ -39,10 +39,8 @@ from app.deps import (
 )
 from app.models.production import (
     ProductionBatch,
-    ProductionBatchState,
     ProductionSite,
     ProductionUnit,
-    ProductionUnitType,
 )
 from app.production.event_catalog import CATALOG
 from app.repositories.audit_repo import AuditRepository
@@ -134,8 +132,10 @@ def get_unit_service(
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
 ) -> ProductionUnitService:
     return ProductionUnitService(
-        unit_repo=unit_repo, unit_type_repo=unit_type_repo,
-        site_repo=site_repo, audit_repo=audit_repo,
+        unit_repo=unit_repo,
+        unit_type_repo=unit_type_repo,
+        site_repo=site_repo,
+        audit_repo=audit_repo,
     )
 
 
@@ -146,8 +146,10 @@ def get_batch_service(
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
 ) -> ProductionBatchService:
     return ProductionBatchService(
-        batch_repo=batch_repo, transition_repo=transition_repo,
-        unit_repo=unit_repo, audit_repo=audit_repo,
+        batch_repo=batch_repo,
+        transition_repo=transition_repo,
+        unit_repo=unit_repo,
+        audit_repo=audit_repo,
     )
 
 
@@ -160,8 +162,12 @@ def get_event_service(
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
 ) -> ProductionEventService:
     return ProductionEventService(
-        event_repo=event_repo, batch_repo=batch_repo, batch_service=batch_service,
-        unit_repo=unit_repo, site_repo=site_repo, audit_repo=audit_repo,
+        event_repo=event_repo,
+        batch_repo=batch_repo,
+        batch_service=batch_service,
+        unit_repo=unit_repo,
+        site_repo=site_repo,
+        audit_repo=audit_repo,
     )
 
 
@@ -174,16 +180,20 @@ async def _load_site_and_farm(
     user: CurrentUser,
     site_repo: ProductionSiteRepository,
     session: DBSession,
-) -> tuple[ProductionSite, "any"]:
+) -> tuple[ProductionSite, any]:
     from app.repositories.org_repo import (
-        FarmMembershipRepository, FarmRepository, OrganizationMembershipRepository,
+        FarmMembershipRepository,
+        FarmRepository,
+        OrganizationMembershipRepository,
     )
     from app.repositories.role_repo import RoleAssignmentRepository
+
     site = await site_repo.get_by_id_including_deleted(site_id)
     if site is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
     # Reuse the exact tenancy invariants that ``get_current_farm`` enforces.
     from app.deps import get_current_farm
+
     farm = await get_current_farm(
         farm_id=site.farm_id,
         user=user,
@@ -199,7 +209,7 @@ async def _load_unit(
     unit_id: uuid.UUID,
     user: CurrentUser,
     session: DBSession,
-) -> tuple[ProductionUnit, ProductionSite, "any"]:
+) -> tuple[ProductionUnit, ProductionSite, any]:
     unit_repo = ProductionUnitRepository(session)
     site_repo = ProductionSiteRepository(session)
     unit = await unit_repo.get_by_id(unit_id)
@@ -213,7 +223,7 @@ async def _load_batch(
     batch_id: uuid.UUID,
     user: CurrentUser,
     session: DBSession,
-) -> tuple[ProductionBatch, ProductionUnit, ProductionSite, "any"]:
+) -> tuple[ProductionBatch, ProductionUnit, ProductionSite, any]:
     batch_repo = ProductionBatchRepository(session)
     batch = await batch_repo.get_by_id(batch_id)
     if batch is None:
@@ -239,12 +249,17 @@ async def create_site(
     service: Annotated[ProductionSiteService, Depends(get_site_service)],
 ) -> ProductionSitePublic:
     site = await service.create(
-        actor=user, farm=farm, data=payload.model_dump(exclude_unset=False), request_ctx=request_ctx,
+        actor=user,
+        farm=farm,
+        data=payload.model_dump(exclude_unset=False),
+        request_ctx=request_ctx,
     )
     return ProductionSitePublic.model_validate(site)
 
 
-@router.get("/farms/{farm_id}/sites", response_model=list[ProductionSitePublic], tags=["production-sites"])
+@router.get(
+    "/farms/{farm_id}/sites", response_model=list[ProductionSitePublic], tags=["production-sites"]
+)
 async def list_sites(
     farm: CurrentFarm,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
@@ -255,7 +270,9 @@ async def list_sites(
 
 @router.get("/sites/{site_id}", response_model=ProductionSitePublic, tags=["production-sites"])
 async def get_site(
-    site_id: uuid.UUID, user: CurrentUser, session: DBSession,
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
 ) -> ProductionSitePublic:
     site = await site_repo.get_by_id(site_id)
@@ -268,11 +285,13 @@ async def get_site(
 
 @router.patch("/sites/{site_id}", response_model=ProductionSitePublic, tags=["production-sites"])
 async def update_site(
-    site_id: uuid.UUID, payload: ProductionSiteUpdate,
-    user: CurrentUser, session: DBSession,
+    site_id: uuid.UUID,
+    payload: ProductionSiteUpdate,
+    user: CurrentUser,
+    session: DBSession,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
 ) -> ProductionSitePublic:
-    site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
+    site, _farm = await _load_site_and_farm(site_id, user, site_repo, session)
     if site.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
     changed = payload.model_dump(exclude_unset=True)
@@ -288,7 +307,10 @@ async def update_site(
 
 @router.delete("/sites/{site_id}", response_model=ProductionSitePublic, tags=["production-sites"])
 async def delete_site(
-    site_id: uuid.UUID, user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
     service: Annotated[ProductionSiteService, Depends(get_site_service)],
 ) -> ProductionSitePublic:
@@ -299,9 +321,14 @@ async def delete_site(
     return ProductionSitePublic.model_validate(site)
 
 
-@router.post("/sites/{site_id}/restore", response_model=ProductionSitePublic, tags=["production-sites"])
+@router.post(
+    "/sites/{site_id}/restore", response_model=ProductionSitePublic, tags=["production-sites"]
+)
 async def restore_site(
-    site_id: uuid.UUID, user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
     service: Annotated[ProductionSiteService, Depends(get_site_service)],
 ) -> ProductionSitePublic:
@@ -313,12 +340,25 @@ async def restore_site(
 # ===================================================================== #
 # ProductionUnitType endpoints
 # ===================================================================== #
-@router.get("/production-unit-types", response_model=list[ProductionUnitTypePublic], tags=["production-unit-types"])
+@router.get(
+    "/production-unit-types",
+    response_model=list[ProductionUnitTypePublic],
+    tags=["production-unit-types"],
+)
 async def list_unit_types(
     user: CurrentUser,
-    organization_id: uuid.UUID | None = Query(default=None, description="Include this org's custom types too."),
+    session: DBSession,
+    organization_id: uuid.UUID | None = Query(
+        default=None, description="Include this org's custom types too."
+    ),
     unit_type_repo: Annotated[ProductionUnitTypeRepository, Depends(get_unit_type_repo)] = None,  # type: ignore
 ) -> list[ProductionUnitTypePublic]:
+    if organization_id is not None and not user.is_superuser:
+        from app.repositories.org_repo import OrganizationMembershipRepository
+
+        mem = await OrganizationMembershipRepository(session).get(user.id, organization_id)
+        if mem is None or not mem.is_active:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found.")
     rows = await unit_type_repo.list_visible(organization_id=organization_id)
     return [ProductionUnitTypePublic.model_validate(r) for r in rows]
 
@@ -328,16 +368,20 @@ async def list_unit_types(
     response_model=ProductionUnitTypePublic,
     status_code=status.HTTP_201_CREATED,
     tags=["production-unit-types"],
-    dependencies=[Depends(require_permission("production_unit_type.create"))],
 )
 async def create_custom_unit_type(
-    organization_id: uuid.UUID, payload: ProductionUnitTypeCreate,
-    user: CurrentUser, request_ctx: RequestCtx,
+    organization_id: uuid.UUID,
+    payload: ProductionUnitTypeCreate,
+    user: CurrentUser,
+    request_ctx: RequestCtx,
+    _authorized: Annotated[object, Depends(require_permission("production_unit_type.create"))],
     service: Annotated[ProductionUnitTypeService, Depends(get_unit_type_service)],
 ) -> ProductionUnitTypePublic:
     row = await service.create_custom(
-        actor=user, organization_id=organization_id,
-        data=payload.model_dump(), request_ctx=request_ctx,
+        actor=user,
+        organization_id=organization_id,
+        data=payload.model_dump(),
+        request_ctx=request_ctx,
     )
     return ProductionUnitTypePublic.model_validate(row)
 
@@ -348,7 +392,10 @@ async def create_custom_unit_type(
     tags=["production-unit-types"],
 )
 async def delete_custom_unit_type(
-    type_id: uuid.UUID, user: CurrentUser, request_ctx: RequestCtx, session: DBSession,
+    type_id: uuid.UUID,
+    user: CurrentUser,
+    request_ctx: RequestCtx,
+    session: DBSession,
     unit_type_repo: Annotated[ProductionUnitTypeRepository, Depends(get_unit_type_repo)],
     service: Annotated[ProductionUnitTypeService, Depends(get_unit_type_service)],
 ) -> ProductionUnitTypePublic:
@@ -359,6 +406,7 @@ async def delete_custom_unit_type(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "System unit types cannot be deleted.")
     # Only owners of the parent org can delete their custom types.
     from app.repositories.org_repo import OrganizationMembershipRepository
+
     if not user.is_superuser:
         mem = await OrganizationMembershipRepository(session).get(user.id, row.organization_id)
         if mem is None or not mem.is_active:
@@ -377,22 +425,32 @@ async def delete_custom_unit_type(
     tags=["production-units"],
 )
 async def create_unit(
-    site_id: uuid.UUID, payload: ProductionUnitCreate,
-    user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    site_id: uuid.UUID,
+    payload: ProductionUnitCreate,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
     service: Annotated[ProductionUnitService, Depends(get_unit_service)],
 ) -> ProductionUnitPublic:
     site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
     unit = await service.create(
-        actor=user, site=site, farm=farm,
-        data=payload.model_dump(), request_ctx=request_ctx,
+        actor=user,
+        site=site,
+        farm=farm,
+        data=payload.model_dump(),
+        request_ctx=request_ctx,
     )
     return ProductionUnitPublic.model_validate(unit)
 
 
-@router.get("/sites/{site_id}/units", response_model=list[ProductionUnitPublic], tags=["production-units"])
+@router.get(
+    "/sites/{site_id}/units", response_model=list[ProductionUnitPublic], tags=["production-units"]
+)
 async def list_units(
-    site_id: uuid.UUID, user: CurrentUser, session: DBSession,
+    site_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
     unit_repo: Annotated[ProductionUnitRepository, Depends(get_unit_repo)],
 ) -> list[ProductionUnitPublic]:
@@ -404,15 +462,19 @@ async def list_units(
 
 
 @router.get("/units/{unit_id}", response_model=ProductionUnitPublic, tags=["production-units"])
-async def get_unit(unit_id: uuid.UUID, user: CurrentUser, session: DBSession) -> ProductionUnitPublic:
+async def get_unit(
+    unit_id: uuid.UUID, user: CurrentUser, session: DBSession
+) -> ProductionUnitPublic:
     unit, _, _ = await _load_unit(unit_id, user, session)
     return ProductionUnitPublic.model_validate(unit)
 
 
 @router.patch("/units/{unit_id}", response_model=ProductionUnitPublic, tags=["production-units"])
 async def update_unit(
-    unit_id: uuid.UUID, payload: ProductionUnitUpdate,
-    user: CurrentUser, session: DBSession,
+    unit_id: uuid.UUID,
+    payload: ProductionUnitUpdate,
+    user: CurrentUser,
+    session: DBSession,
 ) -> ProductionUnitPublic:
     unit, _, _ = await _load_unit(unit_id, user, session)
     changed = payload.model_dump(exclude_unset=True)
@@ -429,7 +491,10 @@ async def update_unit(
 
 @router.delete("/units/{unit_id}", response_model=ProductionUnitPublic, tags=["production-units"])
 async def delete_unit(
-    unit_id: uuid.UUID, user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    unit_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     service: Annotated[ProductionUnitService, Depends(get_unit_service)],
 ) -> ProductionUnitPublic:
     unit, _, farm = await _load_unit(unit_id, user, session)
@@ -447,21 +512,33 @@ async def delete_unit(
     tags=["production-batches"],
 )
 async def create_batch(
-    unit_id: uuid.UUID, payload: ProductionBatchCreate,
-    user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    unit_id: uuid.UUID,
+    payload: ProductionBatchCreate,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     service: Annotated[ProductionBatchService, Depends(get_batch_service)],
 ) -> ProductionBatchPublic:
     unit, _, farm = await _load_unit(unit_id, user, session)
     batch = await service.create(
-        actor=user, unit=unit, farm=farm,
-        data=payload.model_dump(), request_ctx=request_ctx,
+        actor=user,
+        unit=unit,
+        farm=farm,
+        data=payload.model_dump(),
+        request_ctx=request_ctx,
     )
     return ProductionBatchPublic.model_validate(batch)
 
 
-@router.get("/units/{unit_id}/batches", response_model=list[ProductionBatchPublic], tags=["production-batches"])
+@router.get(
+    "/units/{unit_id}/batches",
+    response_model=list[ProductionBatchPublic],
+    tags=["production-batches"],
+)
 async def list_batches(
-    unit_id: uuid.UUID, user: CurrentUser, session: DBSession,
+    unit_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
     batch_repo: Annotated[ProductionBatchRepository, Depends(get_batch_repo)],
 ) -> list[ProductionBatchPublic]:
     unit, _, _ = await _load_unit(unit_id, user, session)
@@ -469,16 +546,24 @@ async def list_batches(
     return [ProductionBatchPublic.model_validate(b) for b in rows]
 
 
-@router.get("/batches/{batch_id}", response_model=ProductionBatchPublic, tags=["production-batches"])
-async def get_batch(batch_id: uuid.UUID, user: CurrentUser, session: DBSession) -> ProductionBatchPublic:
+@router.get(
+    "/batches/{batch_id}", response_model=ProductionBatchPublic, tags=["production-batches"]
+)
+async def get_batch(
+    batch_id: uuid.UUID, user: CurrentUser, session: DBSession
+) -> ProductionBatchPublic:
     batch, _, _, _ = await _load_batch(batch_id, user, session)
     return ProductionBatchPublic.model_validate(batch)
 
 
-@router.patch("/batches/{batch_id}", response_model=ProductionBatchPublic, tags=["production-batches"])
+@router.patch(
+    "/batches/{batch_id}", response_model=ProductionBatchPublic, tags=["production-batches"]
+)
 async def update_batch(
-    batch_id: uuid.UUID, payload: ProductionBatchUpdate,
-    user: CurrentUser, session: DBSession,
+    batch_id: uuid.UUID,
+    payload: ProductionBatchUpdate,
+    user: CurrentUser,
+    session: DBSession,
 ) -> ProductionBatchPublic:
     batch, _, _, _ = await _load_batch(batch_id, user, session)
     changed = payload.model_dump(exclude_unset=True)
@@ -500,16 +585,23 @@ async def update_batch(
     tags=["production-batches"],
 )
 async def transition_batch(
-    batch_id: uuid.UUID, payload: ProductionBatchTransitionRequest,
-    user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    batch_id: uuid.UUID,
+    payload: ProductionBatchTransitionRequest,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     service: Annotated[ProductionBatchService, Depends(get_batch_service)],
     transition_repo: Annotated[ProductionBatchTransitionRepository, Depends(get_transition_repo)],
 ) -> ProductionBatchTransitionPublic:
     batch, _, _, farm = await _load_batch(batch_id, user, session)
     await service.transition(
-        actor=user, batch=batch, farm=farm,
-        target_state=payload.target_state, reason=payload.reason,
-        request_ctx=request_ctx, metadata=payload.metadata_json,
+        actor=user,
+        batch=batch,
+        farm=farm,
+        target_state=payload.target_state,
+        reason=payload.reason,
+        request_ctx=request_ctx,
+        metadata=payload.metadata_json,
     )
     # Return the most recent transition row.
     rows = await transition_repo.list_for_batch(batch.id)
@@ -522,7 +614,9 @@ async def transition_batch(
     tags=["production-batches"],
 )
 async def list_batch_transitions(
-    batch_id: uuid.UUID, user: CurrentUser, session: DBSession,
+    batch_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
     transition_repo: Annotated[ProductionBatchTransitionRepository, Depends(get_transition_repo)],
 ) -> list[ProductionBatchTransitionPublic]:
     batch, _, _, _ = await _load_batch(batch_id, user, session)
@@ -541,7 +635,9 @@ async def list_batch_transitions(
 async def get_event_catalog(user: CurrentUser) -> ProductionEventCatalogResponse:
     del user  # authentication only — catalog is not tenant-specific.
     return ProductionEventCatalogResponse(
-        entries=[ProductionEventCatalogEntry.model_validate(e) for e in CATALOG.as_openapi_catalog()],
+        entries=[
+            ProductionEventCatalogEntry.model_validate(e) for e in CATALOG.as_openapi_catalog()
+        ],
     )
 
 
@@ -552,14 +648,22 @@ async def get_event_catalog(user: CurrentUser) -> ProductionEventCatalogResponse
     tags=["production-events"],
 )
 async def create_event(
-    batch_id: uuid.UUID, payload: ProductionEventCreate,
-    user: CurrentUser, session: DBSession, request_ctx: RequestCtx,
+    batch_id: uuid.UUID,
+    payload: ProductionEventCreate,
+    user: CurrentUser,
+    session: DBSession,
+    request_ctx: RequestCtx,
     service: Annotated[ProductionEventService, Depends(get_event_service)],
 ) -> ProductionEventPublic:
     batch, unit, site, farm = await _load_batch(batch_id, user, session)
     event = await service.create(
-        actor=user, batch=batch, unit=unit, site=site, farm=farm,
-        payload=payload.model_dump(exclude_unset=False), request_ctx=request_ctx,
+        actor=user,
+        batch=batch,
+        unit=unit,
+        site=site,
+        farm=farm,
+        payload=payload.model_dump(exclude_unset=False),
+        request_ctx=request_ctx,
     )
     return ProductionEventPublic.model_validate(event)
 
@@ -570,7 +674,9 @@ async def create_event(
     tags=["production-events"],
 )
 async def list_events(
-    batch_id: uuid.UUID, user: CurrentUser, session: DBSession,
+    batch_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
     limit: int = Query(default=50, ge=1, le=500),
     cursor: str | None = Query(default=None),
     event_type: str | None = Query(default=None),
@@ -578,7 +684,10 @@ async def list_events(
 ) -> ProductionEventPage:
     batch, _, _, _ = await _load_batch(batch_id, user, session)
     rows, next_cursor = await service.list_for_batch(
-        batch, limit=limit, cursor=cursor, event_type=event_type,
+        batch,
+        limit=limit,
+        cursor=cursor,
+        event_type=event_type,
     )
     return ProductionEventPage(
         items=[ProductionEventPublic.model_validate(r) for r in rows],
@@ -589,7 +698,9 @@ async def list_events(
 
 @router.get("/events/{event_id}", response_model=ProductionEventPublic, tags=["production-events"])
 async def get_event(
-    event_id: uuid.UUID, user: CurrentUser, session: DBSession,
+    event_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
     event_repo: Annotated[ProductionEventRepository, Depends(get_event_repo)],
 ) -> ProductionEventPublic:
     event = await event_repo.get_by_id(event_id)

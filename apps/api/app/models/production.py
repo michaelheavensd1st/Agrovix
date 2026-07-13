@@ -293,6 +293,7 @@ class ProductionEvent(Base, UUIDPrimaryKeyMixin):
         Index("ix_events_type_performed", "event_type", "performed_at"),
         Index("ix_events_org_performed", "organization_id", "performed_at"),
         Index("ix_events_farm_performed", "farm_id", "performed_at"),
+        UniqueConstraint("batch_id", "idempotency_key", name="uq_event_batch_idempotency_key"),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
@@ -317,6 +318,7 @@ class ProductionEvent(Base, UUIDPrimaryKeyMixin):
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     event_type_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     performed_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

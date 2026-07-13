@@ -14,19 +14,17 @@ and one 409 — never a corrupt final state.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
 from pydantic import ValidationError
 
-from app.models.audit import AuditEvent
 from app.models.farm import Farm
 from app.models.production import (
     ProductionBatch,
     ProductionBatchState,
     ProductionEvent,
     ProductionSite,
-    ProductionSiteStatus,
     ProductionUnit,
     ProductionUnitStatus,
     ProductionUnitType,
@@ -93,9 +91,13 @@ class ProductionSiteService:
             return  # idempotent
         await self.site_repo.soft_delete(site)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_site.delete",
-            entity_type="production_site", entity_id=str(site.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_site.delete",
+            entity_type="production_site",
+            entity_id=str(site.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
 
     async def restore(
@@ -105,9 +107,13 @@ class ProductionSiteService:
             return site
         await self.site_repo.restore(site)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_site.restore",
-            entity_type="production_site", entity_id=str(site.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_site.restore",
+            entity_type="production_site",
+            entity_id=str(site.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return site
 
@@ -138,9 +144,12 @@ class ProductionUnitTypeService:
             organization_id=organization_id, is_system=False, **data
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit_type.create",
-            entity_type="production_unit_type", entity_id=str(row.id),
-            organization_id=organization_id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit_type.create",
+            entity_type="production_unit_type",
+            entity_id=str(row.id),
+            organization_id=organization_id,
+            **request_ctx,
         )
         return row
 
@@ -156,9 +165,12 @@ class ProductionUnitTypeService:
             return
         await self.unit_type_repo.soft_delete(row)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit_type.delete",
-            entity_type="production_unit_type", entity_id=str(row.id),
-            organization_id=row.organization_id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit_type.delete",
+            entity_type="production_unit_type",
+            entity_id=str(row.id),
+            organization_id=row.organization_id,
+            **request_ctx,
         )
 
 
@@ -204,9 +216,13 @@ class ProductionUnitService:
             )
         unit = await self.unit_repo.create(site_id=site.id, **data)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit.create",
-            entity_type="production_unit", entity_id=str(unit.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit.create",
+            entity_type="production_unit",
+            entity_id=str(unit.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return unit
 
@@ -229,9 +245,13 @@ class ProductionUnitService:
             return
         await self.unit_repo.soft_delete(unit)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit.delete",
-            entity_type="production_unit", entity_id=str(unit.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit.delete",
+            entity_type="production_unit",
+            entity_id=str(unit.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
 
 
@@ -269,9 +289,7 @@ _ALLOWED_TRANSITIONS: dict[ProductionBatchState, set[ProductionBatchState]] = {
 }
 
 # Certain transitions can only be reached via a specific event type.
-_EVENT_DRIVEN_TRANSITIONS: dict[
-    tuple[ProductionBatchState, ProductionBatchState], str
-] = {
+_EVENT_DRIVEN_TRANSITIONS: dict[tuple[ProductionBatchState, ProductionBatchState], str] = {
     (ProductionBatchState.PLANNED, ProductionBatchState.STOCKED): "STOCKING",
     (ProductionBatchState.ACTIVE, ProductionBatchState.HARVESTED): "HARVEST",
 }
@@ -322,9 +340,13 @@ class ProductionBatchService:
             actor_id=actor.id,
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_batch.create",
-            entity_type="production_batch", entity_id=str(batch.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_batch.create",
+            entity_type="production_batch",
+            entity_id=str(batch.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return batch
 
@@ -374,7 +396,7 @@ class ProductionBatchService:
             return batch
 
         # Timestamps for lifecycle milestones.
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ts_fields: dict[str, datetime] = {}
         if target_state == ProductionBatchState.STOCKED:
             ts_fields["stocked_at"] = now
@@ -384,7 +406,10 @@ class ProductionBatchService:
             ts_fields["closed_at"] = now
 
         succeeded = await self.batch_repo.compare_and_set_state(
-            batch.id, from_state=current, to_state=target_state, timestamp_fields=ts_fields,
+            batch.id,
+            from_state=current,
+            to_state=target_state,
+            timestamp_fields=ts_fields,
         )
         if not succeeded:
             # Another caller transitioned the batch first.
@@ -408,9 +433,12 @@ class ProductionBatchService:
             metadata=metadata,
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_batch.transition",
-            entity_type="production_batch", entity_id=str(batch.id),
-            organization_id=farm.organization_id, farm_id=farm.id,
+            actor_id=actor.id,
+            action="production_batch.transition",
+            entity_type="production_batch",
+            entity_id=str(batch.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
             metadata={"from": current.value, "to": target_state.value, "reason": reason},
             **request_ctx,
         )
@@ -449,6 +477,12 @@ class ProductionEventService:
         payload: dict,
         request_ctx: dict,
     ) -> ProductionEvent:
+        idem_key = payload.get("idempotency_key")
+        if idem_key:
+            existing = await self.event_repo.get_by_idempotency_key(batch.id, idem_key)
+            if existing is not None:
+                return existing
+
         if batch.state in _TERMINAL_STATES:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -493,18 +527,23 @@ class ProductionEventService:
             batch_id=batch.id,
             event_type=entry.code,
             event_type_version=entry.version,
+            idempotency_key=idem_key,
             performed_by_id=actor.id,
-            performed_at=payload.get("performed_at") or datetime.now(timezone.utc),
+            performed_at=payload.get("performed_at") or datetime.now(UTC),
             data=validated_data,
             attachments=payload.get("attachments"),
             is_final=is_final,
             notes=payload.get("notes"),
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_event.create",
-            entity_type="production_event", entity_id=str(event.id),
-            organization_id=farm.organization_id, farm_id=farm.id,
-            metadata={"event_type": entry.code}, **request_ctx,
+            actor_id=actor.id,
+            action="production_event.create",
+            entity_type="production_event",
+            entity_id=str(event.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            metadata={"event_type": entry.code},
+            **request_ctx,
         )
 
         # ---- Optional lifecycle transition ----------------------- #
@@ -515,9 +554,13 @@ class ProductionEventService:
                 pass
             elif batch.state != target and target in _ALLOWED_TRANSITIONS.get(batch.state, set()):
                 await self.batch_service.transition(
-                    actor=actor, batch=batch, farm=farm, target_state=target,
+                    actor=actor,
+                    batch=batch,
+                    farm=farm,
+                    target_state=target,
                     reason=f"triggered by {entry.code} event",
-                    request_ctx=request_ctx, triggering_event=event,
+                    request_ctx=request_ctx,
+                    triggering_event=event,
                 )
         return event
 
@@ -525,5 +568,8 @@ class ProductionEventService:
         self, batch: ProductionBatch, *, limit: int, cursor: str | None, event_type: str | None
     ) -> tuple[list[ProductionEvent], str | None]:
         return await self.event_repo.list_for_batch(
-            batch.id, limit=limit, cursor=cursor, event_type=event_type,
+            batch.id,
+            limit=limit,
+            cursor=cursor,
+            event_type=event_type,
         )

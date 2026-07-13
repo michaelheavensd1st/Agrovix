@@ -327,6 +327,18 @@ class ProductionEventRepository:
         await self.session.flush()
         return row
 
+    async def get_by_idempotency_key(
+        self, batch_id: uuid.UUID, idempotency_key: str
+    ) -> ProductionEvent | None:
+        return (
+            await self.session.execute(
+                select(ProductionEvent).where(
+                    ProductionEvent.batch_id == batch_id,
+                    ProductionEvent.idempotency_key == idempotency_key,
+                )
+            )
+        ).scalar_one_or_none()
+
     async def get_by_id(self, event_id: uuid.UUID) -> ProductionEvent | None:
         return (await self.session.execute(
             select(ProductionEvent).where(ProductionEvent.id == event_id)
