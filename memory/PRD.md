@@ -1,93 +1,73 @@
-# PRD — Agrovix AgOS Sprint 0 (Foundation)
+# PRD — Agrovix AgOS
 
 ## Original Problem Statement
-Build an enterprise-grade Agricultural Operating System (AgOS) using a monorepo architecture.
-Sprint 0 = project foundation only (no farm business features). Deliverables:
-- Turborepo + pnpm monorepo
-- FastAPI backend with `/`, `/health`, `/version`
-- Web (Next.js + TS + Tailwind + shadcn) shell: Landing, Login, Register, Dashboard, 404
-- Mobile (Expo/RN) shell: Splash, Login, Register, Dashboard
-- Shared packages: `@agrovix/ui`, `@agrovix/types`, `@agrovix/validation`, `@agrovix/utils`, `@agrovix/config`
-- PostgreSQL + Redis (docker-compose)
-- SQLAlchemy + Alembic
-- JWT + refresh tokens + password hashing + RBAC + revocation store
-- GitHub Actions CI (lint, format, type-check, tests, build, audit)
-- ESLint, Prettier, Ruff, Black, Pytest, Vitest
-- Docker Compose + Dockerfiles
-- README with setup
+Enterprise-grade Agricultural Operating System (aquaculture / fish-hatchery
+first). Monorepo: Next.js web + Expo mobile + FastAPI + PostgreSQL + Redis.
 
-## User Choices
-- Platform: Web (Next.js) + Mobile (Expo) scaffolding, per spec
-- Auth: JWT email/password only (Google/etc later)
-- Monorepo: Turborepo + pnpm workspaces
-- CI: Lint + format + type + tests + web build + audit; no CD yet
-- Package namespace: `@agrovix/*`
+## Sprint 0 — Foundation (accepted 2026-02)
+Full monorepo scaffolding, JWT auth scaffold, Alembic-managed Postgres,
+Turborepo + pnpm, GitHub Actions CI, Docker Compose.
 
-## Architecture Delivered
-```
-/app
-├── apps/
-│   ├── api/       FastAPI + SQLAlchemy async + Alembic + JWT + bcrypt + RBAC
-│   ├── web/       Next.js 14 (App Router) + TS + Tailwind
-│   └── mobile/    Expo SDK 51 + RN + React Navigation
-├── packages/
-│   ├── ui/        cn() + <Button/> primitive
-│   ├── types/     Shared TS types (PublicUser, TokenPair, …)
-│   ├── validation/Zod schemas mirroring API
-│   ├── utils/     Pure helpers (formatDate, assertDefined, …)
-│   └── config/    ESLint / Tailwind / TS presets
-├── .github/workflows/ci.yml
-├── docker-compose.yml (postgres 16, redis 7, api, web)
-├── turbo.json, pnpm-workspace.yaml, tsconfig.base.json
-├── README.md (full setup docs)
-├── backend/server.py   ← pod live-preview shim
-└── frontend/*          ← pod live-preview CRA mirror of the Next.js pages
-```
+## Sprint 1 — Identity, Tenancy, RBAC (this delta)
 
-## What's Implemented (2026-02)
-- **Backend** (`apps/api`)
-  - App factory, config (pydantic-settings), structured logging
-  - Baseline routes: `/`, `/health`, `/version`
-  - v1 routes: `/api/v1/health/`, `/api/v1/health/ready`, `/api/v1/version/`
-  - Auth routes: `/register`, `/login`, `/refresh`, `/logout`, `/me`
-  - SQLAlchemy async models: User, Role, Permission, RefreshToken + associations
-  - Repositories (UserRepository, RefreshTokenRepository)
-  - AuthService with bcrypt hashing + JWT (access + refresh) + hashed refresh-token store + rotation
-  - RBAC dependency (`require_roles(*)`)
-  - Alembic initial migration
-  - Pytest tests (health, version, password hashing, JWT round-trip)
-  - Dockerfile
-- **Web** (`apps/web`)
-  - App Router with Landing, Login, Register, Dashboard, 404
-  - Tailwind + shadcn-style CSS variables
-  - Fetch-based API client + AuthForm component
-  - Vitest tests
-  - Dockerfile
-- **Mobile** (`apps/mobile`)
-  - Expo + RN + React Navigation
-  - Splash, Login, Register, Dashboard screens
-- **Shared packages** — all wired via workspace protocol
-- **CI** — GitHub Actions with install → lint → type-check → test → web build → audit → API ruff/black/pytest with real Postgres+Redis service containers
-- **Docker Compose** — Postgres + Redis + API + Web
-- **Pod live-preview** — `/app/backend/server.py` (FastAPI shim) + `/app/frontend` (CRA mirror) so the Emergent pod serves the AgOS pages/endpoints without needing pnpm/Next.js/Postgres inside the container
+### Foundation corrections
+- ✅ Replaced React Navigation with **Expo Router** (typed routes, file-based).
+- ✅ Web auth = **httpOnly, Secure, SameSite cookies** (never localStorage).
+- ✅ Mobile auth = **Expo SecureStore** (Keychain / EncryptedSharedPreferences).
+- ✅ Structured **JSON logging** — request_id, user_id, organization_id, endpoint, status_code, duration_ms per request.
+- ✅ **OpenTelemetry-ready Tracer interface** (no-op impl; swap-in ready).
+- ✅ **Automated tests**: expired access, refresh rotation, revoked refresh, duplicate email, invalid credentials, unauthorized protected route, permission denial, ownership-orphan guard.
+- ✅ No default superuser. `python -m app.cli create_admin` (interactive) creates the first platform administrator.
+- ✅ CRA/Mongo preview clearly marked. `/app/PREVIEW_SHIM.md` documents policy; production code MongoDB-free (`scripts/verify-no-mongo.sh` in CI).
+- ✅ Verified only "Agrovix" (no "Agrova" occurrences).
 
-## Personas
-- Backend engineer / platform engineer setting up Agrovix Sprint 0 skeleton
-- Frontend engineer needing landing/auth pages to build upon
-- Mobile engineer needing Expo scaffold with navigation
-- QA/DevOps validating CI + Docker Compose
+### Domain models (apps/api)
+- User (extended: `is_verified`, `verified_at`, `deleted_at`)
+- Role (permission-driven; adds `scope`, `is_system`)
+- Permission
+- RoleAssignment (user × role × org? × farm?; revocable; unique-per-scope)
+- Organization (slug, soft delete, active flag)
+- OrganizationMembership (user × org, invited_by, join meta, soft delete)
+- Farm (org_id + code unique, soft delete)
+- FarmMembership (user × farm, soft delete)
+- Invitation (email + hashed token, status enum, expires_at, revoked_at, accepted_at)
+- AuditEvent (actor / org / farm / action / entity / ip / ua / request_id / metadata JSON)
+- EmailVerificationToken (hashed, single-use, expiring)
 
-## Backlog (P0 → P2)
-- **P0** Business models: Farm, Field, Crop, Season, Team + relationships
-- **P0** Real DB-backed auth flows in-pod (currently pod uses in-memory shim; canonical apps/api runs on Postgres)
-- **P1** SSO providers (Google, Microsoft, Apple), phone OTP
-- **P1** Observability: OpenTelemetry, JSON logs, Prometheus metrics
-- **P1** Object storage integration for farm imagery/documents
-- **P2** CD pipelines (staging + prod, per-app), Terraform infra
-- **P2** Feature flags, i18n, audit log
+### Services (permission-driven)
+- AuthService — register, verify_email, resend_verification, login (with cookies), refresh (rotate + revoke), logout
+- OrganizationService — create (auto-owner assignment), delete (ownership guard)
+- FarmService — create/update/delete (audited)
+- InvitationService — create/accept/revoke (scope-aware; audited)
+- RoleAssignmentService — assign/revoke (blocks last-owner revoke; audited)
+
+### API endpoints (`/api/v1`)
+Auth: register, verify, resend-verification, login, refresh, logout, me
+Orgs: create/list/get/patch/delete
+Farms: create-under-org, list-in-org, get, patch
+Invitations: create, list, accept, revoke
+Role assignments: create, revoke
+Audit: list-in-org
+
+### Web (apps/web)
+- New pages: `/verify`, `/onboarding`, `/organizations/[id]`, `/organizations/[id]/farms/new`, `/organizations/[id]/invitations/new`, `/accept-invite`.
+- API client uses `credentials: 'include'`. No token storage in JS.
+
+### Mobile (apps/mobile)
+- Expo Router shell: `app/_layout.tsx`, `app/index.tsx`, `app/login.tsx`, `app/register.tsx`, `app/dashboard.tsx`. AuthProvider + SecureStore.
+
+### CI
+- Adds `mongo-guard` job (`scripts/verify-no-mongo.sh`).
+- Retains lint / type-check / vitest / next-build / ruff / black / pytest / audit.
+
+### Not in Sprint 1 (intentional)
+- Field, Crop, Season (aquaculture-first, deferred to Sprint 2).
+- `scaffold:feature` code generator (only after patterns survive Sprint 1+).
+- Full OpenTelemetry export (interface only).
+- Resend / SendGrid production email backends (LogEmailSender ships).
 
 ## Next Actions
-1. Add farm-domain models (Farm, Field, Crop, Season) + migrations
-2. Seed a canonical superuser + default roles (`admin`, `farm_manager`, `field_worker`)
-3. Wire the Next.js web app to a real API base URL + token persistence
-4. Introduce structured request/response logging
+1. Aquaculture domain: Hatchery, Pond, Batch, StockingEvent, FeedLog, MortalityLog.
+2. Resend backend for `EmailSender` (verified sender + templated HTML).
+3. Fine-grained audit UI + filtering + export.
+4. Mobile onboarding flow (currently just shell).

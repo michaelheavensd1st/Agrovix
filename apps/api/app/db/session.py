@@ -14,14 +14,19 @@ from app.core.config import get_settings
 
 _settings = get_settings()
 
-engine = create_async_engine(
-    _settings.database_url,
-    pool_size=_settings.database_pool_size,
-    max_overflow=_settings.database_max_overflow,
-    echo=_settings.database_echo,
-    pool_pre_ping=True,
-    future=True,
-)
+_engine_kwargs: dict = {
+    "echo": _settings.database_echo,
+    "pool_pre_ping": True,
+    "future": True,
+}
+# Pool sizing options are meaningless for SQLite (single-threaded) and
+# will error out. We keep the async engine sqlite-compatible for local
+# test fixtures.
+if not _settings.database_url.startswith("sqlite"):
+    _engine_kwargs["pool_size"] = _settings.database_pool_size
+    _engine_kwargs["max_overflow"] = _settings.database_max_overflow
+
+engine = create_async_engine(_settings.database_url, **_engine_kwargs)
 
 AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
     bind=engine,
@@ -33,15 +38,14 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
-    """FastAPI dependency yielding an :class:`AsyncSession`."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
+            await session.commit()
         except Exception:
             await session.rollback()
             raise
 
 
 async def dispose_engine() -> None:
-    """Close all pooled connections on shutdown."""
     await engine.dispose()

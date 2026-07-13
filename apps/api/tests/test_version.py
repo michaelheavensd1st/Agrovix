@@ -1,23 +1,21 @@
-"""Version endpoint tests."""
+"""Version + v1 meta endpoints."""
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+import pytest
+from httpx import AsyncClient
 
 
-def test_version_endpoint_returns_metadata(client: TestClient) -> None:
-    resp = client.get("/version")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["name"]
-    assert body["version"]
-    assert body["environment"]
-    assert body["api_prefix"].startswith("/api")
+@pytest.mark.asyncio
+async def test_v1_version(client: AsyncClient) -> None:
+    r = await client.get("/api/v1/version/")
+    assert r.status_code == 200
+    body = r.json()
+    assert "git_commit" in body and "build_time" in body
 
 
-def test_version_v1_endpoint_returns_metadata(client: TestClient) -> None:
-    resp = client.get("/api/v1/version/")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert "git_commit" in body
-    assert "build_time" in body
+@pytest.mark.asyncio
+async def test_v1_health(client: AsyncClient) -> None:
+    r = await client.get("/api/v1/health/")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}

@@ -10,40 +10,43 @@ _settings = get_settings()
 
 
 class RegisterRequest(BaseModel):
-    """Payload for ``POST /api/v1/auth/register``."""
-
     model_config = ConfigDict(str_strip_whitespace=True)
-
     email: EmailStr
     password: str = Field(..., min_length=_settings.password_min_length, max_length=128)
     full_name: str | None = Field(default=None, max_length=255)
 
 
 class LoginRequest(BaseModel):
-    """Payload for ``POST /api/v1/auth/login``."""
-
     model_config = ConfigDict(str_strip_whitespace=True)
-
     email: EmailStr
     password: str = Field(..., min_length=1, max_length=128)
 
 
 class RefreshRequest(BaseModel):
-    """Payload for ``POST /api/v1/auth/refresh``."""
-
-    refresh_token: str = Field(..., min_length=10)
+    refresh_token: str | None = Field(default=None, min_length=10)
 
 
 class LogoutRequest(BaseModel):
-    """Payload for ``POST /api/v1/auth/logout``."""
+    refresh_token: str | None = Field(default=None, min_length=10)
 
-    refresh_token: str = Field(..., min_length=10)
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
 
 
 class TokenPair(BaseModel):
-    """Access + refresh token pair returned by login / refresh."""
+    """Legacy body-token response.
+
+    Web clients receive the tokens as httpOnly cookies instead; this shape
+    is preserved for mobile / server-to-server clients that still opt into
+    header-based auth.
+    """
 
     access_token: str
     refresh_token: str
     token_type: str = Field(default="bearer")
-    expires_in: int = Field(..., description="Access token lifetime in seconds")
+    expires_in: int

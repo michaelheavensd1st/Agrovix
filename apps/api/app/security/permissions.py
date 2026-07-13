@@ -1,0 +1,128 @@
+"""Canonical permission + role catalogue.
+
+Sprint 1 keeps *everything* permission-driven — nothing in the auth
+check path should ever look at a role name. Roles here are simply
+convenient bundles of permissions applied at a scope.
+
+To extend the model:
+* add permission code(s) to :data:`ALL_PERMISSIONS`
+* wire them into :data:`ROLE_DEFINITIONS`
+* run ``alembic upgrade head`` then the seeder — the seeder is
+  idempotent so it is safe to call on every deploy.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from app.models.role import RoleScope
+
+
+@dataclass(frozen=True)
+class PermissionDef:
+    code: str
+    description: str
+
+
+@dataclass(frozen=True)
+class RoleDef:
+    name: str
+    scope: RoleScope
+    description: str
+    permissions: tuple[str, ...]
+
+
+ALL_PERMISSIONS: tuple[PermissionDef, ...] = (
+    PermissionDef("platform.admin", "Full platform administration"),
+    PermissionDef("organization.read", "Read organization details"),
+    PermissionDef("organization.update", "Update organization details"),
+    PermissionDef("organization.delete", "Delete an organization"),
+    PermissionDef("organization.member.invite", "Invite a user to an organization"),
+    PermissionDef("organization.member.remove", "Remove a member from an organization"),
+    PermissionDef("organization.role.assign", "Assign roles to organization members"),
+    PermissionDef("farm.read", "Read farms in scope"),
+    PermissionDef("farm.create", "Create farms in an organization"),
+    PermissionDef("farm.update", "Update farms"),
+    PermissionDef("farm.delete", "Soft-delete farms"),
+    PermissionDef("farm.member.assign", "Grant a user access to a farm"),
+    PermissionDef("audit.read", "View audit events for the organization"),
+    PermissionDef("invitation.create", "Create invitations"),
+    PermissionDef("invitation.revoke", "Revoke invitations"),
+    PermissionDef("invitation.list", "List invitations"),
+)
+
+
+def _codes(*codes: str) -> tuple[str, ...]:
+    return codes
+
+
+ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
+    RoleDef(
+        "platform_admin", RoleScope.PLATFORM,
+        "Platform-wide administrator",
+        _codes("platform.admin"),
+    ),
+    RoleDef(
+        "organization_owner", RoleScope.ORGANIZATION,
+        "Owner of an organization",
+        _codes(
+            "organization.read", "organization.update", "organization.delete",
+            "organization.member.invite", "organization.member.remove",
+            "organization.role.assign",
+            "farm.read", "farm.create", "farm.update", "farm.delete",
+            "farm.member.assign",
+            "audit.read",
+            "invitation.create", "invitation.revoke", "invitation.list",
+        ),
+    ),
+    RoleDef(
+        "farm_director", RoleScope.ORGANIZATION,
+        "Director overseeing multiple farms in an organization",
+        _codes(
+            "organization.read",
+            "farm.read", "farm.create", "farm.update",
+            "farm.member.assign",
+            "audit.read",
+            "invitation.create", "invitation.list",
+        ),
+    ),
+    RoleDef(
+        "farm_manager", RoleScope.FARM,
+        "Manages the operations of a single farm",
+        _codes(
+            "organization.read", "farm.read", "farm.update",
+            "farm.member.assign",
+            "invitation.create", "invitation.list",
+        ),
+    ),
+    RoleDef(
+        "supervisor", RoleScope.FARM,
+        "Supervises daily operations at a farm",
+        _codes("organization.read", "farm.read"),
+    ),
+    RoleDef(
+        "storekeeper", RoleScope.FARM,
+        "Manages farm inventory and stores",
+        _codes("organization.read", "farm.read"),
+    ),
+    RoleDef(
+        "veterinarian", RoleScope.FARM,
+        "Farm veterinarian",
+        _codes("organization.read", "farm.read"),
+    ),
+    RoleDef(
+        "accountant", RoleScope.ORGANIZATION,
+        "Handles finances across the organization",
+        _codes("organization.read", "farm.read", "audit.read"),
+    ),
+    RoleDef(
+        "worker", RoleScope.FARM,
+        "General farm worker",
+        _codes("farm.read"),
+    ),
+    RoleDef(
+        "viewer", RoleScope.ORGANIZATION,
+        "Read-only observer",
+        _codes("organization.read", "farm.read"),
+    ),
+)

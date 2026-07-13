@@ -1,0 +1,110 @@
+"""Organization + Farm domain services (tenancy-safe)."""
+
+from __future__ import annotations
+
+import uuid
+
+from fastapi import HTTPException, status
+
+from app.models.farm import Farm
+from app.models.organization import Organization
+from app.models.user import User
+from app.repositories.audit_repo import AuditRepository
+from app.repositories.org_repo import (
+    FarmMembershipRepository,
+    FarmRepository,
+    OrganizationMembershipRepository,
+    OrganizationRepository,
+)
+from app.repositories.role_repo import RoleAssignmentRepository, RoleRepository
+
+
+class OrganizationService:
+    def __init__(
+        self,
+        *,
+        org_repo: OrganizationRepository,
+        org_mem_repo: OrganizationMembershipRepository,
+        role_repo: RoleRepository,
+        role_assign_repo: RoleAssignmentRepository,
+        audit_repo: AuditRepository,
+    ) -> None:
+        self.org_repo = org_repo
+        self.org_mem_repo = org_mem_repo
+        self.role_repo = role_repo
+        self.role_assign_repo = role_assign_repo
+        self.audit_repo = audit_repo
+
+    async def create(self, *, actor: User, data: dict, request_ctx: dict) -> Organization:
+        existing = await self.org_repo.get_by_slug(data["slug"])
+        if existing is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "That slug is already in use.")
+        org = await self.org_repo.create(**data)
+
+        # Creator becomes an organization_owner + org-member automatically.
+        owner_role = await self.role_repo.get_by_name("organization_owner")
+        if owner_role is None:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Server misconfiguration: organization_owner role missing. Run the seed script.",
+            )
+        await self.role_assign_repo.create(
+            user_id=actor.id, role_id=owner_role.id,
+            organization_id=org.id, farm_id=None, granted_by_id=actor.id,
+        )
+        await self.org_mem_repo.upsert_active(
+            user_id=actor.id, org_id=org.id, invited_by_id=None
+        )
+        await self.audit_repo.record(
+            actor_id=actor.id, action="organization.create",
+            entity_type="organization", entity_id=str(org.id),
+            organization_id=org.id, metadata={"slug": org.slug, "name": org.name},
+            **request_ctx,
+        )
+        return org
+
+    async def delete(self, *, actor: User, org: Organization, request_ctx: dict) -> None:
+        # Ownership orphan guard is implicit — soft-delete cascades to
+        # memberships but the org itself is preserved with a deleted_at.
+        await self.org_repo.soft_delete(org)
+        await self.audit_repo.record(
+            actor_id=actor.id, action="organization.delete",
+            entity_type="organization", entity_id=str(org.id),
+            organization_id=org.id, **request_ctx,
+        )
+
+
+class FarmService:
+    def __init__(
+        self,
+        *,
+        farm_repo: FarmRepository,
+        farm_mem_repo: FarmMembershipRepository,
+        audit_repo: AuditRepository,
+    ) -> None:
+        self.farm_repo = farm_repo
+        self.farm_mem_repo = farm_mem_repo
+        self.audit_repo = audit_repo
+
+    async def create(
+        self, *, actor: User, organization_id: uuid.UUID, data: dict, request_ctx: dict
+    ) -> Farm:
+        farm = await self.farm_repo.create(organization_id=organization_id, **data)
+        # Creator gets explicit farm membership.
+        await self.farm_mem_repo.upsert_active(user_id=actor.id, farm_id=farm.id)
+        await self.audit_repo.record(
+            actor_id=actor.id, action="farm.create",
+            entity_type="farm", entity_id=str(farm.id),
+            organization_id=organization_id, farm_id=farm.id,
+            metadata={"code": farm.code, "name": farm.name},
+            **request_ctx,
+        )
+        return farm
+
+    async def delete(self, *, actor: User, farm: Farm, request_ctx: dict) -> None:
+        await self.farm_repo.soft_delete(farm)
+        await self.audit_repo.record(
+            actor_id=actor.id, action="farm.delete",
+            entity_type="farm", entity_id=str(farm.id),
+            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+        )

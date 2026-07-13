@@ -1,15 +1,16 @@
 import { useEffect } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
-import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import type { RootStackParamList } from '../navigation/AppNavigator';
+import { router } from 'expo-router';
+import { getAccessToken } from '../src/lib/secure-storage';
 
-type Props = NativeStackScreenProps<RootStackParamList, 'Splash'>;
-
-export function SplashScreen({ navigation }: Props) {
+export default function Splash() {
   useEffect(() => {
-    const t = setTimeout(() => navigation.replace('Login'), 1200);
-    return () => clearTimeout(t);
-  }, [navigation]);
+    (async () => {
+      const token = await getAccessToken();
+      // Small artificial delay so the splash is visible on cold-start.
+      setTimeout(() => router.replace(token ? '/dashboard' : '/login'), 900);
+    })();
+  }, []);
 
   return (
     <View style={styles.container} testID="splash-screen">

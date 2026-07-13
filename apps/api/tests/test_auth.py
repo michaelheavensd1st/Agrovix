@@ -8,6 +8,7 @@ import pytest
 from jose import JWTError
 
 from app.core.security import (
+    TokenInvalidError,
     create_token,
     decode_token,
     hash_password,
@@ -34,5 +35,5 @@ def test_create_and_decode_access_token() -> None:
 
 def test_decode_rejects_wrong_token_type() -> None:
     token, _ = create_token(subject=uuid4(), token_type="refresh")
-    with pytest.raises(JWTError):
+    with pytest.raises(TokenInvalidError):
         decode_token(token, expected_type="access")

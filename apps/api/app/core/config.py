@@ -1,8 +1,4 @@
-"""Application settings.
-
-Loaded once via ``get_settings`` (cached) — the FastAPI dependency
-container will inject the same instance for the process lifetime.
-"""
+"""Application settings (env-driven, cached)."""
 
 from __future__ import annotations
 
@@ -13,8 +9,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Environment-driven application settings."""
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -60,10 +54,37 @@ class Settings(BaseSettings):
     password_min_length: int = Field(default=8)
     bcrypt_rounds: int = Field(default=12)
 
+    # --- Cookies (web canonical auth transport) ---
+    cookie_domain: str | None = Field(default=None)
+    cookie_secure: bool = Field(default=True)
+    cookie_samesite: str = Field(default="lax")  # 'lax' | 'strict' | 'none'
+    cookie_access_name: str = Field(default="agrovix_access")
+    cookie_refresh_name: str = Field(default="agrovix_refresh")
+
+    # --- Email (development sender by default) ---
+    email_from_address: str = Field(default="no-reply@agrovix.dev")
+    email_from_name: str = Field(default="Agrovix AgOS")
+    email_provider: str = Field(default="log")  # 'log' | 'resend' | 'sendgrid'
+    resend_api_key: str | None = Field(default=None)
+    web_app_url: str = Field(default="http://localhost:3000")
+    verification_token_expire_hours: int = Field(default=24)
+    invitation_token_expire_days: int = Field(default=14)
+
+    # --- Auth policy ---
+    allow_unverified_login: bool = Field(default=False)  # dev override
+
     @field_validator("api_cors_origins")
     @classmethod
     def _strip_cors(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("cookie_samesite")
+    @classmethod
+    def _validate_samesite(cls, value: str) -> str:
+        v = value.lower()
+        if v not in {"lax", "strict", "none"}:
+            raise ValueError("cookie_samesite must be one of: lax, strict, none")
+        return v
 
     @property
     def cors_origins_list(self) -> list[str]:
@@ -76,5 +97,4 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Return a cached ``Settings`` instance."""
     return Settings()

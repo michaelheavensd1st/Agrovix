@@ -36,7 +36,11 @@ export function AuthForm({ mode }: Props) {
         method: 'POST',
         body: JSON.stringify(payload),
       });
-      router.push('/dashboard');
+      if (mode === 'register') {
+        router.push('/verify');
+      } else {
+        router.push('/dashboard');
+      }
     } catch (err) {
       if (err instanceof ApiError) {
         setError(err.payload.detail ?? 'Something went wrong.');

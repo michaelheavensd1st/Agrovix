@@ -1,9 +1,9 @@
 /**
- * Minimal fetch-based API client.
+ * Cookie-first API client for the Next.js web app.
  *
- * Sprint 0 intentionally keeps this thin — a full HTTP layer with
- * interceptors, retries, and typed endpoints will land alongside real
- * business features.
+ * All auth cookies are httpOnly + Secure — the browser attaches them
+ * automatically once ``credentials: 'include'`` is set. We never touch
+ * localStorage/sessionStorage for tokens.
  */
 
 const API_URL =
@@ -27,15 +27,14 @@ export async function apiFetch<T>(
 ): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
     ...init,
+    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
       ...(init.headers ?? {}),
     },
   });
 
-  const isJson = res.headers
-    .get('content-type')
-    ?.includes('application/json');
+  const isJson = res.headers.get('content-type')?.includes('application/json');
   const body = isJson ? await res.json() : undefined;
 
   if (!res.ok) {

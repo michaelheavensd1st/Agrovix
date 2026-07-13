@@ -1,50 +1,68 @@
 """User model.
 
-Designed to be identity-provider-agnostic:
-- ``hashed_password`` is optional so SSO-only accounts remain valid.
-- ``identities`` (linked in a future sprint) will carry the ``{provider, subject}``
-  tuple for Google/Microsoft/Apple/OTP flows.
+Provider-agnostic account. Verification is required for password login;
+SSO logins added later will short-circuit that check.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, String
+from sqlalchemy import Boolean, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
-from app.models.role import user_roles_table
 
 if TYPE_CHECKING:
+    from app.models.audit import AuditEvent
+    from app.models.invitation import Invitation
+    from app.models.membership import FarmMembership, OrganizationMembership
     from app.models.refresh_token import RefreshToken
-    from app.models.role import Role
+    from app.models.role_assignment import RoleAssignment
+    from app.models.verification import EmailVerificationToken
 
 
 class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
-    """A user account in the AgOS platform."""
-
     __tablename__ = "users"
 
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
-
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
-    roles: Mapped[list["Role"]] = relationship(
-        "Role",
-        secondary=user_roles_table,
-        back_populates="users",
-        lazy="selectin",
-    )
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
-        "RefreshToken",
-        back_populates="user",
+        "RefreshToken", back_populates="user", cascade="all, delete-orphan"
+    )
+    verification_tokens: Mapped[list["EmailVerificationToken"]] = relationship(
+        "EmailVerificationToken", back_populates="user", cascade="all, delete-orphan"
+    )
+    role_assignments: Mapped[list["RoleAssignment"]] = relationship(
+        "RoleAssignment", back_populates="user", foreign_keys="RoleAssignment.user_id",
         cascade="all, delete-orphan",
+    )
+    organization_memberships: Mapped[list["OrganizationMembership"]] = relationship(
+        "OrganizationMembership", back_populates="user",
+        foreign_keys="OrganizationMembership.user_id",
+        cascade="all, delete-orphan",
+    )
+    farm_memberships: Mapped[list["FarmMembership"]] = relationship(
+        "FarmMembership", back_populates="user",
+        foreign_keys="FarmMembership.user_id",
+        cascade="all, delete-orphan",
+    )
+    sent_invitations: Mapped[list["Invitation"]] = relationship(
+        "Invitation", back_populates="invited_by",
+        foreign_keys="Invitation.invited_by_id",
+    )
+    audit_events: Mapped[list["AuditEvent"]] = relationship(
+        "AuditEvent", back_populates="actor",
+        foreign_keys="AuditEvent.actor_id",
     )
 
     def __repr__(self) -> str:  # pragma: no cover

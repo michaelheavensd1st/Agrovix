@@ -1,14 +1,20 @@
 """Agrovix AgOS — Pod live-preview shim.
 
-The canonical FastAPI backend lives at ``apps/api`` and targets PostgreSQL,
-Redis, SQLAlchemy, Alembic, and JWT-based auth as specified in the
-Sprint 0 architecture.
-
-This module is a **thin preview shim** that satisfies the Emergent pod's
-supervisor (which runs ``/app/backend/server.py`` on port 8001) so that
-`/`, `/health`, `/version`, and the auth scaffold can be exercised
-live from the browser without spinning up Postgres or Redis inside the
-pod. It is **not** meant to be shipped as production infrastructure.
+╔══════════════════════════════════════════════════════════════════════╗
+║  ⚠️  PREVIEW SHIM — NOT CANONICAL, NOT DEPLOYED.                     ║
+║                                                                       ║
+║  This file exists ONLY so the Emergent pod URL renders something     ║
+║  during Sprint reviews. The canonical Postgres-backed backend lives  ║
+║  in ``apps/api/``.                                                    ║
+║                                                                       ║
+║  * Do NOT import from this file anywhere.                             ║
+║  * Do NOT add business logic here — Sprint 1+ features live in       ║
+║    ``apps/api``.                                                      ║
+║  * The Sprint 1 changes (httpOnly cookies, email verification,       ║
+║    tenancy, RBAC) are NOT reflected here — this shim only mirrors    ║
+║    the Sprint 0 endpoint surface.                                     ║
+║  * See ``/app/PREVIEW_SHIM.md`` for the full policy.                  ║
+╚══════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations

@@ -1,27 +1,49 @@
-# Test Credentials — Agrovix AgOS (Sprint 0 foundation)
+# Test Credentials — Agrovix AgOS (Sprint 1)
 
 ## Overview
-Sprint 0 ships an authentication **scaffold only** (register / login / refresh / logout).
-No seeded accounts exist by default. Every test must register its own user first.
+Sprint 1 introduces **email verification** and **httpOnly cookie auth**. No
+seeded accounts exist by default. There is no default superuser — one is
+created via `python -m app.cli create_admin` (interactive prompt).
 
-## Recommended test account (register-then-use)
+For local development, `apps/api/.env` includes `ALLOW_UNVERIFIED_LOGIN=false`
+by default. Tests set this to `true` for the hermetic suite. Registered
+accounts must open the verification URL that appears in the API log
+before they can log in.
 
-- **email**: `qa+agos@agrovix.dev`
-- **password**: `SprintZero!2026`
-- **full_name**: `AgOS QA`
+## Recommended test flow
+
+1. `curl` register: `POST /api/v1/auth/register` with `{email, password >=8, full_name}`
+2. Look at the API JSON log for a `email.dispatch` line — the `context.verify_url` field is your link.
+3. `POST /api/v1/auth/verify` with `{token: "..."}` (or open the URL in the web app).
+4. `POST /api/v1/auth/login` — the response sets httpOnly cookies (`agrovix_access`, `agrovix_refresh`) and returns `{token_type, expires_in}`.
+5. Subsequent requests should be made with the cookies attached; the Next.js client sends `credentials: 'include'` automatically.
 
 ## Endpoints (relative to `REACT_APP_BACKEND_URL`)
 
-| Method | Path                        | Notes                                 |
-| ------ | --------------------------- | ------------------------------------- |
-| GET    | `/`                         | Service banner                        |
-| GET    | `/health`                   | Liveness — `{"status":"ok"}`          |
-| GET    | `/version`                  | Service version metadata              |
-| GET    | `/api/v1/health/`           | v1 liveness                           |
-| GET    | `/api/v1/health/ready`      | DB + Redis readiness (shim reports ok)|
-| GET    | `/api/v1/version/`          | Detailed version metadata             |
-| POST   | `/api/v1/auth/register`     | `{email, password, full_name?}`       |
-| POST   | `/api/v1/auth/login`        | `{email, password}` → `{access_token, refresh_token, expires_in, token_type}` |
-| POST   | `/api/v1/auth/refresh`      | `{refresh_token}`                     |
-| POST   | `/api/v1/auth/logout`       | `{refresh_token}`                     |
-| GET    | `/api/v1/auth/me`           | Returns the most recently registered user (pod shim behavior) |
+| Method | Path                                                       | Notes                                                        |
+| ------ | ---------------------------------------------------------- | ------------------------------------------------------------ |
+| POST   | `/api/v1/auth/register`                                    | Creates user, dispatches verify email                        |
+| POST   | `/api/v1/auth/verify`                                      | Confirms email via `{token}`                                 |
+| POST   | `/api/v1/auth/resend-verification`                         | Silent no-op on unknown emails                               |
+| POST   | `/api/v1/auth/login`                                       | Sets httpOnly cookies                                        |
+| POST   | `/api/v1/auth/refresh`                                     | Rotates refresh (cookie or body)                             |
+| POST   | `/api/v1/auth/logout`                                      | Clears cookies + revokes                                     |
+| GET    | `/api/v1/auth/me`                                          | Protected                                                    |
+| POST   | `/api/v1/organizations`                                    | Creator becomes `organization_owner`                         |
+| GET    | `/api/v1/organizations`                                    | Lists only orgs the user belongs to                          |
+| GET    | `/api/v1/organizations/{organization_id}`                  | 404 if not a member (no leak)                                |
+| POST   | `/api/v1/organizations/{organization_id}/farms`            | Requires `farm.create`                                       |
+| GET    | `/api/v1/organizations/{organization_id}/farms`            | Scoped to caller's role assignments                          |
+| GET    | `/api/v1/farms/{farm_id}`                                  | 404 if not a member                                          |
+| POST   | `/api/v1/organizations/{organization_id}/invitations`      | Requires `invitation.create`                                 |
+| POST   | `/api/v1/invitations/accept`                               | Actor must match invitation email                            |
+| POST   | `/api/v1/invitations/{invitation_id}/revoke`               | Requires `invitation.revoke`                                 |
+| POST   | `/api/v1/organizations/{organization_id}/role-assignments` | Requires `organization.role.assign`                          |
+| DELETE | `/api/v1/role-assignments/{assignment_id}`                 | Blocks orphaning last `organization_owner`                   |
+| GET    | `/api/v1/organizations/{organization_id}/audit-events`     | Requires `audit.read`                                        |
+
+## Pod preview
+
+The Emergent pod URL runs a **preview shim** (see `/app/PREVIEW_SHIM.md`).
+It exposes the Sprint 0 endpoint surface only — the Sprint 1 endpoints
+above run against the canonical Postgres-backed API in `apps/api`.

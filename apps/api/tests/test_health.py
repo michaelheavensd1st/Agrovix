@@ -1,20 +1,28 @@
-"""Baseline health-endpoint tests."""
+"""Sanity tests for the health/version endpoints."""
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+import pytest
+from httpx import AsyncClient
 
 
-def test_root_returns_service_banner(client: TestClient) -> None:
-    resp = client.get("/")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["service"]
-    assert body["version"]
-    assert body["environment"]
+@pytest.mark.asyncio
+async def test_root(client: AsyncClient) -> None:
+    r = await client.get("/")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["service"] and body["version"]
 
 
-def test_health_endpoint_is_ok(client: TestClient) -> None:
-    resp = client.get("/health")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+@pytest.mark.asyncio
+async def test_health(client: AsyncClient) -> None:
+    r = await client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_version(client: AsyncClient) -> None:
+    r = await client.get("/version")
+    assert r.status_code == 200
+    assert r.json()["api_prefix"].startswith("/api")

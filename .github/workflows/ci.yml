@@ -183,6 +183,17 @@ jobs:
         run: pytest -v --cov=app --cov-report=xml
 
   # ---------------------------------------------------------------------------
+  # 7. Mongo-guard — production code must not depend on MongoDB
+  # ---------------------------------------------------------------------------
+  mongo-guard:
+    name: Mongo Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify no MongoDB references in apps/ or packages/
+        run: bash scripts/verify-no-mongo.sh
+
+  # ---------------------------------------------------------------------------
   # 6. Security / dependency audit (non-blocking in Sprint 0)
   # ---------------------------------------------------------------------------
   security-audit:

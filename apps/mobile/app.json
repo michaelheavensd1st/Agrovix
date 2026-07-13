@@ -7,22 +7,14 @@
     "userInterfaceStyle": "automatic",
     "scheme": "agrovix",
     "assetBundlePatterns": ["**/*"],
-    "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.agrovix.agos"
-    },
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.agrovix.agos" },
     "android": {
       "package": "com.agrovix.agos",
-      "adaptiveIcon": {
-        "backgroundColor": "#0f2e1e"
-      }
+      "adaptiveIcon": { "backgroundColor": "#0f2e1e" }
     },
-    "web": {
-      "bundler": "metro"
-    },
-    "plugins": ["expo-splash-screen"],
-    "extra": {
-      "apiUrl": "http://localhost:8000/api"
-    }
+    "web": { "bundler": "metro" },
+    "plugins": ["expo-router", "expo-splash-screen", "expo-secure-store"],
+    "experiments": { "typedRoutes": true },
+    "extra": { "apiUrl": "http://localhost:8000/api" }
   }
 }

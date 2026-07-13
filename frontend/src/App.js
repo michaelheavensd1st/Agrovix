@@ -1,3 +1,18 @@
+/**
+ * =====================================================================
+ *  ⚠️  PREVIEW SHIM — NOT CANONICAL, NOT DEPLOYED.
+ *
+ *  The canonical Next.js web app lives in ``apps/web/`` and uses the
+ *  App Router, TypeScript, and Tailwind. This CRA file exists only so
+ *  the Emergent pod URL renders the AgOS pages during Sprint reviews.
+ *
+ *  * Do NOT copy business logic from this file into ``apps/web``.
+ *  * Do NOT deploy this. It is not part of the shipped monorepo.
+ *  * Sprint 1 changes (cookie auth, onboarding, org/farm flows) live
+ *    in ``apps/web/app/*``.
+ *  * See ``/app/PREVIEW_SHIM.md``.
+ * =====================================================================
+ */
 import { BrowserRouter, Routes, Route, Link, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import axios from "axios";
