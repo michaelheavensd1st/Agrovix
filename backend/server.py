@@ -153,10 +153,13 @@ def _issue_pair(user_id: str) -> TokenPair:
 # --------------------------------------------------------------------------- #
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
+# CORS spec: allow_credentials=True cannot be combined with allow_origins=["*"].
+_allow_credentials = _cors_origins != ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=_allow_credentials,
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -262,14 +265,16 @@ async def logout(payload: LogoutRequest) -> dict:
     return {"message": "Logged out"}
 
 
-@auth.get("/me", response_model=UserPublic)
-async def me() -> UserPublic:
-    # The shim does not fully implement JWT validation; this endpoint
-    # exists so that clients can wire their calls end-to-end. It returns
-    # the most recently registered user if one exists.
-    if not _users:
-        raise HTTPException(status_code=401, detail="Not authenticated.")
-    return _public_user(next(reversed(_users.values())))
+@auth.get("/me")
+async def me() -> None:
+    # The canonical implementation of /auth/me lives in apps/api and
+    # validates the bearer token via JWT + DB lookup. The pod shim does
+    # not implement JWT parsing on purpose — surfacing 501 here prevents
+    # accidental reliance on the shim's identity resolution.
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail="/auth/me is only implemented in apps/api (Postgres-backed).",
+    )
 
 
 v1.include_router(auth)
