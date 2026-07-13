@@ -101,10 +101,39 @@ class FarmService:
         )
         return farm
 
+    @staticmethod
+    def ensure_active(farm: Farm) -> None:
+        """Guard used by any service that would attach new records to a farm.
+
+        Raises 409 if the farm has been soft-deleted so downstream
+        writes (invitations, memberships, future operational records)
+        cannot attach to a decommissioned farm.
+        """
+        if farm.deleted_at is not None or not farm.is_active:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This farm has been deleted. Restore it before attaching new records.",
+            )
+
     async def delete(self, *, actor: User, farm: Farm, request_ctx: dict) -> None:
+        if farm.deleted_at is not None:
+            # Idempotent — already soft-deleted; do not double-audit.
+            return
         await self.farm_repo.soft_delete(farm)
         await self.audit_repo.record(
             actor_id=actor.id, action="farm.delete",
             entity_type="farm", entity_id=str(farm.id),
             organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
         )
+
+    async def restore(self, *, actor: User, farm: Farm, request_ctx: dict) -> Farm:
+        if farm.deleted_at is None:
+            # Idempotent — farm is already active.
+            return farm
+        await self.farm_repo.restore(farm)
+        await self.audit_repo.record(
+            actor_id=actor.id, action="farm.restore",
+            entity_type="farm", entity_id=str(farm.id),
+            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+        )
+        return farm

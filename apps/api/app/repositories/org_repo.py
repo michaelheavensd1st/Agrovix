@@ -126,6 +126,16 @@ class FarmRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_id_including_deleted(self, farm_id: uuid.UUID) -> Farm | None:
+        """Lookup that INCLUDES soft-deleted rows — used solely for restore."""
+        stmt = (
+            select(Farm)
+            .where(Farm.id == farm_id)
+            .options(selectinload(Farm.organization))
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def list_for_org(self, org_id: uuid.UUID) -> list[Farm]:
         stmt = (
             select(Farm)
@@ -173,8 +183,23 @@ class FarmRepository:
         return list(result.scalars().unique())
 
     async def soft_delete(self, farm: Farm) -> None:
-        farm.deleted_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        farm.deleted_at = now
         farm.is_active = False
+        # Set updated_at explicitly so the returned ORM instance has a
+        # non-expired value — the ``onupdate=func.now()`` server default
+        # otherwise triggers a lazy re-fetch on attribute access, which
+        # is unsafe outside a greenlet under async SQLAlchemy.
+        farm.updated_at = now
+        self.session.add(farm)
+        await self.session.flush()
+
+    async def restore(self, farm: Farm) -> None:
+        """Undo a soft delete. Returns the farm to normal query visibility."""
+        now = datetime.now(timezone.utc)
+        farm.deleted_at = None
+        farm.is_active = True
+        farm.updated_at = now
         self.session.add(farm)
         await self.session.flush()
 

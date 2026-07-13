@@ -306,6 +306,27 @@ def require_permission(code: str):
         organization_id: uuid.UUID | None = None,
         farm_id: uuid.UUID | None = None,
     ) -> User:
+        # Non-members must NOT be told a resource exists in another
+        # tenant — return 404 before the 403 permission check runs so
+        # that "org exists but you have no perm" is indistinguishable
+        # from "org does not exist" for outsiders.
+        if organization_id is not None and not user.is_superuser:
+            from sqlalchemy import select
+
+            from app.models.membership import OrganizationMembership
+            membership = (
+                await session.execute(
+                    select(OrganizationMembership).where(
+                        OrganizationMembership.user_id == user.id,
+                        OrganizationMembership.organization_id == organization_id,
+                        OrganizationMembership.is_active.is_(True),
+                        OrganizationMembership.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if membership is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found.")
+
         codes = await resolve_permissions(
             session, user, organization_id=organization_id, farm_id=farm_id
         )
@@ -324,8 +345,10 @@ def require_permission(code: str):
 # --------------------------------------------------------------------- #
 def get_request_ctx(request: Request) -> dict:
     from app.core.logging import request_id_var
+    from app.core.trusted_proxy import get_client_ip
     return {
-        "ip_address": request.client.host if request.client else None,
+        # Trusted-proxy-aware client IP — see ``app/core/trusted_proxy.py``.
+        "ip_address": get_client_ip(request),
         "user_agent": request.headers.get("user-agent"),
         "request_id": request_id_var.get(),
     }

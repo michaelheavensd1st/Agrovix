@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -70,6 +70,35 @@ class RoleAssignmentRepository:
     async def revoke(self, assignment: RoleAssignment) -> None:
         assignment.revoked_at = datetime.now(timezone.utc)
         self.session.add(assignment)
+        await self.session.flush()
+
+    async def revoke_if_active(self, assignment_id: uuid.UUID) -> bool:
+        """Compare-and-swap revoke. Returns True if this call performed the revoke.
+
+        Serves as a race-safe primitive for concurrent revocations of the
+        same assignment: only one caller will see ``True``.
+        """
+        now = datetime.now(timezone.utc)
+        stmt = (
+            update(RoleAssignment)
+            .where(
+                RoleAssignment.id == assignment_id,
+                RoleAssignment.revoked_at.is_(None),
+            )
+            .values(revoked_at=now)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        return (result.rowcount or 0) == 1
+
+    async def unrevoke(self, assignment_id: uuid.UUID) -> None:
+        """Reverse a revoke — used to abort when the org would be orphaned."""
+        stmt = (
+            update(RoleAssignment)
+            .where(RoleAssignment.id == assignment_id)
+            .values(revoked_at=None)
+        )
+        await self.session.execute(stmt)
         await self.session.flush()
 
     async def list_for_user(self, user_id: uuid.UUID) -> list[RoleAssignment]:

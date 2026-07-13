@@ -95,9 +95,16 @@ class InvitationService:
             )
 
         if farm_id is not None:
-            farm = await self.farm_repo.get_by_id(farm_id)
+            farm = await self.farm_repo.get_by_id_including_deleted(farm_id)
             if farm is None or farm.organization_id != organization_id:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Farm does not belong to this organization.")
+            # Explicitly reject invitations to a soft-deleted farm — do NOT
+            # let a decommissioned farm accrue new members.
+            if farm.deleted_at is not None or not farm.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Cannot invite to a deleted farm. Restore the farm first.",
+                )
 
         token, expires_at = create_token(
             subject=uuid.uuid4(),  # opaque — the token itself is not tied to a user yet
@@ -284,16 +291,51 @@ class RoleAssignmentService:
         return assignment
 
     async def revoke(self, *, actor: User, assignment, request_ctx: dict) -> None:
-        # Prevent orphaning organization ownership.
+        """Revoke a role assignment safely under concurrency.
+
+        Two concurrent revoke calls used to be able to race past the
+        "last owner" check (both would read ``count_owners == 2`` and
+        both proceed). The new sequence:
+
+        1. Attempt a compare-and-swap revoke (``revoke_if_active``); if
+           two callers hit the SAME assignment only one wins.
+        2. Recount owners AFTER the CAS succeeded.
+        3. If revoking an ``organization_owner`` would have left the
+           org with zero owners (which can happen when two callers hit
+           two DIFFERENT owner assignments simultaneously), we UNDO the
+           revoke and surface a 409.
+        """
         role = await self.role_repo.get_by_id(assignment.role_id)
-        if role and role.name == "organization_owner":
-            remaining = await self.org_repo.count_owners(assignment.organization_id)
-            if remaining <= 1:
+        is_owner_role = role is not None and role.name == "organization_owner"
+
+        # Pre-check for the single-caller case — keeps the error
+        # message identical to Sprint 1 tests when there is no race.
+        if is_owner_role:
+            remaining_before = await self.org_repo.count_owners(assignment.organization_id)
+            if remaining_before <= 1:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     "Cannot revoke the last organization owner — promote another owner first.",
                 )
-        await self.role_assign_repo.revoke(assignment)
+
+        succeeded = await self.role_assign_repo.revoke_if_active(assignment.id)
+        if not succeeded:
+            # Another caller already revoked this exact assignment.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Role assignment is already revoked.",
+            )
+
+        # Post-check — defends against the two-different-owners race.
+        if is_owner_role:
+            remaining_after = await self.org_repo.count_owners(assignment.organization_id)
+            if remaining_after < 1:
+                await self.role_assign_repo.unrevoke(assignment.id)
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Cannot revoke the last organization owner — another owner was revoked concurrently.",
+                )
+
         await self.audit_repo.record(
             actor_id=actor.id, action="role.revoke",
             entity_type="role_assignment", entity_id=str(assignment.id),

@@ -1,0 +1,36 @@
+{
+  "summary": "Sprint 1 closeout fully verified. Full pytest suite (61 tests across 10 files) PASSES in 33.77s with zero failures / zero flakes: test_audit_filters(8), test_auth(3), test_auth_flows(6), test_concurrency(4), test_cross_tenant(8), test_farm_soft_delete(5), test_health(3), test_login_security(5), test_tenancy(3), test_trusted_proxy(9), test_verification(5), test_version(2). All Sprint-1-closeout acceptance items independently corroborated: (1) farm soft-delete + restore lifecycle including 404-on-GET-after-DELETE and reappearance-after-restore; (2) deleted farm rejects new invitations with 409 'deleted farm'; (3) audit endpoint returns {items,total,limit,offset} envelope with (created_at DESC, id DESC) ordering, per-filter tests for farm_id/actor_id/action/entity_type/date_range, and limit>200 clamped; (4) cross-tenant tests confirm 404 (never 403/200) for read/list/update/delete/restore/invitation/audit/role paths thanks to require_permission's pre-403 membership check; (5) concurrent double-DELETE on assignments yields exactly (200,409) and last-two-owners guard keeps at least one active owner alive via unrevoke self-heal; (6) concurrent farm delete never 5xx and settles to (200,200|404); (7) trusted-proxy policy: 8 unit cases + 1 end-to-end verify a spoofed XFF from an untrusted peer cannot bypass per-IP login limiter (30 unique emails → 31st still 429); (8) docs/trusted-proxy.md (127 lines) documents policy, TRUSTED_PROXIES / TRUSTED_PROXY_HEADER config keys, edge→nginx→API topology, nginx snippet, validation steps, and 0.0.0.0/0 warning; (9) grep confirms request.client.host in /app/apps/api/app occurs ONLY inside core/trusted_proxy.py (docstring l.8 + fallback l.102) — auth.py, deps.py, and middleware.py all funnel through get_client_ip(); (10) invitation-accept per-user rate-limit key is derived from actor.id where actor is CurrentUser (Depends(get_current_user), JWT-authenticated) in /app/apps/api/app/api/v1/endpoints/invitations.py:70,74 — NOT any request-controlled data.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/test_reports/pytest/sprint1_closeout.xml",
+    "/app/apps/api/tests/test_farm_soft_delete.py",
+    "/app/apps/api/tests/test_cross_tenant.py",
+    "/app/apps/api/tests/test_audit_filters.py",
+    "/app/apps/api/tests/test_concurrency.py",
+    "/app/apps/api/tests/test_trusted_proxy.py"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "invitation_service.py:213 — Per-user accept limit key is 'invite-accept:user:{actor_id}' where actor_id is stringified UUID from the JWT subject. This correctly satisfies the 'server-derived, never request-controlled' requirement. Consider adding an inline comment near _enforce_accept_rate_limit to make the invariant explicit for future reviewers ('actor.id comes from JWT auth, do NOT accept from request payload').",
+    "trusted_proxy.py:102 — request.client.host fallback is fine, but the module docstring says 'peer address' — verify that when running behind uvicorn+proxy_headers=False (which is the safe default here), request.client.host is truly the socket peer and not spoofed by a Host header. The 9 tests + end-to-end integration test cover this, but a one-line assertion in the module docstring about uvicorn's proxy_headers flag would harden the deployment guidance.",
+    "docs/trusted-proxy.md:44 — Table lists TRUSTED_PROXIES default as '(empty)' and TRUSTED_PROXY_HEADER default as 'x-forwarded-for'. Would be useful to also document what happens if TRUSTED_PROXY_HEADER is set to a non-standard name (e.g. 'x-real-ip') combined with a proxy that emits both; current implementation reads only the configured header, which is correct but non-obvious.",
+    "cross_tenant contract — require_permission now returns 404 for non-members BEFORE the 403 permission check. This is the correct security posture (avoid membership disclosure via 403), but consider adding a short module-level comment in deps.py explaining the ordering choice, since it's an important invariant that a well-meaning refactor could reverse.",
+    "audit endpoint pagination — GET /organizations/{id}/audit-events uses limit<=200 (FastAPI Query validator) and returns 422 on overshoot. This is verified. Consider also documenting the max in the OpenAPI description string on the Query parameter, so API consumers see it without hitting 422 first."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (61/61 pytest)", "frontend": "N/A (backend-only run)"},
+  "test_credentials": "N/A — hermetic pytest suite creates its own users per-test with UUID-suffixed emails via tests/_helpers.py.",
+  "seed_data_creation": "None persisted. Tests use SQLite in-memory (sqlite+aiosqlite:///:memory:) per conftest.py.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Canonical FastAPI backend is /app/apps/api. Run `cd /app/apps/api && python -m pytest -v` for the full 61-test suite (~34s). The /app/backend/server.py preview shim listens on :8001 and is NOT the production app — do NOT curl it to validate /app/apps/api behavior; use the pytest AsyncClient path (tests already cover the DELETE→404-on-GET flow at test_farm_soft_delete.py:45). Alembic head still 0003_verification_active_unique_index; no new migration in Sprint 1 closeout. SQLite tests do not exercise the Postgres partial-unique-index (expected). The invitation-accept per-user rate limit key is server-derived (actor.id from JWT, plumbed as `user: CurrentUser` in endpoints/invitations.py:70,74) — this is the correct anti-spoofing shape. All request.client.host usage outside core/trusted_proxy.py has been eliminated from production paths (auth.py, deps.py, middleware.py all use get_client_ip). /app/backend shim is preview-only and exempt per problem statement.",
+  "rca_of_the_issue": "N/A — no defects found. All 12 Sprint-1-closeout acceptance items verified: farm soft-delete/restore, audit filtering + pagination + envelope, cross-tenant 404-not-403 isolation, concurrent ownership + concurrent farm-delete guards, trusted-proxy policy (unit + integration), documentation, no residual request.client.host in production paths, and server-derived invitation-accept per-user key."
+}

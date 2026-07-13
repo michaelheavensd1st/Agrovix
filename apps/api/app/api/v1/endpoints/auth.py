@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.core.cookies import clear_auth_cookies, set_auth_cookies
+from app.core.trusted_proxy import get_client_ip
 from app.deps import CurrentUser, get_auth_service
 from app.models.user import User
 from app.schemas.auth import (
@@ -63,7 +64,7 @@ async def resend_verification(
     request: Request,
     service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> MessageResponse:
-    ip = request.client.host if request.client else None
+    ip = get_client_ip(request)
     await service.resend_verification(email=payload.email, ip_address=ip)
     # Always OK to avoid leaking account existence.
     return MessageResponse(message="If the account exists, a verification email was sent.")
@@ -76,7 +77,7 @@ async def login(
     service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> JSONResponse:
     ua = request.headers.get("user-agent")
-    ip = request.client.host if request.client else None
+    ip = get_client_ip(request)
     _, tokens = await service.login(email=payload.email, password=payload.password, user_agent=ua, ip_address=ip)
 
     access_life, refresh_life = service.token_lifetimes()
@@ -104,7 +105,7 @@ async def refresh(
     if not refresh_token:
         return JSONResponse({"detail": "Missing refresh token."}, status_code=401)
     ua = request.headers.get("user-agent")
-    ip = request.client.host if request.client else None
+    ip = get_client_ip(request)
     tokens = await service.refresh(refresh_token=refresh_token, user_agent=ua, ip_address=ip)
 
     access_life, refresh_life = service.token_lifetimes()

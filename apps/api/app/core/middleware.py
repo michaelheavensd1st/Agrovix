@@ -10,6 +10,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.core.logging import new_request_id, request_id_var
+from app.core.trusted_proxy import get_client_ip
 
 _logger = logging.getLogger("app.access")
 
@@ -40,7 +41,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                     "query": request.url.query or None,
                     "status_code": status_code,
                     "duration_ms": duration_ms,
-                    "client_ip": request.client.host if request.client else None,
+                    # Trusted-proxy-aware — see ``app/core/trusted_proxy.py``.
+                    "client_ip": get_client_ip(request),
                     "user_agent": request.headers.get("user-agent"),
                 },
             )

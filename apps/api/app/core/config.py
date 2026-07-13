@@ -41,7 +41,10 @@ class Settings(BaseSettings):
     database_echo: bool = Field(default=False)
 
     # --- Redis ---
-    redis_url: str = Field(default="redis://localhost:6379/0")
+    # Default is empty so that "missing REDIS_URL in production" reliably
+    # triggers the fail-fast path in ``rate_limit_factory.get_rate_limiter``.
+    # Dev + tests set this explicitly via ``.env`` / ``docker-compose.yml``.
+    redis_url: str = Field(default="")
 
     # --- JWT / Security ---
     jwt_secret_key: str = Field(default="change-me-in-production")
@@ -72,6 +75,13 @@ class Settings(BaseSettings):
 
     # --- Auth policy ---
     allow_unverified_login: bool = Field(default=False)  # dev override
+
+    # --- Trusted proxy / X-Forwarded-For policy ---
+    # Comma-separated list of IPs or CIDRs that we trust to set the
+    # forwarding header. Empty (default) => header is IGNORED completely.
+    # See ``app/core/trusted_proxy.py`` for the full policy.
+    trusted_proxies: str = Field(default="")
+    trusted_proxy_header: str = Field(default="x-forwarded-for")
 
     # --- Rate limiting: transport policy ---
     # In production, the process-wide limiter MUST be Redis-backed so that
