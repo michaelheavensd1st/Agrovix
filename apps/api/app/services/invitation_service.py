@@ -208,6 +208,14 @@ class InvitationService:
     async def _enforce_accept_rate_limit(
         self, *, actor_id: str, ip_address: str | None
     ) -> None:
+        # ``actor_id`` here is always the stringified UUID of a
+        # JWT-authenticated ``CurrentUser`` (see
+        # ``endpoints/invitations.py::accept_invitation``). It is NEVER
+        # sourced from the request payload — keeping the "per-user" key
+        # trust-anchored to the server-verified session, not to
+        # untrusted client input. ``ip_address`` comes from
+        # ``get_client_ip`` (trusted-proxy-aware) so it also cannot be
+        # spoofed by direct clients.
         window = self.settings.invitation_accept_window_seconds
         allowed, retry = await self.rate_limiter.hit(
             key=f"invite-accept:user:{actor_id}",

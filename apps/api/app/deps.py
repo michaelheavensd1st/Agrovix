@@ -300,6 +300,15 @@ CurrentFarm = Annotated[Farm, Depends(get_current_farm)]
 # Permission dependencies (permission-driven, never role-name based)
 # --------------------------------------------------------------------- #
 def require_permission(code: str):
+    """Permission-check dependency factory.
+
+    Ordering invariant (do NOT reverse this in a refactor):
+    the membership check MUST run before the permission check so that
+    a non-member of a tenant receives 404 (resource-not-found) rather
+    than 403 (permission-denied). Distinguishing those responses would
+    leak the existence of resources in another tenant to outsiders —
+    see ``tests/test_cross_tenant.py`` for the acceptance shape.
+    """
     async def _dep(
         user: CurrentUser,
         session: DBSession,
