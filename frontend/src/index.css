@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-serif {
+  font-family: 'Fraunces', 'Iowan Old Style', 'Palatino', ui-serif, Georgia, serif;
+  letter-spacing: -0.01em;
+  font-weight: 500;
+}
+
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --background: 40 30% 98%;
+    --foreground: 140 30% 10%;
+
+    --card: 40 30% 100%;
+    --card-foreground: 140 30% 10%;
+    --popover: 40 30% 100%;
+    --popover-foreground: 140 30% 10%;
+
+    --primary: 140 45% 22%;
+    --primary-foreground: 40 30% 98%;
+
+    --secondary: 35 45% 92%;
+    --secondary-foreground: 140 30% 15%;
+
+    --muted: 35 20% 94%;
+    --muted-foreground: 140 10% 40%;
+
+    --accent: 25 85% 55%;
+    --accent-foreground: 40 30% 98%;
+
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 40 30% 98%;
+
+    --border: 140 10% 88%;
+    --input: 140 10% 88%;
+    --ring: 140 45% 30%;
+
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 140 30% 8%;
+    --foreground: 40 25% 95%;
+    --card: 140 30% 10%;
+    --card-foreground: 40 25% 95%;
+    --primary: 90 55% 60%;
+    --primary-foreground: 140 30% 10%;
+    --secondary: 140 15% 18%;
+    --secondary-foreground: 40 25% 95%;
+    --muted: 140 12% 16%;
+    --muted-foreground: 40 10% 65%;
+    --accent: 25 85% 60%;
+    --accent-foreground: 140 30% 10%;
+    --destructive: 0 62% 55%;
+    --destructive-foreground: 40 25% 95%;
+    --border: 140 15% 20%;
+    --input: 140 15% 20%;
+    --ring: 90 55% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer base {
+  [data-debug-wrapper="true"] {
+    display: contents !important;
+  }
+}

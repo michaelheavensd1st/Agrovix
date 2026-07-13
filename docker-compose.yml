@@ -1,0 +1,99 @@
+version: "3.9"
+
+# =============================================================================
+# Agrovix AgOS — Local Development Stack
+# -----------------------------------------------------------------------------
+# Services:
+#   - postgres : PostgreSQL 16 (primary data store)
+#   - redis    : Redis 7 (cache + queue backend)
+#   - api      : FastAPI backend (apps/api)
+#   - web      : Next.js frontend (apps/web)
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agrovix_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agrovix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agrovix_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-agrovix_agos}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agrovix} -d ${POSTGRES_DB:-agrovix_agos}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - agrovix
+
+  redis:
+    image: redis:7-alpine
+    container_name: agrovix_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - agrovix
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: agrovix_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-agrovix}:${POSTGRES_PASSWORD:-agrovix_dev}@postgres:5432/${POSTGRES_DB:-agrovix_agos}
+      DATABASE_URL_SYNC: postgresql+psycopg2://${POSTGRES_USER:-agrovix}:${POSTGRES_PASSWORD:-agrovix_dev}@postgres:5432/${POSTGRES_DB:-agrovix_agos}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
+      API_CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+    networks:
+      - agrovix
+
+  web:
+    build:
+      context: .
+      dockerfile: ./apps/web/Dockerfile
+    container_name: agrovix_web
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+    networks:
+      - agrovix
+
+networks:
+  agrovix:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

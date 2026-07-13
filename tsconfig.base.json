@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "preserve",
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": false,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "incremental": true,
+    "composite": false,
+    "baseUrl": ".",
+    "paths": {
+      "@agrovix/ui": ["packages/ui/src/index.ts"],
+      "@agrovix/ui/*": ["packages/ui/src/*"],
+      "@agrovix/types": ["packages/types/src/index.ts"],
+      "@agrovix/types/*": ["packages/types/src/*"],
+      "@agrovix/validation": ["packages/validation/src/index.ts"],
+      "@agrovix/utils": ["packages/utils/src/index.ts"],
+      "@agrovix/config": ["packages/config/src/index.ts"]
+    }
+  },
+  "exclude": ["node_modules", "dist", "build", ".next", ".turbo"]
+}

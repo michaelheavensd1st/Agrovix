@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "Agrovix AgOS",
+    "slug": "agrovix-agos",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "agrovix",
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.agrovix.agos"
+    },
+    "android": {
+      "package": "com.agrovix.agos",
+      "adaptiveIcon": {
+        "backgroundColor": "#0f2e1e"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": ["expo-splash-screen"],
+    "extra": {
+      "apiUrl": "http://localhost:8000/api"
+    }
+  }
+}
