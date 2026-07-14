@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,13 +42,13 @@ class InvitationRepository:
 
     async def mark_accepted(self, invitation: Invitation) -> None:
         invitation.status = InvitationStatus.ACCEPTED
-        invitation.accepted_at = datetime.now(timezone.utc)
+        invitation.accepted_at = datetime.now(UTC)
         self.session.add(invitation)
         await self.session.flush()
 
     async def mark_revoked(self, invitation: Invitation) -> None:
         invitation.status = InvitationStatus.REVOKED
-        invitation.revoked_at = datetime.now(timezone.utc)
+        invitation.revoked_at = datetime.now(UTC)
         self.session.add(invitation)
         await self.session.flush()
 
@@ -56,8 +56,8 @@ class InvitationRepository:
         if invitation.status == InvitationStatus.PENDING:
             exp = invitation.expires_at
             if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
-            if exp < datetime.now(timezone.utc):
+                exp = exp.replace(tzinfo=UTC)
+            if exp < datetime.now(UTC):
                 invitation.status = InvitationStatus.EXPIRED
                 self.session.add(invitation)
                 await self.session.flush()

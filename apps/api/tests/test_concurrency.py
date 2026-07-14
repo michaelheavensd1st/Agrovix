@@ -38,6 +38,7 @@ async def _promote_second_owner(client: AsyncClient, org_id: str, target_email: 
     Returns the RoleAssignment id (needed for revocation tests).
     """
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         target = (
             await session.execute(select(User).where(User.email == target_email))
@@ -55,10 +56,9 @@ async def _find_owner_assignment(user_email: str, org_id: str) -> UUID:
     """Return the RoleAssignment id for ``user_email``'s organization_owner grant."""
     from app.db import session as _db
     from app.models.role import Role
+
     async with _db.AsyncSessionLocal() as session:
-        user = (
-            await session.execute(select(User).where(User.email == user_email))
-        ).scalar_one()
+        user = (await session.execute(select(User).where(User.email == user_email))).scalar_one()
         role = (
             await session.execute(select(Role).where(Role.name == "organization_owner"))
         ).scalar_one()
@@ -96,9 +96,13 @@ async def test_concurrent_revoke_of_same_assignment_only_wins_once(
         return_exceptions=False,
     )
     statuses = sorted([r1.status_code, r2.status_code])
-    # Exactly one 204 (success), and one 409 (already revoked).
+    # Exactly one 200/204 (success), and one rejection. Under SQLite
+    # (unit-test suite) the loser is caught by ``revoke_if_active``
+    # returning False → 409. Under real Postgres concurrency the loser
+    # may instead re-fetch the assignment and see ``revoked_at`` set →
+    # 404. Both prove exactly-once semantics.
     assert statuses[0] in (200, 204), (r1.status_code, r2.status_code, r1.text, r2.text)
-    assert statuses[1] == 409, (r1.text, r2.text)
+    assert statuses[1] in (404, 409), (r1.text, r2.text)
 
 
 @pytest.mark.asyncio
@@ -122,26 +126,41 @@ async def test_concurrent_revoke_of_two_owners_never_orphans(
         return_exceptions=False,
     )
     # At least ONE of the two calls must have been rejected — otherwise
-    # the org would have zero owners.
+    # the org would have zero owners. Depending on race ordering the
+    # rejection may surface as:
+    #   • 409 Conflict — orphan-protection guardrail fired
+    #   • 403 Forbidden — the racing caller lost their owner permission
+    #     mid-flight and the permission check rejected them second.
+    # Both prove the invariant "org keeps ≥1 owner" is enforced.
     statuses = sorted([r1.status_code, r2.status_code])
-    assert 409 in statuses, (r1.status_code, r2.status_code, r1.text, r2.text)
+    assert 409 in statuses or 403 in statuses, (
+        r1.status_code,
+        r2.status_code,
+        r1.text,
+        r2.text,
+    )
 
     # Post-condition: at least one owner remains.
     from app.db import session as _db
     from app.models.role import Role
+
     async with _db.AsyncSessionLocal() as session:
         role = (
             await session.execute(select(Role).where(Role.name == "organization_owner"))
         ).scalar_one()
         active = (
-            await session.execute(
-                select(RoleAssignment).where(
-                    RoleAssignment.organization_id == UUID(org_id),
-                    RoleAssignment.role_id == role.id,
-                    RoleAssignment.revoked_at.is_(None),
+            (
+                await session.execute(
+                    select(RoleAssignment).where(
+                        RoleAssignment.organization_id == UUID(org_id),
+                        RoleAssignment.role_id == role.id,
+                        RoleAssignment.revoked_at.is_(None),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(active) >= 1, "organization must retain at least one active owner"
 
 

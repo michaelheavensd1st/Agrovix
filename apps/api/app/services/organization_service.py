@@ -49,16 +49,20 @@ class OrganizationService:
                 "Server misconfiguration: organization_owner role missing. Run the seed script.",
             )
         await self.role_assign_repo.create(
-            user_id=actor.id, role_id=owner_role.id,
-            organization_id=org.id, farm_id=None, granted_by_id=actor.id,
+            user_id=actor.id,
+            role_id=owner_role.id,
+            organization_id=org.id,
+            farm_id=None,
+            granted_by_id=actor.id,
         )
-        await self.org_mem_repo.upsert_active(
-            user_id=actor.id, org_id=org.id, invited_by_id=None
-        )
+        await self.org_mem_repo.upsert_active(user_id=actor.id, org_id=org.id, invited_by_id=None)
         await self.audit_repo.record(
-            actor_id=actor.id, action="organization.create",
-            entity_type="organization", entity_id=str(org.id),
-            organization_id=org.id, metadata={"slug": org.slug, "name": org.name},
+            actor_id=actor.id,
+            action="organization.create",
+            entity_type="organization",
+            entity_id=str(org.id),
+            organization_id=org.id,
+            metadata={"slug": org.slug, "name": org.name},
             **request_ctx,
         )
         return org
@@ -68,9 +72,12 @@ class OrganizationService:
         # memberships but the org itself is preserved with a deleted_at.
         await self.org_repo.soft_delete(org)
         await self.audit_repo.record(
-            actor_id=actor.id, action="organization.delete",
-            entity_type="organization", entity_id=str(org.id),
-            organization_id=org.id, **request_ctx,
+            actor_id=actor.id,
+            action="organization.delete",
+            entity_type="organization",
+            entity_id=str(org.id),
+            organization_id=org.id,
+            **request_ctx,
         )
 
 
@@ -96,24 +103,34 @@ class FarmService:
         # every farm ships with one "Main Site" that can be renamed but
         # never leaves the farm site-less.
         from app.models.production import ProductionSite, ProductionSiteStatus
+
         default_site = ProductionSite(
-            farm_id=farm.id, name="Main Site", code="MAIN",
+            farm_id=farm.id,
+            name="Main Site",
+            code="MAIN",
             description="Default site created automatically with the farm.",
-            status=ProductionSiteStatus.ACTIVE, is_default=True,
+            status=ProductionSiteStatus.ACTIVE,
+            is_default=True,
         )
         self.farm_repo.session.add(default_site)
         await self.farm_repo.session.flush()
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_site.create",
-            entity_type="production_site", entity_id=str(default_site.id),
-            organization_id=organization_id, farm_id=farm.id,
+            actor_id=actor.id,
+            action="production_site.create",
+            entity_type="production_site",
+            entity_id=str(default_site.id),
+            organization_id=organization_id,
+            farm_id=farm.id,
             metadata={"auto_created": True, "is_default": True},
             **request_ctx,
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="farm.create",
-            entity_type="farm", entity_id=str(farm.id),
-            organization_id=organization_id, farm_id=farm.id,
+            actor_id=actor.id,
+            action="farm.create",
+            entity_type="farm",
+            entity_id=str(farm.id),
+            organization_id=organization_id,
+            farm_id=farm.id,
             metadata={"code": farm.code, "name": farm.name},
             **request_ctx,
         )
@@ -139,9 +156,13 @@ class FarmService:
             return
         await self.farm_repo.soft_delete(farm)
         await self.audit_repo.record(
-            actor_id=actor.id, action="farm.delete",
-            entity_type="farm", entity_id=str(farm.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="farm.delete",
+            entity_type="farm",
+            entity_id=str(farm.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
 
     async def restore(self, *, actor: User, farm: Farm, request_ctx: dict) -> Farm:
@@ -150,8 +171,12 @@ class FarmService:
             return farm
         await self.farm_repo.restore(farm)
         await self.audit_repo.record(
-            actor_id=actor.id, action="farm.restore",
-            entity_type="farm", entity_id=str(farm.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="farm.restore",
+            entity_type="farm",
+            entity_id=str(farm.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return farm

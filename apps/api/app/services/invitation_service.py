@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 
@@ -97,7 +96,9 @@ class InvitationService:
         if farm_id is not None:
             farm = await self.farm_repo.get_by_id_including_deleted(farm_id)
             if farm is None or farm.organization_id != organization_id:
-                raise HTTPException(status.HTTP_400_BAD_REQUEST, "Farm does not belong to this organization.")
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, "Farm does not belong to this organization."
+                )
             # Explicitly reject invitations to a soft-deleted farm — do NOT
             # let a decommissioned farm accrue new members.
             if farm.deleted_at is not None or not farm.is_active:
@@ -142,9 +143,12 @@ class InvitationService:
         )
 
         await self.audit_repo.record(
-            actor_id=actor.id, action="invitation.create",
-            entity_type="invitation", entity_id=str(invitation.id),
-            organization_id=organization_id, farm_id=farm_id,
+            actor_id=actor.id,
+            action="invitation.create",
+            entity_type="invitation",
+            entity_id=str(invitation.id),
+            organization_id=organization_id,
+            farm_id=farm_id,
             metadata={"email": invitation.email, "role": role.name},
             **request_ctx,
         )
@@ -155,9 +159,12 @@ class InvitationService:
             raise HTTPException(status.HTTP_409_CONFLICT, "Invitation is not pending.")
         await self.invitation_repo.mark_revoked(invitation)
         await self.audit_repo.record(
-            actor_id=actor.id, action="invitation.revoke",
-            entity_type="invitation", entity_id=str(invitation.id),
-            organization_id=invitation.organization_id, farm_id=invitation.farm_id,
+            actor_id=actor.id,
+            action="invitation.revoke",
+            entity_type="invitation",
+            entity_id=str(invitation.id),
+            organization_id=invitation.organization_id,
+            farm_id=invitation.farm_id,
             **request_ctx,
         )
 
@@ -176,9 +183,13 @@ class InvitationService:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid invitation token.")
         invitation = await self.invitation_repo.expire_if_needed(invitation)
         if invitation.status != InvitationStatus.PENDING:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Invitation is {invitation.status.value}.")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, f"Invitation is {invitation.status.value}."
+            )
         if invitation.email.lower() != actor.email.lower():
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "This invitation is for a different email address.")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "This invitation is for a different email address."
+            )
 
         # Wire memberships + role assignment
         await self.org_mem_repo.upsert_active(
@@ -198,16 +209,17 @@ class InvitationService:
 
         await self.invitation_repo.mark_accepted(invitation)
         await self.audit_repo.record(
-            actor_id=actor.id, action="invitation.accept",
-            entity_type="invitation", entity_id=str(invitation.id),
-            organization_id=invitation.organization_id, farm_id=invitation.farm_id,
+            actor_id=actor.id,
+            action="invitation.accept",
+            entity_type="invitation",
+            entity_id=str(invitation.id),
+            organization_id=invitation.organization_id,
+            farm_id=invitation.farm_id,
             **request_ctx,
         )
         return invitation
 
-    async def _enforce_accept_rate_limit(
-        self, *, actor_id: str, ip_address: str | None
-    ) -> None:
+    async def _enforce_accept_rate_limit(self, *, actor_id: str, ip_address: str | None) -> None:
         # ``actor_id`` here is always the stringified UUID of a
         # JWT-authenticated ``CurrentUser`` (see
         # ``endpoints/invitations.py::accept_invitation``). It is NEVER
@@ -274,15 +286,23 @@ class RoleAssignmentService:
         if role is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown role: {role_name!r}")
         if role.scope == RoleScope.PLATFORM:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Platform roles cannot be assigned via API.")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "Platform roles cannot be assigned via API."
+            )
         if role.scope == RoleScope.FARM and farm_id is None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "farm_id is required for farm-scoped roles.")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "farm_id is required for farm-scoped roles."
+            )
         if role.scope == RoleScope.ORGANIZATION and farm_id is not None:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "farm_id must be null for organization-scoped roles.")
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "farm_id must be null for organization-scoped roles."
+            )
 
         assignment = await self.role_assign_repo.create(
-            user_id=target_user.id, role_id=role.id,
-            organization_id=organization_id, farm_id=farm_id,
+            user_id=target_user.id,
+            role_id=role.id,
+            organization_id=organization_id,
+            farm_id=farm_id,
             granted_by_id=actor.id,
         )
         await self.org_mem_repo.upsert_active(user_id=target_user.id, org_id=organization_id)
@@ -290,9 +310,12 @@ class RoleAssignmentService:
             await self.farm_mem_repo.upsert_active(user_id=target_user.id, farm_id=farm_id)
 
         await self.audit_repo.record(
-            actor_id=actor.id, action="role.assign",
-            entity_type="role_assignment", entity_id=str(assignment.id),
-            organization_id=organization_id, farm_id=farm_id,
+            actor_id=actor.id,
+            action="role.assign",
+            entity_type="role_assignment",
+            entity_id=str(assignment.id),
+            organization_id=organization_id,
+            farm_id=farm_id,
             metadata={"role": role.name, "target_user_id": str(target_user.id)},
             **request_ctx,
         )
@@ -315,6 +338,13 @@ class RoleAssignmentService:
         """
         role = await self.role_repo.get_by_id(assignment.role_id)
         is_owner_role = role is not None and role.name == "organization_owner"
+
+        # Serialise concurrent owner mutations on this org so the
+        # post-check below sees a consistent view of committed revokes.
+        # (Under Postgres this is a transaction-scoped advisory lock;
+        # SQLite falls through as a no-op — its writers serialise anyway.)
+        if is_owner_role:
+            await self.org_repo.lock_owner_set(assignment.organization_id)
 
         # Pre-check for the single-caller case — keeps the error
         # message identical to Sprint 1 tests when there is no race.
@@ -345,8 +375,11 @@ class RoleAssignmentService:
                 )
 
         await self.audit_repo.record(
-            actor_id=actor.id, action="role.revoke",
-            entity_type="role_assignment", entity_id=str(assignment.id),
-            organization_id=assignment.organization_id, farm_id=assignment.farm_id,
+            actor_id=actor.id,
+            action="role.revoke",
+            entity_type="role_assignment",
+            entity_id=str(assignment.id),
+            organization_id=assignment.organization_id,
+            farm_id=assignment.farm_id,
             **request_ctx,
         )

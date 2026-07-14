@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from app.models.role_assignment import RoleAssignment
 
 
-class RoleScope(str, enum.Enum):
+class RoleScope(enum.StrEnum):
     PLATFORM = "platform"
     ORGANIZATION = "organization"
     FARM = "farm"
@@ -31,8 +31,15 @@ class RoleScope(str, enum.Enum):
 role_permissions_table = Table(
     "role_permissions",
     Base.metadata,
-    Column("role_id", UUID(as_uuid=True), ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True),
-    Column("permission_id", UUID(as_uuid=True), ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True),
+    Column(
+        "role_id", UUID(as_uuid=True), ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True
+    ),
+    Column(
+        "permission_id",
+        UUID(as_uuid=True),
+        ForeignKey("permissions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
 )
 
 
@@ -46,14 +53,15 @@ class Role(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    permissions: Mapped[list["Permission"]] = relationship(
+    permissions: Mapped[list[Permission]] = relationship(
         "Permission",
         secondary=role_permissions_table,
         back_populates="roles",
         lazy="selectin",
     )
-    assignments: Mapped[list["RoleAssignment"]] = relationship(
-        "RoleAssignment", back_populates="role",
+    assignments: Mapped[list[RoleAssignment]] = relationship(
+        "RoleAssignment",
+        back_populates="role",
     )
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -67,7 +75,9 @@ class Permission(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     description: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     roles: Mapped[list[Role]] = relationship(
-        "Role", secondary=role_permissions_table, back_populates="permissions",
+        "Role",
+        secondary=role_permissions_table,
+        back_populates="permissions",
     )
 
     def __repr__(self) -> str:  # pragma: no cover

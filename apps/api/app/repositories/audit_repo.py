@@ -85,8 +85,7 @@ class AuditRepository:
         total = int((await self.session.execute(total_stmt)).scalar_one())
 
         page_stmt = (
-            base
-            .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
+            base.order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc())
             .limit(limit)
             .offset(offset)
         )

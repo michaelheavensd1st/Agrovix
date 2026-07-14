@@ -17,12 +17,12 @@ from app.core.security import create_token, hash_password
 from app.models.invitation import Invitation
 from app.models.user import User
 
-
 DEFAULT_PW = "Sprint0ne!2026"
 
 
 async def create_verified_user(email: str, password: str = DEFAULT_PW) -> User:
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = User(
             email=email.lower(),
@@ -58,7 +58,9 @@ async def create_org(client: AsyncClient, name: str = "Tenant Co", slug: str | N
     return r.json()["id"]
 
 
-async def create_farm(client: AsyncClient, org_id: str, name: str = "Farm A", code: str | None = None) -> str:
+async def create_farm(
+    client: AsyncClient, org_id: str, name: str = "Farm A", code: str | None = None
+) -> str:
     code = code or f"F-{uuid4().hex[:6]}"
     r = await client.post(
         f"/api/v1/organizations/{org_id}/farms",
@@ -98,12 +100,16 @@ async def invite_and_accept(
 
     # Rewrite the stored token to a known raw token.
     from app.db import session as _db
+
     raw_token, _ = create_token(
-        subject=uuid4(), token_type="invite",
+        subject=uuid4(),
+        token_type="invite",
         extra_claims={"org_id": org_id, "email": invitee_email.lower()},
     )
     async with _db.AsyncSessionLocal() as session:
-        inv = (await session.execute(select(Invitation).where(Invitation.id == invitation_id))).scalar_one()
+        inv = (
+            await session.execute(select(Invitation).where(Invitation.id == invitation_id))
+        ).scalar_one()
         inv.token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         session.add(inv)
         await session.commit()

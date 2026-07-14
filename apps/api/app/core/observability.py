@@ -9,8 +9,9 @@ Business code should depend on ``get_tracer()`` — never on OTel directly.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator, Protocol
+from typing import Any, Protocol
 
 
 class Span(Protocol):
@@ -27,7 +28,7 @@ class Tracer(Protocol):
 # No-op default
 # --------------------------------------------------------------------- #
 class _NoopSpan:
-    def set_attribute(self, key: str, value: Any) -> None:  # noqa: D401
+    def set_attribute(self, key: str, value: Any) -> None:
         return None
 
     def record_exception(self, exc: BaseException) -> None:
@@ -36,7 +37,7 @@ class _NoopSpan:
 
 class _NoopTracer:
     @contextmanager
-    def start_span(self, name: str, **attrs: Any) -> Iterator[Span]:  # noqa: D401
+    def start_span(self, name: str, **attrs: Any) -> Iterator[Span]:
         del name, attrs
         yield _NoopSpan()
 

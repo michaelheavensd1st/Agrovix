@@ -8,7 +8,7 @@
     "start": "next start -p 3000",
     "lint": "next lint",
     "type-check": "tsc --noEmit",
-    "test": "vitest",
+    "test": "vitest --run",
     "test:watch": "vitest --watch",
     "clean": "rm -rf .next .turbo node_modules"
   },

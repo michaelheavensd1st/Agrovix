@@ -41,7 +41,7 @@ class RefreshToken(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    user: Mapped["User"] = relationship("User", back_populates="refresh_tokens")
+    user: Mapped[User] = relationship("User", back_populates="refresh_tokens")
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<RefreshToken user_id={self.user_id} revoked={self.is_revoked}>"

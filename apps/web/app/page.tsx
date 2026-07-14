@@ -3,10 +3,7 @@ import { Leaf, Compass, ShieldCheck } from 'lucide-react';
 
 export default function LandingPage() {
   return (
-    <main
-      className="relative isolate overflow-hidden"
-      data-testid="landing-page"
-    >
+    <main className="relative isolate overflow-hidden" data-testid="landing-page">
       {/* Background field texture */}
       <div
         aria-hidden
@@ -55,9 +52,9 @@ export default function LandingPage() {
           data-testid="landing-subheadline"
           className="mt-6 max-w-2xl text-base text-muted-foreground sm:text-lg"
         >
-          Agrovix AgOS unifies farms, fields, teams, and telemetry behind one
-          extensible platform. This is the foundation release — a
-          production-ready architecture ready to grow feature by feature.
+          Agrovix AgOS unifies farms, fields, teams, and telemetry behind one extensible platform.
+          This is the foundation release — a production-ready architecture ready to grow feature by
+          feature.
         </p>
 
         <div className="mt-10 flex flex-wrap gap-3">

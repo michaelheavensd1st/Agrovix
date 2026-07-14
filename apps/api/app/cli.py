@@ -66,6 +66,7 @@ def _prompt_credentials(email: str | None, password: str | None) -> tuple[str, s
 
 async def _create_admin(email: str, password: str) -> None:
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user_repo = UserRepository(session)
         role_repo = RoleRepository(session)
@@ -74,7 +75,9 @@ async def _create_admin(email: str, password: str) -> None:
         user = await user_repo.get_by_email(email)
         if user is None:
             user = await user_repo.create(
-                email=email, hashed_password=hash_password(password), full_name="Platform Administrator",
+                email=email,
+                hashed_password=hash_password(password),
+                full_name="Platform Administrator",
             )
         else:
             user.hashed_password = hash_password(password)
@@ -97,13 +100,17 @@ async def _create_admin(email: str, password: str) -> None:
 
         # Idempotent: only insert if not already present.
         existing = [
-            a for a in await role_assign_repo.list_for_user(user.id)
+            a
+            for a in await role_assign_repo.list_for_user(user.id)
             if a.role_id == role.id and a.organization_id is None and a.farm_id is None
         ]
         if not existing:
             await role_assign_repo.create(
-                user_id=user.id, role_id=role.id,
-                organization_id=None, farm_id=None, granted_by_id=user.id,
+                user_id=user.id,
+                role_id=role.id,
+                organization_id=None,
+                farm_id=None,
+                granted_by_id=user.id,
             )
         await session.commit()
         print(f"Platform administrator ready: {email}")

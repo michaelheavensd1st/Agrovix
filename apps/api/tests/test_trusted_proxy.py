@@ -19,8 +19,8 @@ from __future__ import annotations
 import pytest
 from starlette.requests import Request
 
-from app.core.config import Settings, get_settings
 from app.core import trusted_proxy
+from app.core.config import Settings, get_settings
 
 
 def _make_request(*, peer: str, headers: dict[str, str] | None = None) -> Request:
@@ -145,6 +145,7 @@ async def test_login_uses_trusted_client_ip_end_to_end(client) -> None:
     rate-limit bucket is applied per socket peer.
     """
     from uuid import uuid4
+
     from app.core import rate_limit_factory
     from app.core.rate_limit import InMemoryRateLimiter
 

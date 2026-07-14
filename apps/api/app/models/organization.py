@@ -26,15 +26,17 @@ class Organization(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     timezone: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    memberships: Mapped[list["OrganizationMembership"]] = relationship(
+    memberships: Mapped[list[OrganizationMembership]] = relationship(
         "OrganizationMembership", back_populates="organization", cascade="all, delete-orphan"
     )
-    farms: Mapped[list["Farm"]] = relationship(
+    farms: Mapped[list[Farm]] = relationship(
         "Farm", back_populates="organization", cascade="all, delete-orphan"
     )
-    invitations: Mapped[list["Invitation"]] = relationship(
+    invitations: Mapped[list[Invitation]] = relationship(
         "Invitation", back_populates="organization", cascade="all, delete-orphan"
     )
 

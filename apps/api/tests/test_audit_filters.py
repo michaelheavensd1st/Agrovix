@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC
 from uuid import uuid4
 
 import pytest
@@ -99,9 +100,11 @@ async def test_filter_by_farm(client: AsyncClient) -> None:
 async def test_filter_by_actor(client: AsyncClient) -> None:
     s = await _seed_events(client)
     # Look up owner id.
-    from app.db import session as _db
     from sqlalchemy import select
+
+    from app.db import session as _db
     from app.models.user import User
+
     async with _db.AsyncSessionLocal() as session:
         u = (await session.execute(select(User).where(User.email == s["owner"]))).scalar_one()
 
@@ -117,10 +120,11 @@ async def test_filter_by_actor(client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_filter_by_date_range(client: AsyncClient) -> None:
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
+
     s = await _seed_events(client)
     # A very tight future window returns nothing.
-    future_from = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    future_from = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     r = await client.get(
         f"/api/v1/organizations/{s['org_id']}/audit-events",
         params={"occurred_from": future_from},
@@ -129,7 +133,7 @@ async def test_filter_by_date_range(client: AsyncClient) -> None:
     assert r.json()["total"] == 0
 
     # A window that ended yesterday returns nothing either.
-    past_to = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    past_to = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     r = await client.get(
         f"/api/v1/organizations/{s['org_id']}/audit-events",
         params={"occurred_to": past_to},
@@ -141,8 +145,8 @@ async def test_filter_by_date_range(client: AsyncClient) -> None:
     r = await client.get(
         f"/api/v1/organizations/{s['org_id']}/audit-events",
         params={
-            "occurred_from": (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
-            "occurred_to": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+            "occurred_from": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            "occurred_to": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
         },
     )
     assert r.status_code == 200

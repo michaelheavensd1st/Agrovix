@@ -16,6 +16,7 @@ from app.models.user import User
 
 async def _create_verified_user(email: str, password: str = "Sprint0ne!2026") -> User:
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = User(
             email=email.lower(),
@@ -29,7 +30,9 @@ async def _create_verified_user(email: str, password: str = "Sprint0ne!2026") ->
         return user
 
 
-async def _login(client: AsyncClient, email: str, password: str = "Sprint0ne!2026") -> dict[str, str]:
+async def _login(
+    client: AsyncClient, email: str, password: str = "Sprint0ne!2026"
+) -> dict[str, str]:
     r = await client.post("/api/v1/auth/login", json={"email": email, "password": password})
     assert r.status_code == 200, r.text
     return {get_settings().cookie_access_name: r.cookies.get(get_settings().cookie_access_name)}
@@ -37,7 +40,7 @@ async def _login(client: AsyncClient, email: str, password: str = "Sprint0ne!202
 
 @pytest.mark.asyncio
 async def test_full_onboarding_workflow_with_isolation(client: AsyncClient) -> None:
-    settings = get_settings()
+    get_settings()
 
     # --- alice creates org + farm --------------------------------------
     alice_email = f"alice-{uuid4().hex[:8]}@agrovix.dev"
@@ -76,17 +79,23 @@ async def test_full_onboarding_workflow_with_isolation(client: AsyncClient) -> N
     # Pull the token from the DB (dev EmailSender only logs it — the token
     # is never returned in the API response by design).
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
-        inv = (await session.execute(select(Invitation).where(Invitation.id == invitation_id))).scalar_one()
+        inv = (
+            await session.execute(select(Invitation).where(Invitation.id == invitation_id))
+        ).scalar_one()
 
     # We can't derive the raw token from the hash — so instead accept the
     # invitation by hitting the service via the token_hash-aware admin
     # path. The public endpoint requires the raw token; for the QA path
     # we insert a well-known token and re-hash.
-    from app.core.security import create_token
     import hashlib
+
+    from app.core.security import create_token
+
     raw_token, _ = create_token(
-        subject=uuid4(), token_type="invite",
+        subject=uuid4(),
+        token_type="invite",
         extra_claims={"org_id": org_id, "email": bob_email.lower()},
     )
     inv.token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
@@ -121,7 +130,7 @@ async def test_full_onboarding_workflow_with_isolation(client: AsyncClient) -> N
 @pytest.mark.asyncio
 async def test_permission_denied_when_role_lacks_permission(client: AsyncClient) -> None:
     """A worker cannot invite users (missing invitation.create)."""
-    settings = get_settings()
+    get_settings()
     owner_email = f"owner-{uuid4().hex[:8]}@agrovix.dev"
     worker_email = f"worker-{uuid4().hex[:8]}@agrovix.dev"
     await _create_verified_user(owner_email)
@@ -140,8 +149,11 @@ async def test_permission_denied_when_role_lacks_permission(client: AsyncClient)
 
     # Find worker.user_id via API
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
-        worker = (await session.execute(select(User).where(User.email == worker_email.lower()))).scalar_one()
+        worker = (
+            await session.execute(select(User).where(User.email == worker_email.lower()))
+        ).scalar_one()
 
     # assign worker (permission-driven — must go through the API to also record audit)
     r = await client.post(

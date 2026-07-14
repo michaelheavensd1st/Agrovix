@@ -43,8 +43,12 @@ async def assign_role(
     if target is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Target user not found.")
     assignment = await service.assign(
-        actor=user, organization_id=org.id, target_user=target,
-        role_name=payload.role_name, farm_id=payload.farm_id, request_ctx=request_ctx,
+        actor=user,
+        organization_id=org.id,
+        target_user=target,
+        role_name=payload.role_name,
+        farm_id=payload.farm_id,
+        request_ctx=request_ctx,
     )
     return RoleAssignmentPublic.model_validate(assignment)
 
@@ -64,6 +68,7 @@ async def revoke_role(
     if assignment is None or assignment.revoked_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Role assignment not found.")
     from app.security.authorize import has_permission, resolve_permissions
+
     codes = await resolve_permissions(
         role_assign_repo.session, user, organization_id=assignment.organization_id
     )

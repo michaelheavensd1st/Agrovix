@@ -1,10 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
 
-export default function AcceptInvitePage() {
+function AcceptInviteInner() {
   const params = useSearchParams();
   const router = useRouter();
   const [state, setState] = useState<'idle' | 'ok' | 'error'>('idle');
@@ -26,7 +26,7 @@ export default function AcceptInvitePage() {
       setTimeout(() => router.push('/dashboard'), 900);
     } catch (err) {
       setState('error');
-      setError(err instanceof ApiError ? err.payload.detail ?? 'Failed to accept' : String(err));
+      setError(err instanceof ApiError ? (err.payload.detail ?? 'Failed to accept') : String(err));
     }
   }
 
@@ -40,12 +40,18 @@ export default function AcceptInvitePage() {
         Sign in first (if you have not already), then confirm below.
       </p>
       {state === 'ok' && (
-        <p className="mt-6 rounded-md bg-primary/10 px-3 py-2 text-sm text-primary" data-testid="accept-invite-success">
+        <p
+          className="mt-6 rounded-md bg-primary/10 px-3 py-2 text-sm text-primary"
+          data-testid="accept-invite-success"
+        >
           Invitation accepted. Redirecting…
         </p>
       )}
       {state === 'error' && (
-        <p className="mt-6 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" data-testid="accept-invite-error">
+        <p
+          className="mt-6 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid="accept-invite-error"
+        >
           {error}
         </p>
       )}
@@ -59,5 +65,13 @@ export default function AcceptInvitePage() {
         Confirm invitation
       </button>
     </main>
+  );
+}
+
+export default function AcceptInvitePage() {
+  return (
+    <Suspense fallback={null}>
+      <AcceptInviteInner />
+    </Suspense>
   );
 }

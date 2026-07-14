@@ -34,10 +34,10 @@ later and keeps the platform's operational analytics uniform.
 
 ## Reference data
 
-| Entity                  | Ownership                  | Extensibility                                                        |
-| ----------------------- | -------------------------- | -------------------------------------------------------------------- |
-| `ProductionUnitType`    | System-seeded + org-custom | Orgs create their own custom types; system types are immutable       |
-| `ProductionEventType`   | System-owned (catalog)     | Platform releases only — orgs cannot create or rename event types    |
+| Entity                | Ownership                  | Extensibility                                                     |
+| --------------------- | -------------------------- | ----------------------------------------------------------------- |
+| `ProductionUnitType`  | System-seeded + org-custom | Orgs create their own custom types; system types are immutable    |
+| `ProductionEventType` | System-owned (catalog)     | Platform releases only — orgs cannot create or rename event types |
 
 System-seeded unit types (see `app/seed.py`):
 
@@ -59,9 +59,7 @@ UI can highlight the offending inputs precisely:
 {
   "detail": {
     "event_type": "FEEDING",
-    "errors": [
-      {"field": "feed_kg", "message": "Input should be greater than 0", "type": "greater_than"}
-    ]
+    "errors": [{ "field": "feed_kg", "message": "Input should be greater than 0", "type": "greater_than" }]
   }
 }
 ```

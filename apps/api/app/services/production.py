@@ -13,20 +13,21 @@ and one 409 — never a corrupt final state.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
-from app.models.audit import AuditEvent
 from app.models.farm import Farm
 from app.models.production import (
     ProductionBatch,
     ProductionBatchState,
     ProductionEvent,
     ProductionSite,
-    ProductionSiteStatus,
     ProductionUnit,
     ProductionUnitStatus,
     ProductionUnitType,
@@ -93,9 +94,13 @@ class ProductionSiteService:
             return  # idempotent
         await self.site_repo.soft_delete(site)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_site.delete",
-            entity_type="production_site", entity_id=str(site.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_site.delete",
+            entity_type="production_site",
+            entity_id=str(site.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
 
     async def restore(
@@ -105,9 +110,13 @@ class ProductionSiteService:
             return site
         await self.site_repo.restore(site)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_site.restore",
-            entity_type="production_site", entity_id=str(site.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_site.restore",
+            entity_type="production_site",
+            entity_id=str(site.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return site
 
@@ -138,9 +147,12 @@ class ProductionUnitTypeService:
             organization_id=organization_id, is_system=False, **data
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit_type.create",
-            entity_type="production_unit_type", entity_id=str(row.id),
-            organization_id=organization_id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit_type.create",
+            entity_type="production_unit_type",
+            entity_id=str(row.id),
+            organization_id=organization_id,
+            **request_ctx,
         )
         return row
 
@@ -156,9 +168,12 @@ class ProductionUnitTypeService:
             return
         await self.unit_type_repo.soft_delete(row)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit_type.delete",
-            entity_type="production_unit_type", entity_id=str(row.id),
-            organization_id=row.organization_id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit_type.delete",
+            entity_type="production_unit_type",
+            entity_id=str(row.id),
+            organization_id=row.organization_id,
+            **request_ctx,
         )
 
 
@@ -204,9 +219,13 @@ class ProductionUnitService:
             )
         unit = await self.unit_repo.create(site_id=site.id, **data)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit.create",
-            entity_type="production_unit", entity_id=str(unit.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit.create",
+            entity_type="production_unit",
+            entity_id=str(unit.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return unit
 
@@ -229,9 +248,13 @@ class ProductionUnitService:
             return
         await self.unit_repo.soft_delete(unit)
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_unit.delete",
-            entity_type="production_unit", entity_id=str(unit.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_unit.delete",
+            entity_type="production_unit",
+            entity_id=str(unit.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
 
 
@@ -269,9 +292,7 @@ _ALLOWED_TRANSITIONS: dict[ProductionBatchState, set[ProductionBatchState]] = {
 }
 
 # Certain transitions can only be reached via a specific event type.
-_EVENT_DRIVEN_TRANSITIONS: dict[
-    tuple[ProductionBatchState, ProductionBatchState], str
-] = {
+_EVENT_DRIVEN_TRANSITIONS: dict[tuple[ProductionBatchState, ProductionBatchState], str] = {
     (ProductionBatchState.PLANNED, ProductionBatchState.STOCKED): "STOCKING",
     (ProductionBatchState.ACTIVE, ProductionBatchState.HARVESTED): "HARVEST",
 }
@@ -281,6 +302,23 @@ _TERMINAL_STATES = {
     ProductionBatchState.CANCELLED,
     ProductionBatchState.FAILED,
 }
+
+
+def _compute_payload_hash(event_type: str, validated_data: dict) -> str:
+    """Deterministic SHA-256 hex over the event type + validated payload.
+
+    Stable regardless of dict key order so two clients constructing the
+    same logical payload get the same hash. Used to detect
+    Idempotency-Key replays that would otherwise silently overwrite a
+    different payload (Codex Review Gate 01, finding CRG01-2).
+    """
+    canonical = json.dumps(
+        {"event_type": event_type, "data": validated_data},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ProductionBatchService:
@@ -322,9 +360,13 @@ class ProductionBatchService:
             actor_id=actor.id,
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_batch.create",
-            entity_type="production_batch", entity_id=str(batch.id),
-            organization_id=farm.organization_id, farm_id=farm.id, **request_ctx,
+            actor_id=actor.id,
+            action="production_batch.create",
+            entity_type="production_batch",
+            entity_id=str(batch.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            **request_ctx,
         )
         return batch
 
@@ -374,7 +416,7 @@ class ProductionBatchService:
             return batch
 
         # Timestamps for lifecycle milestones.
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         ts_fields: dict[str, datetime] = {}
         if target_state == ProductionBatchState.STOCKED:
             ts_fields["stocked_at"] = now
@@ -384,7 +426,10 @@ class ProductionBatchService:
             ts_fields["closed_at"] = now
 
         succeeded = await self.batch_repo.compare_and_set_state(
-            batch.id, from_state=current, to_state=target_state, timestamp_fields=ts_fields,
+            batch.id,
+            from_state=current,
+            to_state=target_state,
+            timestamp_fields=ts_fields,
         )
         if not succeeded:
             # Another caller transitioned the batch first.
@@ -408,9 +453,12 @@ class ProductionBatchService:
             metadata=metadata,
         )
         await self.audit_repo.record(
-            actor_id=actor.id, action="production_batch.transition",
-            entity_type="production_batch", entity_id=str(batch.id),
-            organization_id=farm.organization_id, farm_id=farm.id,
+            actor_id=actor.id,
+            action="production_batch.transition",
+            entity_type="production_batch",
+            entity_id=str(batch.id),
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
             metadata={"from": current.value, "to": target_state.value, "reason": reason},
             **request_ctx,
         )
@@ -448,7 +496,16 @@ class ProductionEventService:
         farm: Farm,
         payload: dict,
         request_ctx: dict,
-    ) -> ProductionEvent:
+        idempotency_key: str | None = None,
+    ) -> tuple[ProductionEvent, bool]:
+        """Create (or idempotently replay) a production event.
+
+        Returns ``(event, is_replay)``. ``is_replay=True`` means an
+        existing row with the same ``(batch_id, idempotency_key)`` was
+        returned instead of creating a new one — the endpoint uses
+        this to signal 200 vs 201 to the client (see
+        docs/audits/codex-review-gate-01.md, finding CRG01-2).
+        """
         if batch.state in _TERMINAL_STATES:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -482,32 +539,100 @@ class ProductionEventService:
                 },
             ) from exc
 
+        # ---- Idempotency check (pre-insert) ---------------------- #
+        # Stable hash covering event_type + validated data + is_final
+        # so replaying the SAME key with a DIFFERENT payload is
+        # detected as a conflict.
+        payload_hash = _compute_payload_hash(entry.code, validated_data)
+        if idempotency_key is not None:
+            existing = await self.event_repo.get_by_batch_and_key(batch.id, idempotency_key)
+            if existing is not None:
+                if existing.payload_hash != payload_hash:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        {
+                            "code": "idempotency_key_payload_conflict",
+                            "message": (
+                                "This Idempotency-Key was previously used with a "
+                                "different payload on this batch."
+                            ),
+                            "idempotency_key": idempotency_key,
+                        },
+                    )
+                # Same key + same payload → return prior event; do NOT
+                # re-audit, re-transition, or re-write anything.
+                return existing, True
+
         # Determine is_final flag for events that carry one (e.g. HARVEST).
         is_final = bool(validated_data.get("is_final", False))
 
-        event = await self.event_repo.create(
+        try:
+            # Wrap the INSERT in a SAVEPOINT so that a concurrent-race
+            # ``IntegrityError`` rolls back ONLY this statement, not
+            # the whole request transaction. Without this, the audit +
+            # transition writes queued earlier in the request would
+            # also be lost on collision.
+            async with self.event_repo.session.begin_nested():
+                event = await self.event_repo.create(
+                    organization_id=farm.organization_id,
+                    farm_id=farm.id,
+                    site_id=site.id,
+                    unit_id=unit.id,
+                    batch_id=batch.id,
+                    event_type=entry.code,
+                    event_type_version=entry.version,
+                    performed_by_id=actor.id,
+                    performed_at=payload.get("performed_at") or datetime.now(UTC),
+                    data=validated_data,
+                    attachments=payload.get("attachments"),
+                    is_final=is_final,
+                    notes=payload.get("notes"),
+                    idempotency_key=idempotency_key,
+                    payload_hash=payload_hash if idempotency_key is not None else None,
+                )
+        except IntegrityError as exc:
+            # Concurrent request won the race for this idempotency key.
+            # The savepoint already rolled back this INSERT; the outer
+            # transaction is still valid, so we can safely look up the
+            # winning row and either replay it or emit 409.
+            if idempotency_key is None:
+                raise
+            existing = await self.event_repo.get_by_batch_and_key(batch.id, idempotency_key)
+            if existing is None:  # defensive — should not happen
+                raise
+            if existing.payload_hash != payload_hash:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "idempotency_key_payload_conflict",
+                        "message": (
+                            "This Idempotency-Key was previously used with a "
+                            "different payload on this batch."
+                        ),
+                        "idempotency_key": idempotency_key,
+                    },
+                ) from exc
+            return existing, True
+
+        await self.audit_repo.record(
+            actor_id=actor.id,
+            action="production_event.create",
+            entity_type="production_event",
+            entity_id=str(event.id),
             organization_id=farm.organization_id,
             farm_id=farm.id,
-            site_id=site.id,
-            unit_id=unit.id,
-            batch_id=batch.id,
-            event_type=entry.code,
-            event_type_version=entry.version,
-            performed_by_id=actor.id,
-            performed_at=payload.get("performed_at") or datetime.now(timezone.utc),
-            data=validated_data,
-            attachments=payload.get("attachments"),
-            is_final=is_final,
-            notes=payload.get("notes"),
-        )
-        await self.audit_repo.record(
-            actor_id=actor.id, action="production_event.create",
-            entity_type="production_event", entity_id=str(event.id),
-            organization_id=farm.organization_id, farm_id=farm.id,
-            metadata={"event_type": entry.code}, **request_ctx,
+            metadata={"event_type": entry.code, "idempotency_key": idempotency_key},
+            **request_ctx,
         )
 
         # ---- Optional lifecycle transition ----------------------- #
+        # Atomicity: transition and event write share the same
+        # request-scoped SQLAlchemy session — either both commit or
+        # both roll back. If the transition raises 409 (concurrent
+        # batch state change) we let it propagate; the request-level
+        # rollback in the DB dep removes the event insert too, so we
+        # never leave a "dangling" event with no corresponding
+        # transition on an event-driven type.
         if entry.triggers_transition_to is not None:
             target = ProductionBatchState(entry.triggers_transition_to)
             # HARVEST only closes the batch when marked final.
@@ -515,15 +640,22 @@ class ProductionEventService:
                 pass
             elif batch.state != target and target in _ALLOWED_TRANSITIONS.get(batch.state, set()):
                 await self.batch_service.transition(
-                    actor=actor, batch=batch, farm=farm, target_state=target,
+                    actor=actor,
+                    batch=batch,
+                    farm=farm,
+                    target_state=target,
                     reason=f"triggered by {entry.code} event",
-                    request_ctx=request_ctx, triggering_event=event,
+                    request_ctx=request_ctx,
+                    triggering_event=event,
                 )
-        return event
+        return event, False
 
     async def list_for_batch(
         self, batch: ProductionBatch, *, limit: int, cursor: str | None, event_type: str | None
     ) -> tuple[list[ProductionEvent], str | None]:
         return await self.event_repo.list_for_batch(
-            batch.id, limit=limit, cursor=cursor, event_type=event_type,
+            batch.id,
+            limit=limit,
+            cursor=cursor,
+            event_type=event_type,
         )

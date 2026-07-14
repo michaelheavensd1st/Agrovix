@@ -31,10 +31,14 @@ _settings = get_settings()
 def _to_public(user: User, permissions: list[str] | None = None) -> UserPublic:
     return UserPublic.model_validate(
         {
-            "id": user.id, "email": user.email, "full_name": user.full_name,
-            "is_active": user.is_active, "is_verified": user.is_verified,
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name,
+            "is_active": user.is_active,
+            "is_verified": user.is_verified,
             "is_superuser": user.is_superuser,
-            "created_at": user.created_at, "updated_at": user.updated_at,
+            "created_at": user.created_at,
+            "updated_at": user.updated_at,
             "permissions": permissions or [],
         }
     )
@@ -45,7 +49,9 @@ async def register(
     payload: RegisterRequest,
     service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> UserPublic:
-    user = await service.register(email=payload.email, password=payload.password, full_name=payload.full_name)
+    user = await service.register(
+        email=payload.email, password=payload.password, full_name=payload.full_name
+    )
     return _to_public(user)
 
 
@@ -78,12 +84,12 @@ async def login(
 ) -> JSONResponse:
     ua = request.headers.get("user-agent")
     ip = get_client_ip(request)
-    _, tokens = await service.login(email=payload.email, password=payload.password, user_agent=ua, ip_address=ip)
+    _, tokens = await service.login(
+        email=payload.email, password=payload.password, user_agent=ua, ip_address=ip
+    )
 
     access_life, refresh_life = service.token_lifetimes()
-    response = JSONResponse(
-        {"token_type": "bearer", "expires_in": tokens.expires_in}
-    )
+    response = JSONResponse({"token_type": "bearer", "expires_in": tokens.expires_in})
     set_auth_cookies(
         response,
         access_token=tokens.access_token,

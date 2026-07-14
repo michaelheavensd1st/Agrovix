@@ -1,9 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  emailSchema,
-  passwordSchema,
-  registerRequestSchema,
-} from '../src/index';
+import { emailSchema, passwordSchema, registerRequestSchema } from '../src/index';
 
 describe('validation schemas', () => {
   it('accepts a valid email', () => {

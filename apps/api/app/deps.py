@@ -15,10 +15,10 @@ from fastapi import Cookie, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import rate_limit_factory
 from app.core.config import get_settings
 from app.core.logging import organization_id_var, user_id_var
 from app.core.rate_limit import RateLimiter
-from app.core import rate_limit_factory
 from app.core.security import TokenExpiredError, TokenInvalidError, decode_token
 from app.db.session import get_db_session
 from app.email.base import EmailSender
@@ -138,14 +138,19 @@ def get_auth_service(
 
 def get_organization_service(
     org_repo: Annotated[OrganizationRepository, Depends(get_organization_repository)],
-    org_mem_repo: Annotated[OrganizationMembershipRepository, Depends(get_organization_membership_repository)],
+    org_mem_repo: Annotated[
+        OrganizationMembershipRepository, Depends(get_organization_membership_repository)
+    ],
     role_repo: Annotated[RoleRepository, Depends(get_role_repository)],
     role_assign_repo: Annotated[RoleAssignmentRepository, Depends(get_role_assignment_repository)],
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
 ) -> OrganizationService:
     return OrganizationService(
-        org_repo=org_repo, org_mem_repo=org_mem_repo,
-        role_repo=role_repo, role_assign_repo=role_assign_repo, audit_repo=audit_repo,
+        org_repo=org_repo,
+        org_mem_repo=org_mem_repo,
+        role_repo=role_repo,
+        role_assign_repo=role_assign_repo,
+        audit_repo=audit_repo,
     )
 
 
@@ -163,7 +168,9 @@ def get_invitation_service(
     role_assign_repo: Annotated[RoleAssignmentRepository, Depends(get_role_assignment_repository)],
     user_repo: Annotated[UserRepository, Depends(get_user_repository)],
     org_repo: Annotated[OrganizationRepository, Depends(get_organization_repository)],
-    org_mem_repo: Annotated[OrganizationMembershipRepository, Depends(get_organization_membership_repository)],
+    org_mem_repo: Annotated[
+        OrganizationMembershipRepository, Depends(get_organization_membership_repository)
+    ],
     farm_repo: Annotated[FarmRepository, Depends(get_farm_repository)],
     farm_mem_repo: Annotated[FarmMembershipRepository, Depends(get_farm_membership_repository)],
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
@@ -171,10 +178,16 @@ def get_invitation_service(
     rate_limiter: Annotated[RateLimiter, Depends(get_rate_limiter_dep)],
 ) -> InvitationService:
     return InvitationService(
-        invitation_repo=invitation_repo, role_repo=role_repo, role_assign_repo=role_assign_repo,
-        user_repo=user_repo, org_repo=org_repo, org_mem_repo=org_mem_repo,
-        farm_repo=farm_repo, farm_mem_repo=farm_mem_repo,
-        audit_repo=audit_repo, email_sender=email_sender,
+        invitation_repo=invitation_repo,
+        role_repo=role_repo,
+        role_assign_repo=role_assign_repo,
+        user_repo=user_repo,
+        org_repo=org_repo,
+        org_mem_repo=org_mem_repo,
+        farm_repo=farm_repo,
+        farm_mem_repo=farm_mem_repo,
+        audit_repo=audit_repo,
+        email_sender=email_sender,
         rate_limiter=rate_limiter,
     )
 
@@ -183,14 +196,19 @@ def get_role_assignment_service(
     role_repo: Annotated[RoleRepository, Depends(get_role_repository)],
     role_assign_repo: Annotated[RoleAssignmentRepository, Depends(get_role_assignment_repository)],
     org_repo: Annotated[OrganizationRepository, Depends(get_organization_repository)],
-    org_mem_repo: Annotated[OrganizationMembershipRepository, Depends(get_organization_membership_repository)],
+    org_mem_repo: Annotated[
+        OrganizationMembershipRepository, Depends(get_organization_membership_repository)
+    ],
     farm_mem_repo: Annotated[FarmMembershipRepository, Depends(get_farm_membership_repository)],
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
 ) -> RoleAssignmentService:
     return RoleAssignmentService(
-        role_repo=role_repo, role_assign_repo=role_assign_repo,
-        farm_mem_repo=farm_mem_repo, org_mem_repo=org_mem_repo,
-        org_repo=org_repo, audit_repo=audit_repo,
+        role_repo=role_repo,
+        role_assign_repo=role_assign_repo,
+        farm_mem_repo=farm_mem_repo,
+        org_mem_repo=org_mem_repo,
+        org_repo=org_repo,
+        audit_repo=audit_repo,
     )
 
 
@@ -221,7 +239,9 @@ async def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Access token has expired.",
-            headers={"WWW-Authenticate": 'Bearer error="invalid_token", error_description="expired"'},
+            headers={
+                "WWW-Authenticate": 'Bearer error="invalid_token", error_description="expired"'
+            },
         ) from exc
     except (TokenInvalidError, KeyError, ValueError) as exc:
         raise _unauthorized() from exc
@@ -243,7 +263,9 @@ async def get_current_organization(
     organization_id: uuid.UUID,
     user: CurrentUser,
     org_repo: Annotated[OrganizationRepository, Depends(get_organization_repository)],
-    org_mem_repo: Annotated[OrganizationMembershipRepository, Depends(get_organization_membership_repository)],
+    org_mem_repo: Annotated[
+        OrganizationMembershipRepository, Depends(get_organization_membership_repository)
+    ],
 ) -> Organization:
     org = await org_repo.get_by_id(organization_id)
     if org is None:
@@ -265,7 +287,9 @@ async def get_current_farm(
     user: CurrentUser,
     farm_repo: Annotated[FarmRepository, Depends(get_farm_repository)],
     farm_mem_repo: Annotated[FarmMembershipRepository, Depends(get_farm_membership_repository)],
-    org_mem_repo: Annotated[OrganizationMembershipRepository, Depends(get_organization_membership_repository)],
+    org_mem_repo: Annotated[
+        OrganizationMembershipRepository, Depends(get_organization_membership_repository)
+    ],
     role_assign_repo: Annotated[RoleAssignmentRepository, Depends(get_role_assignment_repository)],
 ) -> Farm:
     farm = await farm_repo.get_by_id(farm_id)
@@ -282,12 +306,12 @@ async def get_current_farm(
 
     # Must have either an org-scoped role assignment OR explicit farm membership
     org_scoped = [
-        a for a in await role_assign_repo.list_for_user(user.id)
+        a
+        for a in await role_assign_repo.list_for_user(user.id)
         if a.organization_id == farm.organization_id and a.farm_id is None
     ]
-    if not org_scoped:
-        if not await farm_mem_repo.user_has_farm(user_id=user.id, farm_id=farm.id):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Farm not found.")
+    if not org_scoped and not await farm_mem_repo.user_has_farm(user_id=user.id, farm_id=farm.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Farm not found.")
 
     organization_id_var.set(str(farm.organization_id))
     return farm
@@ -309,6 +333,7 @@ def require_permission(code: str):
     leak the existence of resources in another tenant to outsiders —
     see ``tests/test_cross_tenant.py`` for the acceptance shape.
     """
+
     async def _dep(
         user: CurrentUser,
         session: DBSession,
@@ -323,6 +348,7 @@ def require_permission(code: str):
             from sqlalchemy import select
 
             from app.models.membership import OrganizationMembership
+
             membership = (
                 await session.execute(
                     select(OrganizationMembership).where(
@@ -355,6 +381,7 @@ def require_permission(code: str):
 def get_request_ctx(request: Request) -> dict:
     from app.core.logging import request_id_var
     from app.core.trusted_proxy import get_client_ip
+
     return {
         # Trusted-proxy-aware client IP — see ``app/core/trusted_proxy.py``.
         "ip_address": get_client_ip(request),

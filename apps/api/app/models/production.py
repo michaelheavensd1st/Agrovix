@@ -44,7 +44,6 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
-    Enum as SQLEnum,
     ForeignKey,
     Index,
     Integer,
@@ -53,6 +52,9 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy import (
+    Enum as SQLEnum,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -60,26 +62,25 @@ from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 if TYPE_CHECKING:
     from app.models.farm import Farm
-    from app.models.organization import Organization
     from app.models.user import User
 
 
 # --------------------------------------------------------------------- #
 # Enums
 # --------------------------------------------------------------------- #
-class ProductionSiteStatus(str, enum.Enum):
+class ProductionSiteStatus(enum.StrEnum):
     ACTIVE = "active"
     MAINTENANCE = "maintenance"
     CLOSED = "closed"
 
 
-class ProductionUnitStatus(str, enum.Enum):
+class ProductionUnitStatus(enum.StrEnum):
     ACTIVE = "active"
     MAINTENANCE = "maintenance"
     CLOSED = "closed"
 
 
-class ProductionBatchState(str, enum.Enum):
+class ProductionBatchState(enum.StrEnum):
     PLANNED = "planned"
     STOCKED = "stocked"
     ACTIVE = "active"
@@ -122,8 +123,10 @@ class ProductionUnitType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
 
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=True, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
     code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -131,7 +134,9 @@ class ProductionUnitType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     metadata_json: Mapped[dict | None] = mapped_column("metadata", _JSON, nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -139,9 +144,7 @@ class ProductionUnitType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 # --------------------------------------------------------------------- #
 class ProductionSite(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "production_sites"
-    __table_args__ = (
-        UniqueConstraint("farm_id", "code", name="uq_site_farm_code"),
-    )
+    __table_args__ = (UniqueConstraint("farm_id", "code", name="uq_site_farm_code"),)
 
     farm_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("farms.id", ondelete="CASCADE"), nullable=False, index=True
@@ -159,14 +162,17 @@ class ProductionSite(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     capacity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[ProductionSiteStatus] = mapped_column(
         SQLEnum(ProductionSiteStatus, name="production_site_status"),
-        nullable=False, default=ProductionSiteStatus.ACTIVE,
+        nullable=False,
+        default=ProductionSiteStatus.ACTIVE,
     )
     metadata_json: Mapped[dict | None] = mapped_column("metadata", _JSON, nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    farm: Mapped["Farm"] = relationship("Farm")
-    manager: Mapped["User | None"] = relationship("User", foreign_keys=[manager_id])
+    farm: Mapped[Farm] = relationship("Farm")
+    manager: Mapped[User | None] = relationship("User", foreign_keys=[manager_id])
 
 
 # --------------------------------------------------------------------- #
@@ -174,30 +180,35 @@ class ProductionSite(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 # --------------------------------------------------------------------- #
 class ProductionUnit(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "production_units"
-    __table_args__ = (
-        UniqueConstraint("site_id", "code", name="uq_unit_site_code"),
-    )
+    __table_args__ = (UniqueConstraint("site_id", "code", name="uq_unit_site_code"),)
 
     site_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_sites.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_sites.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     unit_type_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_unit_types.id", ondelete="RESTRICT"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_unit_types.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     capacity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[ProductionUnitStatus] = mapped_column(
         SQLEnum(ProductionUnitStatus, name="production_unit_status"),
-        nullable=False, default=ProductionUnitStatus.ACTIVE,
+        nullable=False,
+        default=ProductionUnitStatus.ACTIVE,
     )
     metadata_json: Mapped[dict | None] = mapped_column("metadata", _JSON, nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    site: Mapped["ProductionSite"] = relationship("ProductionSite")
-    unit_type: Mapped["ProductionUnitType"] = relationship("ProductionUnitType")
+    site: Mapped[ProductionSite] = relationship("ProductionSite")
+    unit_type: Mapped[ProductionUnitType] = relationship("ProductionUnitType")
 
 
 # --------------------------------------------------------------------- #
@@ -211,13 +222,16 @@ class ProductionBatch(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
 
     unit_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_units.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_units.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[ProductionBatchState] = mapped_column(
         SQLEnum(ProductionBatchState, name="production_batch_state"),
-        nullable=False, default=ProductionBatchState.PLANNED,
+        nullable=False,
+        default=ProductionBatchState.PLANNED,
     )
     species: Mapped[str | None] = mapped_column(String(255), nullable=True)
     planned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -228,9 +242,11 @@ class ProductionBatch(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     actual_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     metadata_json: Mapped[dict | None] = mapped_column("metadata", _JSON, nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    unit: Mapped["ProductionUnit"] = relationship("ProductionUnit")
+    unit: Mapped[ProductionUnit] = relationship("ProductionUnit")
 
 
 # --------------------------------------------------------------------- #
@@ -244,13 +260,13 @@ class ProductionBatchTransition(Base, UUIDPrimaryKeyMixin):
     """
 
     __tablename__ = "production_batch_transitions"
-    __table_args__ = (
-        Index("ix_batch_transitions_batch_occurred", "batch_id", "occurred_at"),
-    )
+    __table_args__ = (Index("ix_batch_transitions_batch_occurred", "batch_id", "occurred_at"),)
 
     batch_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_batches.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_batches.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     from_state: Mapped[ProductionBatchState | None] = mapped_column(
         SQLEnum(ProductionBatchState, name="production_batch_state", create_type=False),
@@ -293,27 +309,49 @@ class ProductionEvent(Base, UUIDPrimaryKeyMixin):
         Index("ix_events_type_performed", "event_type", "performed_at"),
         Index("ix_events_org_performed", "organization_id", "performed_at"),
         Index("ix_events_farm_performed", "farm_id", "performed_at"),
+        # Idempotency (Codex Review Gate 01, finding CRG01-2):
+        # ``(batch_id, idempotency_key)`` must be unique when the key is
+        # supplied by the client. The partial unique index guarantees at
+        # most one row per key per batch even under concurrent retries.
+        Index(
+            "uq_events_batch_idempotency_key",
+            "batch_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     farm_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("farms.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("farms.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     site_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_sites.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_sites.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     unit_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_units.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_units.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     batch_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("production_batches.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("production_batches.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     event_type_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -321,11 +359,22 @@ class ProductionEvent(Base, UUIDPrimaryKeyMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     # Partition-key candidate; also drives cursor pagination ordering.
-    performed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    performed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     data: Mapped[dict] = mapped_column(_JSON, nullable=False)
     attachments: Mapped[list | None] = mapped_column(_JSON, nullable=True)
     is_final: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    # Idempotency support — see ``ProductionEventService.create``.
+    # ``idempotency_key`` is optional; when supplied, the tuple
+    # ``(batch_id, idempotency_key)`` is unique (partial index above).
+    # ``payload_hash`` is a stable SHA-256 hex of the validated data
+    # + event_type so that replaying the SAME key with a DIFFERENT
+    # payload can be rejected as a conflict rather than silently
+    # accepted.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     audit_event_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("audit_events.id", ondelete="SET NULL"), nullable=True
     )

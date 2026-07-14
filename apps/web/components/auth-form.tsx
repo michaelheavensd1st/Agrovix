@@ -53,11 +53,7 @@ export function AuthForm({ mode }: Props) {
   }
 
   return (
-    <form
-      onSubmit={onSubmit}
-      className="mt-8 flex flex-col gap-4"
-      data-testid={`${mode}-form`}
-    >
+    <form onSubmit={onSubmit} className="mt-8 flex flex-col gap-4" data-testid={`${mode}-form`}>
       {mode === 'register' && (
         <label className="flex flex-col gap-1 text-sm">
           <span className="text-muted-foreground">Full name</span>
@@ -112,11 +108,7 @@ export function AuthForm({ mode }: Props) {
         data-testid={`${mode}-submit-button`}
         className="mt-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition disabled:opacity-60"
       >
-        {submitting
-          ? 'Please wait…'
-          : mode === 'login'
-            ? 'Sign in'
-            : 'Create account'}
+        {submitting ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
       </button>
     </form>
   );

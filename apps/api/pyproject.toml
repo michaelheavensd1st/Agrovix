@@ -48,6 +48,8 @@ addopts = "-ra --strict-markers --strict-config"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 markers = [
     "unit: unit tests (fast, isolated)",
     "integration: integration tests (touch DB / Redis)",

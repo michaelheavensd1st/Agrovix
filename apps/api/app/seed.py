@@ -14,36 +14,41 @@ from app.models.production import ProductionUnitType
 from app.models.role import Permission, Role
 from app.security.permissions import ALL_PERMISSIONS, ROLE_DEFINITIONS
 
-
 # System-owned production unit types (aquaculture-first; extend on release).
 SYSTEM_UNIT_TYPES: tuple[dict, ...] = (
     {
-        "code": "HATCHERY_TANK", "name": "Hatchery Tank",
+        "code": "HATCHERY_TANK",
+        "name": "Hatchery Tank",
         "category": "hatchery",
         "description": "Indoor rearing tank for larvae and post-larvae.",
     },
     {
-        "code": "NURSERY_TANK", "name": "Nursery Tank",
+        "code": "NURSERY_TANK",
+        "name": "Nursery Tank",
         "category": "nursery",
         "description": "Grow-on tank for juveniles before pond transfer.",
     },
     {
-        "code": "GROW_OUT_POND", "name": "Grow-out Pond",
+        "code": "GROW_OUT_POND",
+        "name": "Grow-out Pond",
         "category": "grow_out",
         "description": "Outdoor pond used for the main grow-out cycle.",
     },
     {
-        "code": "CAGE", "name": "Cage",
+        "code": "CAGE",
+        "name": "Cage",
         "category": "grow_out",
         "description": "Suspended net cage in open water.",
     },
     {
-        "code": "RACEWAY", "name": "Raceway",
+        "code": "RACEWAY",
+        "name": "Raceway",
         "category": "grow_out",
         "description": "Linear flow-through raceway system.",
     },
     {
-        "code": "BIOFLOC_TANK", "name": "Biofloc Tank",
+        "code": "BIOFLOC_TANK",
+        "name": "Biofloc Tank",
         "category": "biofloc",
         "description": "High-density biofloc-based rearing tank.",
     },
@@ -53,6 +58,7 @@ SYSTEM_UNIT_TYPES: tuple[dict, ...] = (
 async def seed_permissions_and_roles() -> None:
     # Late import so test fixtures that swap the engine take effect.
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         # Permissions
         perms_by_code: dict[str, Permission] = {}
@@ -101,7 +107,9 @@ async def seed_permissions_and_roles() -> None:
             if existing is None:
                 session.add(
                     ProductionUnitType(
-                        organization_id=None, is_system=True, **spec,
+                        organization_id=None,
+                        is_system=True,
+                        **spec,
                     )
                 )
             else:

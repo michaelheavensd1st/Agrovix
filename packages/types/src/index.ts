@@ -38,9 +38,4 @@ export interface HealthResponse {
 }
 
 /** Extensible auth-provider tag — enables future SSO integrations. */
-export type AuthProvider =
-  | 'password'
-  | 'google'
-  | 'microsoft'
-  | 'apple'
-  | 'phone_otp';
+export type AuthProvider = 'password' | 'google' | 'microsoft' | 'apple' | 'phone_otp';

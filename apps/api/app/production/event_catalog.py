@@ -24,7 +24,6 @@ Adding a new event type:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Type
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -39,7 +38,9 @@ class _StrictModel(BaseModel):
 class StockingEventSchema(_StrictModel):
     quantity: int = Field(ge=1, description="Individuals stocked into the batch.")
     average_weight_g: float | None = Field(default=None, ge=0)
-    source: str | None = Field(default=None, max_length=255, description="Hatchery / supplier reference.")
+    source: str | None = Field(
+        default=None, max_length=255, description="Hatchery / supplier reference."
+    )
 
 
 class FeedingEventSchema(_StrictModel):
@@ -86,7 +87,9 @@ class TransferEventSchema(_StrictModel):
 class HarvestEventSchema(_StrictModel):
     quantity: int = Field(ge=0)
     biomass_kg: float | None = Field(default=None, ge=0)
-    is_final: bool = Field(default=False, description="If true, marks the terminal harvest for the batch.")
+    is_final: bool = Field(
+        default=False, description="If true, marks the terminal harvest for the batch."
+    )
 
 
 class InspectionEventSchema(_StrictModel):
@@ -101,7 +104,7 @@ class InspectionEventSchema(_StrictModel):
 @dataclass(frozen=True)
 class EventCatalogEntry:
     code: str
-    schema: Type[_StrictModel]
+    schema: type[_StrictModel]
     version: int
     display_name: str
     category: str
@@ -125,7 +128,7 @@ class ProductionEventCatalog:
     def register(
         self,
         code: str,
-        schema: Type[_StrictModel],
+        schema: type[_StrictModel],
         *,
         version: int = 1,
         display_name: str | None = None,
@@ -179,8 +182,11 @@ class ProductionEventCatalog:
 CATALOG = ProductionEventCatalog()
 
 CATALOG.register(
-    "STOCKING", StockingEventSchema, version=1,
-    display_name="Stocking", category="lifecycle",
+    "STOCKING",
+    StockingEventSchema,
+    version=1,
+    display_name="Stocking",
+    category="lifecycle",
     triggers_transition_to="stocked",
     metadata={"description": "Initial stocking of a batch into a unit."},
 )
@@ -191,8 +197,11 @@ CATALOG.register("WATER_QUALITY", WaterQualityEventSchema, display_name="Water Q
 CATALOG.register("MEDICATION", MedicationEventSchema, display_name="Medication")
 CATALOG.register("TRANSFER", TransferEventSchema, display_name="Transfer")
 CATALOG.register(
-    "HARVEST", HarvestEventSchema, version=1,
-    display_name="Harvest", category="lifecycle",
+    "HARVEST",
+    HarvestEventSchema,
+    version=1,
+    display_name="Harvest",
+    category="lifecycle",
     triggers_transition_to="harvested",
     metadata={
         "description": "Harvest event. Batch transitions to HARVESTED only when is_final=true.",
@@ -205,15 +214,15 @@ CATALOG.register("INSPECTION", InspectionEventSchema, display_name="Inspection")
 __all__ = [
     "CATALOG",
     "EventCatalogEntry",
-    "ProductionEventCatalog",
-    "StockingEventSchema",
     "FeedingEventSchema",
-    "MortalityEventSchema",
-    "SamplingEventSchema",
-    "WaterQualityEventSchema",
-    "MedicationEventSchema",
-    "TransferEventSchema",
     "HarvestEventSchema",
     "InspectionEventSchema",
+    "MedicationEventSchema",
+    "MortalityEventSchema",
+    "ProductionEventCatalog",
+    "SamplingEventSchema",
+    "StockingEventSchema",
+    "TransferEventSchema",
     "ValidationError",  # re-exported for callers that catch validation failures
+    "WaterQualityEventSchema",
 ]

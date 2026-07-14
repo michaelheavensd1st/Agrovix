@@ -5,7 +5,10 @@
  */
 
 /** Assert-style check that narrows the value to non-nullable. */
-export function assertDefined<T>(value: T | null | undefined, msg = 'Expected value to be defined'): T {
+export function assertDefined<T>(
+  value: T | null | undefined,
+  msg = 'Expected value to be defined',
+): T {
   if (value === null || value === undefined) {
     throw new Error(msg);
   }

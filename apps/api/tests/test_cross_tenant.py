@@ -123,9 +123,11 @@ async def test_alpha_cannot_read_beta_audit_events(client: AsyncClient) -> None:
 async def test_alpha_cannot_assign_or_revoke_roles_in_beta(client: AsyncClient) -> None:
     t = await _two_tenants(client)
     # Alpha's own user id — try to slip in as a beta member via the assignment endpoint.
-    from app.db import session as _db
     from sqlalchemy import select
+
+    from app.db import session as _db
     from app.models.user import User
+
     async with _db.AsyncSessionLocal() as session:
         alpha_user = (
             await session.execute(select(User).where(User.email == t["alpha_owner"]))

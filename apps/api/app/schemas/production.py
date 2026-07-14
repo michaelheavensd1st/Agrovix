@@ -223,6 +223,7 @@ class ProductionEventPublic(BaseModel):
     attachments: list[dict] | None
     is_final: bool
     notes: str | None
+    idempotency_key: str | None = None
     created_at: datetime
 
 

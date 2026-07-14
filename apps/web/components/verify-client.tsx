@@ -19,19 +19,29 @@ export function VerifyClient({ token }: { token: string }) {
       setTimeout(() => router.push('/login'), 1200);
     } catch (err) {
       setState('error');
-      setError(err instanceof ApiError ? err.payload.detail ?? 'Verification failed' : 'Verification failed');
+      setError(
+        err instanceof ApiError
+          ? (err.payload.detail ?? 'Verification failed')
+          : 'Verification failed',
+      );
     }
   }
 
   return (
     <div className="mt-6 flex flex-col gap-3">
       {state === 'ok' && (
-        <p className="rounded-md bg-primary/10 px-3 py-2 text-sm text-primary" data-testid="verify-success">
+        <p
+          className="rounded-md bg-primary/10 px-3 py-2 text-sm text-primary"
+          data-testid="verify-success"
+        >
           Email verified. Redirecting…
         </p>
       )}
       {state === 'error' && (
-        <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" data-testid="verify-error">
+        <p
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid="verify-error"
+        >
           {error}
         </p>
       )}

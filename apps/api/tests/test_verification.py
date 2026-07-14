@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -31,16 +30,21 @@ async def _register(client: AsyncClient, email: str, password: str = "Sprint0ne!
 
 async def _active_tokens_for(email: str) -> list[EmailVerificationToken]:
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = (await session.execute(select(User).where(User.email == email.lower()))).scalar_one()
         rows = (
-            await session.execute(
-                select(EmailVerificationToken).where(
-                    EmailVerificationToken.user_id == user.id,
-                    EmailVerificationToken.is_used.is_(False),
+            (
+                await session.execute(
+                    select(EmailVerificationToken).where(
+                        EmailVerificationToken.user_id == user.id,
+                        EmailVerificationToken.is_used.is_(False),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return list(rows)
 
 
@@ -67,6 +71,7 @@ async def test_expired_verification_token_is_rejected(client: AsyncClient) -> No
     email = f"exp-{uuid4().hex[:8]}@agrovix.dev"
     # Register a user directly and forge an already-expired token in the DB.
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = User(
             email=email.lower(),
@@ -77,14 +82,15 @@ async def test_expired_verification_token_is_rejected(client: AsyncClient) -> No
         await session.commit()
 
         expired_token, _ = create_token(
-            subject=user.id, token_type="verify",
+            subject=user.id,
+            token_type="verify",
             expires_delta=timedelta(seconds=-60),
         )
         session.add(
             EmailVerificationToken(
                 user_id=user.id,
                 token_hash=_hash(expired_token),
-                expires_at=datetime.now(timezone.utc) - timedelta(seconds=60),
+                expires_at=datetime.now(UTC) - timedelta(seconds=60),
             )
         )
         await session.commit()
@@ -102,21 +108,30 @@ async def test_verification_token_invalidated_after_successful_verify(client: As
 
     # Fabricate a token in DB with a known raw value so we can present it.
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = (await session.execute(select(User).where(User.email == email.lower()))).scalar_one()
         # Invalidate any residual (should be exactly 1) and insert our own.
         await session.execute(
             select(EmailVerificationToken).where(EmailVerificationToken.user_id == user.id)
         )
-        for row in (await session.execute(
-            select(EmailVerificationToken).where(EmailVerificationToken.user_id == user.id)
-        )).scalars().all():
+        for row in (
+            (
+                await session.execute(
+                    select(EmailVerificationToken).where(EmailVerificationToken.user_id == user.id)
+                )
+            )
+            .scalars()
+            .all()
+        ):
             row.is_used = True
             session.add(row)
         raw_token, exp = create_token(subject=user.id, token_type="verify")
         session.add(
             EmailVerificationToken(
-                user_id=user.id, token_hash=_hash(raw_token), expires_at=exp,
+                user_id=user.id,
+                token_hash=_hash(raw_token),
+                expires_at=exp,
             )
         )
         await session.commit()

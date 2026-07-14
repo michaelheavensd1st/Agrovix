@@ -14,16 +14,20 @@ import logging
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, ClassVar
 
 from app.core.config import get_settings
 
 # --------------------------------------------------------------------- #
 # Context — populated by middleware, consumed by the JSON formatter.
 # --------------------------------------------------------------------- #
-request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
+request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "request_id", default=None
+)
 user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("user_id", default=None)
-organization_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("organization_id", default=None)
+organization_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "organization_id", default=None
+)
 
 
 def new_request_id() -> str:
@@ -33,11 +37,29 @@ def new_request_id() -> str:
 class JsonFormatter(logging.Formatter):
     """Structured, single-line JSON formatter."""
 
-    _RESERVED = {
-        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
-        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
-        "created", "msecs", "relativeCreated", "thread", "threadName",
-        "processName", "process", "message", "asctime",
+    _RESERVED: ClassVar[set[str]] = {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "message",
+        "asctime",
     }
 
     def format(self, record: logging.LogRecord) -> str:

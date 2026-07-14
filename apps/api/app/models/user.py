@@ -34,34 +34,42 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
+    refresh_tokens: Mapped[list[RefreshToken]] = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
     )
-    verification_tokens: Mapped[list["EmailVerificationToken"]] = relationship(
+    verification_tokens: Mapped[list[EmailVerificationToken]] = relationship(
         "EmailVerificationToken", back_populates="user", cascade="all, delete-orphan"
     )
-    role_assignments: Mapped[list["RoleAssignment"]] = relationship(
-        "RoleAssignment", back_populates="user", foreign_keys="RoleAssignment.user_id",
+    role_assignments: Mapped[list[RoleAssignment]] = relationship(
+        "RoleAssignment",
+        back_populates="user",
+        foreign_keys="RoleAssignment.user_id",
         cascade="all, delete-orphan",
     )
-    organization_memberships: Mapped[list["OrganizationMembership"]] = relationship(
-        "OrganizationMembership", back_populates="user",
+    organization_memberships: Mapped[list[OrganizationMembership]] = relationship(
+        "OrganizationMembership",
+        back_populates="user",
         foreign_keys="OrganizationMembership.user_id",
         cascade="all, delete-orphan",
     )
-    farm_memberships: Mapped[list["FarmMembership"]] = relationship(
-        "FarmMembership", back_populates="user",
+    farm_memberships: Mapped[list[FarmMembership]] = relationship(
+        "FarmMembership",
+        back_populates="user",
         foreign_keys="FarmMembership.user_id",
         cascade="all, delete-orphan",
     )
-    sent_invitations: Mapped[list["Invitation"]] = relationship(
-        "Invitation", back_populates="invited_by",
+    sent_invitations: Mapped[list[Invitation]] = relationship(
+        "Invitation",
+        back_populates="invited_by",
         foreign_keys="Invitation.invited_by_id",
     )
-    audit_events: Mapped[list["AuditEvent"]] = relationship(
-        "AuditEvent", back_populates="actor",
+    audit_events: Mapped[list[AuditEvent]] = relationship(
+        "AuditEvent",
+        back_populates="actor",
         foreign_keys="AuditEvent.actor_id",
     )
 

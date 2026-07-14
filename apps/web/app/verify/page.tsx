@@ -1,10 +1,6 @@
 import Link from 'next/link';
 
-export default function VerifyPage({
-  searchParams,
-}: {
-  searchParams: { token?: string };
-}) {
+export default function VerifyPage({ searchParams }: { searchParams: { token?: string } }) {
   const token = searchParams?.token;
   return (
     <main

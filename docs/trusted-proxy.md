@@ -13,8 +13,8 @@ limits, and IP-scoped security decisions.
    direct socket peer address (`request.client.host`) and **ignores
    `X-Forwarded-For` completely**. This is the correct default when
    the API is exposed directly (dev, single-node preview, sidecars).
-2. **Trusted proxies configured** → the header is consulted *only when
-   the request's peer address itself is inside the trusted set*. That
+2. **Trusted proxies configured** → the header is consulted _only when
+   the request's peer address itself is inside the trusted set_. That
    is, we only trust the header when we know the request just came out
    of our own reverse proxy tier.
 3. **Header parsing** walks the chain right-to-left, skipping every
@@ -39,10 +39,10 @@ Two settings drive the behaviour. Both live in
 [`app/core/config.py`](../apps/api/app/core/config.py) and are populated
 from `.env` / process env.
 
-| Env variable            | Default             | Purpose                                                                                     |
-| ----------------------- | ------------------- | ------------------------------------------------------------------------------------------- |
-| `TRUSTED_PROXIES`       | *(empty)*           | Comma-separated IPv4/IPv6 addresses or CIDRs. Empty = header IGNORED.                       |
-| `TRUSTED_PROXY_HEADER`  | `x-forwarded-for`   | Case-insensitive header name the middleware reads.                                          |
+| Env variable           | Default           | Purpose                                                               |
+| ---------------------- | ----------------- | --------------------------------------------------------------------- |
+| `TRUSTED_PROXIES`      | _(empty)_         | Comma-separated IPv4/IPv6 addresses or CIDRs. Empty = header IGNORED. |
+| `TRUSTED_PROXY_HEADER` | `x-forwarded-for` | Case-insensitive header name the middleware reads.                    |
 
 > **Never** set `TRUSTED_PROXIES=0.0.0.0/0`. That effectively re-enables
 > the spoof vector by trusting every possible client.

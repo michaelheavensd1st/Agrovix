@@ -1,6 +1,6 @@
 """Sprint 1 hardening: enforce single-active email-verification token per user.
 
-Revision ID: 0003_verification_active_unique_index
+Revision ID: 0003_verify_active_uniq
 Revises: 0002_sprint1_identity_tenancy
 Create Date: 2026-02-06 00:00:00.000000
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0003_verification_active_unique_index"
+revision = "0003_verify_active_uniq"
 down_revision = "0002_sprint1_identity_tenancy"
 branch_labels = None
 depends_on = None

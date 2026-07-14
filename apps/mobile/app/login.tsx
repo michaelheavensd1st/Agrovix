@@ -1,5 +1,13 @@
 import { useState } from 'react';
-import { View, Text, TextInput, Pressable, StyleSheet, KeyboardAvoidingView, Platform } from 'react-native';
+import {
+  View,
+  Text,
+  TextInput,
+  Pressable,
+  StyleSheet,
+  KeyboardAvoidingView,
+  Platform,
+} from 'react-native';
 import { Link, router } from 'expo-router';
 import { useAuth } from '../src/lib/auth-context';
 
@@ -22,8 +30,20 @@ export default function Login() {
       <Text style={styles.title}>Welcome back</Text>
       <Text style={styles.subtitle}>Sign in to your Agrovix AgOS account.</Text>
 
-      <Field label="Email" value={email} onChange={setEmail} keyboardType="email-address" testID="login-email-input" />
-      <Field label="Password" value={password} onChange={setPassword} secureTextEntry testID="login-password-input" />
+      <Field
+        label="Email"
+        value={email}
+        onChange={setEmail}
+        keyboardType="email-address"
+        testID="login-email-input"
+      />
+      <Field
+        label="Password"
+        value={password}
+        onChange={setPassword}
+        secureTextEntry
+        testID="login-password-input"
+      />
 
       {error && (
         <Text style={styles.error} testID="login-error">
@@ -58,7 +78,14 @@ interface FieldProps {
   keyboardType?: 'default' | 'email-address';
 }
 
-function Field({ label, value, onChange, testID, secureTextEntry, keyboardType = 'default' }: FieldProps) {
+function Field({
+  label,
+  value,
+  onChange,
+  testID,
+  secureTextEntry,
+  keyboardType = 'default',
+}: FieldProps) {
   return (
     <View style={styles.field}>
       <Text style={styles.label}>{label}</Text>
@@ -80,7 +107,13 @@ const styles = StyleSheet.create({
   title: { fontSize: 28, fontWeight: '600', color: '#0f2e1e', marginTop: 16 },
   subtitle: { fontSize: 14, color: '#4a5c50', marginTop: 6, marginBottom: 24 },
   field: { marginBottom: 16 },
-  label: { fontSize: 12, color: '#4a5c50', marginBottom: 6, textTransform: 'uppercase', letterSpacing: 1 },
+  label: {
+    fontSize: 12,
+    color: '#4a5c50',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
   input: {
     borderWidth: 1,
     borderColor: '#d6d1c1',

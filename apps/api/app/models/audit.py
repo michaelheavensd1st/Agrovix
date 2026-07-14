@@ -5,9 +5,8 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, JSON, String
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON, ForeignKey, String
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -23,7 +22,10 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True, index=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     farm_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("farms.id", ondelete="SET NULL"), nullable=True, index=True
@@ -41,4 +43,6 @@ class AuditEvent(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         "metadata", JSON().with_variant(JSONB(), "postgresql"), nullable=True
     )
 
-    actor: Mapped["User | None"] = relationship("User", back_populates="audit_events", foreign_keys=[actor_id])
+    actor: Mapped[User | None] = relationship(
+        "User", back_populates="audit_events", foreign_keys=[actor_id]
+    )

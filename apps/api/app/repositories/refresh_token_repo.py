@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,7 +43,7 @@ class RefreshTokenRepository:
         return result.scalar_one_or_none()
 
     async def revoke_by_hash(self, token_hash: str) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stmt = (
             update(RefreshToken)
             .where(RefreshToken.token_hash == token_hash)
@@ -52,7 +52,7 @@ class RefreshTokenRepository:
         await self.session.execute(stmt)
 
     async def revoke_all_for_user(self, user_id: uuid.UUID) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stmt = (
             update(RefreshToken)
             .where(RefreshToken.user_id == user_id, RefreshToken.is_revoked.is_(False))

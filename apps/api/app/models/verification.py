@@ -40,4 +40,4 @@ class EmailVerificationToken(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    user: Mapped["User"] = relationship("User", back_populates="verification_tokens")
+    user: Mapped[User] = relationship("User", back_populates="verification_tokens")

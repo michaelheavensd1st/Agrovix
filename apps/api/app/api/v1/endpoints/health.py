@@ -31,7 +31,7 @@ async def readiness(
     try:
         await db.execute(text("SELECT 1"))
         db_ok = True
-    except Exception:  # noqa: BLE001 — health probes must never leak
+    except Exception:
         db_ok = False
 
     redis_ok = False
@@ -40,7 +40,7 @@ async def readiness(
         pong = await client.ping()
         redis_ok = bool(pong)
         await client.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         redis_ok = False
 
     ready = db_ok and redis_ok

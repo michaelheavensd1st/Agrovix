@@ -33,7 +33,10 @@ class RoleAssignment(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "role_assignments"
     __table_args__ = (
         UniqueConstraint(
-            "user_id", "role_id", "organization_id", "farm_id",
+            "user_id",
+            "role_id",
+            "organization_id",
+            "farm_id",
             name="uq_role_assignment_unique_grant",
         ),
         CheckConstraint(
@@ -50,7 +53,10 @@ class RoleAssignment(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("roles.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
     farm_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("farms.id", ondelete="CASCADE"), nullable=True, index=True
@@ -59,9 +65,13 @@ class RoleAssignment(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     granted_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    user: Mapped["User"] = relationship("User", back_populates="role_assignments", foreign_keys=[user_id])
-    role: Mapped["Role"] = relationship("Role", back_populates="assignments", lazy="joined")
-    organization: Mapped["Organization | None"] = relationship("Organization")
-    farm: Mapped["Farm | None"] = relationship("Farm")
+    user: Mapped[User] = relationship(
+        "User", back_populates="role_assignments", foreign_keys=[user_id]
+    )
+    role: Mapped[Role] = relationship("Role", back_populates="assignments", lazy="joined")
+    organization: Mapped[Organization | None] = relationship("Organization")
+    farm: Mapped[Farm | None] = relationship("Farm")

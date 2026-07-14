@@ -1,4 +1,5 @@
 node_modules
+.pnpm-store
 .next
 .turbo
 dist
@@ -11,3 +12,16 @@ apps/api
 apps/mobile/.expo
 apps/web/.next
 **/*.min.js
+
+# Environment / pod shims (not canonical source).
+frontend
+backend
+
+# Generated / operator artefacts (not source of truth).
+memory
+docs/audits
+test_reports
+test_result.md
+PREVIEW_SHIM.md
+README.md
+handoff

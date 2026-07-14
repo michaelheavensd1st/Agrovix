@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -73,21 +73,21 @@ class AuthService:
     # ------------------------------------------------------------------ #
     # Register + verification
     # ------------------------------------------------------------------ #
-    async def register(
-        self, *, email: str, password: str, full_name: str | None = None
-    ) -> User:
+    async def register(self, *, email: str, password: str, full_name: str | None = None) -> User:
         existing = await self.user_repo.get_by_email(email)
         if existing is not None:
-            raise HTTPException(status.HTTP_409_CONFLICT, "An account with that email already exists.")
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "An account with that email already exists."
+            )
         user = await self.user_repo.create(
-            email=email, hashed_password=hash_password(password), full_name=full_name,
+            email=email,
+            hashed_password=hash_password(password),
+            full_name=full_name,
         )
         await self._issue_verification_email(user)
         return user
 
-    async def resend_verification(
-        self, *, email: str, ip_address: str | None = None
-    ) -> None:
+    async def resend_verification(self, *, email: str, ip_address: str | None = None) -> None:
         # Rate-limit BEFORE any account lookup so brute-force enumeration
         # cannot bypass the throttle.
         await self._enforce_resend_rate_limit(email=email, ip_address=ip_address)
@@ -114,8 +114,8 @@ class AuthService:
         # Column may be naive on SQLite tests; normalise to UTC-aware.
         exp = row.expires_at
         if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        if exp < datetime.now(timezone.utc):
+            exp = exp.replace(tzinfo=UTC)
+        if exp < datetime.now(UTC):
             raise self._bad_token()
 
         try:
@@ -218,7 +218,12 @@ class AuthService:
     # Login / refresh / logout
     # ------------------------------------------------------------------ #
     async def login(
-        self, *, email: str, password: str, user_agent: str | None = None, ip_address: str | None = None,
+        self,
+        *,
+        email: str,
+        password: str,
+        user_agent: str | None = None,
+        ip_address: str | None = None,
     ) -> tuple[User, TokenPair]:
         # Enforce rate limits BEFORE the account lookup so that both
         # brute-force password guessing and account enumeration are throttled
@@ -233,13 +238,21 @@ class AuthService:
         if not user.is_active:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "This account is disabled.")
         if not user.is_verified and not self.settings.allow_unverified_login:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Please verify your email before signing in.")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "Please verify your email before signing in."
+            )
 
-        tokens = await self._issue_token_pair(user=user, user_agent=user_agent, ip_address=ip_address)
+        tokens = await self._issue_token_pair(
+            user=user, user_agent=user_agent, ip_address=ip_address
+        )
         return user, tokens
 
     async def refresh(
-        self, *, refresh_token: str, user_agent: str | None = None, ip_address: str | None = None,
+        self,
+        *,
+        refresh_token: str,
+        user_agent: str | None = None,
+        ip_address: str | None = None,
     ) -> TokenPair:
         try:
             payload = decode_token(refresh_token, expected_type="refresh")
@@ -253,8 +266,8 @@ class AuthService:
         # SQLite drops tz info — normalise before comparing.
         exp = stored.expires_at
         if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        if exp < datetime.now(timezone.utc):
+            exp = exp.replace(tzinfo=UTC)
+        if exp < datetime.now(UTC):
             raise self._invalid_refresh()
 
         try:
@@ -273,20 +286,31 @@ class AuthService:
         await self.refresh_repo.revoke_by_hash(_hash_token(refresh_token))
 
     async def _issue_token_pair(
-        self, *, user: User, user_agent: str | None, ip_address: str | None,
+        self,
+        *,
+        user: User,
+        user_agent: str | None,
+        ip_address: str | None,
     ) -> TokenPair:
         access_token, access_exp = create_token(
-            subject=user.id, token_type="access", extra_claims={"email": user.email},
+            subject=user.id,
+            token_type="access",
+            extra_claims={"email": user.email},
         )
         jti = secrets.token_urlsafe(16)
         refresh_token, refresh_exp = create_token(
-            subject=user.id, token_type="refresh", extra_claims={"jti": jti},
+            subject=user.id,
+            token_type="refresh",
+            extra_claims={"jti": jti},
         )
         await self.refresh_repo.create(
-            user_id=user.id, token_hash=_hash_token(refresh_token),
-            expires_at=refresh_exp, user_agent=user_agent, ip_address=ip_address,
+            user_id=user.id,
+            token_hash=_hash_token(refresh_token),
+            expires_at=refresh_exp,
+            user_agent=user_agent,
+            ip_address=ip_address,
         )
-        expires_in = int((access_exp - datetime.now(timezone.utc)).total_seconds())
+        expires_in = int((access_exp - datetime.now(UTC)).total_seconds())
         return TokenPair(
             access_token=access_token,
             refresh_token=refresh_token,

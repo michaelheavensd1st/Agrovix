@@ -31,12 +31,24 @@ _DEFAULT_LIMIT = 50
 async def list_audit_events(
     org: CurrentOrganization,
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
-    farm_id: uuid.UUID | None = Query(default=None, description="Restrict to a single farm within the org."),
-    actor_id: uuid.UUID | None = Query(default=None, description="Restrict to events performed by this user."),
-    action: str | None = Query(default=None, description="Exact action match (e.g. ``farm.delete``)."),
-    entity_type: str | None = Query(default=None, description="Exact entity_type match (e.g. ``invitation``)."),
-    occurred_from: datetime | None = Query(default=None, description="ISO-8601 lower bound (inclusive)."),
-    occurred_to: datetime | None = Query(default=None, description="ISO-8601 upper bound (inclusive)."),
+    farm_id: uuid.UUID | None = Query(
+        default=None, description="Restrict to a single farm within the org."
+    ),
+    actor_id: uuid.UUID | None = Query(
+        default=None, description="Restrict to events performed by this user."
+    ),
+    action: str | None = Query(
+        default=None, description="Exact action match (e.g. ``farm.delete``)."
+    ),
+    entity_type: str | None = Query(
+        default=None, description="Exact entity_type match (e.g. ``invitation``)."
+    ),
+    occurred_from: datetime | None = Query(
+        default=None, description="ISO-8601 lower bound (inclusive)."
+    ),
+    occurred_to: datetime | None = Query(
+        default=None, description="ISO-8601 upper bound (inclusive)."
+    ),
     limit: int = Query(default=_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> AuditEventPage:

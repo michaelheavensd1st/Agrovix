@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
-class InvitationStatus(str, enum.Enum):
+class InvitationStatus(enum.StrEnum):
     PENDING = "pending"
     ACCEPTED = "accepted"
     REVOKED = "revoked"
@@ -27,12 +27,13 @@ class InvitationStatus(str, enum.Enum):
 
 class Invitation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "invitations"
-    __table_args__ = (
-        UniqueConstraint("token_hash", name="uq_invitation_token_hash"),
-    )
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_invitation_token_hash"),)
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     farm_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("farms.id", ondelete="CASCADE"), nullable=True, index=True
@@ -48,11 +49,15 @@ class Invitation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     token_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     status: Mapped[InvitationStatus] = mapped_column(
         Enum(InvitationStatus, name="invitation_status"),
-        nullable=False, default=InvitationStatus.PENDING, index=True,
+        nullable=False,
+        default=InvitationStatus.PENDING,
+        index=True,
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    organization: Mapped["Organization"] = relationship("Organization", back_populates="invitations")
-    invited_by: Mapped["User | None"] = relationship("User", back_populates="sent_invitations", foreign_keys=[invited_by_id])
+    organization: Mapped[Organization] = relationship("Organization", back_populates="invitations")
+    invited_by: Mapped[User | None] = relationship(
+        "User", back_populates="sent_invitations", foreign_keys=[invited_by_id]
+    )

@@ -33,7 +33,7 @@ export default function OrganizationDetail() {
         setOrg(o);
         setFarms(f);
       } catch (err) {
-        setError(err instanceof ApiError ? err.payload.detail ?? 'Failed to load' : String(err));
+        setError(err instanceof ApiError ? (err.payload.detail ?? 'Failed to load') : String(err));
       }
     })();
   }, [orgId]);
@@ -62,11 +62,17 @@ export default function OrganizationDetail() {
           </Link>
         </div>
         {farms.length === 0 ? (
-          <p className="rounded-2xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground" data-testid="organization-empty-farms">
+          <p
+            className="rounded-2xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground"
+            data-testid="organization-empty-farms"
+          >
             No farms yet.
           </p>
         ) : (
-          <ul className="divide-y divide-border rounded-2xl border border-border" data-testid="organization-farm-list">
+          <ul
+            className="divide-y divide-border rounded-2xl border border-border"
+            data-testid="organization-farm-list"
+          >
             {farms.map((f) => (
               <li key={f.id} className="flex items-center justify-between px-4 py-3">
                 <div>

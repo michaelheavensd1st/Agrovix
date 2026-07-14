@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,14 +43,14 @@ class UserRepository:
 
     async def mark_verified(self, user: User) -> User:
         user.is_verified = True
-        user.verified_at = datetime.now(timezone.utc)
+        user.verified_at = datetime.now(UTC)
         self.session.add(user)
         await self.session.flush()
         await self.session.refresh(user)
         return user
 
     async def soft_delete(self, user: User) -> None:
-        user.deleted_at = datetime.now(timezone.utc)
+        user.deleted_at = datetime.now(UTC)
         user.is_active = False
         self.session.add(user)
         await self.session.flush()

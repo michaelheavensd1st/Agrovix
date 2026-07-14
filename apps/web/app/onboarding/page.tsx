@@ -22,7 +22,11 @@ export default function OnboardingPage() {
       });
       router.push(`/organizations/${org.id}/farms/new`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.payload.detail ?? 'Failed to create organization' : String(err));
+      setError(
+        err instanceof ApiError
+          ? (err.payload.detail ?? 'Failed to create organization')
+          : String(err),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -64,7 +68,11 @@ export default function OnboardingPage() {
           />
         </label>
         {error && (
-          <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" data-testid="onboarding-error">
+          <p
+            role="alert"
+            className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            data-testid="onboarding-error"
+          >
             {error}
           </p>
         )}

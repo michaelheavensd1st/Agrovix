@@ -1,7 +1,7 @@
 """Sprint 2 — Production Engine (sites, unit types, units, batches, events).
 
 Revision ID: 0004_production_engine
-Revises: 0003_verification_active_unique_index
+Revises: 0003_verify_active_uniq
 Create Date: 2026-02-06 21:00:00.000000
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0004_production_engine"
-down_revision = "0003_verification_active_unique_index"
+down_revision = "0003_verify_active_uniq"
 branch_labels = None
 depends_on = None
 
@@ -46,6 +46,10 @@ def upgrade() -> None:
     # --- production_sites -------------------------------------------- #
     site_status = sa.Enum("active", "maintenance", "closed", name="production_site_status")
     site_status.create(op.get_bind(), checkfirst=True)
+    site_status_col = postgresql.ENUM(
+        "active", "maintenance", "closed",
+        name="production_site_status", create_type=False,
+    )
     op.create_table(
         "production_sites",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -61,7 +65,7 @@ def upgrade() -> None:
         sa.Column("manager_id", postgresql.UUID(as_uuid=True),
                   sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
         sa.Column("capacity", sa.Integer, nullable=True),
-        sa.Column("status", site_status, nullable=False, server_default="active"),
+        sa.Column("status", site_status_col, nullable=False, server_default="active"),
         sa.Column("metadata", postgresql.JSONB, nullable=True),
         sa.Column("is_default", sa.Boolean, nullable=False, server_default=sa.text("false")),
         sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
@@ -75,6 +79,10 @@ def upgrade() -> None:
     # --- production_units -------------------------------------------- #
     unit_status = sa.Enum("active", "maintenance", "closed", name="production_unit_status")
     unit_status.create(op.get_bind(), checkfirst=True)
+    unit_status_col = postgresql.ENUM(
+        "active", "maintenance", "closed",
+        name="production_unit_status", create_type=False,
+    )
     op.create_table(
         "production_units",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -85,7 +93,7 @@ def upgrade() -> None:
         sa.Column("name", sa.String(255), nullable=False),
         sa.Column("code", sa.String(64), nullable=False),
         sa.Column("capacity", sa.Integer, nullable=True),
-        sa.Column("status", unit_status, nullable=False, server_default="active"),
+        sa.Column("status", unit_status_col, nullable=False, server_default="active"),
         sa.Column("metadata", postgresql.JSONB, nullable=True),
         sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
@@ -103,13 +111,18 @@ def upgrade() -> None:
         name="production_batch_state",
     )
     batch_state.create(op.get_bind(), checkfirst=True)
+    batch_state_col = postgresql.ENUM(
+        "planned", "stocked", "active", "harvested", "closed",
+        "suspended", "cancelled", "failed",
+        name="production_batch_state", create_type=False,
+    )
     op.create_table(
         "production_batches",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("unit_id", postgresql.UUID(as_uuid=True),
                   sa.ForeignKey("production_units.id", ondelete="CASCADE"), nullable=False),
         sa.Column("code", sa.String(64), nullable=False),
-        sa.Column("state", batch_state, nullable=False, server_default="planned"),
+        sa.Column("state", batch_state_col, nullable=False, server_default="planned"),
         sa.Column("species", sa.String(255), nullable=True),
         sa.Column("planned_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("stocked_at", sa.DateTime(timezone=True), nullable=True),
@@ -176,8 +189,8 @@ def upgrade() -> None:
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("batch_id", postgresql.UUID(as_uuid=True),
                   sa.ForeignKey("production_batches.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("from_state", batch_state, nullable=True),
-        sa.Column("to_state", batch_state, nullable=False),
+        sa.Column("from_state", batch_state_col, nullable=True),
+        sa.Column("to_state", batch_state_col, nullable=False),
         sa.Column("actor_id", postgresql.UUID(as_uuid=True),
                   sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
         sa.Column("event_id", postgresql.UUID(as_uuid=True),

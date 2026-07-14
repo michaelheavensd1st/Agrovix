@@ -16,12 +16,12 @@ from app.deps import (
     require_permission,
 )
 from app.repositories.invitation_repo import InvitationRepository
+from app.schemas.common import MessageResponse
 from app.schemas.invitation import (
     AcceptInvitationRequest,
     InvitationCreateRequest,
     InvitationPublic,
 )
-from app.schemas.common import MessageResponse
 from app.services.invitation_service import InvitationService
 
 router = APIRouter()
@@ -88,10 +88,13 @@ async def revoke_invitation(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Invitation not found.")
     # Manually re-check permission scoped to invitation.organization_id
     from app.security.authorize import has_permission, resolve_permissions
+
     codes = await resolve_permissions(
         invitation_repo.session, user, organization_id=invitation.organization_id
     )
     if not has_permission(codes, "invitation.revoke"):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Missing required permission: invitation.revoke")
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Missing required permission: invitation.revoke"
+        )
     await service.revoke(actor=user, invitation=invitation, request_ctx=request_ctx)
     return MessageResponse(message="Invitation revoked")

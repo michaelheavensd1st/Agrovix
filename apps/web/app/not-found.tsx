@@ -6,9 +6,7 @@ export default function NotFound() {
       className="mx-auto flex min-h-screen max-w-md flex-col items-center justify-center px-6 py-12 text-center"
       data-testid="not-found-page"
     >
-      <p className="text-xs uppercase tracking-widest text-muted-foreground">
-        404
-      </p>
+      <p className="text-xs uppercase tracking-widest text-muted-foreground">404</p>
       <h1 className="mt-2 font-display text-4xl">Field not found</h1>
       <p className="mt-4 text-sm text-muted-foreground">
         We couldn&apos;t locate the page you&apos;re looking for.

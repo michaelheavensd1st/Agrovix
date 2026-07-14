@@ -25,7 +25,9 @@ export default function FarmNewPage() {
       });
       router.push(`/organizations/${orgId}`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.payload.detail ?? 'Failed to create farm' : String(err));
+      setError(
+        err instanceof ApiError ? (err.payload.detail ?? 'Failed to create farm') : String(err),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -66,7 +68,11 @@ export default function FarmNewPage() {
           />
         </label>
         {error && (
-          <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" data-testid="farm-new-error">
+          <p
+            role="alert"
+            className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            data-testid="farm-new-error"
+          >
             {error}
           </p>
         )}

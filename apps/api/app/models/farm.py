@@ -19,12 +19,13 @@ if TYPE_CHECKING:
 
 class Farm(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "farms"
-    __table_args__ = (
-        UniqueConstraint("organization_id", "code", name="uq_farm_org_code"),
-    )
+    __table_args__ = (UniqueConstraint("organization_id", "code", name="uq_farm_org_code"),)
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -32,10 +33,12 @@ class Farm(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     timezone: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    organization: Mapped["Organization"] = relationship("Organization", back_populates="farms")
-    memberships: Mapped[list["FarmMembership"]] = relationship(
+    organization: Mapped[Organization] = relationship("Organization", back_populates="farms")
+    memberships: Mapped[list[FarmMembership]] = relationship(
         "FarmMembership", back_populates="farm", cascade="all, delete-orphan"
     )
 

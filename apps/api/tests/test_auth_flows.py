@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from datetime import timedelta
 from uuid import uuid4
 
@@ -16,6 +15,7 @@ from app.models.user import User
 
 async def _create_verified_user(email: str, password: str = "Sprint0ne!2026") -> User:
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = User(
             email=email.lower(),
@@ -55,7 +55,9 @@ async def test_expired_access_token_rejected(client: AsyncClient) -> None:
     user = await _create_verified_user(email)
     # Manually forge an expired access token — the codepath in decode_token
     # returns TokenExpiredError, which /auth/me maps to 401.
-    expired, _ = create_token(subject=user.id, token_type="access", expires_delta=timedelta(seconds=-1))
+    expired, _ = create_token(
+        subject=user.id, token_type="access", expires_delta=timedelta(seconds=-1)
+    )
     r = await client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {expired}"})
     assert r.status_code == 401
     assert "expired" in r.json()["detail"].lower()
@@ -74,17 +76,15 @@ async def test_refresh_token_rotation_and_revocation(client: AsyncClient) -> Non
     assert refresh_cookie is not None, "login must set the refresh cookie"
 
     # First refresh — succeeds, rotates.
-    r1 = await client.post(
-        "/api/v1/auth/refresh", json={"refresh_token": refresh_cookie}
-    )
+    r1 = await client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_cookie})
     assert r1.status_code == 200, r1.text
 
     # Reuse of the ORIGINAL refresh — must now be revoked.
-    r2 = await client.post(
-        "/api/v1/auth/refresh", json={"refresh_token": refresh_cookie}
-    )
+    r2 = await client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_cookie})
     assert r2.status_code == 401
-    assert "expired refresh" in r2.json()["detail"].lower() or "invalid" in r2.json()["detail"].lower()
+    assert (
+        "expired refresh" in r2.json()["detail"].lower() or "invalid" in r2.json()["detail"].lower()
+    )
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,7 +68,7 @@ class RoleAssignmentRepository:
         return result.scalar_one_or_none()
 
     async def revoke(self, assignment: RoleAssignment) -> None:
-        assignment.revoked_at = datetime.now(timezone.utc)
+        assignment.revoked_at = datetime.now(UTC)
         self.session.add(assignment)
         await self.session.flush()
 
@@ -78,7 +78,7 @@ class RoleAssignmentRepository:
         Serves as a race-safe primitive for concurrent revocations of the
         same assignment: only one caller will see ``True``.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         stmt = (
             update(RoleAssignment)
             .where(
@@ -94,9 +94,7 @@ class RoleAssignmentRepository:
     async def unrevoke(self, assignment_id: uuid.UUID) -> None:
         """Reverse a revoke — used to abort when the org would be orphaned."""
         stmt = (
-            update(RoleAssignment)
-            .where(RoleAssignment.id == assignment_id)
-            .values(revoked_at=None)
+            update(RoleAssignment).where(RoleAssignment.id == assignment_id).values(revoked_at=None)
         )
         await self.session.execute(stmt)
         await self.session.flush()

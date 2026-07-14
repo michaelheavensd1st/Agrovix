@@ -10,8 +10,8 @@ from __future__ import annotations
 import base64
 import json
 import uuid
-from datetime import datetime, timezone
-from typing import Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,9 +22,7 @@ from app.models.production import (
     ProductionBatchTransition,
     ProductionEvent,
     ProductionSite,
-    ProductionSiteStatus,
     ProductionUnit,
-    ProductionUnitStatus,
     ProductionUnitType,
 )
 
@@ -50,9 +48,9 @@ class ProductionSiteRepository:
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def get_by_id_including_deleted(self, site_id: uuid.UUID) -> ProductionSite | None:
-        return (await self.session.execute(
-            select(ProductionSite).where(ProductionSite.id == site_id)
-        )).scalar_one_or_none()
+        return (
+            await self.session.execute(select(ProductionSite).where(ProductionSite.id == site_id))
+        ).scalar_one_or_none()
 
     async def list_for_farm(self, farm_id: uuid.UUID) -> Sequence[ProductionSite]:
         stmt = (
@@ -70,14 +68,14 @@ class ProductionSiteRepository:
         return int((await self.session.execute(stmt)).scalar_one())
 
     async def soft_delete(self, site: ProductionSite) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         site.deleted_at = now
         site.updated_at = now
         self.session.add(site)
         await self.session.flush()
 
     async def restore(self, site: ProductionSite) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         site.deleted_at = None
         site.updated_at = now
         self.session.add(site)
@@ -118,10 +116,23 @@ class ProductionUnitTypeRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def list_visible(self, *, organization_id: uuid.UUID | None) -> Sequence[ProductionUnitType]:
+    async def list_visible(
+        self, *, organization_ids: list[uuid.UUID] | None = None
+    ) -> Sequence[ProductionUnitType]:
+        """List system + org-custom unit types visible to the caller.
+
+        ``organization_ids`` is the SET of orgs the caller belongs to
+        (empty list means "system only"). Only org-custom types owned
+        by one of those orgs are returned. Never accept an unverified
+        ``organization_id`` from the request URL — the caller MUST
+        derive the list from the caller's memberships.
+
+        This closes the cross-tenant leak documented in
+        ``docs/audits/codex-review-gate-01.md`` (finding CRG01-1).
+        """
         conditions = [ProductionUnitType.is_system.is_(True)]
-        if organization_id is not None:
-            conditions.append(ProductionUnitType.organization_id == organization_id)
+        if organization_ids:
+            conditions.append(ProductionUnitType.organization_id.in_(organization_ids))
         stmt = (
             select(ProductionUnitType)
             .where(ProductionUnitType.deleted_at.is_(None), or_(*conditions))
@@ -142,7 +153,7 @@ class ProductionUnitTypeRepository:
         return int((await self.session.execute(stmt)).scalar_one()) > 0
 
     async def soft_delete(self, row: ProductionUnitType) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         row.deleted_at = now
         row.updated_at = now
         self.session.add(row)
@@ -177,7 +188,7 @@ class ProductionUnitRepository:
         return (await self.session.execute(stmt)).scalars().all()
 
     async def soft_delete(self, unit: ProductionUnit) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         unit.deleted_at = now
         unit.updated_at = now
         self.session.add(unit)
@@ -187,11 +198,13 @@ class ProductionUnitRepository:
         stmt = select(func.count(ProductionBatch.id)).where(
             ProductionBatch.unit_id == unit_id,
             ProductionBatch.deleted_at.is_(None),
-            ProductionBatch.state.notin_([
-                ProductionBatchState.CLOSED,
-                ProductionBatchState.CANCELLED,
-                ProductionBatchState.FAILED,
-            ]),
+            ProductionBatch.state.notin_(
+                [
+                    ProductionBatchState.CLOSED,
+                    ProductionBatchState.CANCELLED,
+                    ProductionBatchState.FAILED,
+                ]
+            ),
         )
         return int((await self.session.execute(stmt)).scalar_one())
 
@@ -269,7 +282,7 @@ class ProductionBatchTransitionRepository:
         reason: str | None = None,
         metadata: dict | None = None,
     ) -> ProductionBatchTransition:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         row = ProductionBatchTransition(
             batch_id=batch_id,
             from_state=from_state,
@@ -319,7 +332,7 @@ class ProductionEventRepository:
         self.session = session
 
     async def create(self, **kwargs) -> ProductionEvent:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         kwargs.setdefault("created_at", now)
         kwargs.setdefault("performed_at", now)
         row = ProductionEvent(**kwargs)
@@ -328,9 +341,25 @@ class ProductionEventRepository:
         return row
 
     async def get_by_id(self, event_id: uuid.UUID) -> ProductionEvent | None:
-        return (await self.session.execute(
-            select(ProductionEvent).where(ProductionEvent.id == event_id)
-        )).scalar_one_or_none()
+        return (
+            await self.session.execute(
+                select(ProductionEvent).where(ProductionEvent.id == event_id)
+            )
+        ).scalar_one_or_none()
+
+    async def get_by_batch_and_key(
+        self, batch_id: uuid.UUID, idempotency_key: str
+    ) -> ProductionEvent | None:
+        """Lookup used for idempotent replay handling.
+
+        Paired with the partial unique index
+        ``uq_events_batch_idempotency_key`` in the ORM schema.
+        """
+        stmt = select(ProductionEvent).where(
+            ProductionEvent.batch_id == batch_id,
+            ProductionEvent.idempotency_key == idempotency_key,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def list_for_batch(
         self,

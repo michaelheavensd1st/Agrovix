@@ -22,6 +22,7 @@ from app.models.user import User
 
 async def _create_verified_user(email: str, password: str = "Sprint0ne!2026") -> User:
     from app.db import session as _db
+
     async with _db.AsyncSessionLocal() as session:
         user = User(
             email=email.lower(),
@@ -49,7 +50,7 @@ def _install_fresh_limiter() -> tuple[InMemoryRateLimiter, callable]:
 # --------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_repeated_invalid_password_triggers_429(client: AsyncClient) -> None:
-    fresh, original = _install_fresh_limiter()
+    _fresh, original = _install_fresh_limiter()
     try:
         email = f"brute-{uuid4().hex[:8]}@agrovix.dev"
         await _create_verified_user(email)
@@ -93,7 +94,7 @@ async def test_repeated_invalid_password_triggers_429(client: AsyncClient) -> No
 # --------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_unknown_email_is_rate_limited_identically(client: AsyncClient) -> None:
-    fresh, original = _install_fresh_limiter()
+    _fresh, original = _install_fresh_limiter()
     try:
         settings = get_settings()
         email = f"ghost-{uuid4().hex[:8]}@agrovix.dev"  # never registered
@@ -204,7 +205,7 @@ async def test_shared_limiter_state_across_workers(client: AsyncClient) -> None:
 # --------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_per_ip_throttle_catches_email_spraying(client: AsyncClient) -> None:
-    fresh, original = _install_fresh_limiter()
+    _fresh, original = _install_fresh_limiter()
     try:
         settings = get_settings()
 

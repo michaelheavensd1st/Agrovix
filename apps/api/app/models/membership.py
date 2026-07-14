@@ -28,7 +28,10 @@ class OrganizationMembership(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     invited_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -38,17 +41,19 @@ class OrganizationMembership(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    user: Mapped["User"] = relationship("User", back_populates="organization_memberships", foreign_keys=[user_id])
-    organization: Mapped["Organization"] = relationship("Organization", back_populates="memberships")
+    user: Mapped[User] = relationship(
+        "User", back_populates="organization_memberships", foreign_keys=[user_id]
+    )
+    organization: Mapped[Organization] = relationship("Organization", back_populates="memberships")
 
 
 class FarmMembership(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "farm_memberships"
-    __table_args__ = (
-        UniqueConstraint("user_id", "farm_id", name="uq_farm_membership_user_farm"),
-    )
+    __table_args__ = (UniqueConstraint("user_id", "farm_id", name="uq_farm_membership_user_farm"),)
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
@@ -61,7 +66,11 @@ class FarmMembership(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
-    user: Mapped["User"] = relationship("User", back_populates="farm_memberships", foreign_keys=[user_id])
-    farm: Mapped["Farm"] = relationship("Farm", back_populates="memberships")
+    user: Mapped[User] = relationship(
+        "User", back_populates="farm_memberships", foreign_keys=[user_id]
+    )
+    farm: Mapped[Farm] = relationship("Farm", back_populates="memberships")

@@ -70,7 +70,7 @@ def get_rate_limiter() -> RateLimiter:
 
     try:
         client = redis.from_url(settings.redis_url, decode_responses=True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         if settings.is_production and not settings.rate_limit_allow_inmemory:
             raise RateLimiterUnavailableError(
                 f"Failed to construct Redis client from REDIS_URL: {exc}. "
@@ -107,5 +107,5 @@ async def check_rate_limiter_health() -> tuple[bool, str]:
     try:
         pong = await limiter._client.ping()  # type: ignore[attr-defined]
         return bool(pong), "redis"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, f"redis-error: {exc}"

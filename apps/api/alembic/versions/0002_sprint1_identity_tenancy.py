@@ -153,6 +153,10 @@ def upgrade() -> None:
     # --- invitations -----------------------------------------------------
     inv_status = sa.Enum("pending", "accepted", "revoked", "expired", name="invitation_status")
     inv_status.create(op.get_bind(), checkfirst=True)
+    inv_status_col = postgresql.ENUM(
+        "pending", "accepted", "revoked", "expired",
+        name="invitation_status", create_type=False,
+    )
     op.create_table(
         "invitations",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
@@ -162,7 +166,7 @@ def upgrade() -> None:
         sa.Column("invited_by_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("email", sa.String(length=255), nullable=False),
         sa.Column("token_hash", sa.String(length=128), nullable=False),
-        sa.Column("status", inv_status, nullable=False, server_default="pending"),
+        sa.Column("status", inv_status_col, nullable=False, server_default="pending"),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("accepted_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),

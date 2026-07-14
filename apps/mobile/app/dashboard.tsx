@@ -18,12 +18,15 @@ export default function Dashboard() {
       <View style={styles.card} testID="dashboard-empty-state">
         <Text style={styles.cardTitle}>Shell only</Text>
         <Text style={styles.cardBody}>
-          Mobile remains a shell during Sprint 1. Full aquaculture-first
-          workflows land in Sprint 2.
+          Mobile remains a shell during Sprint 1. Full aquaculture-first workflows land in Sprint 2.
         </Text>
       </View>
 
-      <Pressable testID="dashboard-signout-button" style={styles.signOutButton} onPress={handleSignOut}>
+      <Pressable
+        testID="dashboard-signout-button"
+        style={styles.signOutButton}
+        onPress={handleSignOut}
+      >
         <Text style={styles.signOutLabel}>Sign out</Text>
       </Pressable>
     </ScrollView>

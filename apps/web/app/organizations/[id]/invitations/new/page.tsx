@@ -43,7 +43,7 @@ export default function InvitationNewPage() {
       setOk(true);
       setTimeout(() => router.push(`/organizations/${orgId}`), 900);
     } catch (err) {
-      setError(err instanceof ApiError ? err.payload.detail ?? 'Failed to invite' : String(err));
+      setError(err instanceof ApiError ? (err.payload.detail ?? 'Failed to invite') : String(err));
     } finally {
       setSubmitting(false);
     }
@@ -97,12 +97,19 @@ export default function InvitationNewPage() {
           />
         </label>
         {error && (
-          <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive" data-testid="invitation-error">
+          <p
+            role="alert"
+            className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            data-testid="invitation-error"
+          >
             {error}
           </p>
         )}
         {ok && (
-          <p className="rounded-md bg-primary/10 px-3 py-2 text-sm text-primary" data-testid="invitation-success">
+          <p
+            className="rounded-md bg-primary/10 px-3 py-2 text-sm text-primary"
+            data-testid="invitation-success"
+          >
             Invitation sent.
           </p>
         )}

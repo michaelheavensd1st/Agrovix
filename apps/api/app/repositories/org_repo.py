@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -26,12 +26,16 @@ class OrganizationRepository:
         return org
 
     async def get_by_id(self, org_id: uuid.UUID) -> Organization | None:
-        stmt = select(Organization).where(Organization.id == org_id, Organization.deleted_at.is_(None))
+        stmt = select(Organization).where(
+            Organization.id == org_id, Organization.deleted_at.is_(None)
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
     async def get_by_slug(self, slug: str) -> Organization | None:
-        stmt = select(Organization).where(Organization.slug == slug.lower(), Organization.deleted_at.is_(None))
+        stmt = select(Organization).where(
+            Organization.slug == slug.lower(), Organization.deleted_at.is_(None)
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -50,7 +54,7 @@ class OrganizationRepository:
         return list(result.scalars().unique())
 
     async def soft_delete(self, org: Organization) -> None:
-        org.deleted_at = datetime.now(timezone.utc)
+        org.deleted_at = datetime.now(UTC)
         org.is_active = False
         self.session.add(org)
         await self.session.flush()
@@ -74,6 +78,30 @@ class OrganizationRepository:
         )
         result = await self.session.execute(stmt)
         return len(result.scalars().all())
+
+    async def lock_owner_set(self, org_id: uuid.UUID) -> None:
+        """Serialize concurrent transactions that mutate the ownership
+        set of this organization.
+
+        Uses a Postgres transaction-scoped advisory lock keyed on the
+        organization id so that two callers racing to revoke DIFFERENT
+        owner assignments queue up rather than both passing the
+        "≥ 1 owner remains" post-check with a stale (uncommitted) view
+        of each other's writes. Falls back to a no-op on non-Postgres
+        engines (SQLite unit-test path serialises writers anyway).
+        """
+        dialect = self.session.bind.dialect.name if self.session.bind else ""
+        if dialect != "postgresql":
+            return
+        # Advisory locks are keyed on two int4s; derive them from the
+        # UUID bytes so two different orgs never collide.
+        as_int = int(org_id.int)
+        key1 = (as_int >> 32) & 0x7FFFFFFF
+        key2 = as_int & 0x7FFFFFFF
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(:k1, :k2)"),
+            {"k1": key1, "k2": key2},
+        )
 
 
 class OrganizationMembershipRepository:
@@ -100,7 +128,10 @@ class OrganizationMembershipRepository:
                 await self.session.flush()
             return existing
         row = OrganizationMembership(
-            user_id=user_id, organization_id=org_id, invited_by_id=invited_by_id, is_active=True,
+            user_id=user_id,
+            organization_id=org_id,
+            invited_by_id=invited_by_id,
+            is_active=True,
         )
         self.session.add(row)
         await self.session.flush()
@@ -128,11 +159,7 @@ class FarmRepository:
 
     async def get_by_id_including_deleted(self, farm_id: uuid.UUID) -> Farm | None:
         """Lookup that INCLUDES soft-deleted rows — used solely for restore."""
-        stmt = (
-            select(Farm)
-            .where(Farm.id == farm_id)
-            .options(selectinload(Farm.organization))
-        )
+        stmt = select(Farm).where(Farm.id == farm_id).options(selectinload(Farm.organization))
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -154,14 +181,11 @@ class FarmRepository:
         farms in that org. Users with only farm-scoped assignments see
         just the farms they were assigned to.
         """
-        org_scoped_stmt = (
-            select(RoleAssignment)
-            .where(
-                RoleAssignment.user_id == user_id,
-                RoleAssignment.organization_id == org_id,
-                RoleAssignment.farm_id.is_(None),
-                RoleAssignment.revoked_at.is_(None),
-            )
+        org_scoped_stmt = select(RoleAssignment).where(
+            RoleAssignment.user_id == user_id,
+            RoleAssignment.organization_id == org_id,
+            RoleAssignment.farm_id.is_(None),
+            RoleAssignment.revoked_at.is_(None),
         )
         org_scoped = (await self.session.execute(org_scoped_stmt)).scalars().first()
 
@@ -183,7 +207,7 @@ class FarmRepository:
         return list(result.scalars().unique())
 
     async def soft_delete(self, farm: Farm) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         farm.deleted_at = now
         farm.is_active = False
         # Set updated_at explicitly so the returned ORM instance has a
@@ -196,7 +220,7 @@ class FarmRepository:
 
     async def restore(self, farm: Farm) -> None:
         """Undo a soft delete. Returns the farm to normal query visibility."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         farm.deleted_at = None
         farm.is_active = True
         farm.updated_at = now
@@ -241,14 +265,11 @@ class FarmMembershipRepository:
         in the given org, or ``None`` when the user's assignments already
         grant them access to *all* farms in the org (org-scoped role).
         """
-        org_stmt = (
-            select(RoleAssignment)
-            .where(
-                RoleAssignment.user_id == user_id,
-                RoleAssignment.organization_id == org_id,
-                RoleAssignment.farm_id.is_(None),
-                RoleAssignment.revoked_at.is_(None),
-            )
+        org_stmt = select(RoleAssignment).where(
+            RoleAssignment.user_id == user_id,
+            RoleAssignment.organization_id == org_id,
+            RoleAssignment.farm_id.is_(None),
+            RoleAssignment.revoked_at.is_(None),
         )
         if (await self.session.execute(org_stmt)).scalars().first() is not None:
             return None
@@ -269,8 +290,8 @@ class FarmMembershipRepository:
 
 
 __all__ = [
-    "OrganizationRepository",
-    "OrganizationMembershipRepository",
-    "FarmRepository",
     "FarmMembershipRepository",
+    "FarmRepository",
+    "OrganizationMembershipRepository",
+    "OrganizationRepository",
 ]
