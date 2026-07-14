@@ -1,0 +1,43 @@
+{
+  "summary": "Independent curl/HTTP verification of Codex Review Gate 01 (CRG01-1 cross-tenant unit-type isolation + CRG01-2 production-event idempotency) against a live FastAPI + real Postgres backend. All 9 tests pass. Both invariants fully verified: cross-tenant leak is closed (spoofed organization_id filter is silently stripped, outsider sees only is_system=true entries) and per-batch idempotency behaves correctly for replay (200 + X-Idempotent-Replay: true), payload conflict (409 + detail.code=idempotency_key_payload_conflict), missing header (independent 201s), cross-batch key reuse (both 201, distinct rows), stocking transition (no double-transition on replay), high-concurrency race (6 parallel POSTs -> 1x201 + 5x200, exactly one DB row), and event/transition happy-path atomicity (PLANNED->STOCKED + event both persisted).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "alembic migration 0002_sprint1_identity_tenancy.py + app/models/role.py",
+        "issue": "Enum mismatch between alembic and SQLAlchemy model: migration creates role_scope enum with lowercase labels ('platform','organization','farm') but the SQLAlchemy Enum(RoleScope, name='role_scope') column defaults to writing enum NAMES ('PLATFORM','ORGANIZATION','FARM'). Fresh test DB seeded via `alembic upgrade head` + `python -m app.seed` fails with `invalid input value for enum role_scope: \"PLATFORM\"`. The pytest suite works because conftest uses Base.metadata.create_all (which regenerates the enum with SQLAlchemy names). This is latent and will break `alembic upgrade head` + seed on any fresh staging/prod deploy. Recommended fix: add `values_callable=lambda e: [m.value for m in e]` to the Enum() column (or migrate labels to uppercase). Not part of CRG01 scope but worth flagging."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/apps/api/tests/test_crg01_curl_e2e.py",
+    "/app/test_reports/pytest/crg01_curl_e2e.xml"
+  ],
+  "action_items": [
+    "OPTIONAL/OUT-OF-SCOPE: fix role_scope enum name/value mismatch between alembic 0002 migration and SQLAlchemy model so `alembic upgrade head` + `python -m app.seed` works against a fresh Postgres DB (the CRG01 fixes themselves are correct and complete)."
+  ],
+  "critical_code_review_comments": [
+    "CRG01-1 fix in ProductionUnitTypeRepository.list_visible correctly ignores organization_id filter when the caller is not a member of that org (silent strip, no 403 leak signal). Verified.",
+    "CRG01-2 idempotency implementation is well-layered: (1) pre-insert lookup via (batch_id, idempotency_key), (2) SAVEPOINT-wrapped INSERT so IntegrityError from the partial unique index only rolls back the statement, (3) post-collision second lookup for the race winner. Payload hash covers event_type + validated data + is_final. Correct.",
+    "Partial unique index `uq_events_batch_idempotency_key ON production_events (batch_id, idempotency_key) WHERE idempotency_key IS NOT NULL` is present and enforcing exactly-once at the DB layer. Verified.",
+    "Event/transition atomicity: transition and event share the request-scoped SQLAlchemy session; a raise from batch_service.transition propagates through the request handler, and the DB dep rolls back both writes. Happy path verified via curl.",
+    "Latent bug: role_scope enum labels differ between alembic (lowercase) and SQLAlchemy Enum column (writes NAMES = uppercase). Breaks a fresh `alembic upgrade head` + seed. Same issue would apply to any other native Postgres enum that goes through both paths. See minor issue above."
+  ],
+  "updated_files": [
+    "/app/apps/api/tests/test_crg01_curl_e2e.py (new; HTTP-driven regression suite)",
+    "/app/apps/api/.env (dev-only, non-tracked; SQLite -> Postgres localhost:5433/agrovix_test, ALLOW_UNVERIFIED_LOGIN=true, RATE_LIMIT_ALLOW_INMEMORY=true, BCRYPT_ROUNDS=4)",
+    "Postgres agrovix_test DB was wiped and re-created via Base.metadata.create_all + seed_permissions_and_roles() to work around the alembic/enum mismatch above. No canonical code was touched."
+  ],
+  "success_rate": {"backend": "100% (9/9 curl-driven tests pass)", "frontend": "skipped-per-request"},
+  "test_credentials": "Test users are self-provisioned per test via POST /api/v1/auth/register (password=Sprint0ne!2026, ALLOW_UNVERIFIED_LOGIN=true in test env).",
+  "seed_data_creation": "System permissions/roles + 6 system production_unit_types (HATCHERY_TANK, NURSERY_TANK, GROW_OUT_POND, CAGE, RACEWAY, BIOFLOC_TANK) seeded via app.seed.seed_permissions_and_roles(). No test users are seeded — each test creates its own.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Live FastAPI (canonical apps/api) is running on http://localhost:8002 backed by Postgres localhost:5433/agrovix_test. Env file at /app/apps/api/.env. Rerun with `cd /app/apps/api && python -m pytest tests/test_crg01_curl_e2e.py -v`. Suite is idempotent (each test provisions its own user/org/farm/unit/batch). The Emergent pod URL and localhost:8001 are a Mongo-backed Sprint-0-only shim that does NOT expose /api/v1/production-unit-types or /api/v1/batches/*/events — always test against the canonical apps/api process, not the pod URL.",
+  "rca of the issue": "N/A — no bug found in the CRG01-1 or CRG01-2 remediations. Both invariants hold against a real Postgres backend under both single-request and concurrent (6-way parallel) traffic. The only latent issue observed is unrelated to CRG01: the role_scope enum name/value mismatch between alembic and the SQLAlchemy model, which prevents `alembic upgrade head` + `app.seed` from succeeding on a fresh Postgres DB (workaround: use Base.metadata.create_all as the test fixtures do)."
+}
