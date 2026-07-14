@@ -3,6 +3,17 @@
 from app.db.base import Base
 from app.models.audit import AuditEvent
 from app.models.farm import Farm
+from app.models.inventory import (
+    InventoryItem,
+    InventoryItemCategory,
+    InventoryLot,
+    InventoryTransaction,
+    InventoryTransactionType,
+    StockUnit,
+    StorageLocation,
+    Warehouse,
+    WarehouseStatus,
+)
 from app.models.invitation import Invitation, InvitationStatus
 from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.organization import Organization
@@ -29,6 +40,11 @@ __all__ = [
     "EmailVerificationToken",
     "Farm",
     "FarmMembership",
+    "InventoryItem",
+    "InventoryItemCategory",
+    "InventoryLot",
+    "InventoryTransaction",
+    "InventoryTransactionType",
     "Invitation",
     "InvitationStatus",
     "Organization",
@@ -47,6 +63,10 @@ __all__ = [
     "Role",
     "RoleAssignment",
     "RoleScope",
+    "StockUnit",
+    "StorageLocation",
     "User",
+    "Warehouse",
+    "WarehouseStatus",
     "role_permissions_table",
 ]
