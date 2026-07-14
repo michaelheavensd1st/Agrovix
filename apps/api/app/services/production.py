@@ -143,6 +143,11 @@ class ProductionUnitTypeService:
                 status.HTTP_409_CONFLICT,
                 f"Code {data['code']!r} is reserved by a system-owned production unit type.",
             )
+        # Backfill display_name from name if omitted so the UI never
+        # has to fall back to the abstract "Production Unit" label.
+        data = dict(data)
+        if not data.get("display_name"):
+            data["display_name"] = data["name"]
         row = await self.unit_type_repo.create(
             organization_id=organization_id, is_system=False, **data
         )
@@ -563,6 +568,17 @@ class ProductionEventService:
                 # re-audit, re-transition, or re-write anything.
                 return existing, True
 
+        # ---- Sprint 3 business rules ----------------------------- #
+        # These run AFTER idempotency lookup so replays are cheap and
+        # BEFORE the INSERT so no partial write ever escapes.
+        await self._enforce_business_rules(
+            code=entry.code,
+            data=validated_data,
+            batch=batch,
+            unit=unit,
+            farm=farm,
+        )
+
         # Determine is_final flag for events that carry one (e.g. HARVEST).
         is_final = bool(validated_data.get("is_final", False))
 
@@ -659,3 +675,159 @@ class ProductionEventService:
             cursor=cursor,
             event_type=event_type,
         )
+
+    # ------------------------------------------------------------ #
+    # Sprint 3 — aquaculture business rules
+    # ------------------------------------------------------------ #
+    async def _enforce_business_rules(
+        self,
+        *,
+        code: str,
+        data: dict,
+        batch: ProductionBatch,
+        unit: ProductionUnit,
+        farm: Farm,
+    ) -> None:
+        """Vertical-neutral pre-insert guards for Sprint 3 events.
+
+        The APE contract is:
+
+        * Deleted / inactive units and farms already fail through
+          ``_load_batch`` in the endpoint (soft-deleted rows are 404).
+        * MORTALITY count cannot exceed the batch's estimated
+          remaining population. There is no "negative stock" mode
+          in Sprint 3.
+        * TRANSFER events must reference the batch's current unit
+          as source, and a destination unit inside the SAME farm
+          (and therefore the same organization). Cross-farm
+          transfers are blocked pending a Sprint 4 lineage feature.
+        """
+        if code == "MORTALITY":
+            await self._enforce_mortality_bounds(batch=batch, data=data)
+        elif code == "TRANSFER":
+            await self._enforce_transfer_scope(batch=batch, unit=unit, farm=farm, data=data)
+
+    async def _enforce_mortality_bounds(self, *, batch: ProductionBatch, data: dict) -> None:
+        from app.services.projections import compute_batch_projections  # local import: cycle-safe
+
+        count = int(data.get("count", 0) or 0)
+        if count <= 0:
+            return
+        events = await self.event_repo.list_all_for_batch_asc(batch.id)
+        projections = compute_batch_projections(batch, events)
+        if projections.initial_stocked_quantity == 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "mortality_before_stocking",
+                    "message": (
+                        "Cannot log mortality on a batch that has not been " "stocked yet."
+                    ),
+                },
+            )
+        remaining = projections.estimated_remaining_population
+        if count > remaining:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "mortality_exceeds_population",
+                    "message": (
+                        f"Mortality count {count} exceeds estimated remaining "
+                        f"population {remaining}. Use an authorised correction "
+                        "workflow to reconcile — the platform will not silently "
+                        "accept negative stock."
+                    ),
+                    "count": count,
+                    "estimated_remaining_population": remaining,
+                },
+            )
+
+    async def _enforce_transfer_scope(
+        self,
+        *,
+        batch: ProductionBatch,
+        unit: ProductionUnit,
+        farm: Farm,
+        data: dict,
+    ) -> None:
+        raw_src = str(data.get("source_unit_id", "")).strip()
+        raw_dst = str(data.get("destination_unit_id", "")).strip()
+        try:
+            src_id = uuid.UUID(raw_src)
+            dst_id = uuid.UUID(raw_dst)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": "transfer_invalid_unit_id",
+                    "message": "source_unit_id and destination_unit_id must be UUIDs.",
+                },
+            ) from exc
+
+        if src_id != unit.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_source_mismatch",
+                    "message": ("TRANSFER source_unit_id must equal the batch's current unit."),
+                    "expected": str(unit.id),
+                    "received": str(src_id),
+                },
+            )
+
+        dst_unit = await self.unit_repo.get_by_id(dst_id)
+        if dst_unit is None or dst_unit.deleted_at is not None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                {
+                    "code": "transfer_destination_not_found",
+                    "message": "Destination unit not found or has been deleted.",
+                    "destination_unit_id": str(dst_id),
+                },
+            )
+
+        dst_site = await self.site_repo.get_by_id_including_deleted(dst_unit.site_id)
+        if dst_site is None or dst_site.deleted_at is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_destination_site_unavailable",
+                    "message": "Destination unit's site is unavailable.",
+                },
+            )
+
+        # Cross-farm transfers are blocked in Sprint 3.
+        if dst_site.farm_id != farm.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_cross_farm_blocked",
+                    "message": (
+                        "Cross-farm transfers are not permitted in Sprint 3. "
+                        "The destination unit must belong to the same farm as "
+                        "the source batch."
+                    ),
+                    "source_farm_id": str(farm.id),
+                    "destination_farm_id": str(dst_site.farm_id),
+                },
+            )
+
+        # Population guard: quantity + transfer_loss ≤ remaining population.
+        from app.services.projections import compute_batch_projections  # local: cycle-safe
+
+        qty = int(data.get("quantity", 0) or 0)
+        loss = int(data.get("transfer_loss", 0) or 0)
+        events = await self.event_repo.list_all_for_batch_asc(batch.id)
+        projections = compute_batch_projections(batch, events)
+        if qty + loss > projections.estimated_remaining_population:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_exceeds_population",
+                    "message": (
+                        f"Transfer quantity+loss ({qty + loss}) exceeds "
+                        f"estimated remaining population "
+                        f"({projections.estimated_remaining_population})."
+                    ),
+                },
+            )

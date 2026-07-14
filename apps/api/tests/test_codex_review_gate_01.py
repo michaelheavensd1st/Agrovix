@@ -25,6 +25,8 @@ from httpx import AsyncClient
 from tests._helpers import (
     create_org,
     create_verified_user,
+    feeding_payload,
+    stocking_payload,
     switch_user,
 )
 from tests.test_production_engine import (
@@ -113,7 +115,7 @@ async def _prepare_active_batch(client: AsyncClient) -> str:
     # PLANNED -> STOCKED via STOCKING event; STOCKED -> ACTIVE explicit
     await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "STOCKING", "data": {"quantity": 1}},
+        json={"event_type": "STOCKING", "data": stocking_payload(quantity=1)},
     )
     await client.post(
         f"/api/v1/batches/{batch_id}/transitions",
@@ -126,7 +128,7 @@ async def _prepare_active_batch(client: AsyncClient) -> str:
 async def test_same_key_same_payload_returns_replay(client: AsyncClient) -> None:
     batch_id = await _prepare_active_batch(client)
     key = f"idem-{uuid4().hex}"
-    body = {"event_type": "FEEDING", "data": {"feed_kg": 2.5, "feed_type": "grower"}}
+    body = {"event_type": "FEEDING", "data": feeding_payload(quantity=2.5)}
 
     r1 = await client.post(
         f"/api/v1/batches/{batch_id}/events",
@@ -155,14 +157,14 @@ async def test_same_key_different_payload_returns_409(client: AsyncClient) -> No
 
     r1 = await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "FEEDING", "data": {"feed_kg": 1.0, "feed_type": "starter"}},
+        json={"event_type": "FEEDING", "data": feeding_payload(quantity=1.0)},
         headers={"Idempotency-Key": key},
     )
     assert r1.status_code == 201
 
     r2 = await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "FEEDING", "data": {"feed_kg": 999.9, "feed_type": "grower"}},
+        json={"event_type": "FEEDING", "data": feeding_payload(quantity=999.9)},
         headers={"Idempotency-Key": key},
     )
     assert r2.status_code == 409, r2.text
@@ -176,7 +178,7 @@ async def test_missing_header_does_not_activate_idempotency(client: AsyncClient)
     """Without an ``Idempotency-Key`` header, each POST creates a NEW
     event even with identical payloads — legacy behavior preserved."""
     batch_id = await _prepare_active_batch(client)
-    body = {"event_type": "FEEDING", "data": {"feed_kg": 1.0, "feed_type": "starter"}}
+    body = {"event_type": "FEEDING", "data": feeding_payload(quantity=1.0)}
     r1 = await client.post(f"/api/v1/batches/{batch_id}/events", json=body)
     r2 = await client.post(f"/api/v1/batches/{batch_id}/events", json=body)
     assert r1.status_code == r2.status_code == 201
@@ -194,7 +196,7 @@ async def test_idempotent_stocking_does_not_double_transition(client: AsyncClien
     batch_id = await _create_batch(client, unit_id)
 
     key = f"stock-{uuid4().hex}"
-    body = {"event_type": "STOCKING", "data": {"quantity": 100}}
+    body = {"event_type": "STOCKING", "data": stocking_payload(quantity=100)}
     r1 = await client.post(
         f"/api/v1/batches/{batch_id}/events",
         json=body,
@@ -249,7 +251,7 @@ async def test_concurrent_same_key_produces_exactly_one_event(client: AsyncClien
     """
     batch_id = await _prepare_active_batch(client)
     key = f"race-{uuid4().hex}"
-    body = {"event_type": "FEEDING", "data": {"feed_kg": 3.0, "feed_type": "grower"}}
+    body = {"event_type": "FEEDING", "data": feeding_payload(quantity=3.0)}
 
     r1, r2 = await asyncio.gather(
         client.post(
@@ -289,7 +291,7 @@ async def test_idempotent_replay_is_scoped_per_batch(client: AsyncClient) -> Non
     b1 = await _create_batch(client, unit_id)
     b2 = await _create_batch(client, unit_id)
     key = f"shared-{uuid4().hex}"
-    body = {"event_type": "STOCKING", "data": {"quantity": 1}}
+    body = {"event_type": "STOCKING", "data": stocking_payload(quantity=1)}
 
     r1 = await client.post(
         f"/api/v1/batches/{b1}/events", json=body, headers={"Idempotency-Key": key}

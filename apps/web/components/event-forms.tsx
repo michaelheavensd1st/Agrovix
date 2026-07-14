@@ -1,0 +1,716 @@
+'use client';
+
+/**
+ * Deliberate operational forms for STOCKING / FEEDING / MORTALITY,
+ * plus a controlled catalog-driven form for the remaining Sprint 3
+ * event types (SAMPLING / WATER_QUALITY / TRANSFER / HARVEST).
+ *
+ * We intentionally do NOT drive stocking / feeding / mortality
+ * through a generic JSON-schema form renderer — those are the
+ * primary operational workflows and deserve first-class UX.
+ */
+
+import { FormEvent, useEffect, useState } from 'react';
+import { ApiError, apiFetch } from '@/lib/api';
+import type { EventCatalogEntry, ProductionEvent } from '@/lib/types';
+
+interface EventFormProps {
+  batchId: string;
+  onCreated(evt: ProductionEvent): void;
+  onCancel(): void;
+  eventType: 'STOCKING' | 'FEEDING' | 'MORTALITY';
+}
+
+interface CatalogFormProps {
+  batchId: string;
+  onCreated(evt: ProductionEvent): void;
+  onCancel(): void;
+  entry: EventCatalogEntry;
+}
+
+interface CreateResponse {
+  event: ProductionEvent;
+  replay: boolean;
+}
+
+async function postEvent(
+  batchId: string,
+  body: { event_type: string; data: Record<string, unknown> },
+  idempotencyKey: string,
+): Promise<CreateResponse> {
+  const res = await fetch(
+    `${process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000/api'}/v1/batches/${batchId}/events`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  const isJson = res.headers.get('content-type')?.includes('application/json');
+  const payload = isJson ? await res.json() : {};
+  if (!res.ok) throw new ApiError(res.status, payload);
+  return {
+    event: payload as ProductionEvent,
+    replay: res.headers.get('X-Idempotent-Replay') === 'true',
+  };
+}
+
+function nowLocalIso(): string {
+  const d = new Date();
+  d.setSeconds(0, 0);
+  return d.toISOString().slice(0, 16);
+}
+
+function extractServerMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    const detail = err.payload.detail as unknown;
+    if (typeof detail === 'string') return detail;
+    if (detail && typeof detail === 'object') {
+      const d = detail as { message?: string; code?: string };
+      return d.message ?? d.code ?? 'Request failed.';
+    }
+    return `Request failed (${err.status}).`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+/* ================================================================= */
+/* STOCKING — deliberate                                              */
+/* ================================================================= */
+
+export function StockingForm({ batchId, onCreated, onCancel }: Omit<EventFormProps, 'eventType'>) {
+  const [species, setSpecies] = useState('WHITE_SHRIMP');
+  const [quantity, setQuantity] = useState('25000');
+  const [avgWeight, setAvgWeight] = useState('0.02');
+  const [weightUnit, setWeightUnit] = useState<'g' | 'kg'>('g');
+  const [source, setSource] = useState('');
+  const [stockedAt, setStockedAt] = useState(nowLocalIso());
+  const [notes, setNotes] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState(false);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!confirm) {
+      setError('Please confirm this stocking event before saving.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const { event } = await postEvent(
+        batchId,
+        {
+          event_type: 'STOCKING',
+          data: {
+            species_code: species.trim(),
+            quantity: Number(quantity),
+            average_weight: Number(avgWeight),
+            weight_unit: weightUnit,
+            source: source.trim() || null,
+            stocked_at: new Date(stockedAt).toISOString(),
+            ...(notes.trim() ? { notes: notes.trim() } : {}),
+          },
+        },
+        `stock-${batchId}-${Date.now()}-${crypto.randomUUID()}`,
+      );
+      onCreated(event);
+    } catch (err) {
+      setError(extractServerMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-4" data-testid="stocking-form">
+      <h3 className="font-display text-lg">Record stocking</h3>
+      <p className="text-xs text-muted-foreground">
+        Stocking transitions the batch to <strong>Stocked</strong>. This is irreversible.
+      </p>
+      <label className="block text-sm">
+        Species code
+        <input
+          data-testid="stocking-species"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={species}
+          onChange={(e) => setSpecies(e.target.value)}
+          required
+        />
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block text-sm">
+          Quantity (individuals)
+          <input
+            data-testid="stocking-quantity"
+            type="number"
+            min={1}
+            className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+            required
+          />
+        </label>
+        <label className="block text-sm">
+          Average weight
+          <div className="mt-1 flex gap-1">
+            <input
+              data-testid="stocking-avg-weight"
+              type="number"
+              min={0}
+              step="0.001"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              value={avgWeight}
+              onChange={(e) => setAvgWeight(e.target.value)}
+              required
+            />
+            <select
+              data-testid="stocking-weight-unit"
+              className="rounded-md border border-border bg-background px-2 text-sm"
+              value={weightUnit}
+              onChange={(e) => setWeightUnit(e.target.value as 'g' | 'kg')}
+            >
+              <option value="g">g</option>
+              <option value="kg">kg</option>
+            </select>
+          </div>
+        </label>
+      </div>
+      <label className="block text-sm">
+        Source (hatchery, supplier)
+        <input
+          data-testid="stocking-source"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={source}
+          onChange={(e) => setSource(e.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        Stocked at
+        <input
+          data-testid="stocking-stocked-at"
+          type="datetime-local"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={stockedAt}
+          onChange={(e) => setStockedAt(e.target.value)}
+          required
+        />
+      </label>
+      <label className="block text-sm">
+        Notes
+        <textarea
+          data-testid="stocking-notes"
+          rows={2}
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+        />
+      </label>
+      <label className="flex items-start gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          data-testid="stocking-confirm"
+          className="mt-0.5"
+          checked={confirm}
+          onChange={(e) => setConfirm(e.target.checked)}
+        />
+        I confirm the batch has been stocked with these values. This is an append-only operational
+        event and cannot be edited later.
+      </label>
+      {error && (
+        <p
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid="stocking-error"
+        >
+          {error}
+        </p>
+      )}
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={busy}
+          data-testid="stocking-submit"
+          className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
+        >
+          {busy ? 'Saving…' : 'Record stocking'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/* ================================================================= */
+/* FEEDING — deliberate                                               */
+/* ================================================================= */
+
+export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProps, 'eventType'>) {
+  const [description, setDescription] = useState('Grower crumble 35%');
+  const [quantity, setQuantity] = useState('2.5');
+  const [unit, setUnit] = useState<'g' | 'kg'>('kg');
+  const [method, setMethod] = useState('broadcast');
+  const [round, setRound] = useState('1');
+  const [notes, setNotes] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const { event } = await postEvent(
+        batchId,
+        {
+          event_type: 'FEEDING',
+          data: {
+            feed_description: description.trim(),
+            quantity: Number(quantity),
+            unit,
+            feeding_method: method,
+            ...(round ? { feeding_round: Number(round) } : {}),
+            ...(notes.trim() ? { notes: notes.trim() } : {}),
+          },
+        },
+        `feed-${batchId}-${Date.now()}-${crypto.randomUUID()}`,
+      );
+      onCreated(event);
+    } catch (err) {
+      setError(extractServerMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-4" data-testid="feeding-form">
+      <h3 className="font-display text-lg">Record feeding</h3>
+      <label className="block text-sm">
+        Feed description
+        <input
+          data-testid="feeding-description"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          required
+        />
+      </label>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block text-sm">
+          Quantity
+          <div className="mt-1 flex gap-1">
+            <input
+              data-testid="feeding-quantity"
+              type="number"
+              min={0.001}
+              step="0.001"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              value={quantity}
+              onChange={(e) => setQuantity(e.target.value)}
+              required
+            />
+            <select
+              data-testid="feeding-unit"
+              className="rounded-md border border-border bg-background px-2 text-sm"
+              value={unit}
+              onChange={(e) => setUnit(e.target.value as 'g' | 'kg')}
+            >
+              <option value="kg">kg</option>
+              <option value="g">g</option>
+            </select>
+          </div>
+        </label>
+        <label className="block text-sm">
+          Feeding round
+          <input
+            data-testid="feeding-round"
+            type="number"
+            min={1}
+            className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+            value={round}
+            onChange={(e) => setRound(e.target.value)}
+          />
+        </label>
+      </div>
+      <label className="block text-sm">
+        Method
+        <select
+          data-testid="feeding-method"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={method}
+          onChange={(e) => setMethod(e.target.value)}
+        >
+          <option value="broadcast">Broadcast</option>
+          <option value="tray">Tray</option>
+          <option value="automatic">Automatic</option>
+          <option value="hand">By hand</option>
+        </select>
+      </label>
+      <label className="block text-sm">
+        Notes
+        <textarea
+          data-testid="feeding-notes"
+          rows={2}
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+        />
+      </label>
+      {error && (
+        <p
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid="feeding-error"
+        >
+          {error}
+        </p>
+      )}
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={busy}
+          data-testid="feeding-submit"
+          className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
+        >
+          {busy ? 'Saving…' : 'Record feeding'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/* ================================================================= */
+/* MORTALITY — deliberate                                             */
+/* ================================================================= */
+
+export function MortalityForm({ batchId, onCreated, onCancel }: Omit<EventFormProps, 'eventType'>) {
+  const [count, setCount] = useState('10');
+  const [cause, setCause] = useState('');
+  const [disposal, setDisposal] = useState('burial');
+  const [observedAt, setObservedAt] = useState(nowLocalIso());
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (!confirm) {
+      setError('Confirm before recording mortality — this cannot be edited later.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const { event } = await postEvent(
+        batchId,
+        {
+          event_type: 'MORTALITY',
+          data: {
+            count: Number(count),
+            ...(cause.trim() ? { suspected_cause: cause.trim() } : {}),
+            disposal_method: disposal,
+            observed_at: new Date(observedAt).toISOString(),
+          },
+        },
+        `mort-${batchId}-${Date.now()}-${crypto.randomUUID()}`,
+      );
+      onCreated(event);
+    } catch (err) {
+      setError(extractServerMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-4" data-testid="mortality-form">
+      <h3 className="font-display text-lg">Record mortality</h3>
+      <p className="text-xs text-muted-foreground">
+        Mortality is deducted from the estimated remaining population. If the count exceeds
+        population, the platform will reject the entry — use the sampling workflow to reconcile the
+        count first.
+      </p>
+      <label className="block text-sm">
+        Number of individuals
+        <input
+          data-testid="mortality-count"
+          type="number"
+          min={1}
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={count}
+          onChange={(e) => setCount(e.target.value)}
+          required
+        />
+      </label>
+      <label className="block text-sm">
+        Suspected cause
+        <input
+          data-testid="mortality-cause"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={cause}
+          onChange={(e) => setCause(e.target.value)}
+        />
+      </label>
+      <label className="block text-sm">
+        Disposal method
+        <select
+          data-testid="mortality-disposal"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={disposal}
+          onChange={(e) => setDisposal(e.target.value)}
+        >
+          <option value="burial">Burial</option>
+          <option value="incineration">Incineration</option>
+          <option value="compost">Compost</option>
+          <option value="rendering">Rendering</option>
+          <option value="other">Other</option>
+        </select>
+      </label>
+      <label className="block text-sm">
+        Observed at
+        <input
+          data-testid="mortality-observed-at"
+          type="datetime-local"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+          value={observedAt}
+          onChange={(e) => setObservedAt(e.target.value)}
+          required
+        />
+      </label>
+      <label className="flex items-start gap-2 text-xs text-muted-foreground">
+        <input
+          type="checkbox"
+          data-testid="mortality-confirm"
+          className="mt-0.5"
+          checked={confirm}
+          onChange={(e) => setConfirm(e.target.checked)}
+        />
+        I confirm this mortality count is correct and append-only.
+      </label>
+      {error && (
+        <p
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid="mortality-error"
+        >
+          {error}
+        </p>
+      )}
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={busy}
+          data-testid="mortality-submit"
+          className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
+        >
+          {busy ? 'Saving…' : 'Record mortality'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/* ================================================================= */
+/* Catalog-driven fallback (SAMPLING / WATER_QUALITY / TRANSFER / HARVEST) */
+/* ================================================================= */
+
+interface JsonSchema {
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  type?: string;
+  enum?: string[];
+  format?: string;
+  description?: string;
+  minimum?: number;
+  maximum?: number;
+  default?: unknown;
+  $ref?: string;
+  anyOf?: JsonSchema[];
+}
+
+function inputTypeFor(prop: JsonSchema): 'text' | 'number' | 'datetime-local' | 'checkbox' {
+  if (prop.type === 'number' || prop.type === 'integer') return 'number';
+  if (prop.type === 'boolean') return 'checkbox';
+  if (prop.format === 'date-time') return 'datetime-local';
+  return 'text';
+}
+
+export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: CatalogFormProps) {
+  const schema = entry.schema as JsonSchema;
+  const properties = schema.properties ?? {};
+  const required = new Set(schema.required ?? []);
+  const [values, setValues] = useState<Record<string, string>>(() => {
+    const example = (entry.openapi_example ?? {}) as Record<string, unknown>;
+    const seed: Record<string, string> = {};
+    for (const key of Object.keys(properties)) {
+      const v = example[key];
+      if (v == null) continue;
+      if (typeof v === 'object') continue; // nested — leave blank
+      seed[key] = String(v);
+    }
+    return seed;
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function set(key: string, val: string) {
+    setValues((prev) => ({ ...prev, [key]: val }));
+  }
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const data: Record<string, unknown> = {};
+      for (const [key, prop] of Object.entries(properties)) {
+        const raw = values[key];
+        if (raw === undefined || raw === '') {
+          if (required.has(key)) throw new Error(`${key} is required.`);
+          continue;
+        }
+        if (prop.type === 'number' || prop.type === 'integer') data[key] = Number(raw);
+        else if (prop.type === 'boolean') data[key] = raw === 'true';
+        else if (prop.format === 'date-time') data[key] = new Date(raw).toISOString();
+        else data[key] = raw;
+      }
+      // Seed nested defaults from the example (e.g. WATER_QUALITY.measurement_units)
+      const example = (entry.openapi_example ?? {}) as Record<string, unknown>;
+      for (const [key, val] of Object.entries(example)) {
+        if (val != null && typeof val === 'object' && !(key in data)) data[key] = val;
+      }
+      const { event } = await postEvent(
+        batchId,
+        { event_type: entry.code, data },
+        `${entry.code.toLowerCase()}-${batchId}-${Date.now()}-${crypto.randomUUID()}`,
+      );
+      onCreated(event);
+    } catch (err) {
+      setError(extractServerMessage(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3" data-testid={`catalog-form-${entry.code}`}>
+      <h3 className="font-display text-lg">Record {entry.display_name}</h3>
+      <p className="text-xs text-muted-foreground">
+        Fields defined by the platform event catalog. Nested unit annotations auto-seed from the
+        platform defaults.
+      </p>
+      {Object.entries(properties).map(([key, prop]) => {
+        // Skip nested objects — we auto-populate from example defaults.
+        if (prop.type === 'object' || prop.$ref) return null;
+        const type = inputTypeFor(prop);
+        const isEnum = Array.isArray(prop.enum);
+        return (
+          <label key={key} className="block text-sm">
+            {key}
+            {required.has(key) && <span className="ml-1 text-destructive">*</span>}
+            {isEnum ? (
+              <select
+                data-testid={`catalog-field-${key}`}
+                className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={values[key] ?? ''}
+                onChange={(e) => set(key, e.target.value)}
+                required={required.has(key)}
+              >
+                <option value="" />
+                {(prop.enum ?? []).map((opt) => (
+                  <option key={opt} value={opt}>
+                    {opt}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                data-testid={`catalog-field-${key}`}
+                type={type}
+                className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={values[key] ?? ''}
+                onChange={(e) => set(key, e.target.value)}
+                required={required.has(key)}
+                step={prop.type === 'number' ? '0.001' : undefined}
+                min={prop.minimum}
+                max={prop.maximum}
+              />
+            )}
+            {prop.description && (
+              <span className="mt-0.5 block text-xs text-muted-foreground">{prop.description}</span>
+            )}
+          </label>
+        );
+      })}
+      {error && (
+        <p
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          data-testid={`catalog-error-${entry.code}`}
+        >
+          {error}
+        </p>
+      )}
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={busy}
+          data-testid={`catalog-submit-${entry.code}`}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
+        >
+          {busy ? 'Saving…' : `Record ${entry.display_name.toLowerCase()}`}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/* ================================================================= */
+/* Hook: fetch event catalog                                          */
+/* ================================================================= */
+
+export function useEventCatalog() {
+  const [catalog, setCatalog] = useState<EventCatalogEntry[] | null>(null);
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await apiFetch<{ entries: EventCatalogEntry[] }>(
+          '/v1/production-events/catalog',
+        );
+        setCatalog(res.entries);
+      } catch {
+        setCatalog([]);
+      }
+    })();
+  }, []);
+  return catalog;
+}

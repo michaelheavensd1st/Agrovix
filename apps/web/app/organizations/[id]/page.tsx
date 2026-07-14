@@ -75,10 +75,14 @@ export default function OrganizationDetail() {
           >
             {farms.map((f) => (
               <li key={f.id} className="flex items-center justify-between px-4 py-3">
-                <div>
+                <Link
+                  href={`/farms/${f.id}`}
+                  data-testid={`organization-farm-${f.code}`}
+                  className="flex-1"
+                >
                   <p className="text-sm font-medium">{f.name}</p>
                   <p className="text-xs text-muted-foreground">{f.code}</p>
-                </div>
+                </Link>
               </li>
             ))}
           </ul>

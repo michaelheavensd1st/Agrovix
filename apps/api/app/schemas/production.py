@@ -76,9 +76,32 @@ class ProductionSitePublic(BaseModel):
 # --------------------------------------------------------------------- #
 # ProductionUnitType
 # --------------------------------------------------------------------- #
+class BatchProjectionsPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    batch_id: UUID
+    initial_stocked_quantity: int
+    cumulative_mortality: int
+    cumulative_harvest: int
+    cumulative_transfer_out: int
+    estimated_remaining_population: int
+    latest_average_weight: float | None
+    weight_unit: str | None
+    estimated_biomass_kg: float | None
+    total_feed_kg: float
+    survival_rate: float | None
+    batch_age_days: int | None
+    latest_water_quality: dict | None
+    latest_sampling_at: str | None
+    computed_at: str
+
+
 class ProductionUnitTypeCreate(BaseModel):
     code: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=255)
+    display_name: str | None = Field(default=None, max_length=255)
+    plural_name: str | None = Field(default=None, max_length=255)
+    vertical: str | None = Field(default=None, max_length=64)
     description: str | None = Field(default=None, max_length=1000)
     category: str | None = Field(default=None, max_length=64)
     metadata_json: dict | None = None
@@ -91,6 +114,9 @@ class ProductionUnitTypePublic(BaseModel):
     organization_id: UUID | None
     code: str
     name: str
+    display_name: str
+    plural_name: str | None
+    vertical: str | None
     description: str | None
     category: str | None
     is_system: bool

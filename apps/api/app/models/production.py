@@ -130,6 +130,23 @@ class ProductionUnitType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     code: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="",
+        doc="User-facing singular label (e.g. 'Pond'). Never expose 'Production Unit' in the UI.",
+    )
+    plural_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="User-facing plural label (e.g. 'Ponds'). Falls back to display_name + 's'.",
+    )
+    vertical: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+        doc="Optional vertical tag ('aquaculture', 'livestock', 'crop', …).",
+    )
     description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

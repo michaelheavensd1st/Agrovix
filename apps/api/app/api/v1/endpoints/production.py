@@ -54,6 +54,7 @@ from app.repositories.production import (
     ProductionUnitTypeRepository,
 )
 from app.schemas.production import (
+    BatchProjectionsPublic,
     ProductionBatchCreate,
     ProductionBatchPublic,
     ProductionBatchTransitionPublic,
@@ -771,3 +772,31 @@ async def get_event(
     # Tenant check via the parent batch.
     await _load_batch(event.batch_id, user, session)
     return ProductionEventPublic.model_validate(event)
+
+
+# ===================================================================== #
+# APE Batch Projections — derived, read-only aggregates
+# ===================================================================== #
+@router.get(
+    "/batches/{batch_id}/projections",
+    response_model=BatchProjectionsPublic,
+    tags=["production-batches"],
+)
+async def get_batch_projections(
+    batch_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
+    event_repo: Annotated[ProductionEventRepository, Depends(get_event_repo)],
+) -> BatchProjectionsPublic:
+    """Return read-only aggregates for a single batch.
+
+    Nothing here is stored as an editable field — every value is
+    derived from the append-only event stream on demand. See
+    :mod:`app.services.projections`.
+    """
+    from app.services.projections import compute_batch_projections
+
+    batch, _unit, _site, _farm = await _load_batch(batch_id, user, session)
+    events = await event_repo.list_all_for_batch_asc(batch.id)
+    projections = compute_batch_projections(batch, events)
+    return BatchProjectionsPublic.model_validate(projections.as_dict())

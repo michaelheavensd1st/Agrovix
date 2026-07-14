@@ -14,43 +14,110 @@ from app.models.production import ProductionUnitType
 from app.models.role import Permission, Role
 from app.security.permissions import ALL_PERMISSIONS, ROLE_DEFINITIONS
 
-# System-owned production unit types (aquaculture-first; extend on release).
+# System-owned production unit types.
+#
+# Sprint 3 — Aquaculture Vertical Slice 01: this is the first vertical
+# to actually populate the catalog. The list below is comprehensive
+# enough to model the full grow-out lifecycle from broodstock to
+# harvest without introducing any parallel domain tables.
+#
+# Codes are IMMUTABLE once a system row exists. The seeder updates
+# `name`, `display_name`, `plural_name`, `description`, `category`
+# and `vertical`, but never changes `code`. Rename in the UI by
+# updating `display_name` — do NOT edit `code`.
 SYSTEM_UNIT_TYPES: tuple[dict, ...] = (
+    # -- Aquaculture — broodstock & hatchery lineage -------------- #
+    {
+        "code": "BROODSTOCK_UNIT",
+        "name": "Broodstock Unit",
+        "display_name": "Broodstock Unit",
+        "plural_name": "Broodstock Units",
+        "category": "broodstock",
+        "vertical": "aquaculture",
+        "description": "Tank or holding used exclusively for mature broodstock.",
+    },
+    {
+        "code": "INCUBATION_UNIT",
+        "name": "Incubation Unit",
+        "display_name": "Incubation Unit",
+        "plural_name": "Incubation Units",
+        "category": "hatchery",
+        "vertical": "aquaculture",
+        "description": "Incubator holding fertilised eggs before hatching.",
+    },
     {
         "code": "HATCHERY_TANK",
         "name": "Hatchery Tank",
+        "display_name": "Hatchery Tank",
+        "plural_name": "Hatchery Tanks",
         "category": "hatchery",
+        "vertical": "aquaculture",
         "description": "Indoor rearing tank for larvae and post-larvae.",
+    },
+    {
+        "code": "FRY_TANK",
+        "name": "Fry Tank",
+        "display_name": "Fry Tank",
+        "plural_name": "Fry Tanks",
+        "category": "hatchery",
+        "vertical": "aquaculture",
+        "description": "Rearing tank for very early juveniles.",
     },
     {
         "code": "NURSERY_TANK",
         "name": "Nursery Tank",
+        "display_name": "Nursery Tank",
+        "plural_name": "Nursery Tanks",
         "category": "nursery",
+        "vertical": "aquaculture",
         "description": "Grow-on tank for juveniles before pond transfer.",
     },
+    # -- Aquaculture — grow-out ----------------------------------- #
     {
         "code": "GROW_OUT_POND",
         "name": "Grow-out Pond",
+        "display_name": "Pond",
+        "plural_name": "Ponds",
         "category": "grow_out",
+        "vertical": "aquaculture",
         "description": "Outdoor pond used for the main grow-out cycle.",
-    },
-    {
-        "code": "CAGE",
-        "name": "Cage",
-        "category": "grow_out",
-        "description": "Suspended net cage in open water.",
-    },
-    {
-        "code": "RACEWAY",
-        "name": "Raceway",
-        "category": "grow_out",
-        "description": "Linear flow-through raceway system.",
     },
     {
         "code": "BIOFLOC_TANK",
         "name": "Biofloc Tank",
+        "display_name": "Biofloc Tank",
+        "plural_name": "Biofloc Tanks",
         "category": "biofloc",
+        "vertical": "aquaculture",
         "description": "High-density biofloc-based rearing tank.",
+    },
+    {
+        "code": "RACEWAY",
+        "name": "Raceway",
+        "display_name": "Raceway",
+        "plural_name": "Raceways",
+        "category": "grow_out",
+        "vertical": "aquaculture",
+        "description": "Linear flow-through raceway system.",
+    },
+    {
+        "code": "FLOATING_CAGE",
+        "name": "Floating Cage",
+        "display_name": "Cage",
+        "plural_name": "Cages",
+        "category": "grow_out",
+        "vertical": "aquaculture",
+        "description": "Suspended net cage in open water.",
+    },
+    # -- Aquaculture — bio-security ------------------------------- #
+    {
+        "code": "QUARANTINE_UNIT",
+        "name": "Quarantine Unit",
+        "display_name": "Quarantine Unit",
+        "plural_name": "Quarantine Units",
+        "category": "biosecurity",
+        "vertical": "aquaculture",
+        "description": "Isolated holding used for observation before movement.",
     },
 )
 
@@ -116,6 +183,9 @@ async def seed_permissions_and_roles() -> None:
                 existing.name = spec["name"]
                 existing.description = spec["description"]
                 existing.category = spec["category"]
+                existing.display_name = spec["display_name"]
+                existing.plural_name = spec.get("plural_name")
+                existing.vertical = spec.get("vertical")
 
         await session.commit()
 

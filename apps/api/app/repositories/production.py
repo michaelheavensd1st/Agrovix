@@ -401,3 +401,16 @@ class ProductionEventRepository:
             next_cursor = _encode_cursor(last.performed_at, last.id)
             rows = rows[:limit]
         return rows, next_cursor
+
+    async def list_all_for_batch_asc(self, batch_id: uuid.UUID) -> list[ProductionEvent]:
+        """Return every event for a batch in insertion order (asc).
+
+        Used by :func:`compute_batch_projections` — must reflect the
+        physical timeline so "latest" wins on later events.
+        """
+        stmt = (
+            select(ProductionEvent)
+            .where(ProductionEvent.batch_id == batch_id)
+            .order_by(ProductionEvent.performed_at.asc(), ProductionEvent.id.asc())
+        )
+        return list((await self.session.execute(stmt)).scalars().all())

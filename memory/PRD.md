@@ -200,10 +200,117 @@ the fix is to **extend APE first** (add the primitive, generalise
 it, ship it in a migration) and then let the vertical consume it —
 never fork the engine.
 
+## Sprint 3 — Aquaculture Vertical Slice 01 (2026-02-08)
+
+First vertical to run **on top of APE without a parallel domain
+track.** Sprint 3 proves the "extend, never duplicate" contract by
+delivering a complete stock-through-report workflow using nothing
+but APE primitives + vertical registrations.
+
+### Backend
+- **10 aquaculture unit types** system-seeded (idempotent):
+  `BROODSTOCK_UNIT`, `INCUBATION_UNIT`, `HATCHERY_TANK`, `FRY_TANK`,
+  `NURSERY_TANK`, `GROW_OUT_POND`, `BIOFLOC_TANK`, `RACEWAY`,
+  `FLOATING_CAGE`, `QUARANTINE_UNIT`.
+- **User-facing naming** on `ProductionUnitType`: added
+  `display_name`, `plural_name`, `vertical` columns (migration
+  `0006_aqua_vertical_slice_01`). `GROW_OUT_POND` renders as
+  "Pond" / "Ponds"; `FLOATING_CAGE` as "Cage" / "Cages".
+  Architecture stays abstract; product language stays natural.
+- **Sprint-3 event catalog** (only these 7, per spec): `STOCKING`,
+  `FEEDING`, `MORTALITY`, `SAMPLING`, `WATER_QUALITY`, `TRANSFER`,
+  `HARVEST`. Every schema is `extra="forbid"`, every schema has an
+  OpenAPI example, weight/feed/measurement units are explicit.
+- **Business rules** (pre-insert, atomic with event insert):
+  - `MORTALITY.count` cannot exceed
+    `estimated_remaining_population`; no silent negative stock.
+  - `TRANSFER.source_unit_id` must equal the batch's current unit;
+    destination must exist and share the same farm;
+    cross-farm transfers rejected with
+    `transfer_cross_farm_blocked`; population guard applies.
+  - `HARVEST.is_final=true` triggers the existing
+    HARVESTED transition; partial harvests stay ACTIVE.
+- **Projections service** (`app/services/projections.py`): derived,
+  read-only aggregates over the append-only event stream —
+  `initial_stocked_quantity`, `cumulative_mortality`,
+  `cumulative_harvest`, `cumulative_transfer_out`,
+  `estimated_remaining_population` (SAMPLING override or
+  mass-balance), `latest_average_weight`, `estimated_biomass_kg`,
+  `total_feed_kg`, `survival_rate`, `batch_age_days`,
+  `latest_water_quality`. Exposed at
+  `GET /api/v1/batches/{id}/projections` via `BatchProjectionsPublic`.
+- **Idempotency** applied to every new event type (SAVEPOINT +
+  partial-unique index — unchanged from CRG01).
+- Bug fix (found while wiring OpenAPI for the projections
+  endpoint): removed `response_class=None` from
+  `DELETE /organizations/{id}` which was breaking
+  `app.openapi()` generation.
+
+### Frontend (`apps/web`)
+- New pages:
+  - `/farms/[farmId]` — sites index
+  - `/sites/[siteId]` — units grouped by their vertical display
+    name ("Ponds", "Cages", "Hatchery Tanks", …)
+  - `/units/[unitId]` — batches for a unit
+  - `/batches/[batchId]` — event timeline, projections panel,
+    record-event workflows
+- **Deliberate forms** (not JSON-schema renderers) for STOCKING,
+  FEEDING, MORTALITY (`components/event-forms.tsx`).
+- **Catalog-driven fallback form** for SAMPLING / WATER_QUALITY /
+  TRANSFER / HARVEST, seeded from the OpenAPI example, nested
+  unit annotations auto-populated.
+- Shared UX components (`components/ape-ui.tsx`): Breadcrumbs,
+  StateBadge (colour-coded lifecycle), Loading, EmptyState,
+  ErrorBanner, ForbiddenBanner — covers **explicit loading,
+  empty, error, forbidden, offline states** (spec requirement).
+- Every interactive element carries `data-testid`.
+- Mobile-responsive Tailwind layouts throughout.
+
+### Testing
+- **New test file** `test_aquaculture_slice_01.py` (26 tests) —
+  unit-type seeding + idempotency, valid payloads per event type,
+  schema-level rejections (missing species, ph=15, min>avg,
+  harvest total requires is_final), deleted-unit rejection,
+  idempotency replay + payload conflict for new event types,
+  mortality guard (exceeds population, on planned batch),
+  transfer source-mismatch / destination-not-found /
+  cross-farm-blocked, final vs partial harvest, projections
+  correctness incl. SAMPLING population override, timeline
+  cursor pagination stability, cross-tenant rejection.
+- Test helpers in `_helpers.py` provide canonical payload
+  builders for all 7 event types so downstream sprints stay
+  aligned automatically.
+- Vitest coverage in `apps/web/tests/event-forms.test.tsx`
+  proves the deliberate forms gate empty / unconfirmed
+  submissions client-side.
+
+### Validation (branch `fix/codex-review-gate-01` continued)
+- ruff / black: PASS
+- pytest SQLite: **110 passed / 1 skipped** (postgres-only race)
+- pytest Postgres: **111 passed**
+- Alembic full round-trip on fresh Postgres:
+  `upgrade head` → `downgrade base` → `upgrade head` — clean.
+- `alembic upgrade head + python -m app.seed` on fresh Postgres:
+  SEED OK.
+- prettier / eslint / tsc / `vitest --run` — 7/7 workspaces green.
+- Next.js production build: 15 routes, 0 prerender errors.
+- Curl-driven E2E: register → verify → create org / farm / site /
+  3 ponds / batch → STOCKING (25 000 shrimp, PL10) → transition
+  to ACTIVE → 3 feedings + mortality + sampling + water-quality;
+  `GET /projections` returns:
+  `stocked=25 000, mortality=420, remaining=23 800 (sampling
+  override), avg=4.8g, biomass=114.24kg, feed=19.5kg,
+  survival=95.2%, latest_water_quality={temp 29.4°C, DO 5.6mg/l,
+  pH 7.9, …}`.
+
+**Test total: 111 on Postgres** (was 85 → +26 for the vertical
+slice).
+
 ## Next Actions
-1. Extend APE with vertical-specific catalog entries (aquaculture-first)
-   and any new lifecycle rules they require — no parallel
-   domain-model track.
+1. **Await approval before Sprint 4.** Do NOT begin inventory
+   integration or additional aquaculture lifecycle features
+   (breeding, spawning, incubation, hatching, grading,
+   medication, sales) without explicit go.
 2. Resend backend for `EmailSender` (verified sender + templated HTML).
 3. Fine-grained audit UI + filtering + export.
 4. Mobile onboarding flow (currently just shell).

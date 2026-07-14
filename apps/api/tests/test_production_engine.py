@@ -19,6 +19,9 @@ from tests._helpers import (
     create_farm,
     create_org,
     create_verified_user,
+    feeding_payload,
+    harvest_payload,
+    stocking_payload,
     switch_user,
 )
 
@@ -132,9 +135,13 @@ async def test_system_unit_types_are_seeded(client: AsyncClient) -> None:
         "HATCHERY_TANK",
         "NURSERY_TANK",
         "GROW_OUT_POND",
-        "CAGE",
+        "FLOATING_CAGE",
         "RACEWAY",
         "BIOFLOC_TANK",
+        "BROODSTOCK_UNIT",
+        "INCUBATION_UNIT",
+        "FRY_TANK",
+        "QUARANTINE_UNIT",
     ):
         assert expected in codes
 
@@ -200,7 +207,7 @@ async def test_batch_lifecycle_via_event_and_explicit_transitions(client: AsyncC
         f"/api/v1/batches/{batch_id}/events",
         json={
             "event_type": "STOCKING",
-            "data": {"quantity": 10000, "average_weight_g": 0.2, "source": "Hatchery X"},
+            "data": stocking_payload(quantity=10000, average_weight=0.2, source="Hatchery X"),
         },
     )
     assert r.status_code == 201, r.text
@@ -222,7 +229,7 @@ async def test_batch_lifecycle_via_event_and_explicit_transitions(client: AsyncC
         f"/api/v1/batches/{batch_id}/events",
         json={
             "event_type": "HARVEST",
-            "data": {"quantity": 9500, "biomass_kg": 1200.0, "is_final": True},
+            "data": harvest_payload(quantity=9500, total_weight=1200.0, is_final=True),
         },
     )
     assert r.status_code == 201
@@ -241,7 +248,7 @@ async def test_batch_lifecycle_via_event_and_explicit_transitions(client: AsyncC
     # Cannot log new events on a closed batch.
     r = await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "FEEDING", "data": {"feed_kg": 1.0, "feed_type": "starter"}},
+        json={"event_type": "FEEDING", "data": feeding_payload()},
     )
     assert r.status_code == 409
 
@@ -279,7 +286,7 @@ async def test_batch_transitions_are_recorded_in_history(client: AsyncClient) ->
 
     await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "STOCKING", "data": {"quantity": 100}},
+        json={"event_type": "STOCKING", "data": stocking_payload(quantity=100)},
     )
 
     r = await client.get(f"/api/v1/batches/{batch_id}/transitions")
@@ -304,7 +311,7 @@ async def test_concurrent_transitions_only_one_wins(client: AsyncClient) -> None
     # Move to STOCKED so both transitions below are legal from that state.
     await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "STOCKING", "data": {"quantity": 5}},
+        json={"event_type": "STOCKING", "data": stocking_payload(quantity=5)},
     )
 
     # Concurrent STOCKED→ACTIVE and STOCKED→SUSPENDED
@@ -325,17 +332,17 @@ async def test_event_catalog_returns_all_types(client: AsyncClient) -> None:
     r = await client.get("/api/v1/production-events/catalog")
     assert r.status_code == 200, r.text
     codes = {e["code"] for e in r.json()["entries"]}
+    # Sprint 3 aquaculture slice — MEDICATION / INSPECTION are
+    # explicitly deferred; verticals will register them later.
     assert {
         "STOCKING",
         "FEEDING",
         "MORTALITY",
         "SAMPLING",
         "WATER_QUALITY",
-        "MEDICATION",
         "TRANSFER",
         "HARVEST",
-        "INSPECTION",
-    }.issubset(codes)
+    } == codes
 
 
 @pytest.mark.asyncio
@@ -369,7 +376,7 @@ async def test_event_rejects_extra_fields(client: AsyncClient) -> None:
         f"/api/v1/batches/{batch_id}/events",
         json={
             "event_type": "FEEDING",
-            "data": {"feed_kg": 5.0, "feed_type": "grower", "totally_extra": True},
+            "data": {**feeding_payload(quantity=5.0), "totally_extra": True},
         },
     )
     assert r.status_code == 422, r.text
@@ -386,11 +393,13 @@ async def test_event_rejects_missing_required_field(client: AsyncClient) -> None
     batch_id = await _create_batch(client, unit_id)
     r = await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "STOCKING", "data": {}},  # missing quantity
+        json={"event_type": "STOCKING", "data": {}},  # missing required fields
     )
     assert r.status_code == 422, r.text
     body = r.json()["detail"]
-    assert any(e["field"] == "quantity" for e in body["errors"])
+    fields = {e["field"] for e in body["errors"]}
+    assert "quantity" in fields
+    assert "species_code" in fields
 
 
 @pytest.mark.asyncio
@@ -410,7 +419,7 @@ async def test_event_pagination_is_stable_and_cursor_based(client: AsyncClient) 
     for i in range(5):
         r = await client.post(
             f"/api/v1/batches/{batch_id}/events",
-            json={"event_type": "FEEDING", "data": {"feed_kg": 1.0 + i, "feed_type": "grower"}},
+            json={"event_type": "FEEDING", "data": feeding_payload(quantity=1.0 + i)},
         )
         assert r.status_code == 201
 
@@ -448,7 +457,7 @@ async def test_cross_tenant_access_returns_404(client: AsyncClient) -> None:
     # Log an event so we have something concrete to leak.
     await client.post(
         f"/api/v1/batches/{a_batch}/events",
-        json={"event_type": "STOCKING", "data": {"quantity": 1}},
+        json={"event_type": "STOCKING", "data": stocking_payload(quantity=1)},
     )
     r = await client.get(f"/api/v1/batches/{a_batch}/events")
     event_id = r.json()["items"][0]["id"]
