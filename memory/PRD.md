@@ -131,8 +131,34 @@ Commits: `f790649` (initial sweep), `85254e1` (enum label fix + drop live-HTTP s
 
 **Test total: 85** on Postgres (was 77 → +8 for CRG01 regressions).
 
+## Domain positioning (2026-02-07)
+
+The **Production Engine** built in Sprint 2 (`Organization → Farm →
+ProductionSite → ProductionUnit → ProductionBatch → ProductionEvent`
++ pluggable `EventCatalog`) **is** the canonical agricultural domain
+foundation. All future vertical capabilities — aquaculture, crop,
+livestock — extend the engine rather than introduce a parallel set
+of generic domain models. New "domain" work manifests as:
+
+- Additional `ProductionUnitType` codes (system-seeded and/or org-custom).
+- New `EventCatalogEntry` registrations with Pydantic payload schemas
+  and (optionally) a `triggers_transition_to` mapping.
+- New batch-state predicates and lifecycle rules attached to the
+  existing state machine.
+- New reporting / aggregation projections over `production_events`.
+
+There is **no** roadmap item to build `Crop`, `Season`, `Hatchery`,
+`Pond`, `FeedLog`, `MortalityLog`, etc. as free-standing tables. Those
+names are aquaculture-flavoured surface concepts; their persistence
+lives inside `ProductionEvent.data` (JSONB), governed by their catalog
+schema. `StockingEvent`, `HARVEST`, `FEEDING`, `MORTALITY`,
+`WATER_QUALITY`, `SAMPLING`, `MEDICATION`, `TRANSFER`, `INSPECTION`
+are already registered.
+
 ## Next Actions
-1. Aquaculture domain: Hatchery, Pond, Batch, StockingEvent, FeedLog, MortalityLog.
+1. Extend the Production Engine with vertical-specific catalog entries
+   (aquaculture-first) and any new lifecycle rules they require — no
+   parallel domain-model track.
 2. Resend backend for `EmailSender` (verified sender + templated HTML).
 3. Fine-grained audit UI + filtering + export.
 4. Mobile onboarding flow (currently just shell).
