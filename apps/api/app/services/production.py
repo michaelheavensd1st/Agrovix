@@ -413,6 +413,17 @@ class ProductionBatchService:
         triggering_event: ProductionEvent | None = None,
         metadata: dict | None = None,
     ) -> ProductionBatch:
+        # Serialise concurrent transitions through the same row lock
+        # used by event insertion (Codex Review Gate 02). Skipped when
+        # this call is already re-entering under an event write —
+        # ``triggering_event is not None`` means the caller already
+        # acquired the lock a few frames up, avoiding a self-deadlock.
+        if triggering_event is None:
+            locked = await self.batch_repo.get_by_id_for_update(batch.id)
+            if locked is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Batch not found.")
+            batch = locked
+
         current = batch.state
         self._validate_transition(
             current=current, target=target_state, triggering_event=triggering_event
@@ -510,14 +521,16 @@ class ProductionEventService:
         returned instead of creating a new one — the endpoint uses
         this to signal 200 vs 201 to the client (see
         docs/audits/codex-review-gate-01.md, finding CRG01-2).
-        """
-        if batch.state in _TERMINAL_STATES:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                f"Cannot log new events on a {batch.state.value} batch.",
-            )
 
-        # ---- Catalog validation ---------------------------------- #
+        Concurrency (Codex Review Gate 02):
+        the batch row is loaded with ``SELECT ... FOR UPDATE`` inside
+        the request transaction so mortality/transfer/harvest
+        population arithmetic, STOCKING-once enforcement and
+        final-harvest gating cannot race with a concurrent event
+        write on the same batch. All population reads used for
+        validation happen AFTER the lock is held.
+        """
+        # ---- Catalog validation (schema first — cheap, no DB) ---- #
         code = str(payload.get("event_type", "")).upper()
         entry: EventCatalogEntry | None = CATALOG.get(code)
         if entry is None:
@@ -544,10 +557,9 @@ class ProductionEventService:
                 },
             ) from exc
 
-        # ---- Idempotency check (pre-insert) ---------------------- #
-        # Stable hash covering event_type + validated data + is_final
-        # so replaying the SAME key with a DIFFERENT payload is
-        # detected as a conflict.
+        # ---- Idempotency check (pre-lock, pre-insert) ------------ #
+        # Cheap short-circuit for the common replay case so we don't
+        # take out the batch lock unnecessarily.
         payload_hash = _compute_payload_hash(entry.code, validated_data)
         if idempotency_key is not None:
             existing = await self.event_repo.get_by_batch_and_key(batch.id, idempotency_key)
@@ -568,19 +580,46 @@ class ProductionEventService:
                 # re-audit, re-transition, or re-write anything.
                 return existing, True
 
-        # ---- Sprint 3 business rules ----------------------------- #
-        # These run AFTER idempotency lookup so replays are cheap and
-        # BEFORE the INSERT so no partial write ever escapes.
+        # ---- Serialise on the batch row (Postgres: FOR UPDATE) --- #
+        # Every subsequent read used for population validation must
+        # go through ``self.event_repo`` on the same session so the
+        # queries observe the same snapshot the lock is holding.
+        locked_batch = await self.batch_repo.get_by_id_for_update(batch.id)
+        if locked_batch is None:
+            # Deleted between the endpoint's tenancy load and now.
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Batch not found.")
+        # Reflect the freshly-locked state onto the ORM instance the
+        # caller passed in so downstream code (transitions, audit
+        # metadata) sees the truth.
+        batch = locked_batch
+
+        if batch.state in _TERMINAL_STATES:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Cannot log new events on a {batch.state.value} batch.",
+            )
+
+        # ---- Site / Unit lifecycle policy (Codex Review Gate 02) - #
+        await self._enforce_site_unit_lifecycle_policy(
+            code=entry.code,
+            site=site,
+            unit=unit,
+            batch=batch,
+            data=validated_data,
+        )
+
+        # ---- Sprint 3 business rules (now under batch lock) ------ #
+        # These run AFTER lock acquisition so mortality / transfer /
+        # harvest population arithmetic is race-free.
+        is_final = bool(validated_data.get("is_final", False))
         await self._enforce_business_rules(
             code=entry.code,
             data=validated_data,
             batch=batch,
             unit=unit,
             farm=farm,
+            is_final=is_final,
         )
-
-        # Determine is_final flag for events that carry one (e.g. HARVEST).
-        is_final = bool(validated_data.get("is_final", False))
 
         try:
             # Wrap the INSERT in a SAVEPOINT so that a concurrent-race
@@ -687,25 +726,78 @@ class ProductionEventService:
         batch: ProductionBatch,
         unit: ProductionUnit,
         farm: Farm,
+        is_final: bool = False,
     ) -> None:
-        """Vertical-neutral pre-insert guards for Sprint 3 events.
+        """Vertical-neutral pre-insert guards.
 
-        The APE contract is:
+        Called AFTER the batch row is held under
+        ``SELECT ... FOR UPDATE`` so every population-based decision
+        is race-free with concurrent event writes on the same batch.
 
-        * Deleted / inactive units and farms already fail through
-          ``_load_batch`` in the endpoint (soft-deleted rows are 404).
-        * MORTALITY count cannot exceed the batch's estimated
-          remaining population. There is no "negative stock" mode
-          in Sprint 3.
-        * TRANSFER events must reference the batch's current unit
-          as source, and a destination unit inside the SAME farm
-          (and therefore the same organization). Cross-farm
-          transfers are blocked pending a Sprint 4 lineage feature.
+        Contract (Codex Review Gate 02):
+
+        * STOCKING is allowed only while batch state is ``PLANNED`` and
+          only once per batch. A second STOCKING attempt returns 409
+          ``stocking_already_recorded``. See PRD "Sprint 3 STOCKING
+          policy".
+        * MORTALITY / TRANSFER / HARVEST quantities cannot exceed the
+          estimated remaining population computed inside the lock.
+        * HARVEST with ``is_final=true`` is rejected if the batch has
+          already recorded a final HARVEST (409 ``harvest_already_final``)
+          — HARVESTED batches also block through the terminal-state
+          check upstream, this guard covers the ACTIVE-batch race
+          where two final harvests would otherwise land simultaneously.
+        * TRANSFER events must reference the batch's current unit as
+          source, and a destination unit inside the SAME farm (and
+          therefore the same organization). Cross-farm transfers
+          rejected pending a Sprint 4 lineage feature.
         """
-        if code == "MORTALITY":
+        if code == "STOCKING":
+            await self._enforce_stocking_once(batch=batch)
+        elif code == "MORTALITY":
             await self._enforce_mortality_bounds(batch=batch, data=data)
         elif code == "TRANSFER":
             await self._enforce_transfer_scope(batch=batch, unit=unit, farm=farm, data=data)
+        elif code == "HARVEST":
+            await self._enforce_harvest_rules(batch=batch, data=data, is_final=is_final)
+
+    async def _enforce_stocking_once(self, *, batch: ProductionBatch) -> None:
+        """Sprint 3 STOCKING policy: exactly one STOCKING per batch, PLANNED only.
+
+        Rationale (see PRD "Sprint 3 STOCKING policy"): a batch is one
+        biologically coherent cohort. Allowing multiple STOCKINGs would
+        distort ``initial_stocked_quantity``, cumulative mortality,
+        survival rate, biomass and harvest projections. Corrections
+        require a dedicated future correction/adjustment workflow so
+        the audit trail stays intact.
+        """
+        if batch.state != ProductionBatchState.PLANNED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "stocking_only_in_planned_state",
+                    "message": (
+                        "STOCKING is only allowed while the batch is in the PLANNED "
+                        f"state. Current state: {batch.state.value}."
+                    ),
+                    "batch_state": batch.state.value,
+                },
+            )
+        # Serialised through the FOR UPDATE lock on the batch row taken
+        # in :meth:`create`, so this count is race-safe.
+        already = await self.event_repo.count_by_type(batch.id, "STOCKING")
+        if already > 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "stocking_already_recorded",
+                    "message": (
+                        "This batch already has a STOCKING event. A batch represents "
+                        "a single biological cohort; additional stock must go into a "
+                        "new batch or arrive via a TRANSFER event."
+                    ),
+                },
+            )
 
     async def _enforce_mortality_bounds(self, *, batch: ProductionBatch, data: dict) -> None:
         from app.services.projections import compute_batch_projections  # local import: cycle-safe
@@ -741,6 +833,139 @@ class ProductionEventService:
                     "estimated_remaining_population": remaining,
                 },
             )
+
+    async def _enforce_harvest_rules(
+        self,
+        *,
+        batch: ProductionBatch,
+        data: dict,
+        is_final: bool,
+    ) -> None:
+        """Harvest validation completeness (Codex Review Gate 02):
+
+        * ``quantity <= remaining_population``
+        * ``total_weight > 0`` (schema enforced; guarded again here)
+        * A second final HARVEST is rejected 409
+          ``harvest_already_final`` — atomic with the transition.
+        """
+        from app.services.projections import compute_batch_projections  # cycle-safe
+
+        qty = int(data.get("quantity", 0) or 0)
+        total_weight = float(data.get("total_weight", 0) or 0)
+        if total_weight <= 0:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": "harvest_total_weight_required",
+                    "message": "HARVEST total_weight must be greater than zero.",
+                },
+            )
+
+        events = await self.event_repo.list_all_for_batch_asc(batch.id)
+        projections = compute_batch_projections(batch, events)
+        remaining = projections.estimated_remaining_population
+        if qty > remaining:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "harvest_exceeds_population",
+                    "message": (
+                        f"Harvest quantity {qty} exceeds estimated remaining "
+                        f"population {remaining}."
+                    ),
+                    "quantity": qty,
+                    "estimated_remaining_population": remaining,
+                },
+            )
+
+        if is_final and await self.event_repo.has_final_harvest(batch.id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "harvest_already_final",
+                    "message": (
+                        "This batch already has a final HARVEST event. "
+                        "Additional harvests are not permitted."
+                    ),
+                },
+            )
+
+    async def _enforce_site_unit_lifecycle_policy(
+        self,
+        *,
+        code: str,
+        site: ProductionSite,
+        unit: ProductionUnit,
+        batch: ProductionBatch,
+        data: dict,
+    ) -> None:
+        """Site + Unit lifecycle policy (Codex Review Gate 02).
+
+        Reads are always allowed (they never reach here). Writes are
+        governed by:
+
+        Unit / Site status = ``CLOSED`` → *all* event writes 409
+        ``resource_closed_no_writes``. A CLOSED unit or site is
+        read-only; batches must be transferred, harvested, cancelled
+        or failed before their unit can transition to CLOSED (enforced
+        at the PATCH endpoint).
+
+        Unit / Site status = ``MAINTENANCE`` → only WATER_QUALITY and
+        TRANSFER-out (source_unit_id == this batch's current unit)
+        are permitted. All other event types 409
+        ``resource_under_maintenance``.
+        """
+        # Site-first (a MAINTENANCE / CLOSED site strictly implies the
+        # units underneath share the constraint even if the unit row
+        # is still ACTIVE — this keeps the policy consistent).
+        site_status = getattr(site, "status", None)
+        unit_status = getattr(unit, "status", None)
+
+        # Two allow-lists so the wording of the 409 stays specific.
+        maintenance_allowed = {"WATER_QUALITY"}
+        # TRANSFER is allowed under MAINTENANCE only when it evacuates
+        # OUT of the maintenance unit; the transfer-scope guard below
+        # already forces source_unit_id == current-unit == this unit.
+        if code == "TRANSFER":
+            src = str(data.get("source_unit_id", "")).strip()
+            if src == str(unit.id):
+                maintenance_allowed.add("TRANSFER")
+
+        # CLOSED — reject everything.
+        for label, value in (("site", site_status), ("unit", unit_status)):
+            if value == getattr(type(value), "CLOSED", "closed") or value == "closed":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "resource_closed_no_writes",
+                        "message": (
+                            f"The {label} for this batch is CLOSED. No new events, "
+                            "transitions, or mutations are permitted."
+                        ),
+                        "resource": label,
+                    },
+                )
+
+        # MAINTENANCE — narrow allow-list.
+        for label, value in (("site", site_status), ("unit", unit_status)):
+            is_maintenance = value == "maintenance" or value == getattr(
+                type(value), "MAINTENANCE", "maintenance"
+            )
+            if is_maintenance and code not in maintenance_allowed:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "resource_under_maintenance",
+                        "message": (
+                            f"The {label} for this batch is under MAINTENANCE. "
+                            "Only WATER_QUALITY readings and evacuating TRANSFER "
+                            "events are permitted while maintenance is in progress."
+                        ),
+                        "resource": label,
+                        "allowed_events": sorted(maintenance_allowed),
+                    },
+                )
+        del batch  # unused today — placeholder for future batch-state gates.
 
     async def _enforce_transfer_scope(
         self,
@@ -795,6 +1020,37 @@ class ProductionEventService:
                     "message": "Destination unit's site is unavailable.",
                 },
             )
+
+        # Destination lifecycle — Codex Review Gate 02: never transfer
+        # INTO a CLOSED or MAINTENANCE unit / site. TRANSFERs into
+        # MAINTENANCE would violate the "only water-quality + evacuate"
+        # allow-list; CLOSED is read-only entirely.
+        dst_site_status = getattr(dst_site, "status", None)
+        dst_unit_status = getattr(dst_unit, "status", None)
+        for label, value in (("site", dst_site_status), ("unit", dst_unit_status)):
+            if value == "closed":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_destination_closed",
+                        "message": (
+                            f"Destination {label} is CLOSED. TRANSFER is not " "permitted."
+                        ),
+                        "resource": label,
+                    },
+                )
+            if value == "maintenance":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_destination_under_maintenance",
+                        "message": (
+                            f"Destination {label} is under MAINTENANCE. Wait for "
+                            "the maintenance window to end before transferring in."
+                        ),
+                        "resource": label,
+                    },
+                )
 
         # Cross-farm transfers are blocked in Sprint 3.
         if dst_site.farm_id != farm.id:

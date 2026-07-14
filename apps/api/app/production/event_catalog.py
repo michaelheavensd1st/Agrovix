@@ -235,7 +235,7 @@ class HarvestEventSchema(_StrictModel):
     ``is_final=true``. Partial harvests remain in-state."""
 
     quantity: int = Field(ge=1)
-    total_weight: float = Field(ge=0)
+    total_weight: float = Field(gt=0, description="Aggregate harvested biomass; must be positive.")
     average_weight: float | None = Field(default=None, ge=0)
     weight_unit: WeightUnit = Field(default=WeightUnit.KG)
     harvest_type: HarvestType = Field(default=HarvestType.PARTIAL)

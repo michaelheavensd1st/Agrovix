@@ -314,3 +314,111 @@ slice).
 2. Resend backend for `EmailSender` (verified sender + templated HTML).
 3. Fine-grained audit UI + filtering + export.
 4. Mobile onboarding flow (currently just shell).
+
+## Codex Review Gate 02 — pre-merge hardening (2026-02-08 pm)
+
+Locked-in policies and enforcement pass on branch
+`fix/codex-review-gate-01`. Fixed the five items surfaced during the
+Sprint 3 acceptance review before merge.
+
+### CRG02-1 · Endpoint permission enforcement
+Every APE production endpoint now enforces an explicit permission
+scope AFTER the tenancy 404 check. Order is unchanged
+(non-members still get 404, not 403) so the cross-tenant leak
+invariant from Sprint 1 is preserved.
+
+Codes enforced per route (permission-driven, never role-name):
+- Sites: `production_site.create|read|update|delete|restore`
+- Unit types: `production_unit_type.create|delete`
+  (`.read` implicit — the list endpoint is scope-filtered)
+- Units: `production_unit.create|read|update|delete`
+- Batches: `production_batch.create|read|update|transition`
+- Events: `production_event.create|read`
+
+Regression tests (`test_codex_review_gate_02.py`):
+- viewer role → 403 on POST /events
+- non-member → 404 (tenancy 404 still precedes permission 403)
+- viewer role → 200 on GET /batches/{id}
+
+### CRG02-2 · Postgres row-level concurrency
+`ProductionBatchRepository.get_by_id_for_update()` emits
+`SELECT ... FOR UPDATE` on Postgres. `ProductionEventService.create()`
+and `ProductionBatchService.transition()` acquire the batch lock at
+the top of their flow so:
+- MORTALITY / TRANSFER / HARVEST population validation reads happen
+  INSIDE the same lock as the INSERT
+- Two mortalities that together exceed remaining population resolve
+  to exactly one 201 + one 409 (proven under real Postgres in
+  `test_concurrent_mortalities_never_overshoot`)
+- Same for TRANSFER and final HARVEST races (dedicated tests each)
+- Two racing STOCKING events resolve to exactly one 201 + one 409
+
+Under SQLite the FOR UPDATE clause is a no-op, but StaticPool +
+single connection already serialise writers so the domain guards
+still hold. Race tests are `_postgres_only`.
+
+### CRG02-3 · STOCKING policy (documented + enforced)
+**Exactly one STOCKING event per batch, allowed only while
+`state == PLANNED`.**
+
+Rationale — a batch is one biologically coherent cohort. Multiple
+stocking events would distort `initial_stocked_quantity`, cumulative
+mortality, biomass and survival rate. Additional intake must arrive
+via:
+- a new batch, or
+- a TRANSFER event from a source batch where lineage is preserved.
+
+Adjustments are deliberately NOT in scope for Sprint 3 — a
+controlled correction workflow is a Sprint 4+ backlog item.
+
+Enforcement points:
+- `ProductionEventService._enforce_stocking_once()` — 409
+  `stocking_only_in_planned_state` outside PLANNED, 409
+  `stocking_already_recorded` on repeat
+- Batch state machine (STOCKING drives PLANNED → STOCKED once)
+- Postgres FOR UPDATE lock serialises concurrent stocking attempts
+
+### CRG02-4 · HARVEST validation
+- `quantity <= estimated_remaining_population` → 409
+  `harvest_exceeds_population`
+- `total_weight > 0` — tightened schema (`gt=0`); a redundant
+  server-side guard covers the corner case that would otherwise
+  need a migration
+- Second final HARVEST rejected: either 409
+  `harvest_already_final` (racing on ACTIVE) or the terminal-state
+  guard (batch already HARVESTED)
+- All checks run under the batch FOR UPDATE lock so concurrent
+  final harvests resolve to exactly one 201 + one 409
+
+### CRG02-5 · Site / Unit lifecycle policy
+**MAINTENANCE — narrow allow-list of writes.** Only these events
+are permitted while a site or unit is in maintenance:
+- `WATER_QUALITY` — readings must continue during maintenance
+- `TRANSFER` — permitted only when the source unit is the unit
+  under maintenance (i.e. an evacuation). Transfer INTO a
+  MAINTENANCE unit is blocked with `transfer_destination_under_maintenance`.
+
+Blocked while MAINTENANCE: `STOCKING`, `FEEDING`, `MORTALITY`,
+`SAMPLING`, `HARVEST`, and any TRANSFER not evacuating.
+A mortality observation during maintenance is BLOCKED for Sprint 3
+and documented as a limitation — a Sprint 4+ emergency / incident
+pathway can handle exceptions.
+
+**CLOSED — read-only.** Every write returns 409
+`resource_closed_no_writes`. A unit or site cannot transition to
+CLOSED while it still holds an active (PLANNED / STOCKED / ACTIVE
+/ SUSPENDED) batch — enforced at PATCH `/units/{id}` and PATCH
+`/sites/{id}` with error codes `unit_close_blocked_by_active_batches`
+and `site_close_blocked_by_active_batches`. HARVESTED batches are
+permitted (final harvest IS the exit gate).
+
+### Validation (all green on this branch)
+- ruff / black — 0 issues
+- pytest SQLite: **123 passed / 5 skipped** (Postgres-only race
+  tests)
+- pytest Postgres: **128 passed** — including all 4 CRG02 concurrency
+  tests
+- alembic upgrade head → downgrade base → upgrade head — clean on
+  fresh Postgres
+
+**Test total: 128 on Postgres** (was 111 → +17 for CRG02).

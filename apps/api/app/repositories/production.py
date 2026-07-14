@@ -228,6 +228,33 @@ class ProductionBatchRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_by_id_for_update(self, batch_id: uuid.UUID) -> ProductionBatch | None:
+        """Locked read of a batch row inside the current transaction.
+
+        Emits ``SELECT ... FOR UPDATE`` on Postgres so any concurrent
+        event insertion, mortality/transfer/harvest validation, and
+        lifecycle transition on the same batch serialises behind this
+        lock. On SQLite the ``with_for_update`` clause is a no-op — the
+        driver already serialises writers, so the domain-level guards
+        remain correct.
+
+        Callers MUST use this INSIDE the request-scoped transaction
+        (i.e. before any subsequent read of the batch state used for
+        validation).
+        """
+        # ``populate_existing`` forces SQLAlchemy to refresh the ORM
+        # attributes for the returned row even if the identity map
+        # already contains it — otherwise the lock buys us serialisation
+        # but the batch.state we validate against could be stale from
+        # an earlier read in the same transaction.
+        stmt = (
+            select(ProductionBatch)
+            .where(ProductionBatch.id == batch_id, ProductionBatch.deleted_at.is_(None))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def list_for_unit(self, unit_id: uuid.UUID) -> Sequence[ProductionBatch]:
         stmt = (
             select(ProductionBatch)
@@ -414,3 +441,18 @@ class ProductionEventRepository:
             .order_by(ProductionEvent.performed_at.asc(), ProductionEvent.id.asc())
         )
         return list((await self.session.execute(stmt)).scalars().all())
+
+    async def count_by_type(self, batch_id: uuid.UUID, event_type: str) -> int:
+        stmt = select(func.count(ProductionEvent.id)).where(
+            ProductionEvent.batch_id == batch_id,
+            ProductionEvent.event_type == event_type.upper(),
+        )
+        return int((await self.session.execute(stmt)).scalar_one())
+
+    async def has_final_harvest(self, batch_id: uuid.UUID) -> bool:
+        stmt = select(func.count(ProductionEvent.id)).where(
+            ProductionEvent.batch_id == batch_id,
+            ProductionEvent.event_type == "HARVEST",
+            ProductionEvent.is_final.is_(True),
+        )
+        return int((await self.session.execute(stmt)).scalar_one()) > 0

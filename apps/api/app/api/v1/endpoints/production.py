@@ -74,6 +74,7 @@ from app.schemas.production import (
     ProductionUnitTypePublic,
     ProductionUnitUpdate,
 )
+from app.security.authorize import has_permission, resolve_permissions
 from app.services.production import (
     ProductionBatchService,
     ProductionEventService,
@@ -83,6 +84,39 @@ from app.services.production import (
 )
 
 router = APIRouter()
+
+
+# --------------------------------------------------------------------- #
+# Codex Review Gate 02 — production endpoint permission enforcement.
+#
+# Every APE endpoint below MUST call this helper with the caller's
+# resolved organization / farm scope AFTER the tenancy load has
+# returned 404 for non-members. Order is critical: tenancy 404 first,
+# permission 403 second — otherwise the mere shape of the response
+# tells outsiders whether a resource exists in another tenant.
+# --------------------------------------------------------------------- #
+async def _enforce_prod_permission(
+    *,
+    user,
+    session,
+    code: str,
+    organization_id: uuid.UUID | None,
+    farm_id: uuid.UUID | None,
+) -> None:
+    """Raise 403 if ``user`` lacks ``code`` for the supplied scope.
+
+    Callers already validated tenancy (i.e. non-members got 404) so
+    this only checks the RBAC scope. Superusers bypass; the shared
+    ``resolve_permissions`` helper already handles that convention.
+    """
+    codes = await resolve_permissions(
+        session, user, organization_id=organization_id, farm_id=farm_id
+    )
+    if not has_permission(codes, code):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Missing required permission: {code}",
+        )
 
 
 # --------------------------------------------------------------------- #
@@ -247,9 +281,17 @@ async def create_site(
     payload: ProductionSiteCreate,
     farm: CurrentFarm,
     user: CurrentUser,
+    session: DBSession,
     request_ctx: RequestCtx,
     service: Annotated[ProductionSiteService, Depends(get_site_service)],
 ) -> ProductionSitePublic:
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_site.create",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     site = await service.create(
         actor=user,
         farm=farm,
@@ -264,8 +306,17 @@ async def create_site(
 )
 async def list_sites(
     farm: CurrentFarm,
+    user: CurrentUser,
+    session: DBSession,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
 ) -> list[ProductionSitePublic]:
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_site.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     rows = await site_repo.list_for_farm(farm.id)
     return [ProductionSitePublic.model_validate(r) for r in rows]
 
@@ -281,7 +332,14 @@ async def get_site(
     if site is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
     # Tenancy check via farm dep.
-    await _load_site_and_farm(site.id, user, site_repo, session)
+    _site, farm = await _load_site_and_farm(site.id, user, site_repo, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_site.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     return ProductionSitePublic.model_validate(site)
 
 
@@ -293,17 +351,68 @@ async def update_site(
     session: DBSession,
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
 ) -> ProductionSitePublic:
-    site, _farm = await _load_site_and_farm(site_id, user, site_repo, session)
+    site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
     if site.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_site.update",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     changed = payload.model_dump(exclude_unset=True)
     # Defence-in-depth: tenancy-critical fields cannot be reassigned via
     # PATCH regardless of what the update schema might grow to accept.
     for reserved in ("farm_id", "is_default", "deleted_at"):
         changed.pop(reserved, None)
+    # Codex Review Gate 02: a site cannot transition to CLOSED while it
+    # still contains active (planned / stocked / active / suspended)
+    # batches. This mirrors the soft-delete guard.
+    if changed.get("status") == "closed":
+        from sqlalchemy import func as _func
+        from sqlalchemy import select as _select
+
+        from app.models.production import (
+            ProductionBatch as _Batch,
+        )
+        from app.models.production import (
+            ProductionBatchState as _State,
+        )
+        from app.models.production import (
+            ProductionUnit as _Unit,
+        )
+
+        active_batches = int(
+            (
+                await session.execute(
+                    _select(_func.count(_Batch.id))
+                    .join(_Unit, _Unit.id == _Batch.unit_id)
+                    .where(
+                        _Unit.site_id == site.id,
+                        _Batch.deleted_at.is_(None),
+                        _Batch.state.notin_(
+                            [_State.CLOSED, _State.CANCELLED, _State.FAILED, _State.HARVESTED]
+                        ),
+                    )
+                )
+            ).scalar_one()
+        )
+        if active_batches > 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "site_close_blocked_by_active_batches",
+                    "message": (
+                        f"Cannot close a site with {active_batches} active batch(es). "
+                        "Transfer, harvest, cancel or fail the batches first."
+                    ),
+                },
+            )
     for k, v in changed.items():
         setattr(site, k, v)
     await session.flush()
+    await session.refresh(site)
     return ProductionSitePublic.model_validate(site)
 
 
@@ -319,6 +428,13 @@ async def delete_site(
     site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
     if site.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_site.delete",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     await service.soft_delete(actor=user, site=site, farm=farm, request_ctx=request_ctx)
     return ProductionSitePublic.model_validate(site)
 
@@ -335,6 +451,13 @@ async def restore_site(
     service: Annotated[ProductionSiteService, Depends(get_site_service)],
 ) -> ProductionSitePublic:
     site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_site.restore",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     await service.restore(actor=user, site=site, farm=farm, request_ctx=request_ctx)
     return ProductionSitePublic.model_validate(site)
 
@@ -450,6 +573,13 @@ async def delete_custom_unit_type(
         mem = await OrganizationMembershipRepository(session).get(user.id, row.organization_id)
         if mem is None or not mem.is_active:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit type not found.")
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_unit_type.delete",
+        organization_id=row.organization_id,
+        farm_id=None,
+    )
     await service.delete_custom(actor=user, row=row, request_ctx=request_ctx)
     return ProductionUnitTypePublic.model_validate(row)
 
@@ -473,6 +603,13 @@ async def create_unit(
     service: Annotated[ProductionUnitService, Depends(get_unit_service)],
 ) -> ProductionUnitPublic:
     site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_unit.create",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     unit = await service.create(
         actor=user,
         site=site,
@@ -493,9 +630,16 @@ async def list_units(
     site_repo: Annotated[ProductionSiteRepository, Depends(get_site_repo)],
     unit_repo: Annotated[ProductionUnitRepository, Depends(get_unit_repo)],
 ) -> list[ProductionUnitPublic]:
-    site, _ = await _load_site_and_farm(site_id, user, site_repo, session)
+    site, farm = await _load_site_and_farm(site_id, user, site_repo, session)
     if site.deleted_at is not None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Site not found.")
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_unit.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     rows = await unit_repo.list_for_site(site.id)
     return [ProductionUnitPublic.model_validate(r) for r in rows]
 
@@ -504,7 +648,14 @@ async def list_units(
 async def get_unit(
     unit_id: uuid.UUID, user: CurrentUser, session: DBSession
 ) -> ProductionUnitPublic:
-    unit, _, _ = await _load_unit(unit_id, user, session)
+    unit, _, farm = await _load_unit(unit_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_unit.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     return ProductionUnitPublic.model_validate(unit)
 
 
@@ -515,16 +666,69 @@ async def update_unit(
     user: CurrentUser,
     session: DBSession,
 ) -> ProductionUnitPublic:
-    unit, _, _ = await _load_unit(unit_id, user, session)
+    unit, _, farm = await _load_unit(unit_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_unit.update",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     changed = payload.model_dump(exclude_unset=True)
     # Defence-in-depth: never allow a PATCH to relocate a unit across
     # sites or change its type — those are lifecycle events, not
     # updates.
     for reserved in ("site_id", "unit_type_id", "deleted_at"):
         changed.pop(reserved, None)
+    # Codex Review Gate 02: a unit cannot transition to CLOSED while
+    # it still contains active (planned / stocked / active / suspended)
+    # batches. HARVESTED batches allow close (final harvest IS the
+    # exit gate); CLOSED / CANCELLED / FAILED terminal states are also
+    # fine.
+    if changed.get("status") == "closed":
+        from sqlalchemy import func as _func
+        from sqlalchemy import select as _select
+
+        from app.models.production import (
+            ProductionBatch as _Batch,
+        )
+        from app.models.production import (
+            ProductionBatchState as _State,
+        )
+
+        active_batches = int(
+            (
+                await session.execute(
+                    _select(_func.count(_Batch.id)).where(
+                        _Batch.unit_id == unit.id,
+                        _Batch.deleted_at.is_(None),
+                        _Batch.state.notin_(
+                            [
+                                _State.CLOSED,
+                                _State.CANCELLED,
+                                _State.FAILED,
+                                _State.HARVESTED,
+                            ]
+                        ),
+                    )
+                )
+            ).scalar_one()
+        )
+        if active_batches > 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "unit_close_blocked_by_active_batches",
+                    "message": (
+                        f"Cannot close a unit with {active_batches} active batch(es). "
+                        "Transfer, harvest, cancel or fail the batches first."
+                    ),
+                },
+            )
     for k, v in changed.items():
         setattr(unit, k, v)
     await session.flush()
+    await session.refresh(unit)
     return ProductionUnitPublic.model_validate(unit)
 
 
@@ -537,6 +741,13 @@ async def delete_unit(
     service: Annotated[ProductionUnitService, Depends(get_unit_service)],
 ) -> ProductionUnitPublic:
     unit, _, farm = await _load_unit(unit_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_unit.delete",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     await service.soft_delete(actor=user, unit=unit, farm=farm, request_ctx=request_ctx)
     return ProductionUnitPublic.model_validate(unit)
 
@@ -559,6 +770,13 @@ async def create_batch(
     service: Annotated[ProductionBatchService, Depends(get_batch_service)],
 ) -> ProductionBatchPublic:
     unit, _, farm = await _load_unit(unit_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.create",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     batch = await service.create(
         actor=user,
         unit=unit,
@@ -580,7 +798,14 @@ async def list_batches(
     session: DBSession,
     batch_repo: Annotated[ProductionBatchRepository, Depends(get_batch_repo)],
 ) -> list[ProductionBatchPublic]:
-    unit, _, _ = await _load_unit(unit_id, user, session)
+    unit, _, farm = await _load_unit(unit_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     rows = await batch_repo.list_for_unit(unit.id)
     return [ProductionBatchPublic.model_validate(b) for b in rows]
 
@@ -591,7 +816,14 @@ async def list_batches(
 async def get_batch(
     batch_id: uuid.UUID, user: CurrentUser, session: DBSession
 ) -> ProductionBatchPublic:
-    batch, _, _, _ = await _load_batch(batch_id, user, session)
+    batch, _, _, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     return ProductionBatchPublic.model_validate(batch)
 
 
@@ -604,7 +836,14 @@ async def update_batch(
     user: CurrentUser,
     session: DBSession,
 ) -> ProductionBatchPublic:
-    batch, _, _, _ = await _load_batch(batch_id, user, session)
+    batch, _, _, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.update",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     changed = payload.model_dump(exclude_unset=True)
     # Defence-in-depth: state changes MUST go through /transitions —
     # never allow a PATCH to touch state / lifecycle timestamps even if
@@ -615,6 +854,7 @@ async def update_batch(
     for k, v in changed.items():
         setattr(batch, k, v)
     await session.flush()
+    await session.refresh(batch)
     return ProductionBatchPublic.model_validate(batch)
 
 
@@ -633,6 +873,13 @@ async def transition_batch(
     transition_repo: Annotated[ProductionBatchTransitionRepository, Depends(get_transition_repo)],
 ) -> ProductionBatchTransitionPublic:
     batch, _, _, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.transition",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     await service.transition(
         actor=user,
         batch=batch,
@@ -658,7 +905,14 @@ async def list_batch_transitions(
     session: DBSession,
     transition_repo: Annotated[ProductionBatchTransitionRepository, Depends(get_transition_repo)],
 ) -> list[ProductionBatchTransitionPublic]:
-    batch, _, _, _ = await _load_batch(batch_id, user, session)
+    batch, _, _, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     rows = await transition_repo.list_for_batch(batch.id)
     return [ProductionBatchTransitionPublic.model_validate(r) for r in rows]
 
@@ -713,6 +967,13 @@ async def create_event(
       code ``idempotency_key_payload_conflict``.
     """
     batch, unit, site, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_event.create",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     event, is_replay = await service.create(
         actor=user,
         batch=batch,
@@ -745,7 +1006,14 @@ async def list_events(
     event_type: str | None = Query(default=None),
     service: Annotated[ProductionEventService, Depends(get_event_service)] = None,  # type: ignore
 ) -> ProductionEventPage:
-    batch, _, _, _ = await _load_batch(batch_id, user, session)
+    batch, _, _, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_event.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     rows, next_cursor = await service.list_for_batch(
         batch,
         limit=limit,
@@ -770,7 +1038,14 @@ async def get_event(
     if event is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found.")
     # Tenant check via the parent batch.
-    await _load_batch(event.batch_id, user, session)
+    _batch, _unit, _site, farm = await _load_batch(event.batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_event.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     return ProductionEventPublic.model_validate(event)
 
 
@@ -796,7 +1071,14 @@ async def get_batch_projections(
     """
     from app.services.projections import compute_batch_projections
 
-    batch, _unit, _site, _farm = await _load_batch(batch_id, user, session)
+    batch, _unit, _site, farm = await _load_batch(batch_id, user, session)
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_batch.read",
+        organization_id=farm.organization_id,
+        farm_id=farm.id,
+    )
     events = await event_repo.list_all_for_batch_asc(batch.id)
     projections = compute_batch_projections(batch, events)
     return BatchProjectionsPublic.model_validate(projections.as_dict())
