@@ -366,9 +366,15 @@ async def update_site(
     # PATCH regardless of what the update schema might grow to accept.
     for reserved in ("farm_id", "is_default", "deleted_at"):
         changed.pop(reserved, None)
+    # Codex Review Gate 02 (final) — central lifecycle helper is the
+    # single source of truth for CLOSED / MAINTENANCE update policy.
+    from app.production.lifecycle_policy import assert_site_update_allowed
+
+    assert_site_update_allowed(site, changed.keys())
     # Codex Review Gate 02: a site cannot transition to CLOSED while it
     # still contains active (planned / stocked / active / suspended)
-    # batches. This mirrors the soft-delete guard.
+    # batches. Terminal + HARVESTED batches are fine (harvest is the
+    # exit gate); the soft-delete guard uses the same rule.
     if changed.get("status") == "closed":
         from sqlalchemy import func as _func
         from sqlalchemy import select as _select
@@ -680,6 +686,10 @@ async def update_unit(
     # updates.
     for reserved in ("site_id", "unit_type_id", "deleted_at"):
         changed.pop(reserved, None)
+    # Codex Review Gate 02 (final) — central lifecycle helper.
+    from app.production.lifecycle_policy import assert_unit_update_allowed
+
+    assert_unit_update_allowed(unit, changed.keys())
     # Codex Review Gate 02: a unit cannot transition to CLOSED while
     # it still contains active (planned / stocked / active / suspended)
     # batches. HARVESTED batches allow close (final harvest IS the
@@ -769,7 +779,7 @@ async def create_batch(
     request_ctx: RequestCtx,
     service: Annotated[ProductionBatchService, Depends(get_batch_service)],
 ) -> ProductionBatchPublic:
-    unit, _, farm = await _load_unit(unit_id, user, session)
+    unit, site, farm = await _load_unit(unit_id, user, session)
     await _enforce_prod_permission(
         user=user,
         session=session,
@@ -780,6 +790,7 @@ async def create_batch(
     batch = await service.create(
         actor=user,
         unit=unit,
+        site=site,
         farm=farm,
         data=payload.model_dump(),
         request_ctx=request_ctx,
@@ -872,7 +883,7 @@ async def transition_batch(
     service: Annotated[ProductionBatchService, Depends(get_batch_service)],
     transition_repo: Annotated[ProductionBatchTransitionRepository, Depends(get_transition_repo)],
 ) -> ProductionBatchTransitionPublic:
-    batch, _, _, farm = await _load_batch(batch_id, user, session)
+    batch, unit, site, farm = await _load_batch(batch_id, user, session)
     await _enforce_prod_permission(
         user=user,
         session=session,
@@ -888,6 +899,8 @@ async def transition_batch(
         reason=payload.reason,
         request_ctx=request_ctx,
         metadata=payload.metadata_json,
+        site=site,
+        unit=unit,
     )
     # Return the most recent transition row.
     rows = await transition_repo.list_for_batch(batch.id)

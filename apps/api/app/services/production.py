@@ -29,11 +29,16 @@ from app.models.production import (
     ProductionEvent,
     ProductionSite,
     ProductionUnit,
-    ProductionUnitStatus,
     ProductionUnitType,
 )
 from app.models.user import User
 from app.production.event_catalog import CATALOG, EventCatalogEntry
+from app.production.lifecycle_policy import (
+    assert_can_create_batch,
+    assert_can_create_unit_in_site,
+    assert_can_manually_transition,
+    assert_event_allowed_by_lifecycle,
+)
 from app.repositories.audit_repo import AuditRepository
 from app.repositories.production import (
     ProductionBatchRepository,
@@ -213,6 +218,10 @@ class ProductionUnitService:
                 status.HTTP_409_CONFLICT,
                 "Cannot add a production unit to a deleted site. Restore the site first.",
             )
+        # Codex Review Gate 02 (final) — parent-site lifecycle gate.
+        # Central helper is the single source of truth for
+        # ACTIVE / MAINTENANCE / CLOSED semantics.
+        assert_can_create_unit_in_site(site)
         # Verify the type is visible to this org (system or their own).
         unit_type = await self.unit_type_repo.get_visible(
             data["unit_type_id"], organization_id=farm.organization_id
@@ -345,15 +354,20 @@ class ProductionBatchService:
         *,
         actor: User,
         unit: ProductionUnit,
+        site: ProductionSite,
         farm: Farm,
         data: dict,
         request_ctx: dict,
     ) -> ProductionBatch:
-        if unit.deleted_at is not None or unit.status == ProductionUnitStatus.CLOSED:
+        if unit.deleted_at is not None:
             raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "Cannot start a batch in a deleted or closed production unit.",
+                status.HTTP_404_NOT_FOUND,
+                "Production unit not found.",
             )
+        # Codex Review Gate 02 (final) — parent site + unit must be
+        # ACTIVE for new batches. Single source of truth in
+        # ``app.production.lifecycle_policy``.
+        assert_can_create_batch(site, unit)
         batch = await self.batch_repo.create(
             unit_id=unit.id, state=ProductionBatchState.PLANNED, **data
         )
@@ -412,7 +426,18 @@ class ProductionBatchService:
         request_ctx: dict,
         triggering_event: ProductionEvent | None = None,
         metadata: dict | None = None,
+        site: ProductionSite | None = None,
+        unit: ProductionUnit | None = None,
     ) -> ProductionBatch:
+        # Codex Review Gate 02 (final) — MANUAL transitions must
+        # respect the parent site / unit lifecycle. Event-driven
+        # transitions (``triggering_event is not None``) are already
+        # governed by ``assert_event_allowed_by_lifecycle`` at the
+        # event-service layer, so we skip the extra guard here to
+        # avoid double-rejecting an allowed evacuation transfer.
+        if triggering_event is None and site is not None and unit is not None:
+            assert_can_manually_transition(site, unit)
+
         # Serialise concurrent transitions through the same row lock
         # used by event insertion (Codex Review Gate 02). Skipped when
         # this call is already re-entering under an event write —
@@ -899,73 +924,21 @@ class ProductionEventService:
         batch: ProductionBatch,
         data: dict,
     ) -> None:
-        """Site + Unit lifecycle policy (Codex Review Gate 02).
+        """Delegate to the central lifecycle policy helper.
 
-        Reads are always allowed (they never reach here). Writes are
-        governed by:
-
-        Unit / Site status = ``CLOSED`` → *all* event writes 409
-        ``resource_closed_no_writes``. A CLOSED unit or site is
-        read-only; batches must be transferred, harvested, cancelled
-        or failed before their unit can transition to CLOSED (enforced
-        at the PATCH endpoint).
-
-        Unit / Site status = ``MAINTENANCE`` → only WATER_QUALITY and
-        TRANSFER-out (source_unit_id == this batch's current unit)
-        are permitted. All other event types 409
-        ``resource_under_maintenance``.
+        Kept as a thin method so tests + audit trails have a stable
+        service-level entry point. All ACTIVE / MAINTENANCE / CLOSED
+        rules live in ``app.production.lifecycle_policy``.
         """
-        # Site-first (a MAINTENANCE / CLOSED site strictly implies the
-        # units underneath share the constraint even if the unit row
-        # is still ACTIVE — this keeps the policy consistent).
-        site_status = getattr(site, "status", None)
-        unit_status = getattr(unit, "status", None)
-
-        # Two allow-lists so the wording of the 409 stays specific.
-        maintenance_allowed = {"WATER_QUALITY"}
-        # TRANSFER is allowed under MAINTENANCE only when it evacuates
-        # OUT of the maintenance unit; the transfer-scope guard below
-        # already forces source_unit_id == current-unit == this unit.
-        if code == "TRANSFER":
-            src = str(data.get("source_unit_id", "")).strip()
-            if src == str(unit.id):
-                maintenance_allowed.add("TRANSFER")
-
-        # CLOSED — reject everything.
-        for label, value in (("site", site_status), ("unit", unit_status)):
-            if value == getattr(type(value), "CLOSED", "closed") or value == "closed":
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "resource_closed_no_writes",
-                        "message": (
-                            f"The {label} for this batch is CLOSED. No new events, "
-                            "transitions, or mutations are permitted."
-                        ),
-                        "resource": label,
-                    },
-                )
-
-        # MAINTENANCE — narrow allow-list.
-        for label, value in (("site", site_status), ("unit", unit_status)):
-            is_maintenance = value == "maintenance" or value == getattr(
-                type(value), "MAINTENANCE", "maintenance"
-            )
-            if is_maintenance and code not in maintenance_allowed:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "resource_under_maintenance",
-                        "message": (
-                            f"The {label} for this batch is under MAINTENANCE. "
-                            "Only WATER_QUALITY readings and evacuating TRANSFER "
-                            "events are permitted while maintenance is in progress."
-                        ),
-                        "resource": label,
-                        "allowed_events": sorted(maintenance_allowed),
-                    },
-                )
-        del batch  # unused today — placeholder for future batch-state gates.
+        del batch  # batch state is validated separately
+        assert_event_allowed_by_lifecycle(
+            site=site,
+            unit=unit,
+            event_code=code,
+            source_unit_id=(
+                str(data.get("source_unit_id", "")).strip() if code == "TRANSFER" else None
+            ),
+        )
 
     async def _enforce_transfer_scope(
         self,
@@ -1022,13 +995,15 @@ class ProductionEventService:
             )
 
         # Destination lifecycle — Codex Review Gate 02: never transfer
-        # INTO a CLOSED or MAINTENANCE unit / site. TRANSFERs into
-        # MAINTENANCE would violate the "only water-quality + evacuate"
-        # allow-list; CLOSED is read-only entirely.
-        dst_site_status = getattr(dst_site, "status", None)
-        dst_unit_status = getattr(dst_unit, "status", None)
-        for label, value in (("site", dst_site_status), ("unit", dst_unit_status)):
-            if value == "closed":
+        # INTO a CLOSED or MAINTENANCE unit / site. Uses the central
+        # lifecycle helper so the exit codes match every other write
+        # gate (site_closed_no_writes / unit_closed_no_writes / etc.)
+        # but with the destination-specific "transferring-in" framing.
+        from app.production.lifecycle_policy import is_closed as _lp_closed
+        from app.production.lifecycle_policy import is_maintenance as _lp_maintenance
+
+        for label, resource in (("site", dst_site), ("unit", dst_unit)):
+            if _lp_closed(resource):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
@@ -1039,7 +1014,7 @@ class ProductionEventService:
                         "resource": label,
                     },
                 )
-            if value == "maintenance":
+            if _lp_maintenance(resource):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {

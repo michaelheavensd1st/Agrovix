@@ -422,3 +422,64 @@ permitted (final harvest IS the exit gate).
   fresh Postgres
 
 **Test total: 128 on Postgres** (was 111 → +17 for CRG02).
+
+## Codex Review Gate 02 (final) — centralised lifecycle policy (2026-02-08 evening)
+
+Re-review follow-up: closed the "creation + manual transition + update"
+gaps left after the first CRG02 pass and consolidated ALL
+ACTIVE / MAINTENANCE / CLOSED semantics behind one helper module so
+future divergence is impossible.
+
+### New central helper — `app/production/lifecycle_policy.py`
+Single source of truth used by:
+- `ProductionUnitService.create()` — `assert_can_create_unit_in_site`
+- `ProductionBatchService.create()` — `assert_can_create_batch`
+- `ProductionBatchService.transition()` (manual endpoint only —
+  event-driven transitions stay governed by the event gate below)
+  — `assert_can_manually_transition`
+- `ProductionEventService._enforce_site_unit_lifecycle_policy` —
+  `assert_event_allowed_by_lifecycle` (includes evacuating TRANSFER
+  exception when `source_unit_id == unit.id`)
+- `PATCH /sites/{id}` — `assert_site_update_allowed`
+- `PATCH /units/{id}` — `assert_unit_update_allowed`
+
+### Enforced semantics
+- **CLOSED** site or unit → *no writes at all*. Cannot host new
+  units or batches, cannot record events, cannot be transitioned
+  manually, cannot be edited except for a controlled `status`
+  reopen. Error codes: `site_closed_no_writes`, `unit_closed_no_writes`.
+- **MAINTENANCE** site or unit → narrow write allow-list:
+  events limited to `WATER_QUALITY` and evacuating `TRANSFER`
+  (source unit == unit under maintenance); PATCH restricted to
+  `status` + safe administrative metadata (`name`, `description`,
+  `address`, `timezone`, `manager_id`, `metadata_json` — units:
+  `status`, `name`, `metadata_json`). Structural fields such as
+  `capacity` are refused. Error codes: `site_under_maintenance`,
+  `unit_under_maintenance`.
+- **ACTIVE** site or unit → normal behaviour.
+
+### New tests (`test_codex_review_gate_02.py`)
++ `test_cannot_create_unit_under_maintenance_site`
++ `test_cannot_create_unit_under_closed_site`
++ `test_cannot_create_batch_under_maintenance_unit`
++ `test_cannot_create_batch_under_closed_unit`
++ `test_cannot_create_batch_under_maintenance_site`
++ `test_cannot_create_batch_under_closed_site`
++ `test_cannot_manual_transition_under_maintenance_unit`
++ `test_cannot_manual_transition_under_maintenance_site`
++ `test_cannot_manual_transition_under_closed_unit`
++ `test_evacuation_transfer_still_works_from_maintenance`
++ `test_closed_site_is_read_only_for_patch`
++ `test_closed_unit_is_read_only_for_patch`
++ `test_maintenance_site_disallows_capacity_edit`
+
+### Validation (all green)
+- ruff / black — 0 issues
+- pytest SQLite: **136 passed / 5 skipped** (Postgres-only race
+  tests)
+- pytest Postgres: **141 passed** — including all 4 concurrency
+  tests + 10 new lifecycle-gap tests
+- alembic upgrade head → downgrade base → upgrade head — clean
+- pnpm lint / type-check / test / next build (7/7 workspaces) — green
+
+**Test total: 141 on Postgres** (was 128 → +13 lifecycle-gap tests).

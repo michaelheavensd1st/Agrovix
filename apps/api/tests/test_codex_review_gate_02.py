@@ -309,7 +309,10 @@ async def test_feeding_blocked_on_maintenance_unit(client: AsyncClient) -> None:
         json={"event_type": "FEEDING", "data": {"quantity": 1.0, "feed_description": "x"}},
     )
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "resource_under_maintenance"
+    assert r.json()["detail"]["code"] in {
+        "site_under_maintenance",
+        "unit_under_maintenance",
+    }
 
     # WATER_QUALITY still allowed.
     from tests._helpers import water_quality_payload
@@ -406,7 +409,224 @@ async def test_transfer_into_maintenance_destination_blocked(client: AsyncClient
 
 
 # ===================================================================== #
-# 5. Postgres-only concurrency races
+# 5. Codex Review Gate 02 (final) — creation + transition + update
+#    lifecycle gates. Centralised in ``app.production.lifecycle_policy``.
+# ===================================================================== #
+async def test_cannot_create_unit_under_maintenance_site(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    r = await client.patch(
+        f"/api/v1/sites/{ctx['site_id']}",
+        json={"status": "maintenance"},
+    )
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/sites/{ctx['site_id']}/units",
+        json={"unit_type_id": ut, "name": "Rejected", "code": f"R-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_under_maintenance"
+
+
+async def test_cannot_create_unit_under_closed_site(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    # No batches exist yet — closing the empty site is allowed.
+    r = await client.patch(
+        f"/api/v1/sites/{ctx['site_id']}",
+        json={"status": "closed"},
+    )
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/sites/{ctx['site_id']}/units",
+        json={"unit_type_id": ut, "name": "Rejected", "code": f"R-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_closed_no_writes"
+
+
+async def test_cannot_create_batch_under_maintenance_unit(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/units/{unit_id}/batches",
+        json={"code": f"B-{uuid4().hex[:6]}", "species": "L. vannamei"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "unit_under_maintenance"
+
+
+async def test_cannot_create_batch_under_closed_unit(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/units/{unit_id}/batches",
+        json={"code": f"B-{uuid4().hex[:6]}", "species": "L. vannamei"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "unit_closed_no_writes"
+
+
+async def test_cannot_create_batch_under_maintenance_site(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    # Unit stays ACTIVE, but the SITE moves to maintenance.
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/units/{unit_id}/batches",
+        json={"code": f"B-{uuid4().hex[:6]}", "species": "L. vannamei"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_under_maintenance"
+
+
+async def test_cannot_create_batch_under_closed_site(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/units/{unit_id}/batches",
+        json={"code": f"B-{uuid4().hex[:6]}", "species": "L. vannamei"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_closed_no_writes"
+
+
+async def test_cannot_manual_transition_under_maintenance_unit(client: AsyncClient) -> None:
+    """Manual /transitions endpoint must be gated by unit lifecycle."""
+    ctx = await _prepare_active_batch(client, quantity=50)
+    r = await client.patch(f"/api/v1/units/{ctx['unit_id']}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/transitions",
+        json={"target_state": "suspended"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] in {
+        "unit_under_maintenance",
+        "site_under_maintenance",
+    }
+
+
+async def test_cannot_manual_transition_under_maintenance_site(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=50)
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/transitions",
+        json={"target_state": "suspended"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_under_maintenance"
+
+
+async def test_cannot_manual_transition_under_closed_unit(client: AsyncClient) -> None:
+    """CLOSED unit blocks manual transitions.
+
+    Reaching CLOSED requires no active batches, so we take the batch
+    to HARVESTED (final-harvest) first, then close the unit.
+    """
+    ctx = await _prepare_active_batch(client, quantity=25)
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/events",
+        json={
+            "event_type": "HARVEST",
+            "data": harvest_payload(
+                quantity=25, total_weight=10.0, harvest_type="total", is_final=True
+            ),
+        },
+    )
+    assert r.status_code == 201, r.text
+    r = await client.patch(f"/api/v1/units/{ctx['unit_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    # HARVESTED → CLOSED is a legal state-machine transition, but the
+    # lifecycle gate refuses it because the parent unit is CLOSED
+    # (read-only) — no ordinary batch mutations are permitted.
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/transitions",
+        json={"target_state": "closed"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "unit_closed_no_writes"
+
+
+async def test_evacuation_transfer_still_works_from_maintenance(
+    client: AsyncClient,
+) -> None:
+    """MAINTENANCE unit still permits an evacuating TRANSFER out."""
+    ctx = await _prepare_active_batch(client, quantity=100)
+    dst_unit_id = await _create_unit(client, ctx["site_id"], ctx["unit_type_id"])
+    r = await client.patch(f"/api/v1/units/{ctx['unit_id']}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/events",
+        json={
+            "event_type": "TRANSFER",
+            "data": transfer_payload(
+                source_unit_id=ctx["unit_id"],
+                destination_unit_id=dst_unit_id,
+                quantity=10,
+            ),
+        },
+    )
+    assert r.status_code == 201, r.text
+
+
+async def test_closed_site_is_read_only_for_patch(client: AsyncClient) -> None:
+    """CLOSED site accepts only a `status` reopen — no other fields."""
+    ctx = await _new_owner_org_farm(client)
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"name": "Renamed while closed"})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_closed_no_writes"
+
+    # Controlled reopen is allowed.
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "active"})
+    assert r.status_code == 200, r.text
+
+
+async def test_closed_unit_is_read_only_for_patch(client: AsyncClient) -> None:
+    """CLOSED unit accepts only a `status` reopen — no other fields."""
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"name": "Nope"})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "unit_closed_no_writes"
+    # Controlled reopen.
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "active"})
+    assert r.status_code == 200, r.text
+
+
+async def test_maintenance_site_disallows_capacity_edit(client: AsyncClient) -> None:
+    """MAINTENANCE narrows PATCH to safe admin metadata + status."""
+    ctx = await _new_owner_org_farm(client)
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    # `capacity` is structural — refused while under maintenance.
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"capacity": 500})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_under_maintenance"
+    # `name` is safe admin metadata — allowed.
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"name": "Rename OK"})
+    assert r.status_code == 200, r.text
+
+
+# ===================================================================== #
+# 6. Postgres-only concurrency races
 # ===================================================================== #
 @_postgres_only
 async def test_concurrent_mortalities_never_overshoot(client: AsyncClient) -> None:
