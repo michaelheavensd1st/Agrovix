@@ -161,7 +161,11 @@ class ProductionSite(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     capacity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[ProductionSiteStatus] = mapped_column(
-        SQLEnum(ProductionSiteStatus, name="production_site_status"),
+        SQLEnum(
+            ProductionSiteStatus,
+            name="production_site_status",
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
         nullable=False,
         default=ProductionSiteStatus.ACTIVE,
     )
@@ -198,7 +202,11 @@ class ProductionUnit(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     capacity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[ProductionUnitStatus] = mapped_column(
-        SQLEnum(ProductionUnitStatus, name="production_unit_status"),
+        SQLEnum(
+            ProductionUnitStatus,
+            name="production_unit_status",
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
         nullable=False,
         default=ProductionUnitStatus.ACTIVE,
     )
@@ -229,7 +237,11 @@ class ProductionBatch(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     code: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[ProductionBatchState] = mapped_column(
-        SQLEnum(ProductionBatchState, name="production_batch_state"),
+        SQLEnum(
+            ProductionBatchState,
+            name="production_batch_state",
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
         nullable=False,
         default=ProductionBatchState.PLANNED,
     )
@@ -269,11 +281,21 @@ class ProductionBatchTransition(Base, UUIDPrimaryKeyMixin):
         index=True,
     )
     from_state: Mapped[ProductionBatchState | None] = mapped_column(
-        SQLEnum(ProductionBatchState, name="production_batch_state", create_type=False),
+        SQLEnum(
+            ProductionBatchState,
+            name="production_batch_state",
+            create_type=False,
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
         nullable=True,  # NULL when creating the batch (into PLANNED)
     )
     to_state: Mapped[ProductionBatchState] = mapped_column(
-        SQLEnum(ProductionBatchState, name="production_batch_state", create_type=False),
+        SQLEnum(
+            ProductionBatchState,
+            name="production_batch_state",
+            create_type=False,
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
         nullable=False,
     )
     actor_id: Mapped[uuid.UUID | None] = mapped_column(

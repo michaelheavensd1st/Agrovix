@@ -49,7 +49,13 @@ class Role(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     description: Mapped[str | None] = mapped_column(String(255), nullable=True)
     scope: Mapped[RoleScope] = mapped_column(
-        Enum(RoleScope, name="role_scope"), nullable=False, default=RoleScope.ORGANIZATION
+        Enum(
+            RoleScope,
+            name="role_scope",
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
+        nullable=False,
+        default=RoleScope.ORGANIZATION,
     )
     is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 

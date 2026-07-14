@@ -48,7 +48,11 @@ class Invitation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     token_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     status: Mapped[InvitationStatus] = mapped_column(
-        Enum(InvitationStatus, name="invitation_status"),
+        Enum(
+            InvitationStatus,
+            name="invitation_status",
+            values_callable=lambda enum: [m.value for m in enum],
+        ),
         nullable=False,
         default=InvitationStatus.PENDING,
         index=True,
