@@ -1,6 +1,9 @@
-# The Production Engine
+# Agrovix Production Engine (APE)
 
-The **Production Engine** is the species-agnostic core of Agrovix.
+The **Agrovix Production Engine** — **APE** — is the species-agnostic
+core of Agrovix and the **universal production engine for every
+agricultural vertical** (aquaculture, livestock, crop).
+
 Instead of separate tables for hatcheries, ponds, batches and
 species-specific event logs, everything operational flows through a
 single, uniform hierarchy:
@@ -12,17 +15,53 @@ Organization
     ↓
   ProductionSite      ← a physical operating location
     ↓
-  ProductionUnit      ← tank / pond / cage / raceway / biofloc
+  ProductionUnit      ← tank / pond / cage / raceway / biofloc / plot / greenhouse / pen / barn
     ↓
-  ProductionBatch     ← a stocking cycle with a typed lifecycle
+  ProductionBatch     ← a stocking / planting cycle with a typed lifecycle
     ↓
   ProductionEvent     ← append-only operational activity
 ```
 
 Every operational activity is a **`ProductionEvent`** with an
-event-type code drawn from a small, platform-owned catalog. One
-table, one API, one permission model, one audit model, one event
-stream.
+event-type code drawn from a single, platform-owned
+**`ProductionEventCatalog`**. One table, one API, one permission
+model, one audit model, one event stream.
+
+## Architectural invariant
+
+APE owns, and is the **single source of truth** for:
+
+- `ProductionSite`, `ProductionUnit`, `ProductionUnitType`
+- `ProductionBatch`, `ProductionEvent`
+- `ProductionEventCatalog`
+- Batch lifecycle & state machine
+- Event validation, event history
+- Production analytics foundation
+
+Verticals **never duplicate** these. They extend APE by contributing:
+
+- Unit types (new `ProductionUnitType` codes — system or org-custom)
+- Event catalog entries (new `EventCatalogEntry` with a Pydantic
+  payload schema, optional `triggers_transition_to`)
+- Validation schemas (`extra="forbid"` remains mandatory)
+- Lifecycle rules layered on the existing state machine
+- Reporting projections over `production_events`
+- Vertical-specific services that compose APE primitives (never
+  bypass them)
+
+**No vertical module may redefine `ProductionBatch`,
+`ProductionEvent`, or `ProductionUnit`.** Any PR that introduces a
+parallel table, model, or lifecycle machine for these concepts is
+rejected in review. See `memory/PRD.md § Architectural invariant —
+Agrovix Production Engine (APE)` for the full reviewer checklist.
+
+Illustrative vertical extensions:
+
+| Vertical    | Unit types (extend `ProductionUnitType`) | Events (extend `EventCatalog`)               |
+| ----------- | ---------------------------------------- | -------------------------------------------- |
+| Aquaculture | Pond, Raceway, Cage                      | Stocking, Feeding, Mortality                 |
+| Livestock   | Barn, Pen                                | Vaccination, Breeding, Weaning               |
+| Crop        | Plot, Greenhouse                         | Planting, Irrigation, Fertilization, Harvest |
 
 ## Why one engine
 

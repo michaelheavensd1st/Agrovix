@@ -91,7 +91,7 @@ Audit: list-in-org
 - **Real Resend backend** (P2, deferred): only when a staging env with a verified sending domain exists. API keys never committed; introduced via `apps/api/.env` per environment.
 - **RateLimiter.ping()** protocol method (P2): current implementation uses `_client.ping()` directly. Only worth doing if we add a non-Redis backend that needs its own probe.
 
-## Sprint 2 — Production Engine (2026-02-06 evening)
+## Sprint 2 — Agrovix Production Engine (APE) (2026-02-06 evening)
 - ✅ Species-agnostic hierarchy: `Organization → Farm → ProductionSite → ProductionUnit → ProductionBatch → ProductionEvent`.
 - ✅ 6 domain models in `app/models/production.py` — Site (rich physical location with lat/lng/timezone/manager/capacity/status), UnitType (system-seeded + org-custom, partial unique on system codes), Unit, Batch (with typed state machine), BatchTransition (append-only history), Event (append-only, JSONB payload, denormalised tenant fields).
 - ✅ Alembic migration `0004_production_engine` — Postgres DDL including composite index `(batch_id, performed_at, id)`, 6 per-column indexes on events, partition-ready `performed_at` column.
@@ -131,34 +131,79 @@ Commits: `f790649` (initial sweep), `85254e1` (enum label fix + drop live-HTTP s
 
 **Test total: 85** on Postgres (was 77 → +8 for CRG01 regressions).
 
-## Domain positioning (2026-02-07)
+## Architectural invariant — Agrovix Production Engine (APE) (2026-02-07)
 
-The **Production Engine** built in Sprint 2 (`Organization → Farm →
-ProductionSite → ProductionUnit → ProductionBatch → ProductionEvent`
-+ pluggable `EventCatalog`) **is** the canonical agricultural domain
-foundation. All future vertical capabilities — aquaculture, crop,
-livestock — extend the engine rather than introduce a parallel set
-of generic domain models. New "domain" work manifests as:
+The Sprint-2 engine is now the named canonical foundation:
+**Agrovix Production Engine (APE)** (short form: **APE**).
+APE is the **universal production engine for every agricultural
+vertical** — aquaculture, livestock, and crop all run on top of it.
 
-- Additional `ProductionUnitType` codes (system-seeded and/or org-custom).
-- New `EventCatalogEntry` registrations with Pydantic payload schemas
-  and (optionally) a `triggers_transition_to` mapping.
-- New batch-state predicates and lifecycle rules attached to the
-  existing state machine.
-- New reporting / aggregation projections over `production_events`.
+### APE owns (single source of truth — no vertical may duplicate)
+- `ProductionSite`
+- `ProductionUnit`
+- `ProductionUnitType`
+- `ProductionBatch`
+- `ProductionEvent`
+- `ProductionEventCatalog`
+- Batch lifecycle
+- State machine
+- Event validation
+- Event history
+- Production analytics foundation
 
-There is **no** roadmap item to build `Crop`, `Season`, `Hatchery`,
-`Pond`, `FeedLog`, `MortalityLog`, etc. as free-standing tables. Those
-names are aquaculture-flavoured surface concepts; their persistence
-lives inside `ProductionEvent.data` (JSONB), governed by their catalog
-schema. `StockingEvent`, `HARVEST`, `FEEDING`, `MORTALITY`,
-`WATER_QUALITY`, `SAMPLING`, `MEDICATION`, `TRANSFER`, `INSPECTION`
-are already registered.
+### How verticals extend APE (never duplicate)
+A vertical is a **plug-in surface**, not a parallel domain. It ships
+its capability by contributing:
+
+- **Unit types** — new `ProductionUnitType` codes (system-seeded or
+  org-custom).
+- **Event catalog entries** — new `EventCatalogEntry` registrations
+  with Pydantic payload schemas and (optionally) a
+  `triggers_transition_to` mapping.
+- **Validation schemas** — Pydantic models bound to those catalog
+  entries (`extra="forbid"` remains mandatory).
+- **Lifecycle rules** — additional batch-state predicates layered on
+  the existing state machine (no parallel state graph).
+- **Reporting projections** — vertical-specific read-only projections
+  and aggregates over `production_events` (materialised views,
+  cursor endpoints, dashboards).
+- **Vertical-specific services** — domain logic that composes APE
+  primitives; never reaches around them to write directly to
+  `production_*` tables.
+
+### Illustrative (non-exhaustive) vertical surface concepts
+
+| Vertical | Unit types (extend `ProductionUnitType`) | Events (extend `EventCatalog`) |
+|---|---|---|
+| Aquaculture | Pond, Raceway, Cage | Stocking, Feeding, Mortality |
+| Livestock | Barn, Pen | Vaccination, Breeding, Weaning |
+| Crop | Plot, Greenhouse | Planting, Irrigation, Fertilization, Harvest |
+
+These names are **surface concepts**, not new tables. Their
+persistence lives inside `ProductionUnitType` (structural) and
+`ProductionEvent.data` (JSONB, governed by their catalog schema).
+
+### Architectural invariant (non-negotiable)
+**No vertical module may redefine `ProductionBatch`,
+`ProductionEvent`, or `ProductionUnit`.** Any PR that introduces a
+parallel table, model, or lifecycle machine for these concepts is a
+regression against APE and must be rejected in review. Reviewers
+should also reject:
+
+- Parallel state machines for batch-like entities.
+- Direct writes to `production_*` tables bypassing APE services.
+- New "event log" tables that shadow `production_events`.
+- Vertical-owned `Site` / `Unit` / `Batch` copies.
+
+When a vertical genuinely needs a concept APE does not yet expose,
+the fix is to **extend APE first** (add the primitive, generalise
+it, ship it in a migration) and then let the vertical consume it —
+never fork the engine.
 
 ## Next Actions
-1. Extend the Production Engine with vertical-specific catalog entries
-   (aquaculture-first) and any new lifecycle rules they require — no
-   parallel domain-model track.
+1. Extend APE with vertical-specific catalog entries (aquaculture-first)
+   and any new lifecycle rules they require — no parallel
+   domain-model track.
 2. Resend backend for `EmailSender` (verified sender + templated HTML).
 3. Fine-grained audit UI + filtering + export.
 4. Mobile onboarding flow (currently just shell).
