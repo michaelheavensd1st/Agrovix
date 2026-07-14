@@ -106,6 +106,31 @@ Audit: list-in-org
 - ✅ Docs: `/app/docs/production-engine.md` with hierarchy, state-machine diagram, API surface, and deferred work.
 - **Test total: 77** (was 61 → +16 for the Production Engine).
 
+## Codex Review Gate 01 — validation gate (2026-02-07)
+Pre-Sprint 3 hardening pass on branch `fix/codex-review-gate-01`.
+Findings & fixes documented in `docs/audits/codex-review-gate-01.md`.
+
+- ✅ **CRG01-1**: Cross-tenant leak on `GET /production-unit-types` closed. Non-members no longer see foreign org customs; superusers still see all.
+- ✅ **CRG01-2**: Production-event idempotency (`Idempotency-Key`). Partial unique index `uq_events_batch_idempotency_key` + SAVEPOINT-wrapped INSERT + payload-hash conflict detection. Replay returns 200 + `X-Idempotent-Replay: true`; same-key/different-payload returns 409 `idempotency_key_payload_conflict`; concurrent-race collapses to exactly one row.
+- ✅ **CRG01-3**: New CI job `alembic-upgrade` — spins Postgres 16, upgrades to head, asserts current==heads, then round-trips downgrade base → upgrade head.
+- ✅ **CRG01-4**: Yarn → pnpm hygiene. `pnpm-lock.yaml` shipped, every `pnpm install` in CI now uses `--frozen-lockfile`.
+- ✅ **CRG01-5**: Migration bring-up bugs fixed (Duplicate enum `CREATE TYPE`, over-long revision IDs), conftest respects `DATABASE_URL`, real Postgres `pg_advisory_xact_lock` to close the last-owner orphan race under concurrent revokes.
+- ✅ **CRG01-6**: Frontend scaffold made buildable end-to-end (`.prettierignore`, root eslint config + `apps/mobile/.eslintrc.cjs`, `packages/config/tsconfig.json`, `declaration:false` on web tsconfig, `publicHoistPattern` for `@types/*`, `<Suspense>` on `/accept-invite`, `vitest --run` for `pnpm test`).
+- ✅ **CRG01-7** (testing-agent finding): Enum label mismatch (`values_callable=lambda enum: [m.value for m in enum]`) so `alembic upgrade head` + `python -m app.seed` succeeds on a fresh Postgres. Verified `SEED OK`.
+
+Final validation set (all green on this branch):
+- ruff / black — 0 issues
+- pytest — SQLite: 84 passed, 1 skipped (postgres-only concurrency test) · Postgres: 85 passed
+- alembic upgrade head → head `0005_prod_event_idempotent`; round-trip clean
+- alembic + seed on fresh Postgres → `SEED OK`
+- prettier / eslint / tsc / vitest --run — 7/7 packages green
+- next build — 10 routes emitted, no prerender errors
+- Testing-agent iteration_5: 9/9 curl-driven CRG01-1/CRG01-2 tests pass
+
+Commits: `f790649` (initial sweep), `85254e1` (enum label fix + drop live-HTTP suite).
+
+**Test total: 85** on Postgres (was 77 → +8 for CRG01 regressions).
+
 ## Next Actions
 1. Aquaculture domain: Hatchery, Pond, Batch, StockingEvent, FeedLog, MortalityLog.
 2. Resend backend for `EmailSender` (verified sender + templated HTML).

@@ -167,9 +167,42 @@ touched by this fix.
 
 ---
 
-## Non-changes
+## CRG01-7 — Enum label mismatch (alembic vs SQLAlchemy)
 
-The old Non-changes block moved below CRG01-6.
+### Finding
+Discovered during Gate-01 testing-agent verification (iteration_5):
+`alembic upgrade head` seeded the Postgres native enums with the
+**lowercase enum values** (`'platform'`, `'organization'`, `'farm'`,
+`'active'`, `'planned'`, …), but SQLAlchemy's `Enum(<PythonEnum>, …)`
+column type defaults to writing the enum **names** (`'PLATFORM'`,
+`'ORGANIZATION'`, …). Consequence: a freshly-migrated database
+rejected every seed insert with
+`invalid input value for enum X: "PLATFORM"`. The pytest suite
+passed because `conftest.py` uses `Base.metadata.create_all`, which
+regenerates the enum labels from the model.
+
+### Severity
+**High.** Silent deploy-time failure: any greenfield staging or
+production Postgres would be un-seedable.
+
+### Fix
+Passed `values_callable=lambda enum: [m.value for m in enum]` on
+every SQLAlchemy `Enum` column so the string label written to the
+DB matches the migration:
+
+- `Role.scope` (`role_scope`)
+- `Invitation.status` (`invitation_status`)
+- `ProductionSite.status` (`production_site_status`)
+- `ProductionUnit.status` (`production_unit_status`)
+- `ProductionBatch.state` (`production_batch_state`)
+- `ProductionBatchTransition.{from,to}_state` (`production_batch_state`)
+
+Verified end-to-end:
+```
+alembic upgrade head  →  head 0005_prod_event_idempotent
+python -c "from app.seed import seed_permissions_and_roles; …"  →  SEED OK
+```
+
 
 ## Unresolved limitations
 
