@@ -441,6 +441,12 @@ async def delete_site(
         organization_id=farm.organization_id,
         farm_id=farm.id,
     )
+    # Codex Review Gate 02 follow-up — delete is a write, and CLOSED
+    # is read-only until an explicit reopen. Route through the
+    # central lifecycle helper so the invariant is enforced everywhere.
+    from app.production.lifecycle_policy import assert_site_delete_allowed
+
+    assert_site_delete_allowed(site)
     await service.soft_delete(actor=user, site=site, farm=farm, request_ctx=request_ctx)
     return ProductionSitePublic.model_validate(site)
 
@@ -499,10 +505,63 @@ async def list_unit_types(
       memberships; unknown / non-member org ids are silently ignored so
       that they cannot be used to probe for the existence of custom
       types in other tenants.
+
+    Permission (Codex Review Gate 02 follow-up):
+    - With ``organization_id``: membership check runs first (404 on
+      non-member) then ``production_unit_type.read`` is required at
+      that scope (403 otherwise).
+    - Without ``organization_id``: caller must hold
+      ``production_unit_type.read`` at some scope they own — pure
+      authentication is not enough.
     """
     from sqlalchemy import select
 
     from app.models.membership import OrganizationMembership
+
+    # --- Permission gate (tenancy 404 first, permission 403 second) --- #
+    if organization_id is not None:
+        # Tenancy 404 first — non-members must not learn whether the
+        # organization exists. Membership check reuses the same
+        # active-membership guard as the org-scoped tenant deps.
+        from sqlalchemy import select as _select
+
+        from app.models.membership import OrganizationMembership as _Mem
+
+        if not user.is_superuser:
+            mem = (
+                await session.execute(
+                    _select(_Mem).where(
+                        _Mem.user_id == user.id,
+                        _Mem.organization_id == organization_id,
+                        _Mem.is_active.is_(True),
+                        _Mem.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if mem is None:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    "Organization not found.",
+                )
+        await _enforce_prod_permission(
+            user=user,
+            session=session,
+            code="production_unit_type.read",
+            organization_id=organization_id,
+            farm_id=None,
+        )
+    else:
+        # No org scope — require the permission through the caller's
+        # existing role assignments (platform-scoped OR any
+        # org-scoped grant they hold). Authentication alone is not
+        # enough.
+        await _enforce_prod_permission(
+            user=user,
+            session=session,
+            code="production_unit_type.read",
+            organization_id=None,
+            farm_id=None,
+        )
 
     org_ids: list[uuid.UUID]
     if user.is_superuser:
@@ -521,11 +580,11 @@ async def list_unit_types(
         )
         org_ids = list((await session.execute(mem_stmt)).scalars().all())
 
-    if organization_id is not None:
-        # Intersect the requested filter with the caller's accessible orgs.
-        # Non-members receive system types only — no leak of which orgs
-        # own custom types.
-        org_ids = [o for o in org_ids if o == organization_id]
+    # Intersect the requested filter with the caller's accessible orgs.
+    # Non-members receive system types only — no leak of which orgs
+    # own custom types. When no ``organization_id`` is provided the
+    # endpoint returns system-only types by policy (see docstring).
+    org_ids = [o for o in org_ids if o == organization_id] if organization_id is not None else []
 
     rows = await unit_type_repo.list_visible(organization_ids=org_ids)
     return [ProductionUnitTypePublic.model_validate(r) for r in rows]
@@ -758,6 +817,11 @@ async def delete_unit(
         organization_id=farm.organization_id,
         farm_id=farm.id,
     )
+    # Codex Review Gate 02 follow-up — CLOSED unit must be reopened
+    # under normal safeguards before deletion.
+    from app.production.lifecycle_policy import assert_unit_delete_allowed
+
+    assert_unit_delete_allowed(unit)
     await service.soft_delete(actor=user, unit=unit, farm=farm, request_ctx=request_ctx)
     return ProductionUnitPublic.model_validate(unit)
 
@@ -847,7 +911,7 @@ async def update_batch(
     user: CurrentUser,
     session: DBSession,
 ) -> ProductionBatchPublic:
-    batch, _, _, farm = await _load_batch(batch_id, user, session)
+    batch, unit, site, farm = await _load_batch(batch_id, user, session)
     await _enforce_prod_permission(
         user=user,
         session=session,
@@ -855,6 +919,12 @@ async def update_batch(
         organization_id=farm.organization_id,
         farm_id=farm.id,
     )
+    # Codex Review Gate 02 follow-up — batch updates are also writes;
+    # parent site + unit must be ACTIVE. Delegates to the central
+    # lifecycle helper so the semantics stay unified.
+    from app.production.lifecycle_policy import assert_batch_update_allowed
+
+    assert_batch_update_allowed(site, unit)
     changed = payload.model_dump(exclude_unset=True)
     # Defence-in-depth: state changes MUST go through /transitions —
     # never allow a PATCH to touch state / lifecycle timestamps even if
@@ -938,8 +1008,24 @@ async def list_batch_transitions(
     response_model=ProductionEventCatalogResponse,
     tags=["production-events"],
 )
-async def get_event_catalog(user: CurrentUser) -> ProductionEventCatalogResponse:
-    del user  # authentication only — catalog is not tenant-specific.
+async def get_event_catalog(
+    user: CurrentUser,
+    session: DBSession,
+) -> ProductionEventCatalogResponse:
+    """Return the registered production-event catalog.
+
+    Codex Review Gate 02 follow-up: no longer authentication-only.
+    Callers must hold ``production_event.read`` at some scope (platform
+    admin or via any of their org / farm role assignments). Non-tenant
+    users therefore cannot enumerate the event surface.
+    """
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="production_event.read",
+        organization_id=None,
+        farm_id=None,
+    )
     return ProductionEventCatalogResponse(
         entries=[
             ProductionEventCatalogEntry.model_validate(e) for e in CATALOG.as_openapi_catalog()

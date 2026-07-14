@@ -626,6 +626,193 @@ async def test_maintenance_site_disallows_capacity_edit(client: AsyncClient) -> 
 
 
 # ===================================================================== #
+# 5.a Codex Review Gate 02 (verification pass) — remaining read
+#     endpoints get explicit permission gates, remaining mutations get
+#     the CLOSED lifecycle gate.
+# ===================================================================== #
+async def _create_orphan_user(client: AsyncClient, prefix: str = "orphan") -> str:
+    """User with zero org memberships → holds no APE permissions."""
+    email = f"{prefix}-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(email)
+    await switch_user(client, email)
+    return email
+
+
+async def test_unauthenticated_cannot_list_unit_types(client: AsyncClient) -> None:
+    # Ensure no active session before probing the endpoint.
+    client.cookies.clear()
+    r = await client.get("/api/v1/production-unit-types")
+    assert r.status_code == 401, r.text
+
+
+async def test_orphan_user_cannot_list_unit_types(client: AsyncClient) -> None:
+    """Authenticated but no memberships → 403 (no APE perms anywhere)."""
+    await _create_orphan_user(client)
+    r = await client.get("/api/v1/production-unit-types")
+    assert r.status_code == 403, r.text
+    assert "production_unit_type.read" in r.json()["detail"]
+
+
+async def test_non_member_org_scoped_unit_type_list_returns_404(client: AsyncClient) -> None:
+    """Requesting `?organization_id=<other-tenant>` from a non-member returns 404.
+
+    The tenancy check runs before the RBAC check so non-members can't
+    probe for org existence via the 403/404 shape.
+    """
+    owner_ctx = await _new_owner_org_farm(client)  # owner org (target)
+    # Switch to an outsider who owns a *different* org.
+    outsider = f"outsider-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(outsider)
+    await switch_user(client, outsider)
+    await create_org(client, slug=f"out-{uuid4().hex[:6]}")
+
+    r = await client.get(
+        "/api/v1/production-unit-types",
+        params={"organization_id": owner_ctx["org_id"]},
+    )
+    assert r.status_code == 404, r.text
+
+
+async def test_authorized_member_can_list_unit_types(client: AsyncClient) -> None:
+    """Owner (has viewer/owner roles) → 200 + at least the system types."""
+    ctx = await _new_owner_org_farm(client)
+    r = await client.get(
+        "/api/v1/production-unit-types",
+        params={"organization_id": ctx["org_id"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert isinstance(body, list)
+    assert any(t.get("is_system") for t in body), "expected at least one system unit type"
+
+
+async def test_unauthenticated_cannot_read_event_catalog(client: AsyncClient) -> None:
+    client.cookies.clear()
+    r = await client.get("/api/v1/production-events/catalog")
+    assert r.status_code == 401, r.text
+
+
+async def test_orphan_user_cannot_read_event_catalog(client: AsyncClient) -> None:
+    await _create_orphan_user(client)
+    r = await client.get("/api/v1/production-events/catalog")
+    assert r.status_code == 403, r.text
+    assert "production_event.read" in r.json()["detail"]
+
+
+async def test_authorized_member_can_read_event_catalog(client: AsyncClient) -> None:
+    await _new_owner_org_farm(client)
+    r = await client.get("/api/v1/production-events/catalog")
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json().get("entries"), list)
+
+
+# --- CLOSED lifecycle enforcement on remaining mutations ------------ #
+async def test_batch_patch_blocked_when_parent_unit_is_closed(client: AsyncClient) -> None:
+    """PATCH /batches/{id} refused while the parent unit is CLOSED."""
+    ctx = await _prepare_active_batch(client, quantity=25)
+    # Final-harvest → HARVESTED so the unit can be closed.
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/events",
+        json={
+            "event_type": "HARVEST",
+            "data": harvest_payload(
+                quantity=25, total_weight=10.0, harvest_type="total", is_final=True
+            ),
+        },
+    )
+    assert r.status_code == 201, r.text
+    r = await client.patch(f"/api/v1/units/{ctx['unit_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+
+    r = await client.patch(
+        f"/api/v1/batches/{ctx['batch_id']}",
+        json={"code": "renamed-while-closed"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "unit_closed_no_writes"
+
+
+async def test_batch_patch_blocked_when_parent_site_is_closed(client: AsyncClient) -> None:
+    """PATCH /batches/{id} refused while the parent site is CLOSED."""
+    ctx = await _prepare_active_batch(client, quantity=25)
+    r = await client.post(
+        f"/api/v1/batches/{ctx['batch_id']}/events",
+        json={
+            "event_type": "HARVEST",
+            "data": harvest_payload(
+                quantity=25, total_weight=10.0, harvest_type="total", is_final=True
+            ),
+        },
+    )
+    assert r.status_code == 201, r.text
+    # Reach CLOSED site by first closing the unit, then closing the site.
+    r = await client.patch(f"/api/v1/units/{ctx['unit_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+
+    r = await client.patch(
+        f"/api/v1/batches/{ctx['batch_id']}",
+        json={"code": "renamed-while-site-closed"},
+    )
+    assert r.status_code == 409, r.text
+    # Either the site OR unit closed check may fire first; both are valid.
+    assert r.json()["detail"]["code"] in {"site_closed_no_writes", "unit_closed_no_writes"}
+
+
+async def test_delete_site_blocked_when_site_is_closed(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.delete(f"/api/v1/sites/{ctx['site_id']}")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "site_closed_no_writes"
+
+
+async def test_delete_unit_blocked_when_unit_is_closed(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx["org_id"])
+    unit_id = await _create_unit(client, ctx["site_id"], ut)
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.delete(f"/api/v1/units/{unit_id}")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "unit_closed_no_writes"
+
+
+async def test_reopen_then_delete_follows_normal_safeguards(client: AsyncClient) -> None:
+    """CLOSED site is refused DELETE, but reopening → DELETE succeeds."""
+    ctx = await _new_owner_org_farm(client)
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.delete(f"/api/v1/sites/{ctx['site_id']}")
+    assert r.status_code == 409, r.text
+
+    # Reopen through the explicit status update path.
+    r = await client.patch(f"/api/v1/sites/{ctx['site_id']}", json={"status": "active"})
+    assert r.status_code == 200, r.text
+    # Now DELETE proceeds through the normal soft-delete flow.
+    r = await client.delete(f"/api/v1/sites/{ctx['site_id']}")
+    assert r.status_code == 200, r.text
+    # Soft-deleted sites disappear from the tenancy scope (404 on GET).
+    r = await client.get(f"/api/v1/sites/{ctx['site_id']}")
+    assert r.status_code == 404
+
+    # Same round-trip for a unit.
+    ctx2 = await _new_owner_org_farm(client)
+    ut = await _pick_system_unit_type_id(client, ctx2["org_id"])
+    unit_id = await _create_unit(client, ctx2["site_id"], ut)
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "closed"})
+    assert r.status_code == 200, r.text
+    r = await client.delete(f"/api/v1/units/{unit_id}")
+    assert r.status_code == 409, r.text
+    r = await client.patch(f"/api/v1/units/{unit_id}", json={"status": "active"})
+    assert r.status_code == 200, r.text
+    r = await client.delete(f"/api/v1/units/{unit_id}")
+    assert r.status_code == 200, r.text
+
+
+# ===================================================================== #
 # 6. Postgres-only concurrency races
 # ===================================================================== #
 @_postgres_only

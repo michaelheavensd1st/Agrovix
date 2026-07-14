@@ -60,6 +60,11 @@ async def test_cross_tenant_custom_unit_type_is_never_returned(client: AsyncClie
     await create_org(client, slug=f"crg1-a-{uuid4().hex[:6]}")
 
     # a) No filter — outsider sees ONLY system types.
+    #    Codex Review Gate 02 (verification): when no ``organization_id``
+    #    is provided the endpoint returns system-only types regardless
+    #    of the caller's memberships. This narrows the pre-CRG02 leak
+    #    surface where an unfiltered call could echo custom types from
+    #    orgs the caller happens to belong to.
     r = await client.get("/api/v1/production-unit-types")
     assert r.status_code == 200
     codes = {t["code"] for t in r.json()}
@@ -67,22 +72,26 @@ async def test_cross_tenant_custom_unit_type_is_never_returned(client: AsyncClie
     assert all(t["is_system"] for t in r.json())
 
     # b) Spoofed filter — outsider tries to force B's org id.
-    #    Endpoint must silently strip the unauthorised filter and STILL
-    #    return only system types (no signal about B's existence).
+    #    Codex Review Gate 02 (verification) made this 404: a
+    #    non-member of B must not learn whether B exists at all. The
+    #    old CRG01-1 behaviour (silently strip the filter, return
+    #    system-only 200) is superseded by the stricter policy.
     r = await client.get(
         "/api/v1/production-unit-types",
         params={"organization_id": b["org_id"]},
     )
-    assert r.status_code == 200
-    codes = {t["code"] for t in r.json()}
-    assert "SECRET_TANK" not in codes
-    assert all(t["is_system"] for t in r.json())
+    assert r.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_own_org_custom_unit_type_is_visible(client: AsyncClient) -> None:
     """Positive control: the owning org's user CAN see their own custom
-    types, both unfiltered and with the ``organization_id`` filter."""
+    types via the ``organization_id`` filter.
+
+    Codex Review Gate 02 (verification): unfiltered calls now return
+    system-only types by policy, so the visibility check is scoped to
+    the explicit ``organization_id`` query.
+    """
     ctx = await _new_owner_org_farm(client)
     r = await client.post(
         f"/api/v1/organizations/{ctx['org_id']}/production-unit-types",
@@ -90,10 +99,13 @@ async def test_own_org_custom_unit_type_is_visible(client: AsyncClient) -> None:
     )
     assert r.status_code == 201
 
+    # Unfiltered → system only (per CRG02 tightening).
     r = await client.get("/api/v1/production-unit-types")
     codes = {t["code"] for t in r.json()}
-    assert "MY_TANK" in codes
+    assert "MY_TANK" not in codes
+    assert all(t["is_system"] for t in r.json())
 
+    # Filtered by the caller's own org → their custom type is visible.
     r = await client.get(
         "/api/v1/production-unit-types",
         params={"organization_id": ctx["org_id"]},

@@ -483,3 +483,68 @@ Single source of truth used by:
 - pnpm lint / type-check / test / next build (7/7 workspaces) — green
 
 **Test total: 141 on Postgres** (was 128 → +13 lifecycle-gap tests).
+
+## Codex Review Gate 02 (verification pass) — remaining read-perm + CLOSED-mutation blockers (2026-02-08 late)
+
+Verification-only follow-up: two High-severity blockers surfaced in
+the post-consolidation Codex pass. Resolved without expanding scope.
+
+### 1 · Read endpoints — explicit permission gates
+- `GET /production-unit-types`:
+  - `organization_id` provided → tenancy 404 (non-member) BEFORE
+    `production_unit_type.read` (403). System types included.
+  - `organization_id` omitted → returns **system-only** types by
+    policy (no cross-tenant hint) AND requires the caller to hold
+    `production_unit_type.read` at some scope (platform or any
+    org-scoped role assignment). Pure authentication is not enough.
+- `GET /production-events/catalog`: now requires
+  `production_event.read` (any scope). Previously auth-only.
+
+The CRG01 "own-org custom type is visible unfiltered" behaviour has
+been superseded by the stricter CRG02 policy — that test was
+updated to filter explicitly by `organization_id` for the positive
+control.
+
+### 2 · CLOSED lifecycle on remaining mutations
+Central helper additions in `app/production/lifecycle_policy.py`:
+- `assert_batch_update_allowed(site, unit)` — used by `PATCH
+  /batches/{id}`. CLOSED site or unit → 409; MAINTENANCE site or
+  unit → 409 (no batch-admin allow-list defined for Sprint 3).
+- `assert_site_delete_allowed(site)` — used by `DELETE /sites/{id}`.
+  CLOSED → 409. Reopen via explicit `status=active` first.
+- `assert_unit_delete_allowed(unit)` — used by `DELETE /units/{id}`.
+  Same policy as sites.
+
+CLOSED-means-read-only invariant now applies uniformly across
+`update_batch`, `delete_site`, `delete_unit`, alongside the existing
+`update_site`, `update_unit`, unit creation, batch creation, manual
+transition and event creation gates.
+
+### New tests (`test_codex_review_gate_02.py`, +13)
+- unauthenticated → `list_unit_types`, `get_event_catalog` → 401
+- orphan (no memberships) → both endpoints → 403
+- non-member org-scoped `list_unit_types` → 404
+- authorized member → both endpoints → 200
+- batch PATCH blocked when parent unit CLOSED
+- batch PATCH blocked when parent site CLOSED
+- site DELETE blocked when site CLOSED
+- unit DELETE blocked when unit CLOSED
+- reopen → DELETE follows normal safeguards (positive control)
+
+### Validation (all green)
+- ruff / black — 0 issues
+- pytest SQLite: **148 passed / 5 skipped** (Postgres-only race tests)
+- pytest Postgres: **153 passed** (all 4 concurrency tests inclusive)
+- alembic upgrade head → downgrade base → upgrade head — clean on
+  fresh Postgres 15
+- pnpm lint / type-check / test / next build (7/7 workspaces) — green
+
+### Changed files (delta for Codex verification-only pass)
+- `apps/api/app/api/v1/endpoints/production.py`
+- `apps/api/app/production/lifecycle_policy.py`
+- `apps/api/tests/test_codex_review_gate_01.py`
+- `apps/api/tests/test_codex_review_gate_02.py`
+- `memory/PRD.md`
+
+**Commit SHA (base):** `4fb1601`
+**Unresolved blockers:** none. Awaiting `APPROVE FOR MERGE`.

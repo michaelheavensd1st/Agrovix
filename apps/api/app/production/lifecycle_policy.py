@@ -132,6 +132,48 @@ def assert_can_manually_transition(site: ProductionSite, unit: ProductionUnit) -
         _raise_maintenance("unit", "transition the batch")
 
 
+def assert_batch_update_allowed(site: ProductionSite, unit: ProductionUnit) -> None:
+    """Gate PATCH /batches/{id} on the parent site + unit lifecycle.
+
+    Policy (Codex Review Gate 02 final follow-up):
+
+    * CLOSED site or unit → refuse *any* batch update. CLOSED is
+      read-only until an explicit reopen; batch mutations while the
+      parent is CLOSED would sidestep the read-only invariant.
+    * MAINTENANCE site or unit → refuse batch updates. Sprint 3
+      hasn't documented a "batch admin metadata allow-list" separate
+      from the batch schema, so we refuse the whole PATCH surface
+      while the parent is under maintenance and defer that
+      allow-list to a follow-on sprint.
+    * ACTIVE site + ACTIVE unit → normal update rules apply.
+    """
+    if is_closed(site):
+        _raise_closed("site", "update the batch")
+    if is_closed(unit):
+        _raise_closed("unit", "update the batch")
+    if is_maintenance(site):
+        _raise_maintenance("site", "update the batch")
+    if is_maintenance(unit):
+        _raise_maintenance("unit", "update the batch")
+
+
+def assert_site_delete_allowed(site: ProductionSite) -> None:
+    """Delete is a write. A CLOSED site must be reopened first.
+
+    Rationale: CLOSED is read-only until an explicit reopen. Deletion
+    would violate that invariant and skip the "reopen under normal
+    safeguards → then delete" flow the lifecycle policy is designed
+    to preserve.
+    """
+    if is_closed(site):
+        _raise_closed("site", "delete the site")
+
+
+def assert_unit_delete_allowed(unit: ProductionUnit) -> None:
+    if is_closed(unit):
+        _raise_closed("unit", "delete the unit")
+
+
 # --------------------------------------------------------------------- #
 # Update gates — PATCH endpoints
 # --------------------------------------------------------------------- #
@@ -280,11 +322,14 @@ def assert_event_allowed_by_lifecycle(
 __all__ = [
     "ProductionSiteStatus",
     "ProductionUnitStatus",
+    "assert_batch_update_allowed",
     "assert_can_create_batch",
     "assert_can_create_unit_in_site",
     "assert_can_manually_transition",
     "assert_event_allowed_by_lifecycle",
+    "assert_site_delete_allowed",
     "assert_site_update_allowed",
+    "assert_unit_delete_allowed",
     "assert_unit_update_allowed",
     "is_active",
     "is_closed",
