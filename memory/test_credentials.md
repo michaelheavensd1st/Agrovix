@@ -16,8 +16,9 @@ before they can log in.
 | ----------- | ---------------------------------------- |
 | Email       | `e2e@agrovix.dev`                        |
 | Password    | `testtest123`                            |
-| Organization| `E2E Farm` (slug `e2e-farm`)             |
+| Organization| `E2E Farm` (id `7ef45030-a59c-4579-91c9-97a0ac2f7dc9`) |
 | Warehouse   | `Main Store` (code `MAIN`)               |
+| Warehouse 2 | `Backup Store` (code `BACK`)             |
 | Item        | `Grower crumble` (code `FEED-01`, kg)    |
 | Lot         | `LOT001` (100 kg)                        |
 
