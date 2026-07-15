@@ -1,0 +1,33 @@
+{
+  "summary": "Sprint 4 CRG03 single-blocker verification-only pass. The tightened CLOSED-PATCH guard in InventoryService.update_warehouse() is fully correct: hermetic pytest 34 pass + 2 skips (SQLite concurrency), including all 6 new CRG03 verification tests. Live matrix via curl-equivalent (requests session, cookie auth) on http://127.0.0.1:8055/api: 8/8 pass — including the full matrix on the fixture MAIN warehouse (03aca305-e38e-4da1-86f1-4dfe5214eb86) which was restored to ACTIVE. UI regression on http://127.0.0.1:3001 loads cleanly, all 9 Sprint 4 tabs visible, zero console errors. No new defects.",
+  "backend_issues": { "critical": [], "minor": [] },
+  "frontend_issues": { "ui_bugs": [], "integration_issues": [], "design_issues": [] },
+  "test_report_links": [
+    "/app/apps/api/tests/test_sprint_4_inventory.py (36 tests: 34 pass + 2 SQLite-skip; includes all 6 CRG03 verification tests)",
+    "/app/apps/api/tests/test_crg03_iter8_live.py (new: 8 live curl-cookie tests, all pass)",
+    "/app/test_reports/pytest/sprint4_iter8.xml",
+    "/app/test_reports/pytest/crg03_iter8_live.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "apps/api/app/services/inventory.py:197-219 — CLOSED gate is now the ONLY code path controlling reopen semantics. It computes payload_keys = {k for k,v in data.items() if v is not None} and requires payload_keys == {'status'} AND target_status != CLOSED. Correct: {status:active,name:'x'} yields payload_keys={'status','name'} ≠ {'status'} → 409. Two-step flow is enforced structurally, not by convention.",
+    "detail.submitted_fields is sorted(payload_keys) — deterministic, alphabetical, safe for test assertions. Verified live: {status,name} returns ['name','status']; {status,address} returns ['address','status']; {name} returns ['name'].",
+    "Null-value keys are correctly excluded from payload_keys (line 198) — so a caller who sends {status:'active', name: null} is treated as {status:'active'} and permitted to reopen. This matches Pydantic exclude_none/optional semantics on WarehouseUpdate.",
+    "No partial application on refusal: HTTPException is raised BEFORE the setattr loop at line 220, so the aborted PATCH leaves the warehouse untouched. Verified live: after {status:'active', address:'12 New Rd'} refusal, GET returns status='closed' and address=null.",
+    "endpoint apps/api/app/api/v1/endpoints/inventory.py:update_warehouse remains a thin delegate to the service — no endpoint-local conditionals, per user directive. Correct.",
+    "Iteration-7 cosmetic note still open: audit entity_type='storage_location' vs the 'inventory_*' pattern used elsewhere. Cosmetic-only, not in scope for this verification pass."
+  ],
+  "updated_files": [
+    "/app/apps/api/tests/test_crg03_iter8_live.py (new — live verification matrix, 8 tests)"
+  ],
+  "success_rate": {
+    "backend": "100% (34/34 executed hermetic + 8/8 live; 2 hermetic skipped as intentional Postgres-only gates)",
+    "frontend": "100% (dashboard + inventory load, all 9 Sprint 4 tabs render, 0 console errors)"
+  },
+  "test_credentials": "e2e@agrovix.dev / testtest123 on live Postgres (127.0.0.1:8055). Org E2E Farm = 4e43a952-2f13-4d5a-a99f-5b34c51b228a. MAIN warehouse = 03aca305-e38e-4da1-86f1-4dfe5214eb86 (left ACTIVE after test).",
+  "seed_data_creation": "test_crg03_iter8_live.py creates ~6 throwaway warehouses per module run with codes CRG8-XXXXXX in the E2E Farm org. Not cleaned up; main agent can prune with code LIKE 'CRG8-%' when needed. MAIN warehouse is closed, exercised through the matrix, then explicitly restored to status='active' in the test's finally-block.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Sprint 4 CRG03 is fully green after this verification pass. Do NOT begin Sprint 5. The tightened CLOSED gate lives entirely at services/inventory.py:197-219 — payload_keys == {'status'} is the exact predicate. Re-run: `cd /app/apps/api && python -m pytest tests/test_sprint_4_inventory.py tests/test_crg03_iter8_live.py -v`. Two previous CRG03 live suites (test_crg03_live.py from iter7) still run cleanly alongside.",
+  "rca of the issue": "N/A — verification pass confirms the fix. RCA of the underlying iter7 defect (for archival): the previous update_warehouse() reopen branch allowed the caller to include arbitrary non-status fields alongside {status:'active'}, silently applying them because the CLOSED guard's early-exit condition matched only on status presence, not on payload cardinality. The iter8 fix replaces `if 'status' in data ...` with `if payload_keys == {'status'} and target_status != CLOSED`, converting reopen into a set-equality check so any accompanying key trips the 409. Reproduction steps (now blocked): (1) PATCH wh with {status:'closed'} → 200; (2) PATCH wh with {status:'active', name:'x'} → previously 200 + rename applied, now 409 warehouse_closed_no_writes with submitted_fields=['name','status']."
+}
