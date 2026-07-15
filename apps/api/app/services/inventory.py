@@ -187,22 +187,34 @@ class InventoryService:
         target_status: WarehouseStatus | None = None
         if "status" in data and data["status"] is not None:
             target_status = WarehouseStatus(data["status"])
+
+        # Sprint 4 CRG03 verification — CLOSED warehouses are strictly
+        # read-only. The ONLY valid PATCH is a status-only payload that
+        # transitions the warehouse OUT of CLOSED. Reopening and
+        # ordinary mutation must be two separate requests — that keeps
+        # the audit trail unambiguous (one row for "reopened", one row
+        # for "renamed") and makes the closed-guarantee auditable.
         if warehouse.status == WarehouseStatus.CLOSED:
-            # A CLOSED warehouse only accepts a status transition back
-            # to ACTIVE / MAINTENANCE; every other field is frozen.
-            forbidden = set(data.keys()) - {"status"}
-            # Reopening — allow accompanying fields only if the payload
-            # also changes status (target_status has been resolved above).
-            if forbidden and target_status != WarehouseStatus.CLOSED and target_status is None:
+            payload_keys = {k for k, v in data.items() if v is not None}
+            status_only_reopen = (
+                payload_keys == {"status"}
+                and target_status is not None
+                and target_status != WarehouseStatus.CLOSED
+            )
+            if not status_only_reopen:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
                         "code": "warehouse_closed_no_writes",
                         "message": (
-                            "A CLOSED warehouse can only be updated by "
-                            "including a status transition back to "
-                            "'active' or 'maintenance'."
+                            "A CLOSED warehouse can only be updated by a "
+                            "status-only PATCH that transitions it back "
+                            "to 'active' or 'maintenance'. Reopen the "
+                            "warehouse first, then submit a separate "
+                            "PATCH for any other field changes."
                         ),
+                        "warehouse_id": str(warehouse.id),
+                        "submitted_fields": sorted(payload_keys),
                     },
                 )
         for k, v in data.items():

@@ -733,6 +733,104 @@ async def test_closed_warehouse_only_reopens_via_status_flip(client: AsyncClient
     assert r.json()["status"] == "active"
 
 
+# --------------------------------------------------------------------- #
+# CRG03 verification-only pass — CLOSED PATCH must be status-only.
+# Reopening and ordinary mutations must be two separate requests.
+# --------------------------------------------------------------------- #
+async def test_closed_patch_status_only_active_reopens(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    # Status-only reopen is the ONE allowed shape.
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "active"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "active"
+
+
+async def test_closed_patch_status_only_maintenance_reopens(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "maintenance"
+
+
+async def test_closed_patch_name_only_refused(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"name": "x"})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "warehouse_closed_no_writes"
+    assert "name" in r.json()["detail"]["submitted_fields"]
+
+
+async def test_closed_patch_status_plus_name_refused(client: AsyncClient) -> None:
+    """CRG03 P0 gap — {status: active, name: 'x'} was previously
+    accepted because the reopen branch allowed accompanying fields.
+    This test locks the correct behaviour: mixing status with any
+    other field returns 409 even when the status transition would
+    otherwise be valid."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "active", "name": "x"})
+    assert r.status_code == 409, r.text
+    body = r.json()["detail"]
+    assert body["code"] == "warehouse_closed_no_writes"
+    assert set(body["submitted_fields"]) == {"status", "name"}
+    # Confirm the warehouse is still CLOSED — the aborted PATCH must
+    # have left the state untouched.
+    r = await client.get(f"/api/v1/warehouses/{wh_id}")
+    assert r.status_code == 200
+    assert r.json()["status"] == "closed"
+
+
+async def test_closed_patch_status_plus_farm_id_refused(client: AsyncClient) -> None:
+    """farm_id is not part of ``WarehouseUpdate`` today, but the
+    guard must reject it even if the schema is extended. Sends
+    ``address`` instead (present in ``WarehouseUpdate``) as a
+    schema-visible proxy for 'status + other field'."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    r = await client.patch(
+        f"/api/v1/warehouses/{wh_id}", json={"status": "active", "address": "12 New Rd"}
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "warehouse_closed_no_writes"
+    # Still CLOSED — no partial application.
+    r = await client.get(f"/api/v1/warehouses/{wh_id}")
+    assert r.status_code == 200
+    assert r.json()["status"] == "closed"
+    assert r.json()["address"] is None
+
+
+async def test_closed_reopen_then_edit_is_two_step_flow(client: AsyncClient) -> None:
+    """After a successful status-only reopen, ordinary fields may be
+    updated in a subsequent PATCH — proving reopen and mutate are
+    two separate requests."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    # Step 1 — reopen only.
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "active"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "active"
+    # Step 2 — rename in a separate call.
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"name": "HQ (reopened)"})
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "HQ (reopened)"
+    assert r.json()["status"] == "active"
+
+
 async def test_transfer_requires_permission_on_destination(client: AsyncClient) -> None:
     """Source-farm operator without dst-farm access cannot pump stock in."""
     owner = await _new_owner_org_farm(client)
