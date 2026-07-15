@@ -548,3 +548,189 @@ transition and event creation gates.
 
 **Commit SHA (base):** `4fb1601`
 **Unresolved blockers:** none. Awaiting `APPROVE FOR MERGE`.
+
+## Sprint 4 — Operational Resources 01 · Inventory (2026-02-08 late — closeout for CRG03)
+
+Delivered on branch `agent/sprint-4-operational-resources`. Sprint 4 is
+the first vertical-agnostic Operational Resource bounded context to
+run on top of APE, and is designed as an append-only ledger with
+strict Postgres row-level concurrency, tenant isolation, and full
+idempotency semantics — the same disciplines Sprint 2/3 established
+for `ProductionEvent`.
+
+### Domain
+- `Warehouse` — org-scoped or optionally farm-pinned physical storage
+  with `status` in {`active`, `maintenance`, `closed`}. Farm-pinned
+  warehouses require farm-membership OR org-membership to view or
+  mutate. `code` unique per organisation.
+- `StorageLocation` — optional child of a warehouse for finer-grained
+  binning. Not required for Sprint 4 operations; wired for future
+  vertical extensions.
+- `InventoryItem` — org-scoped catalog record with a fixed
+  `canonical_unit` (`kg`/`g`/`L`/`mL`/`count`/`bag`/`pack`) and a
+  `category` (`feed`/`medicine`/`chemical`/`supply`). Canonical unit
+  is immutable after creation; the service layer rejects updates that
+  would change it.
+- `InventoryLot` — a (`warehouse`, `item`, `lot_code`) tuple with
+  optional `expiry_date`, `unit_cost`, and metadata. Balances are
+  **not stored on the lot** — they are computed live from the ledger.
+- `InventoryTransaction` — append-only ledger, one row per movement:
+  `receipt`, `issue`, `adjustment_increase`, `adjustment_decrease`,
+  `transfer_out`, `transfer_in`, `reversal`, `consumption`. Never
+  mutated after insert; every entry carries `performed_by`, optional
+  `reason`, optional `reference_type`/`reference_id`, and the
+  `idempotency_key` that produced it.
+
+### Backend surface (`apps/api/app/api/v1/endpoints/inventory.py`)
+- Warehouses: `POST/GET /organizations/{org}/warehouses`,
+  `GET/PATCH /warehouses/{id}`, and `POST/GET /warehouses/{id}/storage-locations`.
+- Items: `POST/GET /organizations/{org}/inventory-items`,
+  `PATCH /inventory-items/{id}`.
+- Lots: `GET /warehouses/{id}/lots` (returns each lot with a live
+  balance in the item's canonical unit), `GET /lots/{id}`.
+- Ledger actions (all require `Idempotency-Key`; same key + same
+  payload → 200 replay with `X-Idempotent-Replay: true`; same key +
+  different payload → 409 `idempotency_key_payload_conflict`):
+  - `POST /warehouses/{id}/inventory:receive`
+  - `POST /warehouses/{id}/inventory:issue`
+  - `POST /warehouses/{id}/inventory:transfer`
+  - `POST /warehouses/{id}/inventory:adjust` (reason required)
+  - `POST /warehouses/{id}/inventory:reverse`
+- History: `GET /lots/{id}/transactions` with `(performed_at DESC, id DESC)`
+  ordering and opaque cursor pagination (same shape as APE event feed).
+- Permissions (13 codes): `inventory_warehouse.{create,read,update,delete}`,
+  `inventory_item.{create,read,update,delete}`, `inventory_lot.{read}`,
+  `inventory_transaction.{create,read,reverse}`. Cross-tenant leak
+  invariant preserved: tenancy 404 comes before permission 403.
+
+### Concurrency + safety
+- Postgres row-level lock on the lot (`SELECT ... FOR UPDATE`) inside
+  every ledger action, so two racing issues that would together
+  overshoot balance resolve to exactly one 201 + one 409.
+- `values_callable=lambda enum: [m.value for m in enum]` on all
+  SQLAlchemy `Enum` columns to make asyncpg agree with fresh
+  `CREATE TYPE` labels — same fix pattern established during CRG01.
+- Idempotency is enforced via a partial-unique index on
+  `(warehouse_id, idempotency_key) WHERE idempotency_key IS NOT NULL`
+  plus a SAVEPOINT-wrapped INSERT + payload-hash comparison.
+- `MAINTENANCE` warehouses accept `receipt`, `adjustment`, `reversal`
+  but block outbound `issue`/`transfer_out` unless the reason string
+  matches the documented evacuation pattern. `CLOSED` warehouses are
+  strictly read-only.
+
+### FEEDING → inventory consumption wiring
+- `POST /batches/{id}/events` with `event_type=FEEDING` accepts an
+  optional `inventory_lot_id`. When present, the service atomically:
+  1. Acquires the batch lock (existing APE guard).
+  2. Acquires the lot lock (`SELECT … FOR UPDATE`).
+  3. Validates unit compatibility with the item's canonical unit.
+  4. Rejects if the lot doesn't belong to a warehouse in the same
+     organisation, or if the lot is closed / balance would go
+     negative (409 `insufficient_stock`).
+  5. Inserts a `consumption` transaction on the lot with
+     `reference_type='production_event'` and `reference_id` equal to
+     the newly-created event, then completes the event insert in the
+     same transaction. The FEEDING event carries the transaction id
+     back on `data.inventory_transaction_id` for auditability.
+- Ad-hoc feed (no lot) remains supported by providing
+  `feed_description` instead of `inventory_lot_id`.
+
+### Frontend (`apps/web/app/inventory/page.tsx` + `components/ui-polish.tsx`)
+- Deliberate operator workspace with 9 tabs — Overview, Warehouses,
+  Items, Lots & balances, Receive, Issue, Transfer, Adjust /
+  reconcile, Transaction history. `useSearchParams` bootstrap wrapped
+  in `<Suspense>` per Next.js 14 CSR bailout.
+- Sprint 4 UX polish primitives (`ui-polish.tsx`):
+  toast bus (`toast()`, `<Toaster />`), stable `useSyncExternalStore`
+  snapshots, `Skeleton`/`SkeletonRows`, `EmptyStateCard`,
+  `ConfirmDialog`, `friendlyError()` mapping known backend codes
+  (idempotency, insufficient_stock, warehouse_closed_no_writes,
+  reverse_already_reversed, unit_incompatible, …) into user-friendly
+  language.
+- Every interactive control carries a `data-testid`; test IDs are
+  catalogued in `/app/memory/test_credentials.md`.
+- Search/filter on Warehouses, Items, Lots & History; category
+  dropdown on Items; type filter on History (matches the lowercase
+  ledger enum values); empty-state CTAs on first-run screens; submit
+  buttons disable while requests are in flight; destructive posts
+  (Adjust, Issue) always confirm via `ConfirmDialog`.
+- FeedingForm surfaces an optional `feeding-lot-id` field. When
+  populated the description input is disabled and the API is
+  called with `inventory_lot_id` so the lot balance is deducted.
+
+### Migration
+- `0007_inventory_sprint_4` — creates `warehouses`,
+  `storage_locations`, `inventory_items`, `inventory_lots`,
+  `inventory_transactions`; adds the four enum types
+  (`warehousestatus`, `inventoryitemcategory`, `stockunit`,
+  `inventorytransactiontype`); creates the `idempotency_key` partial
+  unique index and the `(lot_id, performed_at, id)` ledger index.
+- Full round-trip clean on fresh Postgres 15:
+  `upgrade head → downgrade base → upgrade head`.
+
+### Validation (all green on branch `agent/sprint-4-operational-resources`)
+- ruff / black — 0 issues (Python 3.12 target).
+- pytest SQLite — **167 passed, 7 skipped** (Postgres-only concurrency).
+- pytest Postgres — **179 passed** (added 5 live-server curl-driven
+  E2E tests in `test_sprint4_e2e_curl.py` that skip cleanly when the
+  local API on `SPRINT4_API_BASE` isn't reachable, so CI stays hermetic).
+- Alembic `upgrade head → downgrade base → upgrade head` on fresh
+  Postgres — clean; `python -m app.seed` — SEED OK.
+- Frontend workspace suite (`pnpm -r` filter '!@agrovix/mobile'):
+  eslint + tsc + vitest — 6/6 green (7 vitest cases pass in
+  `apps/web`; 4 in `@agrovix/validation`).
+- `next build` — 16 routes emitted, 0 prerender errors,
+  `/inventory` 9.11 kB (First Load JS 96.3 kB).
+- `scripts/verify-no-mongo.sh` — clean after the guard was updated to
+  exclude `node_modules` (zod's own template-literal test file was
+  triggering a false positive — see M6 below).
+
+### Sprint 4 milestone log
+- **M1**: models + permissions + migration `0007_inventory_sprint_4`
+  (commit `1994aec`).
+- **M2**: units/schemas/repos/service/endpoints + FEEDING integration
+  (commit `b946677`).
+- **M3**: comprehensive inventory pytest suite (commit `925f5ac`).
+- **M4**: inventory frontend UI polish — toasts, skeletons, filters,
+  confirmation dialogs, empty-state CTAs, submit-disabled semantics,
+  friendly 409 language (commit `895918a`).
+- **M5**: testing-agent-driven fixes — history filter aligned with
+  lowercase ledger enum values, `Toaster` server snapshot stable
+  reference, live-server E2E curl suite skips when API is down
+  (commit `400fb02`).
+- **M6**: `scripts/verify-no-mongo.sh` excludes `node_modules` so
+  bundled zod fixtures don't false-positive (commit `62867ed`).
+
+### Ready for Codex Review Gate 03
+Sprint 4 backend and frontend are functionally complete, tested,
+and all Definition-of-Done gates are green. Awaiting Codex Review
+Gate 03 before merging into develop.
+
+**Test total: 179 on Postgres** (was 141 → +38 for the inventory bounded
+context and its concurrency + idempotency + FEEDING-consumption tests).
+**Do NOT begin Sprint 5.** Procurement, suppliers, purchase approvals,
+equipment/asset management, water resource management, and
+sales/finance costing methods remain in the backlog.
+
+### Known limitations (deliberate, deferred)
+- Adjustments and reversals are auditable but not
+  approval-gated. A Sprint 5+ workflow will add multi-step approval
+  for large adjustments.
+- Inventory does not yet expose barcode/QR scanning or bulk import
+  flows — Sprint 4 focuses on the correctness kernel.
+- The design system remains plain Tailwind (consistent with the
+  farm/batch pages). A separate design-system consolidation pass to
+  Shadcn UI is tracked in the backlog and NOT part of Sprint 4.
+- MAINTENANCE warehouse policy is minimal (evacuation matching by
+  reason). A Sprint 5+ maintenance workflow can generalise this.
+
+### Deployment considerations
+- Migration `0007_inventory_sprint_4` is additive (no data loss on
+  upgrade) and reversible (round-trip verified). Deploy via the
+  standard `alembic upgrade head` step.
+- New permissions (13 codes) are added by `python -m app.seed`; the
+  seeder is idempotent and safe to run on every deploy.
+- No new external integrations; Redis is still optional (in-memory
+  fallback covers dev).
+- No changes to environment variables or CORS defaults.
+
