@@ -1414,13 +1414,14 @@ function TransferPanel({
 // Transaction history
 // -------------------------------------------------------------------- //
 const TX_TYPES = [
-  'RECEIPT',
-  'ISSUE',
-  'ADJUSTMENT',
-  'TRANSFER_OUT',
-  'TRANSFER_IN',
-  'REVERSAL',
-  'CONSUMPTION',
+  'receipt',
+  'issue',
+  'adjustment_increase',
+  'adjustment_decrease',
+  'transfer_out',
+  'transfer_in',
+  'reversal',
+  'consumption',
 ] as const;
 
 function HistoryPanel({
@@ -1457,7 +1458,7 @@ function HistoryPanel({
             <option value="">All types</option>
             {TX_TYPES.map((t) => (
               <option key={t} value={t}>
-                {t}
+                {t.replace(/_/g, ' ')}
               </option>
             ))}
           </select>

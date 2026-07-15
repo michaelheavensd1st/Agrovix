@@ -11,6 +11,7 @@ Focus: verify the invariants called out in the review request:
     same key + different payload => 409)
   - Feeding event with inventory_lot_id deducts lot balance
 """
+
 from __future__ import annotations
 
 import os
@@ -24,6 +25,25 @@ BASE = os.environ.get("SPRINT4_API_BASE", "http://127.0.0.1:8055").rstrip("/")
 EMAIL = "e2e@agrovix.dev"
 PASSWORD = "testtest123"
 ORG_ID = "463c2bbc-da32-4971-9206-8941f15c61fb"
+
+
+def _live_server_reachable() -> bool:
+    try:
+        r = requests.get(f"{BASE}/health", timeout=1.5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _live_server_reachable(),
+    reason=(
+        "Sprint 4 curl-driven E2E requires a live FastAPI at "
+        f"{BASE} plus a seeded E2E account. Skipped when the server is "
+        "not reachable (e.g. hermetic CI). Set SPRINT4_API_BASE to point "
+        "at a running instance to enable this suite."
+    ),
+)
 
 
 @pytest.fixture(scope="module")
