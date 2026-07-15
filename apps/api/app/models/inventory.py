@@ -42,6 +42,7 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy import (
@@ -378,7 +379,7 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
         nullable=False,
     )
     performed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()"), index=True
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )
     reason: Mapped[str | None] = mapped_column(String(500))
     reference_type: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -394,7 +395,7 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
         "metadata", JSONB().with_variant(JSON(), "sqlite"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("now()")
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     __table_args__ = (
