@@ -704,6 +704,110 @@ for `ProductionEvent`.
   (commit `400fb02`).
 - **M6**: `scripts/verify-no-mongo.sh` excludes `node_modules` so
   bundled zod fixtures don't false-positive (commit `62867ed`).
+- **M7**: PRD closeout for CRG03 request (commit `8eaebcf`).
+- **M8**: CRG03 P0/P1 corrections (commit `3796618`). Adds
+  `WarehouseStatus.MAINTENANCE` with a central lifecycle gate
+  (`_assert_warehouse_status_allows`) applied to every ledger writer;
+  extends `warehouse_status` Postgres enum via migration
+  `0008_wh_maintenance` with a fully reversible downgrade; enforces
+  dual-warehouse authorization on `POST :transfer` (source AND
+  destination); moves `update_warehouse` / `update_item` /
+  `create_storage_location` into `InventoryService` with full audit
+  logging; reorders reversal so idempotency replay short-circuits
+  BEFORE the `already_reversed` check; aligns the FEEDING linkage
+  documentation to the canonical direction
+  (`InventoryTransaction.reference_id → ProductionEvent.id`, event
+  stays immutable). +9 integration tests. Backend pytest totals rise
+  to 176 (SQLite) / 183 (Postgres). Testing agent iteration_7:
+  backend 100% pass (176/176 hermetic + 9/9 live curl), frontend
+  100% pass (9/9 tabs), zero critical defects, one cosmetic
+  entity_type inconsistency fixed in the same commit range.
+
+### Sprint 4 CRG03 verification pass — Final Closeout Report
+
+**Branch:** `agent/sprint-4-operational-resources`
+**Final commit SHA:** `3796618` (M8) followed by cosmetic entity_type
+fix currently uncommitted at write-time; will be part of M9 commit.
+
+**Files changed in this correction pass (Sprint 4 M8 + M9):**
+```
+apps/api/alembic/versions/0008_warehouse_maintenance_status.py    (+72)
+apps/api/app/models/inventory.py                                  (+1 −0)
+apps/api/app/services/inventory.py                                (+280 −45)
+apps/api/app/api/v1/endpoints/inventory.py                        (+45 −25)
+apps/api/tests/test_sprint_4_inventory.py                         (+263)
+apps/api/tests/test_crg03_live.py                                 (+484, testing-agent artifact)
+memory/PRD.md                                                     (+70)
+memory/test_credentials.md                                        (+2)
+```
+
+**Migration revisions in Sprint 4:**
+- `0007_inventory_sprint_4` — warehouses / storage_locations /
+  inventory_items / inventory_lots / inventory_transactions +
+  4 enum types + partial-unique idempotency index (base).
+- `0008_wh_maintenance` — adds `maintenance` to `warehouse_status`
+  (upgrade uses idempotent `ADD VALUE IF NOT EXISTS`; downgrade
+  refuses when any warehouse is still in maintenance, otherwise
+  cleanly drops the label via drop-default → rename-old →
+  create-new → alter-using → set-default → drop-old-type).
+
+**Test summary:**
+- **Ruff / Black** — 0 issues (Python 3.12 target).
+- **Pytest SQLite** — 176 passed, 7 skipped (Postgres-only concurrency).
+- **Pytest Postgres** — 183 passed (was 174 pre-CRG03 → +9 CRG03
+  tests). Includes 30+ Sprint 4 inventory tests, 9 new CRG03 tests
+  covering MAINTENANCE lifecycle, transfer dual-auth, reversal
+  idempotency replay, and service-layer audit logging.
+- **Alembic** — `upgrade head → downgrade base → upgrade head`
+  clean on fresh Postgres 15; seed OK.
+- **Frontend workspace** — `pnpm -r` (excluding mobile): eslint +
+  tsc + vitest all green; `next build` — 16 routes, 0 prerender
+  errors.
+- **CI guards** — `scripts/verify-no-mongo.sh` clean.
+- **Testing agent (iteration_7.json)** — backend 100% pass
+  (176/176 hermetic + 9/9 live curl on `http://127.0.0.1:8055`),
+  frontend 100% pass (9/9 tabs on `http://127.0.0.1:3001`), zero
+  critical defects, `retest_needed=false`,
+  `should_main_agent_self_test=false`.
+
+**Remaining known limitations** (deliberate, deferred to backlog):
+- Adjustments and reversals remain auditable but not
+  approval-gated (Sprint 5+ workflow will add multi-step approval).
+- No barcode / QR scanning or bulk import flows yet.
+- Frontend uses plain Tailwind consistent with existing pages; a
+  design-system consolidation to Shadcn UI is a separate,
+  deliberately scheduled pass.
+- MAINTENANCE warehouse policy is intentionally coarse (allow-list
+  by transaction type). A Sprint 5+ maintenance workflow can
+  generalise it with time-boxed windows + reason schemas.
+- `apps/web/app/inventory/page.tsx` remains a single ~1200-line
+  component. Cosmetic; extraction into `_components/*` tracked as a
+  Sprint 5 pre-flight task.
+
+**Deployment considerations:**
+- Migration `0008_wh_maintenance` is additive and reversible.
+  Deploy sequence: `alembic upgrade head` (adds enum label —
+  idempotent) → `python -m app.seed` (permissions unchanged for
+  this migration).
+- No environment variable changes.
+- No new external integrations; Redis remains optional.
+- CORS / rate-limit defaults unchanged.
+- The `inventory:transfer` endpoint now returns 403 in cases that
+  previously succeeded silently (dual-warehouse authorization
+  contract). API clients that hard-coded transfers from a
+  farm-scoped operator into a foreign farm will start seeing 403;
+  this is the intended behavioural change.
+
+**Recommendation:**
+**Sprint 4 with CRG03 P0/P1 corrections is ready for Codex Review
+Gate 03 (verification pass).** All DoD gates are green, all
+testing-agent findings resolved, PRD documentation reflects the
+implementation exactly, and both `ProductionEvent` + `InventoryTransaction`
+retain their append-only invariants.
+
+**Not requesting merge approval.** Awaiting the Codex Review Gate 03
+verification pass before promoting to `develop`. Do NOT begin
+Sprint 5.
 
 ### Ready for Codex Review Gate 03
 Sprint 4 backend and frontend are functionally complete, tested,

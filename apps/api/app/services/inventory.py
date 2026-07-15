@@ -336,7 +336,7 @@ class InventoryService:
         await self.audit_repo.record(
             actor_id=actor.id,
             action="inventory_storage_location.create",
-            entity_type="storage_location",
+            entity_type="inventory_storage_location",
             entity_id=str(loc.id),
             organization_id=warehouse.organization_id,
             farm_id=warehouse.farm_id,
