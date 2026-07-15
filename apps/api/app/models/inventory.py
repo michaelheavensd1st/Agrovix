@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     from app.models.farm import Farm
     from app.models.organization import Organization
     from app.models.production import ProductionSite
-    from app.models.user import User
 
 
 # --------------------------------------------------------------------- #
@@ -99,7 +98,7 @@ class InventoryTransactionType(enum.StrEnum):
     Sign map used by :func:`app.services.inventory.signed_delta`:
 
     * Increase (+): ``RECEIPT``, ``TRANSFER_IN``, ``ADJUSTMENT_INCREASE``
-    * Decrease (−): ``ISSUE``, ``CONSUMPTION``, ``TRANSFER_OUT``,
+    * Decrease (-): ``ISSUE``, ``CONSUMPTION``, ``TRANSFER_OUT``,
       ``ADJUSTMENT_DECREASE``
     * ``REVERSAL`` inverts the sign of the row it references. This
       is enforced in the service layer, not at the DB level, so we
@@ -161,7 +160,12 @@ class Warehouse(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     description: Mapped[str | None] = mapped_column(String(1000))
     address: Mapped[str | None] = mapped_column(String(1000))
     status: Mapped[WarehouseStatus] = mapped_column(
-        SQLEnum(WarehouseStatus, name="warehouse_status", native_enum=True),
+        SQLEnum(
+            WarehouseStatus,
+            name="warehouse_status",
+            native_enum=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
         default=WarehouseStatus.ACTIVE,
         server_default=WarehouseStatus.ACTIVE.value,
@@ -171,10 +175,10 @@ class Warehouse(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
-    organization: Mapped["Organization"] = relationship("Organization")
-    farm: Mapped["Farm | None"] = relationship("Farm")
-    site: Mapped["ProductionSite | None"] = relationship("ProductionSite")
-    storage_locations: Mapped[list["StorageLocation"]] = relationship(
+    organization: Mapped[Organization] = relationship("Organization")
+    farm: Mapped[Farm | None] = relationship("Farm")
+    site: Mapped[ProductionSite | None] = relationship("ProductionSite")
+    storage_locations: Mapped[list[StorageLocation]] = relationship(
         back_populates="warehouse", cascade="all, delete-orphan"
     )
 
@@ -200,11 +204,9 @@ class StorageLocation(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     description: Mapped[str | None] = mapped_column(String(1000))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
-    warehouse: Mapped["Warehouse"] = relationship(back_populates="storage_locations")
+    warehouse: Mapped[Warehouse] = relationship(back_populates="storage_locations")
 
-    __table_args__ = (
-        UniqueConstraint("warehouse_id", "code", name="uq_storage_location_wh_code"),
-    )
+    __table_args__ = (UniqueConstraint("warehouse_id", "code", name="uq_storage_location_wh_code"),)
 
 
 # --------------------------------------------------------------------- #
@@ -230,11 +232,21 @@ class InventoryItem(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(1000))
     category: Mapped[InventoryItemCategory] = mapped_column(
-        SQLEnum(InventoryItemCategory, name="inventory_item_category", native_enum=True),
+        SQLEnum(
+            InventoryItemCategory,
+            name="inventory_item_category",
+            native_enum=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
     )
     canonical_unit: Mapped[StockUnit] = mapped_column(
-        SQLEnum(StockUnit, name="stock_unit", native_enum=True),
+        SQLEnum(
+            StockUnit,
+            name="stock_unit",
+            native_enum=True,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
     )
     sku: Mapped[str | None] = mapped_column(String(128))
@@ -246,7 +258,7 @@ class InventoryItem(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
-    organization: Mapped["Organization"] = relationship("Organization")
+    organization: Mapped[Organization] = relationship("Organization")
 
     __table_args__ = (
         UniqueConstraint("organization_id", "code", name="uq_inventory_item_org_code"),
@@ -292,9 +304,9 @@ class InventoryLot(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
-    item: Mapped["InventoryItem"] = relationship("InventoryItem")
-    warehouse: Mapped["Warehouse"] = relationship("Warehouse")
-    storage_location: Mapped["StorageLocation | None"] = relationship("StorageLocation")
+    item: Mapped[InventoryItem] = relationship("InventoryItem")
+    warehouse: Mapped[Warehouse] = relationship("Warehouse")
+    storage_location: Mapped[StorageLocation | None] = relationship("StorageLocation")
 
     __table_args__ = (
         UniqueConstraint("warehouse_id", "item_id", "lot_code", name="uq_lot_wh_item_code"),
@@ -364,13 +376,20 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
             InventoryTransactionType,
             name="inventory_transaction_type",
             native_enum=True,
+            values_callable=lambda e: [m.value for m in e],
         ),
         nullable=False,
         index=True,
     )
     quantity: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
     unit: Mapped[StockUnit] = mapped_column(
-        SQLEnum(StockUnit, name="stock_unit", native_enum=True, create_type=False),
+        SQLEnum(
+            StockUnit,
+            name="stock_unit",
+            native_enum=True,
+            create_type=False,
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
     )
     performed_by_id: Mapped[uuid.UUID] = mapped_column(

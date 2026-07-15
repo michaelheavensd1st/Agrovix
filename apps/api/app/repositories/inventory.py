@@ -18,7 +18,6 @@ from app.models.inventory import (
     Warehouse,
 )
 
-
 # --------------------------------------------------------------------- #
 # Sign map — INCREASE types add to the balance, DECREASE types subtract.
 # REVERSAL is handled specially in the service (flip the referenced row).

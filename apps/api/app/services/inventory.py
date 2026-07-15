@@ -52,7 +52,6 @@ from app.repositories.inventory import (
     WarehouseRepository,
 )
 
-
 _INCREASE_TYPES = {
     InventoryTransactionType.RECEIPT,
     InventoryTransactionType.TRANSFER_IN,
@@ -197,9 +196,7 @@ class InventoryService:
             )
         return existing
 
-    def _to_canonical(
-        self, *, item: InventoryItem, qty: Decimal, unit: StockUnit
-    ) -> Decimal:
+    def _to_canonical(self, *, item: InventoryItem, qty: Decimal, unit: StockUnit) -> Decimal:
         if not is_compatible(unit, item.canonical_unit):
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -329,9 +326,7 @@ class InventoryService:
                 "lot_id": str(lot.id),
                 "quantity": str(quantity_canonical),
                 "unit": item.canonical_unit.value,
-                "reference": (
-                    f"{reference_type}:{reference_id}" if reference_type else None
-                ),
+                "reference": (f"{reference_type}:{reference_id}" if reference_type else None),
             },
             **request_ctx,
         )
@@ -392,9 +387,7 @@ class InventoryService:
         # Lock the lot BEFORE reading balance / writing the ledger row.
         lot = await self._lock_lot(lot.id)
 
-        qty_canonical = self._to_canonical(
-            item=item, qty=payload["quantity"], unit=payload["unit"]
-        )
+        qty_canonical = self._to_canonical(item=item, qty=payload["quantity"], unit=payload["unit"])
         p_hash = _payload_hash(
             {
                 "op": "receipt",
@@ -448,9 +441,7 @@ class InventoryService:
         item = await self.item_repo.get_by_id(lot.item_id)
         if item is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
-        qty_canonical = self._to_canonical(
-            item=item, qty=payload["quantity"], unit=payload["unit"]
-        )
+        qty_canonical = self._to_canonical(item=item, qty=payload["quantity"], unit=payload["unit"])
         p_hash = _payload_hash(
             {
                 "op": "issue",
@@ -498,13 +489,9 @@ class InventoryService:
         traced together.
         """
         self._assert_warehouse_open(warehouse)
-        dst_warehouse = await self.warehouse_repo.get_by_id(
-            payload["destination_warehouse_id"]
-        )
+        dst_warehouse = await self.warehouse_repo.get_by_id(payload["destination_warehouse_id"])
         if dst_warehouse is None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Destination warehouse not found."
-            )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Destination warehouse not found.")
         if dst_warehouse.organization_id != warehouse.organization_id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -524,9 +511,7 @@ class InventoryService:
         item = await self.item_repo.get_by_id(src_lot.item_id)
         if item is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
-        qty_canonical = self._to_canonical(
-            item=item, qty=payload["quantity"], unit=payload["unit"]
-        )
+        qty_canonical = self._to_canonical(item=item, qty=payload["quantity"], unit=payload["unit"])
 
         # Reuse / create the destination lot.
         dst_lot = await self.lot_repo.find_or_none(
@@ -566,9 +551,7 @@ class InventoryService:
         if replay is not None:
             paired = [
                 t
-                for t in await self.tx_repo.list_by_reference(
-                    "transfer", replay.reference_id
-                )
+                for t in await self.tx_repo.list_by_reference("transfer", replay.reference_id)
                 if t.transaction_type == InventoryTransactionType.TRANSFER_IN
             ]
             if not paired:  # defensive — should not happen
@@ -633,9 +616,7 @@ class InventoryService:
         item = await self.item_repo.get_by_id(lot.item_id)
         if item is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
-        qty_canonical = self._to_canonical(
-            item=item, qty=payload["quantity"], unit=payload["unit"]
-        )
+        qty_canonical = self._to_canonical(item=item, qty=payload["quantity"], unit=payload["unit"])
         direction = payload["direction"]
         tx_type = (
             InventoryTransactionType.ADJUSTMENT_INCREASE
@@ -704,9 +685,7 @@ class InventoryService:
                 },
             )
         # Refuse if the original has already been reversed.
-        already = await self.tx_repo.list_by_reference(
-            "inventory_transaction", original.id
-        )
+        already = await self.tx_repo.list_by_reference("inventory_transaction", original.id)
         if any(t.transaction_type == InventoryTransactionType.REVERSAL for t in already):
             raise HTTPException(
                 status.HTTP_409_CONFLICT,

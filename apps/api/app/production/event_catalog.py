@@ -155,9 +155,7 @@ class FeedingEventSchema(_StrictModel):
     @model_validator(mode="after")
     def _at_least_one_feed_id(self) -> FeedingEventSchema:
         if not self.feed_item_ref and not self.feed_description and not self.inventory_lot_id:
-            raise ValueError(
-                "Provide feed_item_ref, feed_description, or inventory_lot_id."
-            )
+            raise ValueError("Provide feed_item_ref, feed_description, or inventory_lot_id.")
         return self
 
 

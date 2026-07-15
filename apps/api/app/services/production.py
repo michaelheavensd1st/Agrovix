@@ -762,7 +762,7 @@ class ProductionEventService:
             await inv_service.consume_for_event(
                 actor=actor,
                 farm=farm,
-                lot_id=validated_data["inventory_lot_id"],
+                lot_id=uuid.UUID(str(validated_data["inventory_lot_id"])),
                 quantity=_Decimal(str(validated_data["quantity"])),
                 unit=lot_unit,
                 event_id=event.id,

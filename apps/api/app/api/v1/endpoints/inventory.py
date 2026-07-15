@@ -97,9 +97,7 @@ def get_inventory_service(
 # --------------------------------------------------------------------- #
 # Tenancy helpers
 # --------------------------------------------------------------------- #
-async def _assert_org_membership(
-    session: AsyncSession, user, organization_id: uuid.UUID
-) -> None:
+async def _assert_org_membership(session: AsyncSession, user, organization_id: uuid.UUID) -> None:
     """404 for non-members. Superusers pass through."""
     if user.is_superuser:
         return
@@ -117,9 +115,7 @@ async def _assert_org_membership(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found.")
 
 
-async def _assert_farm_membership_or_org_access(
-    session: AsyncSession, user, farm: Farm
-) -> None:
+async def _assert_farm_membership_or_org_access(session: AsyncSession, user, farm: Farm) -> None:
     """Farm access resolves to: (a) superuser, (b) org member, (c) farm
     member. Sprint 4 keeps the same rule as sites/units so warehouse
     farm-pinning behaves identically to the rest of the platform."""
@@ -162,16 +158,16 @@ async def _load_warehouse(
     """
     wh = (
         await session.execute(
-            select(Warehouse).where(
-                Warehouse.id == warehouse_id, Warehouse.deleted_at.is_(None)
-            )
+            select(Warehouse).where(Warehouse.id == warehouse_id, Warehouse.deleted_at.is_(None))
         )
     ).scalar_one_or_none()
     if wh is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
     farm: Farm | None = None
     if wh.farm_id is not None:
-        farm = (await session.execute(select(Farm).where(Farm.id == wh.farm_id))).scalar_one_or_none()
+        farm = (
+            await session.execute(select(Farm).where(Farm.id == wh.farm_id))
+        ).scalar_one_or_none()
         if farm is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
         await _assert_farm_membership_or_org_access(session, user, farm)
@@ -207,11 +203,11 @@ async def create_warehouse(
     )
     # If pinning to a farm, that farm must belong to the same org.
     if payload.farm_id is not None:
-        farm = (await session.execute(select(Farm).where(Farm.id == payload.farm_id))).scalar_one_or_none()
+        farm = (
+            await session.execute(select(Farm).where(Farm.id == payload.farm_id))
+        ).scalar_one_or_none()
         if farm is None or farm.organization_id != organization_id:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Farm not found in this organization."
-            )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Farm not found in this organization.")
     wh = await service.create_warehouse(
         actor=user,
         organization_id=organization_id,
@@ -250,7 +246,9 @@ async def list_warehouses(
                 visible.append(wh)
             else:
                 try:
-                    farm = (await session.execute(select(Farm).where(Farm.id == wh.farm_id))).scalar_one()
+                    farm = (
+                        await session.execute(select(Farm).where(Farm.id == wh.farm_id))
+                    ).scalar_one()
                     await _assert_farm_membership_or_org_access(session, user, farm)
                     visible.append(wh)
                 except HTTPException:
@@ -356,7 +354,10 @@ async def list_storage_locations(
         organization_id=wh.organization_id,
         farm_id=wh.farm_id,
     )
-    return [StorageLocationPublic.model_validate(r) for r in await location_repo.list_for_warehouse(wh.id)]
+    return [
+        StorageLocationPublic.model_validate(r)
+        for r in await location_repo.list_for_warehouse(wh.id)
+    ]
 
 
 # --------------------------------------------------------------------- #
@@ -412,7 +413,9 @@ async def list_items(
         organization_id=organization_id,
         farm_id=None,
     )
-    return [InventoryItemPublic.model_validate(r) for r in await item_repo.list_for_org(organization_id)]
+    return [
+        InventoryItemPublic.model_validate(r) for r in await item_repo.list_for_org(organization_id)
+    ]
 
 
 @router.patch(
