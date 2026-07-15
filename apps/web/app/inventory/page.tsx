@@ -7,13 +7,27 @@
  * calls for: warehouses, items, lots + balances, receive / issue /
  * transfer / adjust / reverse, and per-lot transaction history.
  *
- * We do NOT auto-scaffold generic CRUD screens for other resource
- * types — those live under later bounded contexts.
+ * Sprint 4 UX polish (2026-02-08):
+ *  · Toast notifications for success + failure.
+ *  · Loading skeletons while lists are fetching.
+ *  · Search + filter inputs on Warehouses / Items / Lots / History.
+ *  · Confirmation dialogs before destructive posts (Adjust, Reverse).
+ *  · Empty-state cards with clear CTAs on first-run screens.
+ *  · Submit buttons disable during in-flight requests.
+ *  · Friendly language for 409 / idempotency conflicts.
  */
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
+import {
+  ConfirmDialog,
+  EmptyStateCard,
+  Skeleton,
+  SkeletonRows,
+  friendlyError,
+  toast,
+} from '@/components/ui-polish';
 
 // --- Types ---------------------------------------------------------- //
 interface Organization {
@@ -25,7 +39,7 @@ interface Warehouse {
   id: string;
   code: string;
   name: string;
-  status: 'active' | 'closed';
+  status: 'active' | 'closed' | 'maintenance';
   farm_id: string | null;
 }
 interface InventoryItem {
@@ -77,30 +91,40 @@ async function postWithKey<T>(path: string, body: unknown, key: string): Promise
   });
 }
 
-function friendly(err: unknown): string {
-  if (err instanceof ApiError) {
-    const d = err.payload?.detail;
-    if (typeof d === 'string') return d;
-    if (d && typeof d === 'object' && 'message' in d) return (d as { message: string }).message;
-    return `${err.status} ${err.message}`;
-  }
-  return String(err);
-}
+const UNITS = ['kg', 'g', 'L', 'mL', 'count', 'bag', 'pack'] as const;
+const CATEGORIES = ['feed', 'medicine', 'chemical', 'supply'] as const;
 
 // -------------------------------------------------------------------- //
 export default function InventoryPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="mx-auto max-w-6xl px-6 py-10" data-testid="inventory-page-loading">
+          <Skeleton className="mb-6 h-10 w-64" />
+          <SkeletonRows rows={5} />
+        </main>
+      }
+    >
+      <InventoryInner />
+    </Suspense>
+  );
+}
+
+function InventoryInner() {
   const router = useRouter();
   const params = useSearchParams();
   const [tab, setTab] = useState<Tab>((params.get('tab') as Tab) ?? 'overview');
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [orgId, setOrgId] = useState<string>('');
-  const [error, setError] = useState<string | null>(null);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [selectedWh, setSelectedWh] = useState<string>('');
   const [lots, setLots] = useState<Lot[]>([]);
   const [history, setHistory] = useState<LedgerTx[]>([]);
   const [selectedLot, setSelectedLot] = useState<string>('');
+  const [loadingOrg, setLoadingOrg] = useState(true);
+  const [loadingLots, setLoadingLots] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
 
   // Bootstrap: load orgs.
   useEffect(() => {
@@ -112,13 +136,16 @@ export default function InventoryPage() {
         else router.push('/onboarding');
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) router.push('/login');
-        else setError(friendly(e));
+        else toast(friendlyError(e), 'error');
+      } finally {
+        setLoadingOrg(false);
       }
     })();
   }, [router]);
 
   const reloadOrg = useCallback(async () => {
     if (!orgId) return;
+    setLoadingOrg(true);
     try {
       const [wh, it] = await Promise.all([
         apiFetch<Warehouse[]>(`/v1/organizations/${orgId}/warehouses`),
@@ -128,17 +155,22 @@ export default function InventoryPage() {
       setItems(it);
       if (wh.length > 0 && !selectedWh) setSelectedWh(wh[0].id);
     } catch (e) {
-      setError(friendly(e));
+      toast(friendlyError(e), 'error');
+    } finally {
+      setLoadingOrg(false);
     }
   }, [orgId, selectedWh]);
 
   const reloadLots = useCallback(async () => {
     if (!selectedWh) return;
+    setLoadingLots(true);
     try {
       const list = await apiFetch<Lot[]>(`/v1/warehouses/${selectedWh}/lots`);
       setLots(list);
     } catch (e) {
-      setError(friendly(e));
+      toast(friendlyError(e), 'error');
+    } finally {
+      setLoadingLots(false);
     }
   }, [selectedWh]);
 
@@ -150,11 +182,12 @@ export default function InventoryPage() {
   }, [reloadLots]);
 
   useEffect(() => {
-    if (selectedLot) {
-      apiFetch<{ items: LedgerTx[] }>(`/v1/lots/${selectedLot}/transactions`)
-        .then((r) => setHistory(r.items))
-        .catch((e) => setError(friendly(e)));
-    }
+    if (!selectedLot) return;
+    setLoadingHistory(true);
+    apiFetch<{ items: LedgerTx[] }>(`/v1/lots/${selectedLot}/transactions`)
+      .then((r) => setHistory(r.items))
+      .catch((e) => toast(friendlyError(e), 'error'))
+      .finally(() => setLoadingHistory(false));
   }, [selectedLot]);
 
   const totalBalanceByItem = useMemo(() => {
@@ -209,15 +242,6 @@ export default function InventoryPage() {
         </div>
       </div>
 
-      {error && (
-        <div
-          data-testid="inv-error"
-          className="mb-4 rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive"
-        >
-          {error}
-        </div>
-      )}
-
       <nav
         className="mb-6 flex flex-wrap gap-2 border-b border-border pb-2"
         data-testid="inv-tabs"
@@ -240,41 +264,20 @@ export default function InventoryPage() {
       </nav>
 
       {tab === 'overview' && (
-        <section data-testid="inv-overview" className="grid gap-4 sm:grid-cols-3">
-          <div className="rounded-2xl border border-border p-4">
-            <p className="text-xs text-muted-foreground">Warehouses</p>
-            <p className="font-display text-2xl">{warehouses.length}</p>
-          </div>
-          <div className="rounded-2xl border border-border p-4">
-            <p className="text-xs text-muted-foreground">Items</p>
-            <p className="font-display text-2xl">{items.length}</p>
-          </div>
-          <div className="rounded-2xl border border-border p-4">
-            <p className="text-xs text-muted-foreground">Lots</p>
-            <p className="font-display text-2xl">{lots.length}</p>
-          </div>
-          {totalBalanceByItem.length > 0 && (
-            <div className="col-span-full rounded-2xl border border-border p-4">
-              <p className="mb-2 text-xs uppercase tracking-widest text-muted-foreground">
-                Balances (canonical units)
-              </p>
-              <ul className="grid gap-1 text-sm sm:grid-cols-2">
-                {totalBalanceByItem.map((row) => (
-                  <li key={row.name} className="flex justify-between border-b border-border py-1">
-                    <span>{row.name}</span>
-                    <span className="font-mono">
-                      {row.balance} {row.unit}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </section>
+        <OverviewPanel
+          loading={loadingOrg}
+          warehouses={warehouses}
+          items={items}
+          lots={lots}
+          balances={totalBalanceByItem}
+          onCreateWarehouse={() => setTab('warehouses')}
+          onCreateItem={() => setTab('items')}
+        />
       )}
 
       {tab === 'warehouses' && (
         <WarehousesPanel
+          loading={loadingOrg}
           orgId={orgId}
           warehouses={warehouses}
           onChange={reloadOrg}
@@ -286,11 +289,12 @@ export default function InventoryPage() {
       )}
 
       {tab === 'items' && (
-        <ItemsPanel orgId={orgId} items={items} onChange={reloadOrg} />
+        <ItemsPanel loading={loadingOrg} orgId={orgId} items={items} onChange={reloadOrg} />
       )}
 
       {tab === 'lots' && (
         <LotsPanel
+          loading={loadingLots}
           warehouses={warehouses}
           selectedWh={selectedWh}
           onSelectWh={setSelectedWh}
@@ -300,6 +304,7 @@ export default function InventoryPage() {
             setSelectedLot(id);
             setTab('history');
           }}
+          onReceive={() => setTab('receive')}
         />
       )}
 
@@ -345,6 +350,7 @@ export default function InventoryPage() {
 
       {tab === 'history' && (
         <HistoryPanel
+          loading={loadingHistory}
           lots={lots}
           selectedLot={selectedLot}
           onSelect={setSelectedLot}
@@ -356,14 +362,109 @@ export default function InventoryPage() {
 }
 
 // -------------------------------------------------------------------- //
-// Sub-panels
+// Overview
+// -------------------------------------------------------------------- //
+function OverviewPanel({
+  loading,
+  warehouses,
+  items,
+  lots,
+  balances,
+  onCreateWarehouse,
+  onCreateItem,
+}: {
+  loading: boolean;
+  warehouses: Warehouse[];
+  items: InventoryItem[];
+  lots: Lot[];
+  balances: { balance: number; unit: string; name: string }[];
+  onCreateWarehouse: () => void;
+  onCreateItem: () => void;
+}) {
+  if (loading) {
+    return (
+      <section data-testid="inv-overview" className="grid gap-4 sm:grid-cols-3">
+        <Skeleton className="h-20 w-full" />
+        <Skeleton className="h-20 w-full" />
+        <Skeleton className="h-20 w-full" />
+      </section>
+    );
+  }
+  if (warehouses.length === 0 && items.length === 0) {
+    return (
+      <EmptyStateCard
+        testId="inv-overview-empty"
+        title="Start your inventory workspace"
+        description="Set up a warehouse and a catalog of items to begin tracking stock."
+        action={
+          <div className="flex gap-2">
+            <button
+              type="button"
+              data-testid="inv-overview-cta-warehouse"
+              onClick={onCreateWarehouse}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
+            >
+              Create your first warehouse
+            </button>
+            <button
+              type="button"
+              data-testid="inv-overview-cta-item"
+              onClick={onCreateItem}
+              className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary"
+            >
+              Add an item
+            </button>
+          </div>
+        }
+      />
+    );
+  }
+  return (
+    <section data-testid="inv-overview" className="grid gap-4 sm:grid-cols-3">
+      <div className="rounded-2xl border border-border p-4">
+        <p className="text-xs text-muted-foreground">Warehouses</p>
+        <p className="font-display text-2xl">{warehouses.length}</p>
+      </div>
+      <div className="rounded-2xl border border-border p-4">
+        <p className="text-xs text-muted-foreground">Items</p>
+        <p className="font-display text-2xl">{items.length}</p>
+      </div>
+      <div className="rounded-2xl border border-border p-4">
+        <p className="text-xs text-muted-foreground">Lots</p>
+        <p className="font-display text-2xl">{lots.length}</p>
+      </div>
+      {balances.length > 0 && (
+        <div className="col-span-full rounded-2xl border border-border p-4">
+          <p className="mb-2 text-xs uppercase tracking-widest text-muted-foreground">
+            Balances (canonical units)
+          </p>
+          <ul className="grid gap-1 text-sm sm:grid-cols-2">
+            {balances.map((row) => (
+              <li key={row.name} className="flex justify-between border-b border-border py-1">
+                <span>{row.name}</span>
+                <span className="font-mono">
+                  {row.balance} {row.unit}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// -------------------------------------------------------------------- //
+// Warehouses
 // -------------------------------------------------------------------- //
 function WarehousesPanel({
+  loading,
   orgId,
   warehouses,
   onChange,
   onSelect,
 }: {
+  loading: boolean;
   orgId: string;
   warehouses: Warehouse[];
   onChange: () => void;
@@ -373,23 +474,31 @@ function WarehousesPanel({
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return warehouses;
+    return warehouses.filter(
+      (w) => w.name.toLowerCase().includes(q) || w.code.toLowerCase().includes(q),
+    );
+  }, [warehouses, query]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
-    setErr(null);
     try {
       await apiFetch(`/v1/organizations/${orgId}/warehouses`, {
         method: 'POST',
         body: JSON.stringify({ name: name.trim(), code: code.trim() }),
       });
+      toast(`Warehouse "${name.trim()}" created.`, 'success');
       setName('');
       setCode('');
       setCreating(false);
       onChange();
     } catch (e) {
-      setErr(friendly(e));
+      toast(friendlyError(e), 'error');
     } finally {
       setBusy(false);
     }
@@ -397,19 +506,31 @@ function WarehousesPanel({
 
   return (
     <section data-testid="inv-warehouses">
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-display text-lg">Warehouses</h2>
-        <button
-          type="button"
-          className="rounded-md border border-border px-3 py-1 text-sm hover:bg-secondary"
-          data-testid="inv-warehouse-new"
-          onClick={() => setCreating((v) => !v)}
-        >
-          {creating ? 'Cancel' : '+ New warehouse'}
-        </button>
+        <div className="flex items-center gap-2">
+          <input
+            data-testid="inv-warehouse-search"
+            placeholder="Search warehouses…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+          />
+          <button
+            type="button"
+            className="rounded-md border border-border px-3 py-1 text-sm hover:bg-secondary"
+            data-testid="inv-warehouse-new"
+            onClick={() => setCreating((v) => !v)}
+          >
+            {creating ? 'Cancel' : '+ New warehouse'}
+          </button>
+        </div>
       </div>
       {creating && (
-        <form onSubmit={submit} className="mb-4 grid gap-2 rounded-md border border-border p-3 sm:grid-cols-3">
+        <form
+          onSubmit={submit}
+          className="mb-4 grid gap-2 rounded-md border border-border p-3 sm:grid-cols-3"
+        >
           <input
             data-testid="inv-warehouse-name"
             placeholder="Name"
@@ -434,42 +555,69 @@ function WarehousesPanel({
           >
             {busy ? 'Saving…' : 'Create'}
           </button>
-          {err && <p className="col-span-full text-sm text-destructive">{err}</p>}
         </form>
       )}
-      <ul className="divide-y divide-border rounded-md border border-border">
-        {warehouses.map((w) => (
-          <li key={w.id} className="flex items-center justify-between p-3">
-            <div>
-              <p className="font-medium">{w.name}</p>
-              <p className="text-xs text-muted-foreground">
-                {w.code} · {w.status}
-                {w.farm_id ? ' · farm-pinned' : ' · org-shared'}
-              </p>
-            </div>
+      {loading ? (
+        <SkeletonRows rows={4} testId="inv-warehouses-loading" />
+      ) : warehouses.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-warehouses-empty"
+          title="Create your first warehouse"
+          description="Warehouses hold inventory lots. Pin them to a farm or share them across the whole organization."
+          action={
             <button
               type="button"
-              data-testid={`inv-warehouse-open-${w.code}`}
-              className="rounded-md border border-border px-3 py-1 text-xs hover:bg-secondary"
-              onClick={() => onSelect(w.id)}
+              data-testid="inv-warehouses-empty-cta"
+              onClick={() => setCreating(true)}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
             >
-              Open lots →
+              + New warehouse
             </button>
-          </li>
-        ))}
-        {warehouses.length === 0 && (
-          <li className="p-4 text-sm text-muted-foreground">No warehouses yet.</li>
-        )}
-      </ul>
+          }
+        />
+      ) : filtered.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-warehouses-no-match"
+          title="No warehouses match your search"
+          description="Try a different name or code."
+        />
+      ) : (
+        <ul className="divide-y divide-border rounded-md border border-border">
+          {filtered.map((w) => (
+            <li key={w.id} className="flex items-center justify-between p-3">
+              <div>
+                <p className="font-medium">{w.name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {w.code} · {w.status}
+                  {w.farm_id ? ' · farm-pinned' : ' · org-shared'}
+                </p>
+              </div>
+              <button
+                type="button"
+                data-testid={`inv-warehouse-open-${w.code}`}
+                className="rounded-md border border-border px-3 py-1 text-xs hover:bg-secondary"
+                onClick={() => onSelect(w.id)}
+              >
+                Open lots →
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
 
+// -------------------------------------------------------------------- //
+// Items
+// -------------------------------------------------------------------- //
 function ItemsPanel({
+  loading,
   orgId,
   items,
   onChange,
 }: {
+  loading: boolean;
   orgId: string;
   items: InventoryItem[];
   onChange: () => void;
@@ -478,26 +626,36 @@ function ItemsPanel({
   const [form, setForm] = useState({
     code: '',
     name: '',
-    category: 'feed' as 'feed' | 'medicine' | 'chemical' | 'supply',
-    canonical_unit: 'kg' as string,
+    category: 'feed' as (typeof CATEGORIES)[number],
+    canonical_unit: 'kg' as (typeof UNITS)[number],
   });
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [category, setCategory] = useState<string>('');
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return items.filter(
+      (i) =>
+        (!q || i.name.toLowerCase().includes(q) || i.code.toLowerCase().includes(q)) &&
+        (!category || i.category === category),
+    );
+  }, [items, query, category]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
-    setErr(null);
     try {
       await apiFetch(`/v1/organizations/${orgId}/inventory-items`, {
         method: 'POST',
         body: JSON.stringify(form),
       });
+      toast(`Item "${form.name}" added to catalog.`, 'success');
       setForm({ code: '', name: '', category: 'feed', canonical_unit: 'kg' });
       setCreating(false);
       onChange();
     } catch (e) {
-      setErr(friendly(e));
+      toast(friendlyError(e), 'error');
     } finally {
       setBusy(false);
     }
@@ -505,19 +663,44 @@ function ItemsPanel({
 
   return (
     <section data-testid="inv-items">
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-display text-lg">Catalog items</h2>
-        <button
-          type="button"
-          data-testid="inv-item-new"
-          className="rounded-md border border-border px-3 py-1 text-sm hover:bg-secondary"
-          onClick={() => setCreating((v) => !v)}
-        >
-          {creating ? 'Cancel' : '+ New item'}
-        </button>
+        <div className="flex items-center gap-2">
+          <input
+            data-testid="inv-item-search"
+            placeholder="Search items…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+          />
+          <select
+            data-testid="inv-item-filter-category"
+            value={category}
+            onChange={(e) => setCategory(e.target.value)}
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+          >
+            <option value="">All categories</option>
+            {CATEGORIES.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            data-testid="inv-item-new"
+            className="rounded-md border border-border px-3 py-1 text-sm hover:bg-secondary"
+            onClick={() => setCreating((v) => !v)}
+          >
+            {creating ? 'Cancel' : '+ New item'}
+          </button>
+        </div>
       </div>
       {creating && (
-        <form onSubmit={submit} className="mb-4 grid gap-2 rounded-md border border-border p-3 sm:grid-cols-4">
+        <form
+          onSubmit={submit}
+          className="mb-4 grid gap-2 rounded-md border border-border p-3 sm:grid-cols-4"
+        >
           <input
             data-testid="inv-item-code"
             placeholder="Code"
@@ -538,9 +721,11 @@ function ItemsPanel({
             data-testid="inv-item-category"
             className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             value={form.category}
-            onChange={(e) => setForm({ ...form, category: e.target.value as typeof form.category })}
+            onChange={(e) =>
+              setForm({ ...form, category: e.target.value as (typeof CATEGORIES)[number] })
+            }
           >
-            {(['feed', 'medicine', 'chemical', 'supply'] as const).map((c) => (
+            {CATEGORIES.map((c) => (
               <option key={c} value={c}>
                 {c}
               </option>
@@ -550,9 +735,11 @@ function ItemsPanel({
             data-testid="inv-item-unit"
             className="rounded-md border border-border bg-background px-2 py-1 text-sm"
             value={form.canonical_unit}
-            onChange={(e) => setForm({ ...form, canonical_unit: e.target.value })}
+            onChange={(e) =>
+              setForm({ ...form, canonical_unit: e.target.value as (typeof UNITS)[number] })
+            }
           >
-            {['kg', 'g', 'L', 'mL', 'count', 'bag', 'pack'].map((u) => (
+            {UNITS.map((u) => (
               <option key={u} value={u}>
                 {u}
               </option>
@@ -566,111 +753,188 @@ function ItemsPanel({
           >
             {busy ? 'Saving…' : 'Create item'}
           </button>
-          {err && <p className="col-span-full text-sm text-destructive">{err}</p>}
         </form>
       )}
-      <ul className="divide-y divide-border rounded-md border border-border">
-        {items.map((it) => (
-          <li key={it.id} className="p-3">
-            <p className="font-medium">
-              {it.name} <span className="text-xs text-muted-foreground">({it.code})</span>
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {it.category} · canonical unit {it.canonical_unit}
-            </p>
-            <p className="font-mono text-[10px] text-muted-foreground">{it.id}</p>
-          </li>
-        ))}
-        {items.length === 0 && <li className="p-4 text-sm text-muted-foreground">No items yet.</li>}
-      </ul>
+      {loading ? (
+        <SkeletonRows rows={4} testId="inv-items-loading" />
+      ) : items.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-items-empty"
+          title="Add your first catalog item"
+          description="Items describe what you receive into stock — feed, medicine, chemicals, or supplies."
+          action={
+            <button
+              type="button"
+              data-testid="inv-items-empty-cta"
+              onClick={() => setCreating(true)}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
+            >
+              + New item
+            </button>
+          }
+        />
+      ) : filtered.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-items-no-match"
+          title="No items match those filters"
+          description="Try clearing the search box or the category filter."
+        />
+      ) : (
+        <ul className="divide-y divide-border rounded-md border border-border">
+          {filtered.map((it) => (
+            <li key={it.id} className="p-3">
+              <p className="font-medium">
+                {it.name} <span className="text-xs text-muted-foreground">({it.code})</span>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {it.category} · canonical unit {it.canonical_unit}
+              </p>
+              <p className="font-mono text-[10px] text-muted-foreground">{it.id}</p>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
 
+// -------------------------------------------------------------------- //
+// Lots + balances
+// -------------------------------------------------------------------- //
 function LotsPanel({
+  loading,
   warehouses,
   selectedWh,
   onSelectWh,
   lots,
   items,
   onOpenLot,
+  onReceive,
 }: {
+  loading: boolean;
   warehouses: Warehouse[];
   selectedWh: string;
   onSelectWh: (id: string) => void;
   lots: Lot[];
   items: InventoryItem[];
   onOpenLot: (id: string) => void;
+  onReceive: () => void;
 }) {
+  const [query, setQuery] = useState('');
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return lots;
+    return lots.filter((lot) => {
+      const item = items.find((i) => i.id === lot.item_id);
+      return (
+        lot.lot_code.toLowerCase().includes(q) ||
+        (item?.name.toLowerCase().includes(q) ?? false) ||
+        (item?.code.toLowerCase().includes(q) ?? false)
+      );
+    });
+  }, [lots, items, query]);
+
   return (
     <section data-testid="inv-lots">
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-display text-lg">Lots &amp; balances</h2>
-        <select
-          data-testid="inv-lots-warehouse"
-          className="rounded-md border border-border bg-background px-2 py-1 text-sm"
-          value={selectedWh}
-          onChange={(e) => onSelectWh(e.target.value)}
-        >
-          {warehouses.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.name}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-center gap-2">
+          <input
+            data-testid="inv-lots-search"
+            placeholder="Search lot / item…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+          />
+          <select
+            data-testid="inv-lots-warehouse"
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+            value={selectedWh}
+            onChange={(e) => onSelectWh(e.target.value)}
+          >
+            {warehouses.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.name}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
-      <div className="overflow-x-auto rounded-md border border-border">
-        <table className="w-full text-sm">
-          <thead className="bg-secondary/40 text-xs uppercase tracking-widest text-muted-foreground">
-            <tr>
-              <th className="px-3 py-2 text-left">Lot</th>
-              <th className="px-3 py-2 text-left">Item</th>
-              <th className="px-3 py-2 text-left">Expiry</th>
-              <th className="px-3 py-2 text-right">Balance</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {lots.map((lot) => {
-              const item = items.find((i) => i.id === lot.item_id);
-              return (
-                <tr key={lot.id} className="border-t border-border">
-                  <td className="px-3 py-2 font-mono">{lot.lot_code}</td>
-                  <td className="px-3 py-2">{item?.name ?? lot.item_id}</td>
-                  <td className="px-3 py-2">{lot.expiry_date ?? '—'}</td>
-                  <td className="px-3 py-2 text-right font-mono">
-                    {lot.balance} {lot.balance_unit}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    <button
-                      type="button"
-                      data-testid={`inv-lot-open-${lot.lot_code}`}
-                      className="text-xs text-primary hover:underline"
-                      onClick={() => onOpenLot(lot.id)}
-                    >
-                      History →
-                    </button>
-                    <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-                      {lot.id}
-                    </div>
-                  </td>
-                </tr>
-              );
-            })}
-            {lots.length === 0 && (
+      {loading ? (
+        <SkeletonRows rows={5} testId="inv-lots-loading" />
+      ) : lots.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-lots-empty"
+          title="No lots in this warehouse yet"
+          description="Receive stock to create the first lot."
+          action={
+            <button
+              type="button"
+              data-testid="inv-lots-empty-cta"
+              onClick={onReceive}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
+            >
+              + Receive stock
+            </button>
+          }
+        />
+      ) : filtered.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-lots-no-match"
+          title="No lots match your search"
+          description="Clear the search box to see all lots."
+        />
+      ) : (
+        <div className="overflow-x-auto rounded-md border border-border">
+          <table className="w-full text-sm">
+            <thead className="bg-secondary/40 text-xs uppercase tracking-widest text-muted-foreground">
               <tr>
-                <td colSpan={5} className="p-4 text-center text-muted-foreground">
-                  No lots. Receive stock to create one.
-                </td>
+                <th className="px-3 py-2 text-left">Lot</th>
+                <th className="px-3 py-2 text-left">Item</th>
+                <th className="px-3 py-2 text-left">Expiry</th>
+                <th className="px-3 py-2 text-right">Balance</th>
+                <th />
               </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {filtered.map((lot) => {
+                const item = items.find((i) => i.id === lot.item_id);
+                return (
+                  <tr key={lot.id} className="border-t border-border">
+                    <td className="px-3 py-2 font-mono">{lot.lot_code}</td>
+                    <td className="px-3 py-2">{item?.name ?? lot.item_id}</td>
+                    <td className="px-3 py-2">{lot.expiry_date ?? '—'}</td>
+                    <td className="px-3 py-2 text-right font-mono">
+                      {lot.balance} {lot.balance_unit}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        type="button"
+                        data-testid={`inv-lot-open-${lot.lot_code}`}
+                        className="text-xs text-primary hover:underline"
+                        onClick={() => onOpenLot(lot.id)}
+                      >
+                        History →
+                      </button>
+                      <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+                        {lot.id}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }
 
+// -------------------------------------------------------------------- //
+// Receive
+// -------------------------------------------------------------------- //
 function ReceivePanel({
   warehouses,
   items,
@@ -687,16 +951,13 @@ function ReceivePanel({
   const [itemId, setItemId] = useState('');
   const [lotCode, setLotCode] = useState('');
   const [qty, setQty] = useState('');
-  const [unit, setUnit] = useState('kg');
+  const [unit, setUnit] = useState<(typeof UNITS)[number]>('kg');
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [ok, setOk] = useState<string | null>(null);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
+    if (busy) return;
     setBusy(true);
-    setErr(null);
-    setOk(null);
     try {
       await postWithKey(
         `/v1/warehouses/${selectedWh}/inventory:receive`,
@@ -708,15 +969,25 @@ function ReceivePanel({
         },
         idem('receipt'),
       );
-      setOk('Stock received.');
+      toast(`Received ${qty} ${unit} into lot ${lotCode.trim()}.`, 'success');
       setLotCode('');
       setQty('');
       onDone();
     } catch (e) {
-      setErr(friendly(e));
+      toast(friendlyError(e), 'error');
     } finally {
       setBusy(false);
     }
+  }
+
+  if (warehouses.length === 0 || items.length === 0) {
+    return (
+      <EmptyStateCard
+        testId="inv-receive-blocked"
+        title="Set up warehouses and items first"
+        description="Receiving stock requires at least one warehouse and one catalog item."
+      />
+    );
   }
 
   return (
@@ -787,9 +1058,9 @@ function ReceivePanel({
             data-testid="inv-receive-unit"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
             value={unit}
-            onChange={(e) => setUnit(e.target.value)}
+            onChange={(e) => setUnit(e.target.value as (typeof UNITS)[number])}
           >
-            {['kg', 'g', 'L', 'mL', 'count', 'bag', 'pack'].map((u) => (
+            {UNITS.map((u) => (
               <option key={u} value={u}>
                 {u}
               </option>
@@ -797,12 +1068,6 @@ function ReceivePanel({
           </select>
         </label>
       </div>
-      {err && <p className="col-span-full text-sm text-destructive">{err}</p>}
-      {ok && (
-        <p className="col-span-full text-sm text-emerald-600" data-testid="inv-receive-ok">
-          {ok}
-        </p>
-      )}
       <button
         type="submit"
         disabled={busy || !selectedWh || !itemId}
@@ -815,6 +1080,9 @@ function ReceivePanel({
   );
 }
 
+// -------------------------------------------------------------------- //
+// Issue / Adjust (destructive → confirmation dialog)
+// -------------------------------------------------------------------- //
 function TxPanel({
   mode,
   warehouse,
@@ -830,19 +1098,15 @@ function TxPanel({
 }) {
   const [lotId, setLotId] = useState('');
   const [qty, setQty] = useState('');
-  const [unit, setUnit] = useState('kg');
+  const [unit, setUnit] = useState<(typeof UNITS)[number]>('kg');
   const [direction, setDirection] = useState<'increase' | 'decrease'>('decrease');
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [ok, setOk] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState(false);
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
+  async function doSubmit() {
     if (!warehouse) return;
     setBusy(true);
-    setErr(null);
-    setOk(null);
     try {
       if (mode === 'issue') {
         await postWithKey(
@@ -850,121 +1114,159 @@ function TxPanel({
           { lot_id: lotId, quantity: Number(qty), unit, reason: reason || undefined },
           idem('issue'),
         );
+        toast(`Issued ${qty} ${unit}.`, 'success');
       } else {
         await postWithKey(
           `/v1/warehouses/${warehouse.id}/inventory:adjust`,
           { lot_id: lotId, quantity: Number(qty), unit, direction, reason },
           idem('adjust'),
         );
+        toast(`Adjustment (${direction}) posted.`, 'success');
       }
-      setOk('Posted.');
+      setQty('');
+      setReason('');
+      setLotId('');
       onDone();
     } catch (e) {
-      setErr(friendly(e));
+      toast(friendlyError(e), 'error');
     } finally {
       setBusy(false);
+      setPendingConfirm(false);
     }
   }
 
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    // Adjust always confirms; Issue confirms when decreasing.
+    setPendingConfirm(true);
+  }
+
+  if (!warehouse || lots.length === 0) {
+    return (
+      <EmptyStateCard
+        testId={`inv-${mode}-blocked`}
+        title="No lots available"
+        description="Receive stock into this warehouse before issuing or adjusting."
+      />
+    );
+  }
+
+  const lot = lots.find((l) => l.id === lotId);
+  const item = lot ? items.find((i) => i.id === lot.item_id) : null;
+
   return (
-    <form
-      onSubmit={submit}
-      className="grid gap-3 rounded-md border border-border p-4 sm:grid-cols-2"
-      data-testid={`inv-${mode}-form`}
-    >
-      <label className="block text-sm">
-        Lot
-        <select
-          data-testid={`inv-${mode}-lot`}
-          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
-          value={lotId}
-          onChange={(e) => setLotId(e.target.value)}
-          required
-        >
-          <option value="">— select —</option>
-          {lots.map((lot) => {
-            const item = items.find((i) => i.id === lot.item_id);
-            return (
-              <option key={lot.id} value={lot.id}>
-                {lot.lot_code} · {item?.name} · {lot.balance} {lot.balance_unit}
-              </option>
-            );
-          })}
-        </select>
-      </label>
-      {mode === 'adjust' && (
+    <>
+      <form
+        onSubmit={submit}
+        className="grid gap-3 rounded-md border border-border p-4 sm:grid-cols-2"
+        data-testid={`inv-${mode}-form`}
+      >
         <label className="block text-sm">
-          Direction
+          Lot
           <select
-            data-testid="inv-adjust-direction"
+            data-testid={`inv-${mode}-lot`}
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
-            value={direction}
-            onChange={(e) => setDirection(e.target.value as 'increase' | 'decrease')}
+            value={lotId}
+            onChange={(e) => setLotId(e.target.value)}
+            required
           >
-            <option value="decrease">Decrease</option>
-            <option value="increase">Increase</option>
+            <option value="">— select —</option>
+            {lots.map((l) => {
+              const it = items.find((i) => i.id === l.item_id);
+              return (
+                <option key={l.id} value={l.id}>
+                  {l.lot_code} · {it?.name} · {l.balance} {l.balance_unit}
+                </option>
+              );
+            })}
           </select>
         </label>
-      )}
-      <div className="grid grid-cols-2 gap-2">
-        <label className="block text-sm">
-          Quantity
-          <input
-            data-testid={`inv-${mode}-qty`}
-            type="number"
-            step="0.001"
-            min="0.001"
+        {mode === 'adjust' && (
+          <label className="block text-sm">
+            Direction
+            <select
+              data-testid="inv-adjust-direction"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
+              value={direction}
+              onChange={(e) => setDirection(e.target.value as 'increase' | 'decrease')}
+            >
+              <option value="decrease">Decrease</option>
+              <option value="increase">Increase</option>
+            </select>
+          </label>
+        )}
+        <div className="grid grid-cols-2 gap-2">
+          <label className="block text-sm">
+            Quantity
+            <input
+              data-testid={`inv-${mode}-qty`}
+              type="number"
+              step="0.001"
+              min="0.001"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
+              value={qty}
+              onChange={(e) => setQty(e.target.value)}
+              required
+            />
+          </label>
+          <label className="block text-sm">
+            Unit
+            <select
+              data-testid={`inv-${mode}-unit`}
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
+              value={unit}
+              onChange={(e) => setUnit(e.target.value as (typeof UNITS)[number])}
+            >
+              {UNITS.map((u) => (
+                <option key={u} value={u}>
+                  {u}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <label className="col-span-full block text-sm">
+          Reason {mode === 'adjust' ? '(required)' : '(optional)'}
+          <textarea
+            data-testid={`inv-${mode}-reason`}
+            rows={2}
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
-            value={qty}
-            onChange={(e) => setQty(e.target.value)}
-            required
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            required={mode === 'adjust'}
           />
         </label>
-        <label className="block text-sm">
-          Unit
-          <select
-            data-testid={`inv-${mode}-unit`}
-            className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
-            value={unit}
-            onChange={(e) => setUnit(e.target.value)}
-          >
-            {['kg', 'g', 'L', 'mL', 'count', 'bag', 'pack'].map((u) => (
-              <option key={u} value={u}>
-                {u}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-      <label className="col-span-full block text-sm">
-        Reason {mode === 'adjust' ? '(required)' : '(optional)'}
-        <textarea
-          data-testid={`inv-${mode}-reason`}
-          rows={2}
-          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-          required={mode === 'adjust'}
-        />
-      </label>
-      {err && <p className="col-span-full text-sm text-destructive">{err}</p>}
-      {ok && (
-        <p className="col-span-full text-sm text-emerald-600" data-testid={`inv-${mode}-ok`}>
-          {ok}
-        </p>
-      )}
-      <button
-        type="submit"
-        disabled={busy || !warehouse || !lotId}
-        data-testid={`inv-${mode}-submit`}
-        className="col-span-full rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
-      >
-        {busy ? 'Posting…' : mode === 'issue' ? 'Post issue' : 'Post adjustment'}
-      </button>
-    </form>
+        <button
+          type="submit"
+          disabled={busy || !warehouse || !lotId}
+          data-testid={`inv-${mode}-submit`}
+          className="col-span-full rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
+        >
+          {busy ? 'Posting…' : mode === 'issue' ? 'Post issue' : 'Post adjustment'}
+        </button>
+      </form>
+      <ConfirmDialog
+        open={pendingConfirm}
+        busy={busy}
+        destructive={mode === 'adjust' || direction === 'decrease'}
+        testId={`inv-${mode}-confirm`}
+        title={mode === 'issue' ? 'Confirm inventory issue' : 'Confirm inventory adjustment'}
+        description={
+          mode === 'issue'
+            ? `Issue ${qty} ${unit} from lot ${lot?.lot_code ?? ''} (${item?.name ?? ''}). This is an append-only ledger entry.`
+            : `${direction === 'decrease' ? 'Decrease' : 'Increase'} lot ${lot?.lot_code ?? ''} (${item?.name ?? ''}) by ${qty} ${unit}. Provide a written reason for the audit log.`
+        }
+        confirmLabel={mode === 'issue' ? 'Post issue' : 'Post adjustment'}
+        onConfirm={doSubmit}
+        onCancel={() => setPendingConfirm(false)}
+      />
+    </>
   );
 }
 
+// -------------------------------------------------------------------- //
+// Transfer
+// -------------------------------------------------------------------- //
 function TransferPanel({
   warehouses,
   warehouse,
@@ -981,17 +1283,13 @@ function TransferPanel({
   const [lotId, setLotId] = useState('');
   const [dstWh, setDstWh] = useState('');
   const [qty, setQty] = useState('');
-  const [unit, setUnit] = useState('kg');
+  const [unit, setUnit] = useState<(typeof UNITS)[number]>('kg');
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [ok, setOk] = useState<string | null>(null);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (!warehouse) return;
+    if (!warehouse || busy) return;
     setBusy(true);
-    setErr(null);
-    setOk(null);
     try {
       await postWithKey(
         `/v1/warehouses/${warehouse.id}/inventory:transfer`,
@@ -1003,13 +1301,26 @@ function TransferPanel({
         },
         idem('transfer'),
       );
-      setOk('Transferred.');
+      toast(`Transferred ${qty} ${unit}.`, 'success');
+      setLotId('');
+      setDstWh('');
+      setQty('');
       onDone();
     } catch (e) {
-      setErr(friendly(e));
+      toast(friendlyError(e), 'error');
     } finally {
       setBusy(false);
     }
+  }
+
+  if (!warehouse || lots.length === 0 || warehouses.length < 2) {
+    return (
+      <EmptyStateCard
+        testId="inv-transfer-blocked"
+        title="Transfers require two warehouses with stock"
+        description="Create a second warehouse and receive stock into the source lot before transferring."
+      />
+    );
   }
 
   return (
@@ -1077,9 +1388,9 @@ function TransferPanel({
             data-testid="inv-transfer-unit"
             className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1"
             value={unit}
-            onChange={(e) => setUnit(e.target.value)}
+            onChange={(e) => setUnit(e.target.value as (typeof UNITS)[number])}
           >
-            {['kg', 'g', 'L', 'mL', 'count', 'bag', 'pack'].map((u) => (
+            {UNITS.map((u) => (
               <option key={u} value={u}>
                 {u}
               </option>
@@ -1087,12 +1398,6 @@ function TransferPanel({
           </select>
         </label>
       </div>
-      {err && <p className="col-span-full text-sm text-destructive">{err}</p>}
-      {ok && (
-        <p className="col-span-full text-sm text-emerald-600" data-testid="inv-transfer-ok">
-          {ok}
-        </p>
-      )}
       <button
         type="submit"
         disabled={busy || !warehouse || !lotId || !dstWh}
@@ -1105,70 +1410,120 @@ function TransferPanel({
   );
 }
 
+// -------------------------------------------------------------------- //
+// Transaction history
+// -------------------------------------------------------------------- //
+const TX_TYPES = [
+  'RECEIPT',
+  'ISSUE',
+  'ADJUSTMENT',
+  'TRANSFER_OUT',
+  'TRANSFER_IN',
+  'REVERSAL',
+  'CONSUMPTION',
+] as const;
+
 function HistoryPanel({
+  loading,
   lots,
   selectedLot,
   onSelect,
   history,
 }: {
+  loading: boolean;
   lots: Lot[];
   selectedLot: string;
   onSelect: (id: string) => void;
   history: LedgerTx[];
 }) {
+  const [filterType, setFilterType] = useState<string>('');
+
+  const filtered = useMemo(() => {
+    if (!filterType) return history;
+    return history.filter((h) => h.transaction_type === filterType);
+  }, [history, filterType]);
+
   return (
     <section data-testid="inv-history">
-      <div className="mb-3 flex items-center justify-between">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-display text-lg">Transaction history</h2>
-        <select
-          data-testid="inv-history-lot"
-          className="rounded-md border border-border bg-background px-2 py-1 text-sm"
-          value={selectedLot}
-          onChange={(e) => onSelect(e.target.value)}
-        >
-          <option value="">— pick a lot —</option>
-          {lots.map((lot) => (
-            <option key={lot.id} value={lot.id}>
-              {lot.lot_code}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="overflow-x-auto rounded-md border border-border">
-        <table className="w-full text-sm">
-          <thead className="bg-secondary/40 text-xs uppercase tracking-widest text-muted-foreground">
-            <tr>
-              <th className="px-3 py-2 text-left">When</th>
-              <th className="px-3 py-2 text-left">Type</th>
-              <th className="px-3 py-2 text-right">Qty</th>
-              <th className="px-3 py-2 text-left">Reason</th>
-              <th className="px-3 py-2 text-left">Ref</th>
-            </tr>
-          </thead>
-          <tbody>
-            {history.map((tx) => (
-              <tr key={tx.id} className="border-t border-border">
-                <td className="px-3 py-2 font-mono text-xs">{tx.performed_at}</td>
-                <td className="px-3 py-2">{tx.transaction_type}</td>
-                <td className="px-3 py-2 text-right font-mono">
-                  {tx.quantity} {tx.unit}
-                </td>
-                <td className="px-3 py-2">{tx.reason ?? '—'}</td>
-                <td className="px-3 py-2 text-xs text-muted-foreground">
-                  {tx.reference_type ?? ''}
-                </td>
-              </tr>
+        <div className="flex items-center gap-2">
+          <select
+            data-testid="inv-history-filter-type"
+            value={filterType}
+            onChange={(e) => setFilterType(e.target.value)}
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+          >
+            <option value="">All types</option>
+            {TX_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
             ))}
-            {selectedLot && history.length === 0 && (
-              <tr>
-                <td colSpan={5} className="p-4 text-center text-muted-foreground">
-                  No transactions yet.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+          </select>
+          <select
+            data-testid="inv-history-lot"
+            className="rounded-md border border-border bg-background px-2 py-1 text-sm"
+            value={selectedLot}
+            onChange={(e) => onSelect(e.target.value)}
+          >
+            <option value="">— pick a lot —</option>
+            {lots.map((lot) => (
+              <option key={lot.id} value={lot.id}>
+                {lot.lot_code}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
+      {!selectedLot ? (
+        <EmptyStateCard
+          testId="inv-history-pick"
+          title="Pick a lot to view its ledger"
+          description="Every receipt, issue, transfer, adjustment, reversal and feeding consumption for a lot appears here."
+        />
+      ) : loading ? (
+        <SkeletonRows rows={5} testId="inv-history-loading" />
+      ) : filtered.length === 0 ? (
+        <EmptyStateCard
+          testId="inv-history-empty"
+          title={history.length === 0 ? 'No transactions yet' : 'No transactions match this filter'}
+          description={
+            history.length === 0
+              ? 'Post a receipt into this lot to see its first ledger entry.'
+              : 'Try clearing the type filter.'
+          }
+        />
+      ) : (
+        <div className="overflow-x-auto rounded-md border border-border">
+          <table className="w-full text-sm">
+            <thead className="bg-secondary/40 text-xs uppercase tracking-widest text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2 text-left">When</th>
+                <th className="px-3 py-2 text-left">Type</th>
+                <th className="px-3 py-2 text-right">Qty</th>
+                <th className="px-3 py-2 text-left">Reason</th>
+                <th className="px-3 py-2 text-left">Ref</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((tx) => (
+                <tr key={tx.id} className="border-t border-border">
+                  <td className="px-3 py-2 font-mono text-xs">{tx.performed_at}</td>
+                  <td className="px-3 py-2">{tx.transaction_type}</td>
+                  <td className="px-3 py-2 text-right font-mono">
+                    {tx.quantity} {tx.unit}
+                  </td>
+                  <td className="px-3 py-2">{tx.reason ?? '—'}</td>
+                  <td className="px-3 py-2 text-xs text-muted-foreground">
+                    {tx.reference_type ?? ''}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </section>
   );
 }
