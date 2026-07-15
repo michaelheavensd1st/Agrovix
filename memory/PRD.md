@@ -630,8 +630,12 @@ for `ProductionEvent`.
   5. Inserts a `consumption` transaction on the lot with
      `reference_type='production_event'` and `reference_id` equal to
      the newly-created event, then completes the event insert in the
-     same transaction. The FEEDING event carries the transaction id
-     back on `data.inventory_transaction_id` for auditability.
+     same transaction. The canonical linkage direction is
+     `InventoryTransaction.reference_id → ProductionEvent.id` — the
+     event itself stays immutable (Sprint 2 append-only invariant),
+     so consumers should query `GET /lots/{id}/transactions` filtered
+     by `reference_type='production_event'` when they need to walk
+     from an event to its consumption row.
 - Ad-hoc feed (no lot) remains supported by providing
   `feed_description` instead of `inventory_lot_id`.
 

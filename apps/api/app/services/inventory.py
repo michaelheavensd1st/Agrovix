@@ -39,6 +39,7 @@ from app.models.inventory import (
     InventoryTransaction,
     InventoryTransactionType,
     StockUnit,
+    StorageLocation,
     Warehouse,
     WarehouseStatus,
 )
@@ -157,6 +158,193 @@ class InventoryService:
         )
         return item
 
+    async def update_warehouse(
+        self,
+        *,
+        actor: User,
+        warehouse: Warehouse,
+        data: dict,
+        request_ctx: dict,
+    ) -> Warehouse:
+        """Sprint 4 CRG03 fix — mutations now flow through the service.
+
+        Captures a before/after diff in the audit log and enforces the
+        lifecycle contract: CLOSED warehouses cannot be renamed or
+        moved (only reopened via ``status=active``); ACTIVE ↔
+        MAINTENANCE ↔ CLOSED transitions are always permitted.
+        """
+        before = {
+            "name": warehouse.name,
+            "code": warehouse.code,
+            "status": warehouse.status.value,
+            "farm_id": str(warehouse.farm_id) if warehouse.farm_id else None,
+            "site_id": str(warehouse.site_id) if warehouse.site_id else None,
+        }
+        changed_fields: dict[str, tuple] = {}
+        # Status transitions must be validated before non-status mutations
+        # so that reopening a CLOSED warehouse works even when other
+        # fields are locked.
+        target_status: WarehouseStatus | None = None
+        if "status" in data and data["status"] is not None:
+            target_status = WarehouseStatus(data["status"])
+        if warehouse.status == WarehouseStatus.CLOSED:
+            # A CLOSED warehouse only accepts a status transition back
+            # to ACTIVE / MAINTENANCE; every other field is frozen.
+            forbidden = set(data.keys()) - {"status"}
+            # Reopening — allow accompanying fields only if the payload
+            # also changes status (target_status has been resolved above).
+            if forbidden and target_status != WarehouseStatus.CLOSED and target_status is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "warehouse_closed_no_writes",
+                        "message": (
+                            "A CLOSED warehouse can only be updated by "
+                            "including a status transition back to "
+                            "'active' or 'maintenance'."
+                        ),
+                    },
+                )
+        for k, v in data.items():
+            if hasattr(warehouse, k):
+                old = getattr(warehouse, k)
+                if k == "status" and v is not None:
+                    v = WarehouseStatus(v)
+                if old != v:
+                    changed_fields[k] = (
+                        old.value if hasattr(old, "value") else old,
+                        v.value if hasattr(v, "value") else v,
+                    )
+                    setattr(warehouse, k, v)
+        await self.session.flush()
+        await self.session.refresh(warehouse)
+        after = {
+            "name": warehouse.name,
+            "code": warehouse.code,
+            "status": warehouse.status.value,
+            "farm_id": str(warehouse.farm_id) if warehouse.farm_id else None,
+            "site_id": str(warehouse.site_id) if warehouse.site_id else None,
+        }
+        await self.audit_repo.record(
+            actor_id=actor.id,
+            action="inventory_warehouse.update",
+            entity_type="warehouse",
+            entity_id=str(warehouse.id),
+            organization_id=warehouse.organization_id,
+            farm_id=warehouse.farm_id,
+            metadata={
+                "before": before,
+                "after": after,
+                "changed": {k: {"from": v[0], "to": v[1]} for k, v in changed_fields.items()},
+            },
+            **request_ctx,
+        )
+        return warehouse
+
+    async def update_item(
+        self,
+        *,
+        actor: User,
+        item: InventoryItem,
+        data: dict,
+        request_ctx: dict,
+    ) -> InventoryItem:
+        """Sprint 4 CRG03 fix — item edits are audit-logged.
+
+        Rejects any change to ``canonical_unit`` (immutable after
+        creation) so historical ledger rows stay comparable.
+        """
+        if "canonical_unit" in data and data["canonical_unit"] not in (None, item.canonical_unit):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "canonical_unit_immutable",
+                    "message": (
+                        "Canonical unit cannot be changed after item "
+                        "creation. Create a new item if a different "
+                        "unit is required."
+                    ),
+                },
+            )
+        before = {
+            "name": item.name,
+            "code": item.code,
+            "category": item.category.value,
+            "canonical_unit": item.canonical_unit.value,
+        }
+        changed_fields: dict[str, tuple] = {}
+        for k, v in data.items():
+            if k == "canonical_unit":
+                continue
+            if hasattr(item, k):
+                old = getattr(item, k)
+                if old != v:
+                    changed_fields[k] = (
+                        old.value if hasattr(old, "value") else old,
+                        v.value if hasattr(v, "value") else v,
+                    )
+                    setattr(item, k, v)
+        await self.session.flush()
+        await self.session.refresh(item)
+        after = {
+            "name": item.name,
+            "code": item.code,
+            "category": item.category.value,
+            "canonical_unit": item.canonical_unit.value,
+        }
+        await self.audit_repo.record(
+            actor_id=actor.id,
+            action="inventory_item.update",
+            entity_type="inventory_item",
+            entity_id=str(item.id),
+            organization_id=item.organization_id,
+            farm_id=None,
+            metadata={
+                "before": before,
+                "after": after,
+                "changed": {k: {"from": v[0], "to": v[1]} for k, v in changed_fields.items()},
+            },
+            **request_ctx,
+        )
+        return item
+
+    async def create_storage_location(
+        self,
+        *,
+        actor: User,
+        warehouse: Warehouse,
+        data: dict,
+        request_ctx: dict,
+    ) -> StorageLocation:
+        """Sprint 4 CRG03 fix — storage-location creation flows through service.
+
+        CLOSED warehouses cannot receive new storage locations;
+        MAINTENANCE warehouses can (physical bins are a static
+        concern, unrelated to stock movements).
+        """
+        if warehouse.status == WarehouseStatus.CLOSED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "warehouse_closed_no_writes",
+                    "message": "Cannot add storage locations to a CLOSED warehouse.",
+                },
+            )
+        loc = StorageLocation(warehouse_id=warehouse.id, **data)
+        self.session.add(loc)
+        await self.session.flush()
+        await self.audit_repo.record(
+            actor_id=actor.id,
+            action="inventory_storage_location.create",
+            entity_type="storage_location",
+            entity_id=str(loc.id),
+            organization_id=warehouse.organization_id,
+            farm_id=warehouse.farm_id,
+            metadata={"warehouse_id": str(warehouse.id), "code": loc.code, "name": loc.name},
+            **request_ctx,
+        )
+        return loc
+
     # ---------------------------------------------------------------- #
     # Ledger primitives
     # ---------------------------------------------------------------- #
@@ -215,7 +403,71 @@ class InventoryService:
         except UnitIncompatibleError as exc:  # pragma: no cover — guarded above
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
+    def _assert_warehouse_status_allows(
+        self,
+        warehouse: Warehouse,
+        tx_type: InventoryTransactionType,
+    ) -> None:
+        """Central lifecycle-policy gate for every ledger mutation.
+
+        Sprint 4 lifecycle contract:
+
+        * ``ACTIVE`` — full read/write.
+        * ``MAINTENANCE`` — inbound + audit-only writes allowed:
+          ``RECEIPT``, ``TRANSFER_IN``, ``ADJUSTMENT_INCREASE``,
+          ``REVERSAL``. Every outbound movement is refused with
+          ``warehouse_under_maintenance`` (409) so operational stock
+          is frozen while the site is being serviced.
+        * ``CLOSED`` — strictly read-only. Every mutation returns 409
+          ``warehouse_closed_no_writes``. Reopen via
+          ``PATCH /warehouses/{id}`` (status=active) first.
+
+        The gate runs inside :meth:`_post_ledger` too so any code path
+        that reaches the ledger — including the FEEDING → CONSUMPTION
+        integration and future reversal / adjustment flows — is
+        checked in exactly one place.
+        """
+        if warehouse.status == WarehouseStatus.CLOSED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "warehouse_closed_no_writes",
+                    "message": "This warehouse is CLOSED and read-only.",
+                    "warehouse_id": str(warehouse.id),
+                    "warehouse_status": warehouse.status.value,
+                },
+            )
+        if warehouse.status == WarehouseStatus.MAINTENANCE:
+            allowed_under_maintenance = {
+                InventoryTransactionType.RECEIPT,
+                InventoryTransactionType.TRANSFER_IN,
+                InventoryTransactionType.ADJUSTMENT_INCREASE,
+                InventoryTransactionType.REVERSAL,
+            }
+            if tx_type not in allowed_under_maintenance:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "warehouse_under_maintenance",
+                        "message": (
+                            "This warehouse is under MAINTENANCE. Only "
+                            "inbound movements (receipts, incoming "
+                            "transfers, upward adjustments) and "
+                            "reversals are allowed. Blocked type: "
+                            f"{tx_type.value}."
+                        ),
+                        "warehouse_id": str(warehouse.id),
+                        "warehouse_status": warehouse.status.value,
+                        "transaction_type": tx_type.value,
+                    },
+                )
+
     def _assert_warehouse_open(self, warehouse: Warehouse) -> None:
+        """Back-compat alias used by legacy call sites — CLOSED only.
+
+        Prefer :meth:`_assert_warehouse_status_allows` at every new
+        call site so the MAINTENANCE allow-list is honoured.
+        """
         if warehouse.status == WarehouseStatus.CLOSED:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -247,11 +499,31 @@ class InventoryService:
         reverses_transaction_id: uuid.UUID | None = None,
         request_ctx: dict,
         metadata_json: dict | None = None,
+        bypass_maintenance_gate: bool = False,
     ) -> InventoryTransaction:
         """Insert a ledger row under an already-held lot lock.
 
-        Balance non-negativity is enforced for DECREASE types.
+        Balance non-negativity is enforced for DECREASE types. The
+        warehouse lifecycle gate runs FIRST so a CLOSED warehouse
+        blocks everything and MAINTENANCE only accepts the allow-list
+        documented in :meth:`_assert_warehouse_status_allows`.
+        ``bypass_maintenance_gate=True`` is used by
+        :meth:`reversal` for the inverse ledger row so that
+        corrections stay possible under MAINTENANCE (CLOSED still
+        blocks).
         """
+        if bypass_maintenance_gate:
+            # Reversal-inverse rows: only the CLOSED-strict rule applies.
+            if warehouse.status == WarehouseStatus.CLOSED:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "warehouse_closed_no_writes",
+                        "message": "This warehouse is CLOSED and read-only.",
+                    },
+                )
+        else:
+            self._assert_warehouse_status_allows(warehouse, tx_type)
         # Non-negative guard for decreases (inside the lock).
         if tx_type in _DECREASE_TYPES:
             current = await self._current_balance_canonical(lot.id)
@@ -351,7 +623,7 @@ class InventoryService:
         ``(tx, lot, is_replay)`` — the tx is the ledger row and
         ``is_replay=True`` indicates an idempotent replay.
         """
-        self._assert_warehouse_open(warehouse)
+        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.RECEIPT)
 
         item_id = payload["item_id"]
         item = await self.item_repo.get_by_id(item_id)
@@ -428,7 +700,7 @@ class InventoryService:
         request_ctx: dict,
         idempotency_key: str | None,
     ) -> tuple[InventoryTransaction, bool]:
-        self._assert_warehouse_open(warehouse)
+        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.ISSUE)
         lot = await self._lock_lot(payload["lot_id"])
         if lot.warehouse_id != warehouse.id:
             raise HTTPException(
@@ -488,7 +760,10 @@ class InventoryService:
         ``reference_type='transfer'`` + ``reference_id`` so they can be
         traced together.
         """
-        self._assert_warehouse_open(warehouse)
+        # Source must permit TRANSFER_OUT; destination must permit
+        # TRANSFER_IN. Both are checked BEFORE we touch any lots so a
+        # MAINTENANCE / CLOSED warehouse on either side aborts early.
+        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.TRANSFER_OUT)
         dst_warehouse = await self.warehouse_repo.get_by_id(payload["destination_warehouse_id"])
         if dst_warehouse is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Destination warehouse not found.")
@@ -500,7 +775,7 @@ class InventoryService:
                     "message": "Cannot transfer across organizations.",
                 },
             )
-        self._assert_warehouse_open(dst_warehouse)
+        self._assert_warehouse_status_allows(dst_warehouse, InventoryTransactionType.TRANSFER_IN)
 
         src_lot = await self._lock_lot(payload["lot_id"])
         if src_lot.warehouse_id != warehouse.id:
@@ -606,7 +881,15 @@ class InventoryService:
         request_ctx: dict,
         idempotency_key: str | None,
     ) -> tuple[InventoryTransaction, bool]:
-        self._assert_warehouse_open(warehouse)
+        direction = payload["direction"]
+        tx_type = (
+            InventoryTransactionType.ADJUSTMENT_INCREASE
+            if direction == "increase"
+            else InventoryTransactionType.ADJUSTMENT_DECREASE
+        )
+        # Direction-aware lifecycle gate — INCREASE is allowed under
+        # MAINTENANCE (reconciliation up), DECREASE is not.
+        self._assert_warehouse_status_allows(warehouse, tx_type)
         lot = await self._lock_lot(payload["lot_id"])
         if lot.warehouse_id != warehouse.id:
             raise HTTPException(
@@ -617,12 +900,6 @@ class InventoryService:
         if item is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
         qty_canonical = self._to_canonical(item=item, qty=payload["quantity"], unit=payload["unit"])
-        direction = payload["direction"]
-        tx_type = (
-            InventoryTransactionType.ADJUSTMENT_INCREASE
-            if direction == "increase"
-            else InventoryTransactionType.ADJUSTMENT_DECREASE
-        )
         p_hash = _payload_hash(
             {
                 "op": "adjustment",
@@ -671,8 +948,26 @@ class InventoryService:
         already ignore REVERSAL rows (they carry the audit trail;
         the inverse row carries the balance effect), so double-clicks
         cannot produce a phantom flip.
+
+        Idempotency contract (CRG03 fix): the ``(lot_id, key)`` replay
+        check now runs FIRST — a retried call with the same key
+        replays the original 200 response even after the original
+        successful call left an ``already_reversed`` state. Only
+        callers with a fresh key hit the "already reversed" 409.
         """
-        self._assert_warehouse_open(warehouse)
+        # CLOSED strictly blocks reversals; MAINTENANCE allows them
+        # (reversals are the audit-correction pathway). The inverse
+        # ledger row uses ``bypass_maintenance_gate`` so the DECREASE
+        # side of a reversal still lands under MAINTENANCE.
+        if warehouse.status == WarehouseStatus.CLOSED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "warehouse_closed_no_writes",
+                    "message": "This warehouse is CLOSED and read-only.",
+                    "warehouse_id": str(warehouse.id),
+                },
+            )
         original = await self.tx_repo.get_by_id(payload["reverses_transaction_id"])
         if original is None or original.warehouse_id != warehouse.id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Original transaction not found.")
@@ -684,7 +979,30 @@ class InventoryService:
                     "message": "A REVERSAL row cannot itself be reversed.",
                 },
             )
-        # Refuse if the original has already been reversed.
+
+        lot = await self._lock_lot(original.lot_id)
+        item = await self.item_repo.get_by_id(lot.item_id)
+        if item is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
+
+        p_hash = _payload_hash(
+            {
+                "op": "reversal",
+                "reverses": str(original.id),
+                "reason": payload["reason"],
+            }
+        )
+        # Idempotency replay — MUST come before the "already_reversed"
+        # check so that a retried call with the same key returns the
+        # original successful response (200) instead of a 409.
+        replay = await self._check_idempotency(
+            lot_id=lot.id, key=idempotency_key, payload_hash=p_hash
+        )
+        if replay is not None:
+            return replay, True
+
+        # Only after the replay-lookup do we enforce the once-only
+        # rule for fresh reversals.
         already = await self.tx_repo.list_by_reference("inventory_transaction", original.id)
         if any(t.transaction_type == InventoryTransactionType.REVERSAL for t in already):
             raise HTTPException(
@@ -692,13 +1010,9 @@ class InventoryService:
                 {
                     "code": "already_reversed",
                     "message": "This transaction has already been reversed.",
+                    "original_transaction_id": str(original.id),
                 },
             )
-
-        lot = await self._lock_lot(original.lot_id)
-        item = await self.item_repo.get_by_id(lot.item_id)
-        if item is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
 
         # Inverse type map.
         _inverse: dict[InventoryTransactionType, InventoryTransactionType] = {
@@ -711,20 +1025,10 @@ class InventoryService:
             InventoryTransactionType.ADJUSTMENT_DECREASE: InventoryTransactionType.ADJUSTMENT_INCREASE,
         }
         inverse_type = _inverse[original.transaction_type]
-        p_hash = _payload_hash(
-            {
-                "op": "reversal",
-                "reverses": str(original.id),
-                "reason": payload["reason"],
-            }
-        )
-        replay = await self._check_idempotency(
-            lot_id=lot.id, key=idempotency_key, payload_hash=p_hash
-        )
-        if replay is not None:
-            return replay, True
 
-        # 1) Inverse row (carries the balance effect).
+        # 1) Inverse row (carries the balance effect). Bypasses the
+        # MAINTENANCE gate so a correction can be posted even while
+        # the warehouse is under maintenance. CLOSED still blocks.
         inverse_tx = await self._post_ledger(
             actor=actor,
             organization_id=warehouse.organization_id,
@@ -740,8 +1044,11 @@ class InventoryService:
             reference_type="reversal_inverse_of",
             reference_id=original.id,
             request_ctx=request_ctx,
+            bypass_maintenance_gate=True,
         )
-        # 2) REVERSAL marker (audit only — zero balance effect).
+        # 2) REVERSAL marker (audit only — zero balance effect). The
+        # REVERSAL type is on the MAINTENANCE allow-list so we don't
+        # need to bypass the gate here.
         marker = await self._post_ledger(
             actor=actor,
             organization_id=warehouse.organization_id,
@@ -812,7 +1119,7 @@ class InventoryService:
                     "message": "This lot is pinned to a different farm.",
                 },
             )
-        self._assert_warehouse_open(warehouse)
+        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.CONSUMPTION)
 
         qty_canonical = self._to_canonical(item=item, qty=quantity, unit=unit)
         p_hash = _payload_hash(

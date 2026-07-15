@@ -288,6 +288,8 @@ async def update_warehouse(
     payload: WarehouseUpdate,
     user: CurrentUser,
     session: DBSession,
+    request_ctx: RequestCtx,
+    service: Annotated[InventoryService, Depends(get_inventory_service)],
 ) -> WarehousePublic:
     wh, _ = await _load_warehouse(warehouse_id, user, session)
     await _enforce_prod_permission(
@@ -297,10 +299,12 @@ async def update_warehouse(
         organization_id=wh.organization_id,
         farm_id=wh.farm_id,
     )
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(wh, k, v)
-    await session.flush()
-    await session.refresh(wh)
+    wh = await service.update_warehouse(
+        actor=user,
+        warehouse=wh,
+        data=payload.model_dump(exclude_unset=True),
+        request_ctx=request_ctx,
+    )
     return WarehousePublic.model_validate(wh)
 
 
@@ -318,9 +322,9 @@ async def create_storage_location(
     payload: StorageLocationCreate,
     user: CurrentUser,
     session: DBSession,
+    request_ctx: RequestCtx,
+    service: Annotated[InventoryService, Depends(get_inventory_service)],
 ) -> StorageLocationPublic:
-    from app.models.inventory import StorageLocation
-
     wh, _ = await _load_warehouse(warehouse_id, user, session)
     await _enforce_prod_permission(
         user=user,
@@ -329,9 +333,12 @@ async def create_storage_location(
         organization_id=wh.organization_id,
         farm_id=wh.farm_id,
     )
-    loc = StorageLocation(warehouse_id=wh.id, **payload.model_dump())
-    session.add(loc)
-    await session.flush()
+    loc = await service.create_storage_location(
+        actor=user,
+        warehouse=wh,
+        data=payload.model_dump(),
+        request_ctx=request_ctx,
+    )
     return StorageLocationPublic.model_validate(loc)
 
 
@@ -428,7 +435,9 @@ async def update_item(
     payload: InventoryItemUpdate,
     user: CurrentUser,
     session: DBSession,
+    request_ctx: RequestCtx,
     item_repo: Annotated[InventoryItemRepository, Depends(get_item_repo)],
+    service: Annotated[InventoryService, Depends(get_inventory_service)],
 ) -> InventoryItemPublic:
     item = await item_repo.get_by_id(item_id)
     if item is None:
@@ -441,10 +450,12 @@ async def update_item(
         organization_id=item.organization_id,
         farm_id=None,
     )
-    for k, v in payload.model_dump(exclude_unset=True).items():
-        setattr(item, k, v)
-    await session.flush()
-    await session.refresh(item)
+    item = await service.update_item(
+        actor=user,
+        item=item,
+        data=payload.model_dump(exclude_unset=True),
+        request_ctx=request_ctx,
+    )
     return InventoryItemPublic.model_validate(item)
 
 
@@ -619,10 +630,12 @@ async def transfer_stock(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> InventoryTransactionPublic:
     wh, _ = await _load_warehouse(warehouse_id, user, session)
-    # Access to the destination is validated inside the service; we
-    # additionally require the caller to have read access to it.
     dst_wh, _ = await _load_warehouse(payload.destination_warehouse_id, user, session)
-    del dst_wh  # loaded only for tenancy check
+    # Sprint 4 CRG03 fix: dual write authorization.
+    # Both source and destination warehouses must permit the caller
+    # to POST an inventory transaction — otherwise a farm operator
+    # with write on farm A could pump stock into farm B without
+    # having been invited there.
     await _enforce_prod_permission(
         user=user,
         session=session,
@@ -630,6 +643,14 @@ async def transfer_stock(
         organization_id=wh.organization_id,
         farm_id=wh.farm_id,
     )
+    await _enforce_prod_permission(
+        user=user,
+        session=session,
+        code="inventory_transaction.create",
+        organization_id=dst_wh.organization_id,
+        farm_id=dst_wh.farm_id,
+    )
+    del dst_wh  # further validation happens inside the service
     out_tx, _in, is_replay = await service.transfer(
         actor=user,
         warehouse=wh,

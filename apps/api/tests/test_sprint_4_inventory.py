@@ -587,3 +587,292 @@ async def test_closed_warehouse_blocks_writes(client: AsyncClient) -> None:
     r = await _receipt(client, wh_id, item_id, quantity=1)
     assert r["status"] == 409
     assert r["body"]["detail"]["code"] == "warehouse_closed_no_writes"
+
+
+# --------------------------------------------------------------------- #
+# 10. CRG03 fixes — MAINTENANCE lifecycle, dual-warehouse permission,
+# reversal idempotency replay, audit logging on service-scope mutations.
+# --------------------------------------------------------------------- #
+async def test_maintenance_warehouse_blocks_outbound_but_allows_inbound(
+    client: AsyncClient,
+) -> None:
+    """MAINTENANCE = inbound + reversal allowed; outbound refused."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    # Seed some stock before entering maintenance.
+    seed = await _receipt(client, wh_id, item_id, quantity=100, lot_code="L1")
+    assert seed["status"] == 201, seed["body"]
+    lot_id = await _lot_id_for(client, wh_id)
+
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "maintenance"})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "maintenance"
+
+    # RECEIPT still allowed.
+    r = await _receipt(client, wh_id, item_id, quantity=5, lot_code="L1")
+    assert r["status"] == 201, r["body"]
+
+    # ADJUSTMENT_INCREASE still allowed.
+    r = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:adjust",
+        json={
+            "lot_id": lot_id,
+            "quantity": 1,
+            "unit": "kg",
+            "direction": "increase",
+            "reason": "audit correction",
+        },
+    )
+    assert r.status_code == 201, r.text
+
+    # ISSUE blocked with a clear MAINTENANCE code.
+    r = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:issue",
+        json={"lot_id": lot_id, "quantity": 1, "unit": "kg"},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "warehouse_under_maintenance"
+
+    # ADJUSTMENT_DECREASE blocked.
+    r = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:adjust",
+        json={
+            "lot_id": lot_id,
+            "quantity": 1,
+            "unit": "kg",
+            "direction": "decrease",
+            "reason": "loss",
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "warehouse_under_maintenance"
+
+
+async def test_maintenance_warehouse_blocks_transfer_out(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    src = await _create_warehouse(client, ctx["org_id"], code="SRC-MAINT")
+    dst = await _create_warehouse(client, ctx["org_id"], code="DST-OK")
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    await _receipt(client, src, item_id, quantity=50, lot_code="LM")
+    lot_id = await _lot_id_for(client, src)
+
+    r = await client.patch(f"/api/v1/warehouses/{src}", json={"status": "maintenance"})
+    assert r.status_code == 200
+
+    r = await client.post(
+        f"/api/v1/warehouses/{src}/inventory:transfer",
+        json={
+            "lot_id": lot_id,
+            "destination_warehouse_id": dst,
+            "quantity": 10,
+            "unit": "kg",
+        },
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "warehouse_under_maintenance"
+    assert r.json()["detail"]["transaction_type"] == "transfer_out"
+
+
+async def test_maintenance_reopen_to_active_restores_writes(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    await _receipt(client, wh_id, item_id, quantity=20, lot_code="LR")
+    lot_id = await _lot_id_for(client, wh_id)
+
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "maintenance"})
+    assert r.status_code == 200
+    # blocked
+    r = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:issue",
+        json={"lot_id": lot_id, "quantity": 1, "unit": "kg"},
+    )
+    assert r.status_code == 409
+    # reopen
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "active"})
+    assert r.status_code == 200
+    r = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:issue",
+        json={"lot_id": lot_id, "quantity": 1, "unit": "kg"},
+    )
+    assert r.status_code == 201
+
+
+async def test_reversal_under_maintenance_allowed(client: AsyncClient) -> None:
+    """Reversals are audit corrections — allowed even under MAINTENANCE."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    receipt = await _receipt(client, wh_id, item_id, quantity=30, lot_code="LREV")
+    receipt_tx_id = receipt["body"]["id"]
+
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "maintenance"})
+    assert r.status_code == 200
+
+    r = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:reverse",
+        json={"reverses_transaction_id": receipt_tx_id, "reason": "posted in error"},
+        headers={"Idempotency-Key": f"rev-{uuid4().hex[:8]}"},
+    )
+    assert r.status_code == 201, r.text
+
+
+async def test_closed_warehouse_only_reopens_via_status_flip(client: AsyncClient) -> None:
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "closed"})
+    assert r.status_code == 200
+    # Non-status field on a CLOSED warehouse is refused.
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"name": "Renamed while closed"})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "warehouse_closed_no_writes"
+    # Reopen via status transition works.
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"status": "active"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "active"
+
+
+async def test_transfer_requires_permission_on_destination(client: AsyncClient) -> None:
+    """Source-farm operator without dst-farm access cannot pump stock in."""
+    owner = await _new_owner_org_farm(client)
+    owner_email = owner["owner"]
+
+    # Second farm on the same org (destination).
+    await switch_user(client, owner_email)
+    r = await client.post(
+        f"/api/v1/organizations/{owner['org_id']}/farms",
+        json={"name": "Farm-B", "code": f"farm-b-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 201, r.text
+    farm_b_id = r.json()["id"]
+
+    src = await _create_warehouse(client, owner["org_id"], farm_id=owner["farm_id"], code="SRC-A")
+    dst = await _create_warehouse(client, owner["org_id"], farm_id=farm_b_id, code="DST-B")
+    item_id = await _create_feed_item(client, owner["org_id"])
+    await _receipt(client, src, item_id, quantity=50, lot_code="LX")
+    lot_id = await _lot_id_for(client, src)
+
+    # Farm-A-only manager has no membership on Farm B.
+    operator = f"op-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(operator)
+    await invite_and_accept(
+        client,
+        inviter_email=owner_email,
+        invitee_email=operator,
+        org_id=owner["org_id"],
+        role_name="farm_manager",
+        farm_id=owner["farm_id"],
+    )
+
+    await switch_user(client, operator)
+    r = await client.post(
+        f"/api/v1/warehouses/{src}/inventory:transfer",
+        json={
+            "lot_id": lot_id,
+            "destination_warehouse_id": dst,
+            "quantity": 5,
+            "unit": "kg",
+        },
+        headers={"Idempotency-Key": f"xfer-{uuid4().hex[:8]}"},
+    )
+    # Source-side membership passes; destination-side check must refuse.
+    assert r.status_code in (403, 404), r.text
+    if r.status_code == 403:
+        assert "inventory_transaction.create" in r.json()["detail"]
+
+
+async def test_reversal_idempotency_replays_original_response(client: AsyncClient) -> None:
+    """Second call with same idempotency key must replay, not re-check."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    receipt = await _receipt(client, wh_id, item_id, quantity=10, lot_code="LI")
+    receipt_tx_id = receipt["body"]["id"]
+
+    key = f"rev-key-{uuid4().hex[:8]}"
+    body = {"reverses_transaction_id": receipt_tx_id, "reason": "double-tap safeguard"}
+
+    r1 = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:reverse", json=body, headers={"Idempotency-Key": key}
+    )
+    assert r1.status_code == 201, r1.text
+    marker_id = r1.json()["id"]
+
+    # Second call — same key + same payload — must REPLAY (200 + X-Idempotent-Replay: true)
+    # instead of returning 409 already_reversed.
+    r2 = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:reverse", json=body, headers={"Idempotency-Key": key}
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    assert r2.json()["id"] == marker_id
+
+    # A DIFFERENT idempotency key against the same original transaction
+    # must hit the 'already_reversed' path.
+    r3 = await client.post(
+        f"/api/v1/warehouses/{wh_id}/inventory:reverse",
+        json=body,
+        headers={"Idempotency-Key": f"rev-key-{uuid4().hex[:8]}"},
+    )
+    assert r3.status_code == 409
+    assert r3.json()["detail"]["code"] == "already_reversed"
+
+
+async def test_update_warehouse_is_audited(client: AsyncClient) -> None:
+    """CRG03 P1 — warehouse edits flow through the service and hit the audit log."""
+    ctx = await _new_owner_org_farm(client)
+    wh_id = await _create_warehouse(client, ctx["org_id"])
+    r = await client.patch(f"/api/v1/warehouses/{wh_id}", json={"name": "Renamed HQ"})
+    assert r.status_code == 200
+    assert r.json()["name"] == "Renamed HQ"
+
+    r = await client.get(
+        f"/api/v1/organizations/{ctx['org_id']}/audit-events",
+        params={"entity_type": "warehouse"},
+    )
+    assert r.status_code == 200
+    events = r.json().get("items", r.json())
+    matches = [
+        e
+        for e in events
+        if e.get("entity_id") == wh_id and e.get("action") == "inventory_warehouse.update"
+    ]
+    assert matches, f"expected an inventory_warehouse.update audit row for {wh_id}"
+    md = matches[0].get("metadata") or matches[0].get("metadata_json") or {}
+    assert "changed" in md
+    assert "name" in md["changed"]
+
+
+async def test_update_item_is_audited(client: AsyncClient) -> None:
+    """CRG03 P1 — item edits flow through the service and hit the audit log.
+
+    ``canonical_unit`` is also not part of the ``InventoryItemUpdate``
+    schema so Pydantic silently ignores it — the service defensive
+    check is dead code by construction (belt + suspenders). We verify
+    the schema-level protection at the same time.
+    """
+    ctx = await _new_owner_org_farm(client)
+    item_id = await _create_feed_item(client, ctx["org_id"], canonical_unit="kg")
+    r = await client.patch(
+        f"/api/v1/inventory-items/{item_id}", json={"name": "Renamed feed", "sku": "SKU-1"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "Renamed feed"
+    # canonical_unit is silently dropped by the schema.
+    r = await client.patch(f"/api/v1/inventory-items/{item_id}", json={"canonical_unit": "L"})
+    assert r.status_code == 200, r.text
+    assert r.json()["canonical_unit"] == "kg"
+
+    r = await client.get(
+        f"/api/v1/organizations/{ctx['org_id']}/audit-events",
+        params={"entity_type": "inventory_item"},
+    )
+    assert r.status_code == 200
+    events = r.json().get("items", r.json())
+    matches = [
+        e
+        for e in events
+        if e.get("entity_id") == item_id and e.get("action") == "inventory_item.update"
+    ]
+    assert matches, f"expected inventory_item.update audit row for {item_id}"

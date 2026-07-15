@@ -64,6 +64,7 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------- #
 class WarehouseStatus(enum.StrEnum):
     ACTIVE = "active"
+    MAINTENANCE = "maintenance"
     CLOSED = "closed"
 
 
