@@ -242,10 +242,7 @@ function InventoryInner() {
         </div>
       </div>
 
-      <nav
-        className="mb-6 flex flex-wrap gap-2 border-b border-border pb-2"
-        data-testid="inv-tabs"
-      >
+      <nav className="mb-6 flex flex-wrap gap-2 border-b border-border pb-2" data-testid="inv-tabs">
         {tabs.map((t) => (
           <button
             key={t.key}
@@ -319,13 +316,7 @@ function InventoryInner() {
       )}
 
       {tab === 'issue' && (
-        <TxPanel
-          mode="issue"
-          warehouse={currentWh}
-          lots={lots}
-          items={items}
-          onDone={reloadLots}
-        />
+        <TxPanel mode="issue" warehouse={currentWh} lots={lots} items={items} onDone={reloadLots} />
       )}
 
       {tab === 'transfer' && (

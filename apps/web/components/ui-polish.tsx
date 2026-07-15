@@ -95,13 +95,7 @@ export function Toaster() {
 // Skeleton                                                            //
 // -------------------------------------------------------------------- //
 
-export function Skeleton({
-  className = '',
-  testId,
-}: {
-  className?: string;
-  testId?: string;
-}) {
+export function Skeleton({ className = '', testId }: { className?: string; testId?: string }) {
   return (
     <div
       data-testid={testId ?? 'ui-skeleton'}
@@ -147,9 +141,7 @@ export function EmptyStateCard({
       className="rounded-2xl border border-dashed border-border bg-card/40 p-8 text-center"
     >
       <p className="font-display text-lg">{title}</p>
-      {description && (
-        <p className="mt-1 text-sm text-muted-foreground">{description}</p>
-      )}
+      {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
       {action && <div className="mt-4 flex justify-center">{action}</div>}
     </div>
   );
@@ -202,9 +194,7 @@ export function ConfirmDialog({
     >
       <div className="w-full max-w-md rounded-2xl border border-border bg-card p-5 shadow-lg">
         <h2 className="font-display text-lg">{title}</h2>
-        {description && (
-          <p className="mt-2 text-sm text-muted-foreground">{description}</p>
-        )}
+        {description && <p className="mt-2 text-sm text-muted-foreground">{description}</p>}
         <div className="mt-5 flex justify-end gap-2">
           <button
             type="button"
@@ -242,18 +232,15 @@ const ERROR_CODE_MAP: Record<string, string> = {
     'Duplicate submission with a different payload was detected. Refresh and try again.',
   idempotency_key_required:
     'Missing idempotency key on this operation. Please retry — the app will generate a fresh key.',
-  insufficient_stock:
-    'The lot does not have enough on-hand quantity for this operation.',
+  insufficient_stock: 'The lot does not have enough on-hand quantity for this operation.',
   lot_closed_no_writes:
     'This lot is closed and can no longer be modified. Create a new lot instead.',
-  warehouse_closed_no_writes:
-    'This warehouse is closed and no longer accepts inventory movements.',
+  warehouse_closed_no_writes: 'This warehouse is closed and no longer accepts inventory movements.',
   reverse_transaction_already_reversed:
     'This transaction has already been reversed and cannot be reversed again.',
   transfer_same_warehouse_blocked:
     'Source and destination warehouses must differ. Pick a different destination.',
-  unit_incompatible:
-    'The unit you selected is incompatible with the item’s canonical unit.',
+  unit_incompatible: 'The unit you selected is incompatible with the item’s canonical unit.',
   quantity_must_be_positive: 'Quantity must be greater than zero.',
 };
 

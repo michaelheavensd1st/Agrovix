@@ -5,6 +5,7 @@ http://127.0.0.1:8055/api using cookie auth (matches the frontend flow).
 
 Warehouse under test = 'Main Store' (MAIN) on org 'E2E Farm'.
 """
+
 from __future__ import annotations
 
 import os
@@ -42,9 +43,7 @@ def closed_wh(sess: requests.Session) -> str:
     )
     assert r.status_code == 201, r.text
     wh_id = r.json()["id"]
-    r = sess.patch(
-        f"{BASE_URL}/v1/warehouses/{wh_id}", json={"status": "closed"}, timeout=10
-    )
+    r = sess.patch(f"{BASE_URL}/v1/warehouses/{wh_id}", json={"status": "closed"}, timeout=10)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "closed"
     return wh_id
@@ -73,9 +72,7 @@ def test_closed_status_only_maintenance_reopens(sess, closed_wh):
 
 # ---------------------------------------------------------------- refusals
 def test_closed_name_only_refused(sess, closed_wh):
-    r = sess.patch(
-        f"{BASE_URL}/v1/warehouses/{closed_wh}", json={"name": "x"}, timeout=10
-    )
+    r = sess.patch(f"{BASE_URL}/v1/warehouses/{closed_wh}", json={"name": "x"}, timeout=10)
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]
     assert detail["code"] == "warehouse_closed_no_writes"
