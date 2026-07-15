@@ -64,3 +64,8 @@ node_modules/.pnpm/@next+swc-linux-arm64-musl@14.2.15/node_modules/@next/swc-lin
 node_modules/.pnpm/@next+swc-linux-arm64-gnu@14.2.15/node_modules/@next/swc-linux-arm64-gnu/next-swc.linux-arm64-gnu.node
 .pnpm-store/v3/files/89/17f8f6147f67bec43ec6b1cbfc02743130d1b6d96f7850f17bfa1e00fd83d33d415dee56c91ab250f6439f6a36562cff5f40ae283c0db7af9bbe839aae305c
 .pnpm-store/v3/files/97/2a69c9fd899698e0d72d969a0eb09e1d28a372a45b26b84c4d0f03d4d60d1d220789ba868f02686213defee3de48541630ff97784456aa7af464c8d3bab206
+
+# Coverage artifacts
+coverage.xml
+.coverage
+htmlcov/

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Iterator
 
 import pytest
 import requests
@@ -21,15 +22,38 @@ ORG_ID = "4e43a952-2f13-4d5a-a99f-5b34c51b228a"
 
 
 @pytest.fixture(scope="module")
-def sess() -> requests.Session:
+def sess() -> Iterator[requests.Session]:
+    """Live-server session fixture with graceful skip.
+
+    Matches the pattern in ``test_crg03_live.py`` and
+    ``test_sprint4_e2e_curl.py``: any ``requests.RequestException`` or
+    a non-200 login response causes ``pytest.skip`` so the hermetic
+    CI suite is unaffected when the local FastAPI is not running.
+    """
     s = requests.Session()
-    r = s.post(
-        f"{BASE_URL}/v1/auth/login",
-        json={"email": EMAIL, "password": PASSWORD},
-        timeout=10,
-    )
-    assert r.status_code == 200, r.text
-    return s
+    try:
+        r = s.post(
+            f"{BASE_URL}/v1/auth/login",
+            json={"email": EMAIL, "password": PASSWORD},
+            timeout=5,
+        )
+    except requests.RequestException as exc:
+        s.close()
+        pytest.skip(
+            f"CRG03 iter-8 live suite requires FastAPI at {BASE_URL} "
+            f"plus a seeded E2E account. Unreachable ({exc.__class__.__name__}: "
+            f"{exc}). Set CRG03_LIVE_URL to enable this suite."
+        )
+    if r.status_code != 200:
+        s.close()
+        pytest.skip(
+            f"CRG03 iter-8 live suite login returned HTTP {r.status_code}. "
+            f"Body: {r.text[:200]}. Expected 200 from a seeded E2E account."
+        )
+    try:
+        yield s
+    finally:
+        s.close()
 
 
 @pytest.fixture()
