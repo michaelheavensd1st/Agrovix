@@ -16,6 +16,8 @@ echo "→ Scanning apps/ and packages/ for MongoDB references…"
 MATCHES=$(
   grep -RIn --include="*.py" --include="*.ts" --include="*.tsx" \
        --include="*.js" --include="*.jsx" --include="*.json" \
+       --exclude-dir=node_modules --exclude-dir=.next \
+       --exclude-dir=dist --exclude-dir=build --exclude-dir=.turbo \
        -E "(from motor|import motor|from pymongo|import pymongo|mongodb://|MONGO_URL)" \
        "$ROOT/apps" "$ROOT/packages" 2>/dev/null || true
 )

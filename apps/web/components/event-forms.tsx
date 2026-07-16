@@ -262,6 +262,7 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
   const [method, setMethod] = useState('broadcast');
   const [round, setRound] = useState('1');
   const [notes, setNotes] = useState('');
+  const [lotId, setLotId] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -270,12 +271,18 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
     setBusy(true);
     setError(null);
     try {
+      const trimmedLot = lotId.trim();
+      const trimmedDesc = description.trim();
+      // Server requires at least one of feed_description / inventory_lot_id.
+      const feedRef: Record<string, unknown> = trimmedLot
+        ? { inventory_lot_id: trimmedLot }
+        : { feed_description: trimmedDesc };
       const { event } = await postEvent(
         batchId,
         {
           event_type: 'FEEDING',
           data: {
-            feed_description: description.trim(),
+            ...feedRef,
             quantity: Number(quantity),
             unit,
             feeding_method: method,
@@ -296,14 +303,27 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
   return (
     <form onSubmit={submit} className="space-y-4" data-testid="feeding-form">
       <h3 className="font-display text-lg">Record feeding</h3>
+
       <label className="block text-sm">
-        Feed description
+        Feed lot (optional — deducts inventory)
+        <input
+          data-testid="feeding-lot-id"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono"
+          placeholder="Paste a lot UUID from /inventory, or leave blank for ad-hoc"
+          value={lotId}
+          onChange={(e) => setLotId(e.target.value)}
+        />
+      </label>
+
+      <label className="block text-sm">
+        Feed description {lotId.trim() ? '(ignored when a lot is provided)' : ''}
         <input
           data-testid="feeding-description"
           className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          required
+          disabled={Boolean(lotId.trim())}
+          required={!lotId.trim()}
         />
       </label>
       <div className="grid grid-cols-2 gap-3">

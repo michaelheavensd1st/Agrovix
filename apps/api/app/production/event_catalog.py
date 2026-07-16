@@ -18,6 +18,7 @@ in follow-on sprints without duplicating APE tables.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -114,19 +115,35 @@ class StockingEventSchema(_StrictModel):
 
 
 class FeedingEventSchema(_StrictModel):
-    """Feed delivered to the batch. At least one of feed_item_ref /
-    feed_description must be supplied."""
+    """Feed delivered to the batch. At least one of ``feed_item_ref``,
+    ``feed_description``, or ``inventory_lot_id`` must be supplied.
+
+    Sprint 4 integration: when ``inventory_lot_id`` is provided the
+    event service atomically posts a ``CONSUMPTION`` transaction on
+    that lot (see :meth:`InventoryService.consume_for_event`). The
+    feed lot must belong to the same organization AND (if pinned) the
+    same farm as the batch's unit. Insufficient stock raises 409.
+    """
 
     feed_item_ref: str | None = Field(
         default=None,
         max_length=128,
         description=(
             "Reference to an inventory feed item, if one exists. "
-            "Sprint 3 has no inventory table yet — leave null and use "
-            "``feed_description`` to record ad-hoc feed."
+            "Sprint 4 adds first-class inventory — prefer "
+            "``inventory_lot_id`` when possible."
         ),
     )
     feed_description: str | None = Field(default=None, max_length=255)
+    inventory_lot_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Optional feed lot to deduct against. When supplied, event "
+            "creation and stock deduction succeed or fail together — "
+            "insufficient stock, incompatible units, or cross-tenant "
+            "lot references all reject the whole event."
+        ),
+    )
     quantity: float = Field(gt=0)
     unit: FeedUnit = Field(default=FeedUnit.KG)
     feeding_method: FeedingMethod = Field(default=FeedingMethod.BROADCAST)
@@ -137,8 +154,8 @@ class FeedingEventSchema(_StrictModel):
 
     @model_validator(mode="after")
     def _at_least_one_feed_id(self) -> FeedingEventSchema:
-        if not self.feed_item_ref and not self.feed_description:
-            raise ValueError("Provide either feed_item_ref or feed_description.")
+        if not self.feed_item_ref and not self.feed_description and not self.inventory_lot_id:
+            raise ValueError("Provide feed_item_ref, feed_description, or inventory_lot_id.")
         return self
 
 

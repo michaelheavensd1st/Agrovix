@@ -9,6 +9,7 @@ from app.api.v1.endpoints import (
     auth,
     farms,
     health,
+    inventory,
     invitations,
     organizations,
     production,
@@ -27,3 +28,4 @@ api_v1_router.include_router(invitations.router, tags=["invitations"])
 api_v1_router.include_router(role_assignments.router, tags=["role-assignments"])
 api_v1_router.include_router(audit.router, tags=["audit"])
 api_v1_router.include_router(production.router, tags=["production"])
+api_v1_router.include_router(inventory.router, tags=["inventory"])

@@ -11,7 +11,6 @@ mapped to plain JSON, and the Postgres enums degrade to Python enums.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import os
 
@@ -85,12 +84,15 @@ from app.main import app  # noqa: E402
 from app.models import Base  # noqa: E402
 from app.seed import seed_permissions_and_roles  # noqa: E402
 
-
-@pytest_asyncio.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+# NOTE — event-loop management is handled entirely by pytest-asyncio
+# (>=0.23) via the ``asyncio_default_fixture_loop_scope = "session"``
+# and ``asyncio_default_test_loop_scope = "session"`` settings in
+# pyproject.toml. Defining a custom ``event_loop`` fixture here is
+# deprecated in pytest-asyncio 1.x and reintroduces "Future attached
+# to a different loop" errors when session-scoped async DB fixtures
+# (``_engine``) are shared with function-scoped tests running on
+# their own per-test loop. Keep this comment as a marker so the
+# fixture is not accidentally re-added.
 
 
 @pytest_asyncio.fixture(scope="session")

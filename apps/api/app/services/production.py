@@ -705,6 +705,81 @@ class ProductionEventService:
             **request_ctx,
         )
 
+        # ---- Sprint 4 FEEDING → CONSUMPTION integration ---------- #
+        # When the FEEDING payload carries an ``inventory_lot_id`` we
+        # deduct the recorded quantity from that lot in the SAME
+        # session. The savepoint above already delivered the event
+        # row; if the consumption raises 409 (insufficient stock,
+        # incompatible unit, cross-tenant lot, closed warehouse) the
+        # HTTP layer's request-level rollback undoes BOTH writes so
+        # we never leave a dangling event with no matching deduction.
+        # The idempotency key mirrors the event's key so retries
+        # replay the same deduction instead of double-deducting.
+        if entry.code == "FEEDING" and validated_data.get("inventory_lot_id") is not None:
+            from decimal import Decimal as _Decimal
+
+            from app.models.inventory import StockUnit as _StockUnit
+            from app.repositories.audit_repo import AuditRepository as _AuditRepo
+            from app.repositories.inventory import (
+                InventoryItemRepository as _ItemRepo,
+            )
+            from app.repositories.inventory import (
+                InventoryLotRepository as _LotRepo,
+            )
+            from app.repositories.inventory import (
+                InventoryTransactionRepository as _TxRepo,
+            )
+            from app.repositories.inventory import (
+                StorageLocationRepository as _LocRepo,
+            )
+            from app.repositories.inventory import (
+                WarehouseRepository as _WhRepo,
+            )
+            from app.services.inventory import InventoryService as _InvService
+
+            inv_service = _InvService(
+                session=self.event_repo.session,
+                warehouse_repo=_WhRepo(self.event_repo.session),
+                item_repo=_ItemRepo(self.event_repo.session),
+                lot_repo=_LotRepo(self.event_repo.session),
+                tx_repo=_TxRepo(self.event_repo.session),
+                location_repo=_LocRepo(self.event_repo.session),
+                audit_repo=_AuditRepo(self.event_repo.session),
+            )
+            # ``FeedUnit`` and ``StockUnit`` share the same string
+            # values for the units we support in Sprint 4 (kg / g).
+            raw_unit = str(validated_data["unit"])
+            try:
+                lot_unit = _StockUnit(raw_unit)
+            except ValueError as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "feed_unit_not_supported_by_inventory",
+                        "message": f"Feed unit {raw_unit!r} is not supported by inventory.",
+                    },
+                ) from exc
+            await inv_service.consume_for_event(
+                actor=actor,
+                farm=farm,
+                lot_id=uuid.UUID(str(validated_data["inventory_lot_id"])),
+                quantity=_Decimal(str(validated_data["quantity"])),
+                unit=lot_unit,
+                event_id=event.id,
+                # Scope the inventory idempotency key by the event's
+                # key so a retry of the same request produces the
+                # same paired outcome. If no event key was supplied,
+                # namespace by the event id — still safe against
+                # accidental replay on the inventory side because
+                # the event id is unique per successful insert.
+                idempotency_key=(
+                    f"prod-event:{idempotency_key}"
+                    if idempotency_key is not None
+                    else f"prod-event-id:{event.id}"
+                ),
+                request_ctx=request_ctx,
+            )
+
         # ---- Optional lifecycle transition ----------------------- #
         # Atomicity: transition and event write share the same
         # request-scoped SQLAlchemy session — either both commit or

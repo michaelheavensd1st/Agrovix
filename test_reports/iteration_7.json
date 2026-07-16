@@ -1,0 +1,49 @@
+{
+  "summary": "Sprint 4 CRG03 P0/P1 corrections validated end-to-end. Hermetic pytest suite: 176 passed + 7 skipped (183 total = the 174 pre-CRG03 + 9 new CRG03 tests) — 100% green on SQLite; the 7 skips all require Postgres-level row-locking. Live Postgres API (127.0.0.1:8055): 9/10 curl-tests pass, 1 skipped (dual-auth already covered by hermetic test_transfer_requires_permission_on_destination). UI regression on 127.0.0.1:3001: all 9 tabs present, warehouse search works, all 4 write forms render, history filter now uses lowercase enum values (iteration_6 bug fixed). No new critical defects.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "GET /api/v1/organizations/{org_id}/audit-events?entity_type=…",
+        "issue": "Naming inconsistency across audit entity_type values: warehouse='warehouse', item='inventory_item', transaction='inventory_transaction', but storage_location='storage_location' (no 'inventory_' prefix). The action string DOES follow the pattern ('inventory_storage_location.create'), only entity_type is inconsistent. Not blocking — the row is emitted correctly — but a caller filtering by entity_type='inventory_storage_location' will get empty results. Consider normalising to entity_type='inventory_storage_location' in apps/api/app/services/inventory.py:339."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/apps/api/tests/test_sprint_4_inventory.py (30 tests, 28 pass + 2 SQLite-skip)",
+    "/app/apps/api/tests/test_crg03_live.py (new live curl suite: 9 pass + 1 skip)",
+    "/app/test_reports/pytest/sprint4_iter7.xml",
+    "/app/test_reports/pytest/full_iter7.xml",
+    "/app/test_reports/pytest/crg03_live.xml"
+  ],
+  "action_items": [
+    "OPTIONAL/COSMETIC: Rename entity_type='storage_location' → 'inventory_storage_location' in apps/api/app/services/inventory.py:339 for cross-entity naming consistency. Only cosmetic; row content is correct and action string already matches the pattern.",
+    "OPTIONAL: apps/web/app/inventory/page.tsx is still a single ~1174-line component. Not blocking Sprint 4 but violates the >700-line code-review guideline. Consider extracting each *Panel into apps/web/app/inventory/_components/ before Sprint 5."
+  ],
+  "critical_code_review_comments": [
+    "_assert_warehouse_status_allows() (apps/api/app/services/inventory.py:406) is the single lifecycle gate and is called from every ledger writer: receipt (626), issue (703), transfer both sides (766, 778), adjust (892), reversal (via bypass_maintenance_gate at 526+ / 1047), and consumption (1122). Central-point-of-truth pattern is correct.",
+    "Reversal ordering (services/inventory.py:995 onwards) correctly puts the idempotency replay short-circuit BEFORE the already_reversed check, so a same-key POST returns 200 + X-Idempotent-Replay: true instead of 409. Verified with a live curl double-tap.",
+    "Transfer dual-authorization: apps/api/app/api/v1/endpoints/inventory.py transfer_stock() invokes _enforce_prod_permission twice — on source and destination — and the hermetic test asserts 403 + 'inventory_transaction.create' in the response body.",
+    "canonical_unit change is silently dropped: verified live PATCH /inventory-items/{id} with {canonical_unit:'g'} returned 200 and item.canonical_unit still 'kg'. Behaviour matches the Sprint 4 CRG03 spec (schema-level exclusion).",
+    "Alembic 0008_warehouse_maintenance_status.py applied cleanly to agrovix_dev; live PATCH …/warehouses/{id} {status:'maintenance'} returns 200 with warehouse.status='maintenance' persisted.",
+    "FEEDING linkage (services/inventory.py:1147-1150): reference_type='production_event' and reference_id=event.id are correct. Hermetic test test_feeding_with_lot_deducts_inventory confirms a 'consumption' row is written on the lot ledger."
+  ],
+  "updated_files": [
+    "/app/apps/api/tests/test_crg03_live.py (new — live CRG03 P0/P1 curl suite, 10 tests)"
+  ],
+  "success_rate": {
+    "backend": "100% (176/176 executed pytest + 9/9 executed live curl; 7 pytest + 1 curl skipped as intentional gates: SQLite concurrency and unverified-login flow)",
+    "frontend": "100% (9/9 tabs visible, search filter works, all forms render, no console errors, history filter aligned to lowercase backend enum)"
+  },
+  "test_credentials": "e2e@agrovix.dev / testtest123 on live Postgres agrovix_dev @127.0.0.1:5432 (seeded org=E2E Farm 7ef45030-a59c-4579-91c9-97a0ac2f7dc9, warehouses MAIN baeafc40-a4e1-46d3-a289-3501e71494e1 and BACK b2b18157-6c71-4d29-a566-3f68143fba2c, item FEED-01 614b3a24-a28f-434e-9e21-dafb2d1f39b4, lot LOT001).",
+  "seed_data_creation": "test_crg03_live.py creates ~6 throwaway warehouses (codes CL*/SL*/RN*/WA*/WB*) and 1 throwaway item (code CRG-*) and multiple lots (codes MNT*/REOP*/REV*/CRG03-*) plus a handful of storage locations. Not cleaned up — main agent can prune by code LIKE 'CL%' / 'SL%' / 'RN%' / 'CRG-%' or by lot_code LIKE 'MNT%' / 'REOP%' / 'REV%' / 'CRG03-%' when needed.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Sprint 4 CRG03 is fully green. Do NOT begin Sprint 5 testing per this iteration's constraints. Live FastAPI on http://127.0.0.1:8055 (Postgres agrovix_dev with alembic 0008 applied). Next.js on http://127.0.0.1:3001. Re-run backend suite: `cd /app/apps/api && python -m pytest tests/test_sprint_4_inventory.py tests/test_crg03_live.py -v`. The dual-auth live test is intentionally skipped because setting up a scoped farm_manager needs the unverified-login shortcut only available inside the hermetic test harness; the hermetic test_transfer_requires_permission_on_destination already asserts the exact 403/'inventory_transaction.create' contract. One cosmetic naming inconsistency: audit entity_type is 'storage_location' (not 'inventory_storage_location'). Confirmed lot LOT001 was reversed under maintenance during testing so its balance may differ from the seeded 100kg — main agent should re-seed if a pristine LOT001 is needed for downstream demos.",
+  "rca of the issue": "N/A — no regressions found. Iteration_6 defects (HistoryPanel uppercase TX_TYPES + Toaster getServerSnapshot instability) are both fixed: history filter option values now enumerate as ['', 'receipt', 'issue', 'adjustment_increase', 'adjustment_decrease', 'transfer_out', 'transfer_in', 'reversal', 'consumption'] and browser console shows no useSyncExternalStore warning during a full tab-nav sweep."
+}

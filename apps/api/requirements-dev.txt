@@ -2,7 +2,7 @@
 
 # Testing
 pytest==8.3.4
-pytest-asyncio==0.24.0
+pytest-asyncio==0.26.0
 pytest-cov==6.0.0
 pytest-mock==3.14.0
 httpx==0.28.1
@@ -17,3 +17,5 @@ mypy==1.13.0
 # Types
 types-passlib==1.7.7.20240819
 types-python-jose==3.3.4.20240106
+
+requests==2.32.3
