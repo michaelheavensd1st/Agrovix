@@ -78,64 +78,24 @@ if os.environ["DATABASE_URL"].startswith("sqlite"):
 
     JSONB.impl = JSON  # type: ignore[attr-defined]
 
-# --------------------------------------------------------------------- #
-# Event-loop management — pytest-asyncio 0.24-compatible.
-#
-# CI pins pytest-asyncio == 0.24.0 (see requirements-dev.txt).  In 0.24:
-#   * ``asyncio_default_fixture_loop_scope`` is supported as an ini
-#     option, so session-scoped async **fixtures** share one loop.
-#   * ``asyncio_default_test_loop_scope`` DID NOT exist yet — that
-#     option only landed in pytest-asyncio 0.26. Setting it in
-#     pyproject.toml on 0.24 is either ignored (best case) or errors
-#     under ``--strict-config``, leaving async **tests** on
-#     per-function loops that don't match the session-scoped
-#     ``_engine`` / ``AsyncSessionLocal`` — the exact "Future
-#     attached to a different loop" pattern reported by GitHub
-#     Actions.
-#
-# Fix that works on BOTH 0.24 and 1.x:
-#   1. Keep ``asyncio_default_fixture_loop_scope = "session"`` in
-#      pyproject.toml (works on every version ≥ 0.24).
-#   2. Drop ``asyncio_default_test_loop_scope`` from pyproject.toml
-#      (it's 0.26+ only and hides the bug locally when installed).
-#   3. Register ``pytest.mark.asyncio(loop_scope="session")`` on
-#      every collected async test in the ``pytest_collection_modifyitems``
-#      hook below — the ``loop_scope`` keyword argument to the
-#      ``asyncio`` mark was added in 0.24, so this is the correct
-#      0.24-native way to opt every test onto the session loop.
-#   4. Add explicit ``loop_scope="session"`` to every
-#      ``@pytest_asyncio.fixture`` decorator, so function-scoped
-#      fixtures also stay bound to the session loop.
-#
-# Do NOT re-introduce a custom ``event_loop`` fixture — it's
-# deprecated in pytest-asyncio 1.x and reintroduces the same loop
-# mismatch we're guarding against.
-# --------------------------------------------------------------------- #
-import inspect  # noqa: E402
-
 from app.db import session as db_session_module  # noqa: E402
 from app.deps import get_db_session  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Base  # noqa: E402
 from app.seed import seed_permissions_and_roles  # noqa: E402
 
-
-def pytest_collection_modifyitems(config, items):
-    """Force every async test onto the session-scoped event loop.
-
-    pytest-asyncio 0.24 does NOT ship an ini option for the default
-    test loop scope (that was added in 0.26). Applying the mark
-    programmatically at collection time is the 0.24-native fix and
-    is a no-op on newer pytest-asyncio versions.
-    """
-    session_loop_marker = pytest.mark.asyncio(loop_scope="session")
-    for item in items:
-        func = getattr(item, "function", None)
-        if func is not None and inspect.iscoroutinefunction(func):
-            item.add_marker(session_loop_marker)
+# NOTE — event-loop management is handled entirely by pytest-asyncio
+# (>=0.23) via the ``asyncio_default_fixture_loop_scope = "session"``
+# and ``asyncio_default_test_loop_scope = "session"`` settings in
+# pyproject.toml. Defining a custom ``event_loop`` fixture here is
+# deprecated in pytest-asyncio 1.x and reintroduces "Future attached
+# to a different loop" errors when session-scoped async DB fixtures
+# (``_engine``) are shared with function-scoped tests running on
+# their own per-test loop. Keep this comment as a marker so the
+# fixture is not accidentally re-added.
 
 
-@pytest_asyncio.fixture(scope="session", loop_scope="session")
+@pytest_asyncio.fixture(scope="session")
 async def _engine():
     database_url = os.environ["DATABASE_URL"]
     is_sqlite = database_url.startswith("sqlite")
@@ -173,13 +133,13 @@ async def _engine():
     await engine.dispose()
 
 
-@pytest_asyncio.fixture(loop_scope="session")
+@pytest_asyncio.fixture
 async def db_session(_engine) -> AsyncSession:
     async with db_session_module.AsyncSessionLocal() as session:
         yield session
 
 
-@pytest_asyncio.fixture(loop_scope="session")
+@pytest_asyncio.fixture
 async def client(_engine) -> AsyncClient:
     # Route the app's DB dep through our shared engine.
     async def _override_get_db_session():
