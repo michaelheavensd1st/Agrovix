@@ -1,0 +1,5 @@
+fix(inventory): close Sprint 4.1 Codex medium findings
+
+- authorize inventory lot ownership before FEED category validation
+- harden malformed pagination cursor handling
+- add cross-tenant and malformed-cursor regression coverage
