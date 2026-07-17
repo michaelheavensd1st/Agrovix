@@ -90,33 +90,40 @@ permissions, or dependencies.
 Postgres-only. Grouped by concern:
 
 **Task 1 — FEEDING category guard (5 tests)**
+
 - `test_feeding_rejects_non_feed_category[medicine|chemical|supply]`
 - `test_feeding_succeeds_on_feed_category`
 - `test_feeding_rejection_writes_no_ledger_rows`
 
 **Task 2 — Cursor pagination (3 tests)**
+
 - `test_cursor_pagination_walks_through_all_rows`
 - `test_cursor_pagination_stable_ordering`
 - `test_cursor_pagination_rejects_garbage_cursor`
 
 **Task 3 — Storage-location warehouse ownership (3 tests)**
+
 - `test_receipt_accepts_matching_storage_location`
 - `test_receipt_rejects_foreign_storage_location`
 - `test_transfer_rejects_foreign_dst_storage_location`
 
 **Task 4 — Concurrent receipt lot creation (3 tests)**
+
 - `test_duplicate_receipts_reuse_the_same_lot`
-- `test_concurrent_receipts_same_lot_code_do_not_raise` *(Postgres-only)*
+- `test_concurrent_receipts_same_lot_code_do_not_raise` _(Postgres-only)_
 - `test_idempotent_replay_still_holds_after_race`
 
 **Sprint-5 scope creep guard (1 test)**
+
 - `test_feed_category_enum_still_present_and_unchanged`
 
 **Codex Medium #1 — cross-tenant FEEDING oracle (5 tests)**
+
 - `test_cross_tenant_feeding_hides_item_category[feed|medicine|chemical|supply]`
 - `test_same_tenant_feeding_still_reports_category_error`
 
 **Codex Medium #2 — cursor decoder hardening (12 tests)**
+
 - `test_cursor_decode_returns_400_for_all_malformed_inputs[…]`
   parametrised over: `café`, `日本語`, `🚀`, `!!!not-base64!!!`, `AAA`,
   `gA==`, `_____w==`, `aGVsbG8=`, bad-timestamp, bad-uuid, empty string
