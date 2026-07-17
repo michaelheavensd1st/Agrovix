@@ -24,17 +24,19 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import HTTPException, status
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.inventory.units import UnitIncompatibleError, convert, is_compatible
 from app.models.farm import Farm
 from app.models.inventory import (
     InventoryItem,
+    InventoryItemCategory,
     InventoryLot,
     InventoryTransaction,
     InventoryTransactionType,
@@ -366,6 +368,111 @@ class InventoryService:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Inventory lot not found.")
         return lot
 
+    async def _assert_location_belongs_to_warehouse(
+        self,
+        *,
+        storage_location_id: uuid.UUID | None,
+        warehouse: Warehouse,
+    ) -> None:
+        """Sprint 4.1 P2 Task 3 — reject cross-warehouse storage locations.
+
+        A receipt or transfer must not associate a lot with a
+        storage-location bin that belongs to a different warehouse.
+        The database keeps ``storage_location.warehouse_id`` but does
+        not FK-check it against ``inventory_lot.warehouse_id``, so we
+        enforce the invariant here — BEFORE any lot is inserted and
+        BEFORE the ledger row is written.
+        """
+        if storage_location_id is None:
+            return
+        loc = await self.location_repo.get_by_id(storage_location_id)
+        if loc is None or loc.warehouse_id != warehouse.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "storage_location_wrong_warehouse",
+                    "message": (
+                        "Storage location does not belong to the target warehouse. "
+                        "Pick a storage location from the same warehouse."
+                    ),
+                    "storage_location_id": str(storage_location_id),
+                    "target_warehouse_id": str(warehouse.id),
+                },
+            )
+
+    async def _get_or_create_lot_safe(
+        self,
+        *,
+        warehouse: Warehouse,
+        item: InventoryItem,
+        lot_code: str,
+        storage_location_id: uuid.UUID | None,
+        expiry_date=None,
+        received_at=None,
+        unit_cost_amount=None,
+        unit_cost_currency=None,
+        metadata_json: dict | None = None,
+    ) -> InventoryLot:
+        """Sprint 4.1 P2 Task 4 — concurrency-safe lot upsert.
+
+        The naive ``find_or_none → insert if missing`` pattern is
+        subject to a race: two concurrent receipts on the same
+        ``(warehouse, item, lot_code)`` both find nothing, both
+        ``session.add`` an ``InventoryLot``, and the loser explodes on
+        the ``uq_inventory_lots_warehouse_item_code`` unique
+        constraint (a raw ``IntegrityError`` bubbles up as a 500).
+
+        This helper wraps the INSERT in a SAVEPOINT (`session.begin_nested`)
+        and, on ``IntegrityError``, rolls back the savepoint and
+        re-selects the lot that the winning transaction created. The
+        idempotent replay path further up the stack then behaves
+        identically for both retry-of-same-request and race-with-a-
+        different-client scenarios.
+        """
+        existing = await self.lot_repo.find_or_none(
+            warehouse_id=warehouse.id, item_id=item.id, lot_code=lot_code
+        )
+        if existing is not None:
+            return existing
+
+        lot = InventoryLot(
+            item_id=item.id,
+            warehouse_id=warehouse.id,
+            storage_location_id=storage_location_id,
+            lot_code=lot_code,
+            expiry_date=expiry_date,
+            received_at=received_at or datetime.now(UTC),
+            unit_cost_amount=unit_cost_amount,
+            unit_cost_currency=unit_cost_currency,
+            metadata_json=metadata_json,
+        )
+        try:
+            async with self.session.begin_nested():
+                self.session.add(lot)
+                await self.session.flush()
+            return lot
+        except IntegrityError:
+            # The other request won the race and inserted the lot
+            # first. Re-select and reuse it. This preserves append-only
+            # ledger semantics AND idempotent retry behaviour.
+            #
+            # After the savepoint rolls back the transient ``lot``
+            # instance is typically evicted from the session, but in
+            # SQLAlchemy 2.x some code paths leave it lingering in the
+            # session's pending state. Any subsequent ORM query would
+            # trigger autoflush and retry the failing INSERT, so we
+            # defensively expunge the object (best-effort) and run the
+            # re-select with autoflush disabled.
+            with suppress(InvalidRequestError):
+                self.session.expunge(lot)
+            with self.session.no_autoflush:
+                winner = await self.lot_repo.find_or_none(
+                    warehouse_id=warehouse.id, item_id=item.id, lot_code=lot_code
+                )
+            if winner is None:  # pragma: no cover — should not happen
+                raise
+            return winner
+
     async def _check_idempotency(
         self,
         *,
@@ -648,25 +755,23 @@ class InventoryService:
                 },
             )
 
-        # Reuse existing lot if the caller's (item, lot_code) already
-        # exists at this warehouse. Otherwise create one.
-        lot = await self.lot_repo.find_or_none(
-            warehouse_id=warehouse.id, item_id=item.id, lot_code=payload["lot_code"]
+        # Sprint 4.1 P2 Task 3 — cross-warehouse storage-location guard.
+        await self._assert_location_belongs_to_warehouse(
+            storage_location_id=payload.get("storage_location_id"),
+            warehouse=warehouse,
         )
-        if lot is None:
-            lot = InventoryLot(
-                item_id=item.id,
-                warehouse_id=warehouse.id,
-                storage_location_id=payload.get("storage_location_id"),
-                lot_code=payload["lot_code"],
-                expiry_date=payload.get("expiry_date"),
-                received_at=datetime.now(UTC),
-                unit_cost_amount=payload.get("unit_cost_amount"),
-                unit_cost_currency=payload.get("unit_cost_currency"),
-                metadata_json=payload.get("metadata_json"),
-            )
-            self.session.add(lot)
-            await self.session.flush()
+
+        # Sprint 4.1 P2 Task 4 — concurrent-receipt safe upsert.
+        lot = await self._get_or_create_lot_safe(
+            warehouse=warehouse,
+            item=item,
+            lot_code=payload["lot_code"],
+            storage_location_id=payload.get("storage_location_id"),
+            expiry_date=payload.get("expiry_date"),
+            unit_cost_amount=payload.get("unit_cost_amount"),
+            unit_cost_currency=payload.get("unit_cost_currency"),
+            metadata_json=payload.get("metadata_json"),
+        )
 
         # Lock the lot BEFORE reading balance / writing the ledger row.
         lot = await self._lock_lot(lot.id)
@@ -800,23 +905,25 @@ class InventoryService:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
         qty_canonical = self._to_canonical(item=item, qty=payload["quantity"], unit=payload["unit"])
 
-        # Reuse / create the destination lot.
-        dst_lot = await self.lot_repo.find_or_none(
-            warehouse_id=dst_warehouse.id, item_id=item.id, lot_code=src_lot.lot_code
+        # Sprint 4.1 P2 Task 3 — cross-warehouse storage-location guard
+        # applies to the destination-side bin, if the caller pinned one.
+        await self._assert_location_belongs_to_warehouse(
+            storage_location_id=payload.get("destination_storage_location_id"),
+            warehouse=dst_warehouse,
         )
-        if dst_lot is None:
-            dst_lot = InventoryLot(
-                item_id=item.id,
-                warehouse_id=dst_warehouse.id,
-                storage_location_id=payload.get("destination_storage_location_id"),
-                lot_code=src_lot.lot_code,
-                expiry_date=src_lot.expiry_date,
-                received_at=datetime.now(UTC),
-                unit_cost_amount=src_lot.unit_cost_amount,
-                unit_cost_currency=src_lot.unit_cost_currency,
-            )
-            self.session.add(dst_lot)
-            await self.session.flush()
+
+        # Sprint 4.1 P2 Task 4 — concurrent-transfer safe upsert on the
+        # destination lot. Same race exists as on receipt; same fix
+        # applies here.
+        dst_lot = await self._get_or_create_lot_safe(
+            warehouse=dst_warehouse,
+            item=item,
+            lot_code=src_lot.lot_code,
+            storage_location_id=payload.get("destination_storage_location_id"),
+            expiry_date=src_lot.expiry_date,
+            unit_cost_amount=src_lot.unit_cost_amount,
+            unit_cost_currency=src_lot.unit_cost_currency,
+        )
         dst_lot = await self._lock_lot(dst_lot.id)
 
         # Shared reference id groups the paired ledger rows.
@@ -1110,8 +1217,16 @@ class InventoryService:
         if item is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
 
-        # Cross-tenant check — the lot must belong to the same org as
-        # the farm. Farm-pinned lots must match the farm.
+        # Sprint 4.1 P2 Code Review (Medium) — tenant / farm authorization
+        # MUST run BEFORE the FEEDING category guard, otherwise a caller
+        # who is not a member of the lot's organization can distinguish
+        # between "the lot exists but is medicine/chemical/supply"
+        # (409 inventory_item_not_feed) and "the lot exists and is
+        # feed" (409 cross_org_lot_reference), leaking category and
+        # existence information across tenants. Load the warehouse and
+        # verify org / farm ownership up-front so unauthorized callers
+        # observe a single, uniform response regardless of the target
+        # lot's category.
         warehouse = await self.warehouse_repo.get_by_id(lot.warehouse_id)
         if warehouse is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
@@ -1131,6 +1246,31 @@ class InventoryService:
                     "message": "This lot is pinned to a different farm.",
                 },
             )
+
+        # Sprint 4.1 P2 Task 1 — FEEDING events may only draw down feed
+        # inventory. Consuming medicine, chemicals, or supplies as feed
+        # corrupts inventory accounting AND downstream biomass / FCR
+        # projections. Refuse before any ledger write happens.
+        #
+        # This runs AFTER the tenant / farm authorization above so
+        # cross-tenant callers cannot distinguish item categories via
+        # differential error codes.
+        if item.category != InventoryItemCategory.FEED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "inventory_item_not_feed",
+                    "message": (
+                        "FEEDING events may only consume inventory items "
+                        "of category 'feed'. The referenced lot holds an "
+                        f"item of category '{item.category.value}'."
+                    ),
+                    "item_id": str(item.id),
+                    "item_category": item.category.value,
+                    "lot_id": str(lot.id),
+                },
+            )
+
         self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.CONSUMPTION)
 
         qty_canonical = self._to_canonical(item=item, qty=quantity, unit=unit)

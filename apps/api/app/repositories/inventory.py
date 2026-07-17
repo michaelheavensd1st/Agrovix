@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from fastapi import HTTPException, status
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.inventory import (
@@ -17,6 +21,49 @@ from app.models.inventory import (
     StorageLocation,
     Warehouse,
 )
+
+
+def _encode_cursor(performed_at: datetime, tx_id: uuid.UUID) -> str:
+    """Sprint 4.1 P2 Task 2 — opaque composite cursor.
+
+    Encodes ``(performed_at, id)`` as ``base64("<iso>|<uuid>")`` so
+    callers cannot introspect the position and we can evolve the
+    format later without breaking clients.
+    """
+    raw = f"{performed_at.isoformat()}|{tx_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    """Inverse of :func:`_encode_cursor`. Any decoding failure → HTTP 400.
+
+    Sprint 4.1 P2 Code Review (Medium) — every client-controlled failure
+    mode must funnel into the documented ``400 invalid_cursor`` response
+    so the endpoint never returns 500 for a garbage query parameter.
+    Failure modes explicitly covered:
+
+    * non-ASCII characters (``UnicodeEncodeError`` from ``encode('ascii')``),
+    * invalid base64 padding / alphabet (``binascii.Error``),
+    * base64 payload that is not valid UTF-8 (``UnicodeDecodeError``),
+    * missing ``|`` delimiter (``ValueError`` from tuple unpacking),
+    * malformed ISO-8601 timestamp (``ValueError`` from ``fromisoformat``),
+    * malformed UUID (``ValueError`` from ``uuid.UUID``),
+    * unexpected input type or unknown encoding (``TypeError`` /
+      ``LookupError``).
+
+    The exception message is NOT echoed back to the client so we do not
+    leak internal parser details.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        ts_str, id_str = raw.split("|", 1)
+        return datetime.fromisoformat(ts_str), uuid.UUID(id_str)
+    except (ValueError, TypeError, LookupError, binascii.Error) as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            {"code": "invalid_cursor", "message": "Malformed pagination cursor."},
+        ) from exc
+
 
 # --------------------------------------------------------------------- #
 # Sign map — INCREASE types add to the balance, DECREASE types subtract.
@@ -188,17 +235,31 @@ class InventoryTransactionRepository:
         limit: int = 50,
         cursor: str | None = None,
     ) -> tuple[Sequence[InventoryTransaction], str | None]:
-        stmt = (
-            select(InventoryTransaction)
-            .where(InventoryTransaction.lot_id == lot_id)
-            .order_by(
-                InventoryTransaction.performed_at.desc(),
-                InventoryTransaction.id.desc(),
+        """List a lot's ledger ordered ``performed_at DESC, id DESC``.
+
+        Sprint 4.1 P2 Task 2 — the cursor is an opaque composite
+        ``base64("<performed_at_iso>|<id>")``. It is applied as a
+        strict tuple inequality so pagination is stable even when
+        several rows share the same ``performed_at`` (common for
+        transfers, which write two ledger rows at the same instant).
+        """
+        stmt = select(InventoryTransaction).where(InventoryTransaction.lot_id == lot_id)
+        if cursor is not None:
+            cursor_ts, cursor_id = _decode_cursor(cursor)
+            stmt = stmt.where(
+                tuple_(InventoryTransaction.performed_at, InventoryTransaction.id)
+                < tuple_(cursor_ts, cursor_id)
             )
-            .limit(limit + 1)
-        )
+        stmt = stmt.order_by(
+            InventoryTransaction.performed_at.desc(),
+            InventoryTransaction.id.desc(),
+        ).limit(limit + 1)
         rows = list((await self.session.execute(stmt)).scalars().all())
-        next_cursor = str(rows[limit].id) if len(rows) > limit else None
+        next_cursor = (
+            _encode_cursor(rows[limit - 1].performed_at, rows[limit - 1].id)
+            if len(rows) > limit
+            else None
+        )
         return rows[:limit], next_cursor
 
     async def list_by_reference(
