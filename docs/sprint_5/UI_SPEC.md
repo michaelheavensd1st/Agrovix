@@ -198,15 +198,9 @@ Users should be able to filter transactions by:
 
 The Transfers screen manages stock movement between warehouses or farm locations.
 
-Transfer statuses include:
+Transfers are executed immediately using the existing Inventory API.
 
-- Draft
-- Submitted
-- Approved
-- In transit
-- Received
-- Rejected
-- Cancelled
+Approval workflows, draft transfers, and in-transit states are reserved for a future sprint.
 
 Each transfer should contain:
 
@@ -215,9 +209,7 @@ Each transfer should contain:
 - Items
 - Quantities
 - Requested by
-- Approved by
-- Sent date
-- Received date
+- Timestamp
 - Notes
 - Audit history
 
@@ -245,21 +237,8 @@ Every adjustment must require:
 - A timestamp
 - An audit record
 
-### Suppliers
 
-The Suppliers screen manages businesses and individuals who provide inventory items.
 
-Supplier information includes:
-
-- Supplier name
-- Contact person
-- Phone number
-- Email address
-- Address
-- Items supplied
-- Payment terms
-- Status
-- Notes
 
 ### Inventory Audit History
 
