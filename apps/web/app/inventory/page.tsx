@@ -17,7 +17,7 @@
  *  · Friendly language for 409 / idempotency conflicts.
  */
 
-import { FormEvent, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
 import {
@@ -132,6 +132,24 @@ function InventoryInner() {
   const [loadingLots, setLoadingLots] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
+  // Sprint 5.1 review round #3 — async organization-race guard.
+  //
+  // Every organization-scoped fetch (reloadOrg / reloadLots / lot
+  // history) captures the active orgId + selected warehouse + lot at
+  // request start, along with a monotonically increasing generation
+  // number. Before writing state we verify the captured context is
+  // still current. An obsolete response — for example a slow
+  // organization-A warehouses fetch that resolves AFTER the user has
+  // switched to organization B — is dropped on the floor and can
+  // never overwrite the current view.
+  //
+  // The three refs are decoupled deliberately so a stale lot fetch
+  // does not invalidate an in-flight org fetch (and vice-versa),
+  // even though every generation bumps when orgId changes.
+  const orgGenerationRef = useRef(0);
+  const lotGenerationRef = useRef(0);
+  const historyGenerationRef = useRef(0);
+
   // Bootstrap: load orgs.
   useEffect(() => {
     (async () => {
@@ -159,12 +177,20 @@ function InventoryInner() {
 
   const reloadOrg = useCallback(async () => {
     if (!orgId) return;
+    const capturedOrgId = orgId;
+    const generation = ++orgGenerationRef.current;
+    // Every subsequent state mutation must clear this predicate — if
+    // the user switches org (or triggers another reload) mid-flight
+    // the generation ref bumps and this reload becomes a no-op writer.
+    const isCurrent = () =>
+      orgGenerationRef.current === generation && capturedOrgId === orgId;
     setLoadingOrg(true);
     try {
       const [wh, it] = await Promise.all([
-        apiFetch<Warehouse[]>(`/v1/organizations/${orgId}/warehouses`),
-        apiFetch<InventoryItem[]>(`/v1/organizations/${orgId}/inventory-items`),
+        apiFetch<Warehouse[]>(`/v1/organizations/${capturedOrgId}/warehouses`),
+        apiFetch<InventoryItem[]>(`/v1/organizations/${capturedOrgId}/inventory-items`),
       ]);
+      if (!isCurrent()) return;
       setWarehouses(wh);
       setItems(it);
       // Sprint 5.1 review round #2 — after an organization switch we
@@ -175,24 +201,39 @@ function InventoryInner() {
       // covers both first-load AND org-switch.
       if (wh.length > 0) setSelectedWh((current) => (current ? current : wh[0].id));
     } catch (e) {
+      if (!isCurrent()) return;
       toast(friendlyError(e), 'error');
     } finally {
-      setLoadingOrg(false);
+      if (isCurrent()) setLoadingOrg(false);
     }
   }, [orgId]);
 
   const reloadLots = useCallback(async () => {
     if (!selectedWh) return;
+    const capturedOrgId = orgId;
+    const capturedWh = selectedWh;
+    const generation = ++lotGenerationRef.current;
+    // Two-part staleness check: (1) the lot-generation must still be
+    // the latest lot request; (2) the org+warehouse we captured must
+    // still be the ones on screen. An obsolete lot fetch from a
+    // previous organization or a previously-selected warehouse can
+    // never repopulate lots.
+    const isCurrent = () =>
+      lotGenerationRef.current === generation &&
+      capturedOrgId === orgId &&
+      capturedWh === selectedWh;
     setLoadingLots(true);
     try {
-      const list = await apiFetch<Lot[]>(`/v1/warehouses/${selectedWh}/lots`);
+      const list = await apiFetch<Lot[]>(`/v1/warehouses/${capturedWh}/lots`);
+      if (!isCurrent()) return;
       setLots(list);
     } catch (e) {
+      if (!isCurrent()) return;
       toast(friendlyError(e), 'error');
     } finally {
-      setLoadingLots(false);
+      if (isCurrent()) setLoadingLots(false);
     }
-  }, [selectedWh]);
+  }, [selectedWh, orgId]);
 
   // Sprint 5.1 review round #2 — organization context retention.
   //
@@ -207,6 +248,14 @@ function InventoryInner() {
   // React remounts the form components — see the panel wrappers
   // further down in this file.
   useEffect(() => {
+    // Invalidate any in-flight organization / lot / history request
+    // whose response arrives after this org change. `reloadOrg` /
+    // `reloadLots` will bump the generation again on entry — the
+    // extra bump here closes the window between orgId changing and
+    // the reload callbacks running.
+    orgGenerationRef.current += 1;
+    lotGenerationRef.current += 1;
+    historyGenerationRef.current += 1;
     setWarehouses([]);
     setItems([]);
     setSelectedWh('');
@@ -224,12 +273,29 @@ function InventoryInner() {
 
   useEffect(() => {
     if (!selectedLot) return;
+    const capturedOrgId = orgId;
+    const capturedWh = selectedWh;
+    const capturedLot = selectedLot;
+    const generation = ++historyGenerationRef.current;
+    const isCurrent = () =>
+      historyGenerationRef.current === generation &&
+      capturedOrgId === orgId &&
+      capturedWh === selectedWh &&
+      capturedLot === selectedLot;
     setLoadingHistory(true);
-    apiFetch<{ items: LedgerTx[] }>(`/v1/lots/${selectedLot}/transactions`)
-      .then((r) => setHistory(r.items))
-      .catch((e) => toast(friendlyError(e), 'error'))
-      .finally(() => setLoadingHistory(false));
-  }, [selectedLot]);
+    apiFetch<{ items: LedgerTx[] }>(`/v1/lots/${capturedLot}/transactions`)
+      .then((r) => {
+        if (!isCurrent()) return;
+        setHistory(r.items);
+      })
+      .catch((e) => {
+        if (!isCurrent()) return;
+        toast(friendlyError(e), 'error');
+      })
+      .finally(() => {
+        if (isCurrent()) setLoadingHistory(false);
+      });
+  }, [selectedLot, selectedWh, orgId]);
 
   const totalBalanceByItem = useMemo(() => {
     const acc = new Map<string, { balance: number; unit: string; name: string }>();
