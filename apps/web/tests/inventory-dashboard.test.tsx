@@ -15,7 +15,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 import {
@@ -661,12 +661,29 @@ describe('InventoryDashboardPage', () => {
   // ------------------------------------------------------------------- //
 
   it('ignores a late organization-A response when the user has switched to B', async () => {
-    // We deliberately gate the org-1 warehouses fetch behind a manual
-    // resolver so we can order the responses: B resolves first, then A.
-    let resolveOrgAWarehouses: ((v: DashboardWarehouse[]) => void) | null = null;
-    const orgAPromise = new Promise<DashboardWarehouse[]>((resolve) => {
-      resolveOrgAWarehouses = resolve;
-    });
+    // Sprint 5.1 review round #3 — dashboard stale-write regression.
+    //
+    // We used to stall organization A's fan-out behind a never-
+    // resolving `new Promise(() => {})`, which "proved" the guard
+    // only by leaving A's promises pending for the lifetime of the
+    // test. That leaked React updates outside of `act()` and never
+    // actually exercised the write path we care about.
+    //
+    // The correct shape: use deferred promises so we can complete
+    // organization A's warehouses, items AND lot fan-out AFTER B has
+    // rendered, and then assert that the generation guard has
+    // prevented A's completed projection from stomping on B.
+    function deferred<T>() {
+      let resolve!: (v: T) => void;
+      const promise = new Promise<T>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    }
+
+    const dAWarehouses = deferred<DashboardWarehouse[]>();
+    const dAItems = deferred<DashboardInventoryItem[]>();
+    const dALots = deferred<DashboardLot[]>();
 
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') {
@@ -675,19 +692,11 @@ describe('InventoryDashboardPage', () => {
           { id: 'org-2', name: 'Delta', slug: 'delta' },
         ]);
       }
-      if (path === '/v1/organizations/org-1/warehouses') {
-        return orgAPromise; // stalls until we manually resolve
-      }
-      if (path === '/v1/organizations/org-2/warehouses') {
-        return Promise.resolve([WH_COLD]);
-      }
-      if (path.endsWith('/inventory-items')) {
-        if (path.includes('org-1')) {
-          // Also stalls forever from A so we never accidentally set A's items.
-          return new Promise(() => {});
-        }
-        return Promise.resolve([ITEM_MED]);
-      }
+      if (path === '/v1/organizations/org-1/warehouses') return dAWarehouses.promise;
+      if (path === '/v1/organizations/org-1/inventory-items') return dAItems.promise;
+      if (path === '/v1/organizations/org-2/warehouses') return Promise.resolve([WH_COLD]);
+      if (path === '/v1/organizations/org-2/inventory-items') return Promise.resolve([ITEM_MED]);
+      if (path === `/v1/warehouses/${WH_MAIN.id}/lots`) return dALots.promise;
       if (path === `/v1/warehouses/${WH_COLD.id}/lots`) {
         return Promise.resolve([
           makeLot({
@@ -699,37 +708,53 @@ describe('InventoryDashboardPage', () => {
           }),
         ]);
       }
-      // Any lots call for A never resolves.
-      return new Promise(() => {});
+      return Promise.reject(new ApiError(404, { detail: `unmocked ${path}` }));
     });
 
     render(<InventoryDashboardPage />);
 
-    // A is loading. Switch to B before A completes.
+    // Wait for A's org bootstrap to land (selector is now on org-1)
+    // while its warehouses / items are still stalled.
     await waitFor(() =>
       expect(screen.getByTestId('inventory-dashboard-org-selector')).toBeInTheDocument(),
     );
+    // Switch to B before A completes.
     fireEvent.change(screen.getByTestId('inventory-dashboard-org-selector'), {
       target: { value: 'org-2' },
     });
 
+    // B rendered successfully.
     await waitFor(() =>
       expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Delta'),
     );
-    // B rendered successfully.
     expect(screen.getByTestId('inventory-dashboard-attention')).toBeInTheDocument();
     expect(screen.getByText('Vaccine A')).toBeInTheDocument();
 
-    // Now let A finally return with a payload that would otherwise
-    // "win" and stomp on B if we were vulnerable to the race.
-    (resolveOrgAWarehouses as unknown as (v: DashboardWarehouse[]) => void)([WH_MAIN]);
-    // Give React a tick to flush the (now-stale) resolution.
-    await new Promise((r) => setTimeout(r, 20));
+    // Now let organization A fully complete — warehouses, items AND
+    // the warehouse-lots fan-out. Under a broken guard this would
+    // finish `loadDashboard(org-1)` and stomp B's projection.
+    await act(async () => {
+      dAWarehouses.resolve([WH_MAIN]);
+      dAItems.resolve([ITEM_FEED]);
+      dALots.resolve([makeLot({ id: 'lot-a', warehouse_id: WH_MAIN.id, balance: '77' })]);
+      // Let every awaited-in-flight continuation from A settle so we
+      // are certain the obsolete `setState(...)` branch has had its
+      // chance to run (and, thanks to the generation guard, silently
+      // no-op).
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
-    // B's data must still be on-screen.
+    // B's data must still be on-screen; nothing from A leaked.
     expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Delta');
     expect(screen.getByText('Vaccine A')).toBeInTheDocument();
     expect(screen.queryByText('Starter feed')).not.toBeInTheDocument();
+    // And critically: no summary metric was recomputed from A's lot
+    // (which would put out_of_stock_lots at 0, not the B lot's 1).
+    expect(
+      screen.getByTestId('inventory-dashboard-metric-out_of_stock_lots-value'),
+    ).toHaveTextContent('1');
   });
 
   // ------------------------------------------------------------------- //

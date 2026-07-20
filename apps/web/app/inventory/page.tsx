@@ -182,8 +182,7 @@ function InventoryInner() {
     // Every subsequent state mutation must clear this predicate — if
     // the user switches org (or triggers another reload) mid-flight
     // the generation ref bumps and this reload becomes a no-op writer.
-    const isCurrent = () =>
-      orgGenerationRef.current === generation && capturedOrgId === orgId;
+    const isCurrent = () => orgGenerationRef.current === generation && capturedOrgId === orgId;
     setLoadingOrg(true);
     try {
       const [wh, it] = await Promise.all([

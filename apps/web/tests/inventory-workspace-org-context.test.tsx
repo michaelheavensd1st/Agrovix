@@ -220,8 +220,8 @@ describe('/inventory workspace — async organization-race protection', () => {
   it('Test A — obsolete organization-A warehouse+item response cannot overwrite B', async () => {
     // We stall the org-A warehouse AND item fetch behind manual
     // resolvers so we can complete them AFTER org B has rendered.
-    const dAWh = deferred<typeof WH_A[]>();
-    const dAItems = deferred<typeof ITEM_A[]>();
+    const dAWh = deferred<(typeof WH_A)[]>();
+    const dAItems = deferred<(typeof ITEM_A)[]>();
 
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
@@ -274,7 +274,7 @@ describe('/inventory workspace — async organization-race protection', () => {
     // Org A's warehouse resolves immediately so we can trigger a lot
     // fetch, but we stall the lot fetch itself. Org B's warehouse and
     // lot fetch resolve immediately.
-    const dALots = deferred<typeof LOT_A[]>();
+    const dALots = deferred<(typeof LOT_A)[]>();
 
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
@@ -404,8 +404,8 @@ describe('/inventory workspace — async organization-race protection', () => {
   it('Test D — post-race, write forms cannot select an obsolete org-A warehouse or item', async () => {
     // Same race as Test A. After it finishes, we open the Receive form
     // and verify it cannot select WH_A or ITEM_A.
-    const dAWh = deferred<typeof WH_A[]>();
-    const dAItems = deferred<typeof ITEM_A[]>();
+    const dAWh = deferred<(typeof WH_A)[]>();
+    const dAItems = deferred<(typeof ITEM_A)[]>();
 
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
