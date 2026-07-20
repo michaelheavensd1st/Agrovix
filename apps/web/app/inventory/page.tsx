@@ -226,6 +226,13 @@ function InventoryInner() {
           <h1 className="font-display text-3xl">Inventory</h1>
         </div>
         <div className="flex items-center gap-2 text-sm">
+          <a
+            href="/inventory/dashboard"
+            data-testid="inventory-workspace-dashboard-link"
+            className="rounded-md border border-border px-3 py-1.5 hover:bg-secondary"
+          >
+            Dashboard
+          </a>
           <label className="text-muted-foreground">Organization</label>
           <select
             data-testid="inv-org-selector"
