@@ -132,6 +132,35 @@ function InventoryInner() {
   const [loadingLots, setLoadingLots] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
+  // Sprint 5.1 review round #4 — centralized 401 / 403 handling.
+  //
+  // Every workspace loader (reloadOrg / reloadLots / history) used
+  // to convert authorization errors into ordinary toasts, which is
+  // inconsistent with the organization bootstrap (which redirects
+  // on 401) and hides missing-permission failures behind a generic
+  // error banner.
+  //
+  // We now route auth errors through `handleLoadError`:
+  //   - 401 → unconditional redirect to /login (session-scoped;
+  //           we do NOT write any state before navigating).
+  //   - 403 → clear the affected slice of state and surface a
+  //           dedicated permission banner. State writes are gated
+  //           on `isCurrent()` so a late org-A 403 cannot damage
+  //           org-B once the user has switched.
+  //   - anything else → falls through to the existing friendly
+  //           toast (also gated on `isCurrent()`).
+  //
+  // `forbidden.scope` narrows the visible affected region:
+  //   'org'     → the whole workspace body is replaced by a banner.
+  //   'lot'     → the Lots tab body and any lot-dependent history
+  //               view show a scoped banner (warehouses + items
+  //               stay usable).
+  //   'history' → only the History tab shows a scoped banner.
+  const [forbidden, setForbidden] = useState<{
+    scope: 'org' | 'lot' | 'history';
+    message: string;
+  } | null>(null);
+
   // Sprint 5.1 review round #3 — async organization-race guard.
   //
   // Every organization-scoped fetch (reloadOrg / reloadLots / lot
@@ -149,6 +178,81 @@ function InventoryInner() {
   const orgGenerationRef = useRef(0);
   const lotGenerationRef = useRef(0);
   const historyGenerationRef = useRef(0);
+
+  /**
+   * Sprint 5.1 review round #4 — central workspace load-error handler.
+   *
+   * Returns 'auth' if the error was authorization-related and the
+   * caller should stop (no toast, no other state writes). Returns
+   * 'unhandled' otherwise so the caller can apply its own
+   * (generation-guarded) fallback behavior.
+   *
+   * Contract:
+   *   - 401 → unconditional `router.push('/login')`. We do NOT touch
+   *     any state before navigating, because the session itself is
+   *     invalid and any state we set would either be immediately
+   *     replaced by /login or leak stale context onto the login page.
+   *   - 403 → only mutates state when `isCurrent()` still holds, so
+   *     a late org-A 403 that arrives after the user has switched
+   *     to org-B cannot damage org-B's data or error state.
+   */
+  const handleLoadError = useCallback(
+    (
+      error: unknown,
+      scope: 'org' | 'lot' | 'history',
+      isCurrent: () => boolean,
+    ): 'auth' | 'unhandled' => {
+      if (!(error instanceof ApiError)) return 'unhandled';
+      if (error.status === 401) {
+        router.push('/login');
+        return 'auth';
+      }
+      if (error.status === 403) {
+        if (!isCurrent()) return 'auth';
+        if (scope === 'org') {
+          // Whole-org access lost: invalidate every downstream
+          // generation, drop every organization-scoped slice, and
+          // show a page-level banner in place of the tabs body.
+          orgGenerationRef.current += 1;
+          lotGenerationRef.current += 1;
+          historyGenerationRef.current += 1;
+          setWarehouses([]);
+          setItems([]);
+          setLots([]);
+          setHistory([]);
+          setSelectedWh('');
+          setSelectedLot('');
+          setForbidden({
+            scope: 'org',
+            message: "You don't have permission to view this organization's inventory.",
+          });
+        } else if (scope === 'lot') {
+          // Warehouse-scoped access lost: keep the org's warehouse
+          // catalog + item catalog usable, but drop lots + history.
+          lotGenerationRef.current += 1;
+          historyGenerationRef.current += 1;
+          setLots([]);
+          setSelectedLot('');
+          setHistory([]);
+          setForbidden({
+            scope: 'lot',
+            message: "You don't have permission to view lots in this warehouse.",
+          });
+        } else {
+          // Lot-history scoped access lost: keep everything else.
+          historyGenerationRef.current += 1;
+          setHistory([]);
+          setForbidden({
+            scope: 'history',
+            message: "You don't have permission to view this lot's transaction history.",
+          });
+        }
+        return 'auth';
+      }
+      return 'unhandled';
+    },
+    [router],
+  );
 
   // Bootstrap: load orgs.
   useEffect(() => {
@@ -192,6 +296,8 @@ function InventoryInner() {
       if (!isCurrent()) return;
       setWarehouses(wh);
       setItems(it);
+      // A successful org reload clears any stale org-scope 403 banner.
+      setForbidden((f) => (f?.scope === 'org' ? null : f));
       // Sprint 5.1 review round #2 — after an organization switch we
       // want the workspace to auto-select a fresh warehouse from the
       // new org. The prior `!selectedWh` guard only auto-selected on
@@ -200,12 +306,13 @@ function InventoryInner() {
       // covers both first-load AND org-switch.
       if (wh.length > 0) setSelectedWh((current) => (current ? current : wh[0].id));
     } catch (e) {
+      if (handleLoadError(e, 'org', isCurrent) === 'auth') return;
       if (!isCurrent()) return;
       toast(friendlyError(e), 'error');
     } finally {
       if (isCurrent()) setLoadingOrg(false);
     }
-  }, [orgId]);
+  }, [orgId, handleLoadError]);
 
   const reloadLots = useCallback(async () => {
     if (!selectedWh) return;
@@ -226,13 +333,16 @@ function InventoryInner() {
       const list = await apiFetch<Lot[]>(`/v1/warehouses/${capturedWh}/lots`);
       if (!isCurrent()) return;
       setLots(list);
+      // A successful lot reload clears any stale lot-scope 403 banner.
+      setForbidden((f) => (f?.scope === 'lot' ? null : f));
     } catch (e) {
+      if (handleLoadError(e, 'lot', isCurrent) === 'auth') return;
       if (!isCurrent()) return;
       toast(friendlyError(e), 'error');
     } finally {
       if (isCurrent()) setLoadingLots(false);
     }
-  }, [selectedWh, orgId]);
+  }, [selectedWh, orgId, handleLoadError]);
 
   // Sprint 5.1 review round #2 — organization context retention.
   //
@@ -261,6 +371,9 @@ function InventoryInner() {
     setLots([]);
     setSelectedLot('');
     setHistory([]);
+    // Sprint 5.1 review round #4 — a permission failure on org-A
+    // must never bleed into org-B; wipe the forbidden banner too.
+    setForbidden(null);
   }, [orgId]);
 
   useEffect(() => {
@@ -286,15 +399,19 @@ function InventoryInner() {
       .then((r) => {
         if (!isCurrent()) return;
         setHistory(r.items);
+        // A successful history load clears any stale history-scope
+        // 403 banner (leaves broader lot/org banners in place).
+        setForbidden((f) => (f?.scope === 'history' ? null : f));
       })
       .catch((e) => {
+        if (handleLoadError(e, 'history', isCurrent) === 'auth') return;
         if (!isCurrent()) return;
         toast(friendlyError(e), 'error');
       })
       .finally(() => {
         if (isCurrent()) setLoadingHistory(false);
       });
-  }, [selectedLot, selectedWh, orgId]);
+  }, [selectedLot, selectedWh, orgId, handleLoadError]);
 
   const totalBalanceByItem = useMemo(() => {
     const acc = new Map<string, { balance: number; unit: string; name: string }>();
@@ -377,107 +494,142 @@ function InventoryInner() {
         ))}
       </nav>
 
-      {tab === 'overview' && (
-        <OverviewPanel
-          loading={loadingOrg}
-          warehouses={warehouses}
-          items={items}
-          lots={lots}
-          balances={totalBalanceByItem}
-          onCreateWarehouse={() => setTab('warehouses')}
-          onCreateItem={() => setTab('items')}
-        />
-      )}
+      {forbidden?.scope === 'org' ? (
+        <InventoryForbiddenBanner scope="org" message={forbidden.message} />
+      ) : (
+        <>
+          {tab === 'overview' && (
+            <OverviewPanel
+              loading={loadingOrg}
+              warehouses={warehouses}
+              items={items}
+              lots={lots}
+              balances={totalBalanceByItem}
+              onCreateWarehouse={() => setTab('warehouses')}
+              onCreateItem={() => setTab('items')}
+            />
+          )}
 
-      {tab === 'warehouses' && (
-        <WarehousesPanel
-          loading={loadingOrg}
-          orgId={orgId}
-          warehouses={warehouses}
-          onChange={reloadOrg}
-          onSelect={(id) => {
-            setSelectedWh(id);
-            setTab('lots');
-          }}
-        />
-      )}
+          {tab === 'warehouses' && (
+            <WarehousesPanel
+              loading={loadingOrg}
+              orgId={orgId}
+              warehouses={warehouses}
+              onChange={reloadOrg}
+              onSelect={(id) => {
+                setSelectedWh(id);
+                setTab('lots');
+              }}
+            />
+          )}
 
-      {tab === 'items' && (
-        <ItemsPanel loading={loadingOrg} orgId={orgId} items={items} onChange={reloadOrg} />
-      )}
+          {tab === 'items' && (
+            <ItemsPanel loading={loadingOrg} orgId={orgId} items={items} onChange={reloadOrg} />
+          )}
 
-      {tab === 'lots' && (
-        <LotsPanel
-          loading={loadingLots}
-          warehouses={warehouses}
-          selectedWh={selectedWh}
-          onSelectWh={setSelectedWh}
-          lots={lots}
-          items={items}
-          onOpenLot={(id) => {
-            setSelectedLot(id);
-            setTab('history');
-          }}
-          onReceive={() => setTab('receive')}
-        />
-      )}
+          {tab === 'lots' &&
+            (forbidden?.scope === 'lot' ? (
+              <InventoryForbiddenBanner scope="lot" message={forbidden.message} />
+            ) : (
+              <LotsPanel
+                loading={loadingLots}
+                warehouses={warehouses}
+                selectedWh={selectedWh}
+                onSelectWh={setSelectedWh}
+                lots={lots}
+                items={items}
+                onOpenLot={(id) => {
+                  setSelectedLot(id);
+                  setTab('history');
+                }}
+                onReceive={() => setTab('receive')}
+              />
+            ))}
 
-      {tab === 'receive' && (
-        <ReceivePanel
-          key={orgId || 'no-org'}
-          warehouses={warehouses}
-          items={items}
-          selectedWh={selectedWh}
-          onSelectWh={setSelectedWh}
-          onDone={reloadLots}
-        />
-      )}
+          {tab === 'receive' && (
+            <ReceivePanel
+              key={orgId || 'no-org'}
+              warehouses={warehouses}
+              items={items}
+              selectedWh={selectedWh}
+              onSelectWh={setSelectedWh}
+              onDone={reloadLots}
+            />
+          )}
 
-      {tab === 'issue' && (
-        <TxPanel
-          key={orgId || 'no-org'}
-          mode="issue"
-          warehouse={currentWh}
-          lots={lots}
-          items={items}
-          warehouses={warehouses}
-          onDone={reloadLots}
-        />
-      )}
+          {tab === 'issue' && (
+            <TxPanel
+              key={orgId || 'no-org'}
+              mode="issue"
+              warehouse={currentWh}
+              lots={lots}
+              items={items}
+              warehouses={warehouses}
+              onDone={reloadLots}
+            />
+          )}
 
-      {tab === 'transfer' && (
-        <TransferPanel
-          key={orgId || 'no-org'}
-          warehouses={warehouses}
-          warehouse={currentWh}
-          lots={lots}
-          items={items}
-          onDone={reloadLots}
-        />
-      )}
+          {tab === 'transfer' && (
+            <TransferPanel
+              key={orgId || 'no-org'}
+              warehouses={warehouses}
+              warehouse={currentWh}
+              lots={lots}
+              items={items}
+              onDone={reloadLots}
+            />
+          )}
 
-      {tab === 'adjust' && (
-        <TxPanel
-          key={orgId || 'no-org'}
-          mode="adjust"
-          warehouse={currentWh}
-          lots={lots}
-          items={items}
-          warehouses={warehouses}
-          onDone={reloadLots}
-        />
-      )}
+          {tab === 'adjust' && (
+            <TxPanel
+              key={orgId || 'no-org'}
+              mode="adjust"
+              warehouse={currentWh}
+              lots={lots}
+              items={items}
+              warehouses={warehouses}
+              onDone={reloadLots}
+            />
+          )}
 
-      {tab === 'history' && (
-        <HistoryPanel
-          loading={loadingHistory}
-          lots={lots}
-          selectedLot={selectedLot}
-          onSelect={setSelectedLot}
-          history={history}
-        />
+          {tab === 'history' &&
+            (forbidden?.scope === 'lot' || forbidden?.scope === 'history' ? (
+              <InventoryForbiddenBanner scope={forbidden.scope} message={forbidden.message} />
+            ) : (
+              <HistoryPanel
+                loading={loadingHistory}
+                lots={lots}
+                selectedLot={selectedLot}
+                onSelect={setSelectedLot}
+                history={history}
+              />
+            ))}
+        </>
       )}
     </main>
+  );
+}
+
+// -------------------------------------------------------------------- //
+// Scoped forbidden banner (Sprint 5.1 review round #4). Kept local so
+// it can carry a distinct data-testid per scope for both operator
+// clarity and regression tests.
+// -------------------------------------------------------------------- //
+function InventoryForbiddenBanner({
+  scope,
+  message,
+}: {
+  scope: 'org' | 'lot' | 'history';
+  message: string;
+}) {
+  return (
+    <div
+      className="rounded-2xl border border-dashed border-border bg-card/40 p-10 text-center"
+      data-testid={`inv-forbidden-${scope}`}
+    >
+      <p className="font-display text-lg">You don&apos;t have access.</p>
+      <p className="mt-1 text-sm text-muted-foreground">{message}</p>
+    </div>
   );
 }
 
