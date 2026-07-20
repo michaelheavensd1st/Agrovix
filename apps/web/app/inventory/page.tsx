@@ -20,6 +20,7 @@
 import { FormEvent, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
+import { resolveOrganizationId } from '@/lib/inventory-dashboard';
 import {
   ConfirmDialog,
   EmptyStateCard,
@@ -132,8 +133,16 @@ function InventoryInner() {
       try {
         const list = await apiFetch<Organization[]>('/v1/organizations');
         setOrgs(list);
-        if (list.length > 0) setOrgId(list[0].id);
-        else router.push('/onboarding');
+        if (list.length === 0) {
+          router.push('/onboarding');
+          return;
+        }
+        // Sprint 5.1 review fix — honour `?organization_id=…` when it
+        // matches one of the caller's real orgs. Fall back safely
+        // otherwise; never trust an unvalidated query parameter.
+        const requested = params.get('organization_id');
+        const validated = resolveOrganizationId(requested, list) ?? list[0].id;
+        setOrgId(validated);
       } catch (e) {
         if (e instanceof ApiError && e.status === 401) router.push('/login');
         else toast(friendlyError(e), 'error');
@@ -141,7 +150,7 @@ function InventoryInner() {
         setLoadingOrg(false);
       }
     })();
-  }, [router]);
+  }, [router, params]);
 
   const reloadOrg = useCallback(async () => {
     if (!orgId) return;
@@ -227,7 +236,11 @@ function InventoryInner() {
         </div>
         <div className="flex items-center gap-2 text-sm">
           <a
-            href="/inventory/dashboard"
+            href={
+              orgId
+                ? `/inventory/dashboard?organization_id=${encodeURIComponent(orgId)}`
+                : '/inventory/dashboard'
+            }
             data-testid="inventory-workspace-dashboard-link"
             className="rounded-md border border-border px-3 py-1.5 hover:bg-secondary"
           >

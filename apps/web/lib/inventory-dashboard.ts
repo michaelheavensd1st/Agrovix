@@ -12,8 +12,17 @@
  *
  * Anything the backend does not currently expose (per-item
  * reorder_level, estimated stock value, warehouse utilization,
- * pending / in-transit transfer states) is DELIBERATELY omitted.
- * See docs/sprint_5/API_MAPPING.md for the full gap list.
+ * pending / in-transit transfer states, cross-warehouse recent
+ * activity) is DELIBERATELY omitted. See
+ * docs/sprint_5/API_MAPPING.md for the full gap list.
+ *
+ * Sprint 5.1 review update: the previous `recent_activity` list
+ * (ordered by `lot.updated_at`) was removed. Backend tracing
+ * confirmed that receipts, issues, transfers, adjustments and
+ * reversals do NOT update the parent lot's timestamp, so ordering
+ * by `updated_at` was misleading. Cross-warehouse recent activity
+ * remains explicitly deferred to a future sprint that ships a
+ * dedicated transaction-feed endpoint.
  */
 
 import type { UUID } from '@/lib/types';
@@ -63,7 +72,7 @@ export interface DashboardLot {
   expiry_date: string | null; // ISO date, no time
   balance: number | string; // arrives as string from Decimal serializer
   balance_unit: string;
-  updated_at: string; // ISO datetime
+  updated_at: string; // ISO datetime — NOT used as an activity proxy.
   created_at: string;
 }
 
@@ -89,16 +98,6 @@ export interface LotAttentionRow {
   days_until_expiry: number | null;
 }
 
-export interface RecentActivityRow {
-  lot_id: UUID;
-  item_name: string;
-  warehouse_name: string;
-  lot_code: string;
-  balance: number;
-  balance_unit: string;
-  updated_at: string;
-}
-
 export interface DashboardSummary {
   total_active_items: number;
   total_warehouses: number;
@@ -113,7 +112,6 @@ export interface DashboardSummary {
 export interface DashboardProjection {
   summary: DashboardSummary;
   attention: LotAttentionRow[];
-  recent_activity: RecentActivityRow[];
 }
 
 // --------------------------------------------------------------------- //
@@ -124,14 +122,31 @@ export interface DashboardProjection {
  * every screen — and every test — sees the same value. */
 export const EXPIRING_SOON_DAYS = 30;
 
-/** Cap on the number of rows surfaced in each list. */
+/** Cap on the number of rows surfaced in the attention list. */
 export const ATTENTION_LIST_LIMIT = 20;
-export const RECENT_ACTIVITY_LIMIT = 10;
 
 /** Parse the JSON balance (arrives as string from FastAPI Decimal). */
 export function parseBalance(raw: number | string): number {
   const n = typeof raw === 'string' ? Number(raw) : raw;
   return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * Choose the effective organization for a request-scoped operation:
+ *   - if `requestedId` is present AND belongs to `orgs`, use it;
+ *   - otherwise fall back to the first `orgs` entry;
+ *   - return `null` when the caller has no organizations at all.
+ *
+ * Never trust a query parameter without validating it against the
+ * authenticated user's own list of organizations.
+ */
+export function resolveOrganizationId(
+  requestedId: string | null | undefined,
+  orgs: readonly { id: string }[],
+): string | null {
+  if (orgs.length === 0) return null;
+  if (requestedId && orgs.some((o) => o.id === requestedId)) return requestedId;
+  return orgs[0].id;
 }
 
 /** Whole calendar days between two ISO timestamps (UTC day boundaries).
@@ -185,7 +200,6 @@ export function buildDashboardProjection(input: {
   let expired = 0;
 
   const attentionRows: LotAttentionRow[] = [];
-  const recentRows: RecentActivityRow[] = [];
 
   for (const lot of lots) {
     const item = itemsById.get(lot.item_id);
@@ -215,16 +229,6 @@ export function buildDashboardProjection(input: {
         days_until_expiry,
       });
     }
-
-    recentRows.push({
-      lot_id: lot.id,
-      item_name,
-      warehouse_name,
-      lot_code: lot.lot_code,
-      balance,
-      balance_unit: lot.balance_unit,
-      updated_at: lot.updated_at,
-    });
   }
 
   // Sort attention: out-of-stock first, then expired, then expiring-soon
@@ -245,9 +249,6 @@ export function buildDashboardProjection(input: {
     return (a.days_until_expiry ?? 0) - (b.days_until_expiry ?? 0);
   });
 
-  // Sort recent activity by updated_at DESC.
-  recentRows.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
-
   const summary: DashboardSummary = {
     total_active_items: items.filter((i) => i.is_active).length,
     total_warehouses: warehouses.length,
@@ -261,6 +262,5 @@ export function buildDashboardProjection(input: {
   return {
     summary,
     attention: attentionRows.slice(0, ATTENTION_LIST_LIMIT),
-    recent_activity: recentRows.slice(0, RECENT_ACTIVITY_LIMIT),
   };
 }

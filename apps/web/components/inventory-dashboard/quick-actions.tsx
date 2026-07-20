@@ -4,10 +4,12 @@
  * Inventory Dashboard — quick actions.
  *
  * Every action links to an existing route in the Sprint 4 inventory
- * workspace. Actions that do not yet have a destination screen are
- * NOT rendered as functional buttons — they are marked
- * "Coming later in Sprint 5" and are non-interactive, so the
- * dashboard never creates broken navigation.
+ * workspace, with the currently selected organization propagated via
+ * the `organization_id` query parameter so the workspace can rehydrate
+ * the tenant context on landing. Actions that do not yet have a
+ * destination screen are NOT rendered as functional buttons — they
+ * are marked "Coming later in Sprint 5" and are non-interactive, so
+ * the dashboard never creates broken navigation.
  */
 
 import Link from 'next/link';
@@ -16,8 +18,8 @@ interface ActionSpec {
   key: string;
   label: string;
   description: string;
-  /** Existing app route, or `null` when the destination is deferred. */
-  href: string | null;
+  /** Sub-tab in `/inventory`, or `null` when the destination is deferred. */
+  tab: string | null;
   deferredNote?: string;
 }
 
@@ -26,55 +28,68 @@ const ACTIONS: ActionSpec[] = [
     key: 'view-items',
     label: 'View inventory items',
     description: 'Browse the catalog of feed, medicine, chemical and supply items.',
-    href: '/inventory?tab=items',
+    tab: 'items',
   },
   {
     key: 'view-warehouses',
     label: 'View warehouses',
     description: 'See warehouses and their lots + balances for this organization.',
-    href: '/inventory?tab=warehouses',
+    tab: 'warehouses',
   },
   {
     key: 'receive-stock',
     label: 'Receive stock',
     description: 'Record a new receipt against a lot in a warehouse.',
-    href: '/inventory?tab=receive',
+    tab: 'receive',
   },
   {
     key: 'issue-stock',
     label: 'Issue stock',
     description: 'Consume stock from an existing lot.',
-    href: '/inventory?tab=issue',
+    tab: 'issue',
   },
   {
     key: 'transfer-stock',
     label: 'Transfer stock',
     description: 'Immediate transfer between two warehouses. No draft or in-transit state.',
-    href: '/inventory?tab=transfer',
+    tab: 'transfer',
   },
   {
     key: 'transaction-history',
     label: 'Transaction history',
     description: 'Per-lot ledger with cursor pagination.',
-    href: '/inventory?tab=history',
+    tab: 'history',
   },
   {
     key: 'suppliers',
     label: 'Suppliers',
     description: 'Supplier directory and purchase relationships.',
-    href: null,
+    tab: null,
     deferredNote: 'Coming later in Sprint 5',
   },
   {
     key: 'purchases',
     label: 'Purchases',
     description: 'Purchase orders and inbound receipts.',
-    href: null,
+    tab: null,
     deferredNote: 'Coming later in Sprint 5',
   },
 ];
 
-export function InventoryDashboardQuickActions() {
+/** Build a workspace URL that preserves the organization context. */
+export function buildWorkspaceHref(organizationId: string | null, tab: string | null): string {
+  const params = new URLSearchParams();
+  if (organizationId) params.set('organization_id', organizationId);
+  if (tab) params.set('tab', tab);
+  const qs = params.toString();
+  return qs ? `/inventory?${qs}` : '/inventory';
+}
+
+export function InventoryDashboardQuickActions({
+  organizationId,
+}: {
+  organizationId: string | null;
+}) {
   return (
     <section
       data-testid="inventory-dashboard-quick-actions"
@@ -86,10 +101,10 @@ export function InventoryDashboardQuickActions() {
       </h2>
       <ul className="grid gap-2 sm:grid-cols-2">
         {ACTIONS.map((a) =>
-          a.href ? (
+          a.tab ? (
             <li key={a.key}>
               <Link
-                href={a.href}
+                href={buildWorkspaceHref(organizationId, a.tab)}
                 data-testid={`inventory-dashboard-action-${a.key}`}
                 className="block rounded-md border border-border bg-background px-3 py-2 transition hover:border-primary/40 hover:bg-secondary"
               >

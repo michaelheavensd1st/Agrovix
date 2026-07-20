@@ -1,17 +1,21 @@
 /**
- * Sprint 5.1 — Inventory Dashboard tests.
+ * Sprint 5.1 — Inventory Dashboard tests (post-review-round).
  *
- * We split the coverage into two layers:
- *
- *   1. Pure aggregation unit tests over `buildDashboardProjection`
- *      — deterministic, easy to reason about, no I/O.
- *   2. React rendering tests over the dashboard page + panels using
- *      a mocked `apiFetch` so we can exercise loading / empty /
- *      error / 401 / 403 states end-to-end.
+ * Layers:
+ *   1. Pure aggregation unit tests over `buildDashboardProjection`.
+ *   2. Per-component render tests.
+ *   3. Page-level integration tests with a mocked `apiFetch`:
+ *      · loading / empty / populated
+ *      · organization preservation across quick-action + workspace links
+ *      · stale-response guard when the user switches organization
+ *      · 401 / 403 propagation from the lot fan-out
+ *      · 401 / 403 during the organization bootstrap
+ *      · non-auth partial fan-out → "understated totals" warning
+ *      · the deferred activity placeholder (no ranked list anywhere)
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 import {
@@ -21,15 +25,18 @@ import {
   daysBetween,
   EXPIRING_SOON_DAYS,
   parseBalance,
-  RECENT_ACTIVITY_LIMIT,
+  resolveOrganizationId,
   type DashboardInventoryItem,
   type DashboardLot,
   type DashboardWarehouse,
 } from '@/lib/inventory-dashboard';
 import { InventoryDashboardSummaryCards } from '@/components/inventory-dashboard/summary-cards';
 import { InventoryDashboardAttentionPanel } from '@/components/inventory-dashboard/attention-panel';
-import { InventoryDashboardRecentActivity } from '@/components/inventory-dashboard/recent-activity';
-import { InventoryDashboardQuickActions } from '@/components/inventory-dashboard/quick-actions';
+import { InventoryDashboardActivityPlaceholder } from '@/components/inventory-dashboard/activity-placeholder';
+import {
+  InventoryDashboardQuickActions,
+  buildWorkspaceHref,
+} from '@/components/inventory-dashboard/quick-actions';
 
 // --------------------------------------------------------------------- //
 // Fixtures
@@ -135,7 +142,7 @@ describe('inventory-dashboard aggregation', () => {
     expect(classifyLot(makeLot({ balance: '10', expiry_date: '2027-01-01' }), NOW)).toBe('ok');
   });
 
-  it('buildDashboardProjection produces expected summary + splits attention rows', () => {
+  it('buildDashboardProjection produces expected summary + attention rows', () => {
     const projection = buildDashboardProjection({
       warehouses: [WH_MAIN, WH_COLD, WH_CLOSED],
       items: [ITEM_FEED, ITEM_MED, ITEM_INACTIVE],
@@ -176,8 +183,6 @@ describe('inventory-dashboard aggregation', () => {
     expect(projection.attention[0].status).toBe('out_of_stock');
     expect(projection.attention[1].status).toBe('expired');
     expect(projection.attention[2].status).toBe('expiring_soon');
-    expect(projection.attention[0].warehouse_name).toBe('Main store');
-    expect(projection.attention[1].item_name).toBe('Vaccine A');
   });
 
   it('buildDashboardProjection returns healthy empty projection when nothing to show', () => {
@@ -189,26 +194,8 @@ describe('inventory-dashboard aggregation', () => {
     });
     expect(projection.summary.total_lots).toBe(0);
     expect(projection.attention).toEqual([]);
-    expect(projection.recent_activity).toEqual([]);
-  });
-
-  it('recent activity is sorted by updated_at DESC and truncated', () => {
-    const many: DashboardLot[] = Array.from({ length: 15 }, (_, i) =>
-      makeLot({
-        id: `lot-${i}`,
-        lot_code: `L-${i}`,
-        updated_at: `2026-02-${String(10 + i).padStart(2, '0')}T10:00:00.000Z`,
-      }),
-    );
-    const projection = buildDashboardProjection({
-      warehouses: [WH_MAIN],
-      items: [ITEM_FEED],
-      lots: many,
-      nowIso: NOW,
-    });
-    expect(projection.recent_activity).toHaveLength(RECENT_ACTIVITY_LIMIT);
-    // Most recent update should come first.
-    expect(projection.recent_activity[0].lot_code).toBe('L-14');
+    // Sprint 5.1 review fix — recent_activity is intentionally removed.
+    expect((projection as unknown as Record<string, unknown>).recent_activity).toBeUndefined();
   });
 
   it('attention list is capped by ATTENTION_LIST_LIMIT', () => {
@@ -231,7 +218,51 @@ describe('inventory-dashboard aggregation', () => {
 });
 
 // --------------------------------------------------------------------- //
-// Component rendering tests
+// buildWorkspaceHref helper
+// --------------------------------------------------------------------- //
+
+describe('buildWorkspaceHref', () => {
+  it('emits /inventory when both args are null', () => {
+    expect(buildWorkspaceHref(null, null)).toBe('/inventory');
+  });
+  it('emits an org-only href when tab is null', () => {
+    expect(buildWorkspaceHref('org-1', null)).toBe('/inventory?organization_id=org-1');
+  });
+  it('emits an org + tab href', () => {
+    expect(buildWorkspaceHref('org-1', 'receive')).toBe(
+      '/inventory?organization_id=org-1&tab=receive',
+    );
+  });
+  it('URL-encodes ids that contain query-sensitive characters', () => {
+    expect(buildWorkspaceHref('org-1&drop', 'items')).toBe(
+      '/inventory?organization_id=org-1%26drop&tab=items',
+    );
+  });
+});
+
+describe('resolveOrganizationId', () => {
+  const orgs = [
+    { id: 'org-1', name: 'Aegis' },
+    { id: 'org-2', name: 'Delta' },
+  ];
+  it('accepts a valid requested org', () => {
+    expect(resolveOrganizationId('org-2', orgs)).toBe('org-2');
+  });
+  it('falls back to the first org when the requested id is unknown', () => {
+    expect(resolveOrganizationId('spoofed-org', orgs)).toBe('org-1');
+  });
+  it('falls back to the first org when no requested id is provided', () => {
+    expect(resolveOrganizationId(null, orgs)).toBe('org-1');
+    expect(resolveOrganizationId(undefined, orgs)).toBe('org-1');
+    expect(resolveOrganizationId('', orgs)).toBe('org-1');
+  });
+  it('returns null when the caller has no organizations at all', () => {
+    expect(resolveOrganizationId('anything', [])).toBeNull();
+  });
+});
+
+// --------------------------------------------------------------------- //
+// Component render tests
 // --------------------------------------------------------------------- //
 
 describe('InventoryDashboardSummaryCards', () => {
@@ -310,34 +341,22 @@ describe('InventoryDashboardAttentionPanel', () => {
   });
 });
 
-describe('InventoryDashboardRecentActivity', () => {
-  it('shows empty state when there is no activity', () => {
-    render(<InventoryDashboardRecentActivity rows={[]} nowIso={NOW} />);
-    expect(screen.getByText(/No recent inventory activity/i)).toBeInTheDocument();
+describe('InventoryDashboardActivityPlaceholder', () => {
+  it('renders the deferred copy and history link (with org)', () => {
+    render(<InventoryDashboardActivityPlaceholder organizationId="org-1" />);
+    expect(screen.getByTestId('inventory-dashboard-activity-placeholder')).toBeInTheDocument();
+    expect(
+      screen.getByText(/A cross-warehouse transaction feed is not yet available/i),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId('inventory-dashboard-activity-history-link')).toHaveAttribute(
+      'href',
+      '/inventory?organization_id=org-1&tab=history',
+    );
   });
 
-  it('renders a per-lot row with a relative timestamp', () => {
-    render(
-      <InventoryDashboardRecentActivity
-        nowIso={NOW}
-        rows={[
-          {
-            lot_id: 'lot-a',
-            item_name: 'Starter feed',
-            warehouse_name: 'Main store',
-            lot_code: 'L-1',
-            balance: 42,
-            balance_unit: 'kg',
-            updated_at: '2026-02-15T11:30:00.000Z',
-          },
-        ]}
-      />,
-    );
-    expect(screen.getByTestId('inventory-dashboard-recent-row-lot-a')).toBeInTheDocument();
-    expect(screen.getByTestId('inventory-dashboard-recent-row-lot-a-relative')).toHaveTextContent(
-      /30m ago/,
-    );
-    expect(screen.getByTestId('inventory-dashboard-recent-history-link')).toHaveAttribute(
+  it('falls back to a plain history link when no org is selected yet', () => {
+    render(<InventoryDashboardActivityPlaceholder organizationId={null} />);
+    expect(screen.getByTestId('inventory-dashboard-activity-history-link')).toHaveAttribute(
       'href',
       '/inventory?tab=history',
     );
@@ -345,12 +364,22 @@ describe('InventoryDashboardRecentActivity', () => {
 });
 
 describe('InventoryDashboardQuickActions', () => {
-  it('renders every planned action, with deferred ones non-interactive', () => {
-    render(<InventoryDashboardQuickActions />);
-    const receive = screen.getByTestId('inventory-dashboard-action-receive-stock');
-    expect(receive.tagName).toBe('A');
-    expect(receive).toHaveAttribute('href', '/inventory?tab=receive');
-
+  it('preserves the organization on every functional action', () => {
+    render(<InventoryDashboardQuickActions organizationId="org-42" />);
+    const cases: Array<[string, string]> = [
+      ['view-items', '/inventory?organization_id=org-42&tab=items'],
+      ['view-warehouses', '/inventory?organization_id=org-42&tab=warehouses'],
+      ['receive-stock', '/inventory?organization_id=org-42&tab=receive'],
+      ['issue-stock', '/inventory?organization_id=org-42&tab=issue'],
+      ['transfer-stock', '/inventory?organization_id=org-42&tab=transfer'],
+      ['transaction-history', '/inventory?organization_id=org-42&tab=history'],
+    ];
+    for (const [key, href] of cases) {
+      const el = screen.getByTestId(`inventory-dashboard-action-${key}`);
+      expect(el.tagName).toBe('A');
+      expect(el).toHaveAttribute('href', href);
+    }
+    // Deferred actions remain non-interactive with the coming-later badge.
     const suppliers = screen.getByTestId('inventory-dashboard-action-suppliers');
     expect(suppliers.tagName).toBe('DIV');
     expect(suppliers).toHaveAttribute('aria-disabled', 'true');
@@ -386,39 +415,48 @@ import InventoryDashboardPage from '@/app/inventory/dashboard/page';
 
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
 
+type LotSource = DashboardLot[] | ApiError;
+
 function primeApi(config: {
   orgs?: unknown;
-  warehouses?: unknown;
-  items?: unknown;
-  lotsByWh?: Record<string, unknown>;
-  throwOn?: string;
+  warehousesByOrg?: Record<string, unknown>;
+  itemsByOrg?: Record<string, unknown>;
+  lotsByWh?: Record<string, LotSource>;
+  throwOnOrgs?: ApiError;
 }) {
   mockedApiFetch.mockImplementation((path: string) => {
-    if (config.throwOn && path.includes(config.throwOn)) {
-      return Promise.reject(new ApiError(500, { detail: 'boom' }));
-    }
     if (path === '/v1/organizations') {
+      if (config.throwOnOrgs) return Promise.reject(config.throwOnOrgs);
       return Promise.resolve(config.orgs ?? []);
     }
-    if (path.endsWith('/warehouses')) {
-      return Promise.resolve(config.warehouses ?? []);
+    const whMatch = path.match(/^\/v1\/organizations\/([^/]+)\/warehouses$/);
+    if (whMatch) {
+      return Promise.resolve(config.warehousesByOrg?.[whMatch[1]] ?? []);
     }
-    if (path.endsWith('/inventory-items')) {
-      return Promise.resolve(config.items ?? []);
+    const itemMatch = path.match(/^\/v1\/organizations\/([^/]+)\/inventory-items$/);
+    if (itemMatch) {
+      return Promise.resolve(config.itemsByOrg?.[itemMatch[1]] ?? []);
     }
-    const lotsMatch = path.match(/^\/v1\/warehouses\/(.+)\/lots$/);
+    const lotsMatch = path.match(/^\/v1\/warehouses\/([^/]+)\/lots$/);
     if (lotsMatch) {
-      const key = lotsMatch[1];
-      return Promise.resolve(config.lotsByWh?.[key] ?? []);
+      const src = config.lotsByWh?.[lotsMatch[1]];
+      if (src instanceof ApiError) return Promise.reject(src);
+      return Promise.resolve(src ?? []);
     }
     return Promise.reject(new ApiError(404, { detail: `unmocked ${path}` }));
   });
+}
+
+function setLocationSearch(search: string) {
+  // jsdom does allow overriding window.location.search via pushState.
+  window.history.replaceState({}, '', `/inventory/dashboard${search}`);
 }
 
 describe('InventoryDashboardPage', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    setLocationSearch('');
   });
   afterEach(() => {
     vi.clearAllMocks();
@@ -427,15 +465,14 @@ describe('InventoryDashboardPage', () => {
   it('shows loading state initially', async () => {
     primeApi({ orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }] });
     render(<InventoryDashboardPage />);
-    // The loading label appears before the projection resolves.
     expect(await screen.findByTestId('ape-loading')).toBeInTheDocument();
   });
 
-  it('renders the empty state when there are no warehouses and no items', async () => {
+  it('renders the empty state with an org-scoped CTA when the org has no data', async () => {
     primeApi({
       orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
-      warehouses: [],
-      items: [],
+      warehousesByOrg: { 'org-1': [] },
+      itemsByOrg: { 'org-1': [] },
     });
     render(<InventoryDashboardPage />);
     await waitFor(() =>
@@ -443,15 +480,20 @@ describe('InventoryDashboardPage', () => {
     );
     expect(screen.getByTestId('inventory-dashboard-empty-cta')).toHaveAttribute(
       'href',
-      '/inventory?tab=warehouses',
+      '/inventory?organization_id=org-1&tab=warehouses',
+    );
+    // Open workspace link also carries the org.
+    expect(screen.getByTestId('inventory-dashboard-workspace-link')).toHaveAttribute(
+      'href',
+      '/inventory?organization_id=org-1',
     );
   });
 
-  it('renders summary cards + attention + recent lists when the org has data', async () => {
+  it('renders summary + attention + activity-placeholder when the org has data', async () => {
     primeApi({
       orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
-      warehouses: [WH_MAIN, WH_COLD],
-      items: [ITEM_FEED, ITEM_MED],
+      warehousesByOrg: { 'org-1': [WH_MAIN, WH_COLD] },
+      itemsByOrg: { 'org-1': [ITEM_FEED, ITEM_MED] },
       lotsByWh: {
         [WH_MAIN.id]: [
           makeLot({ id: 'lot-ok', balance: '50' }),
@@ -464,7 +506,7 @@ describe('InventoryDashboardPage', () => {
             warehouse_id: 'wh-2',
             balance: '10',
             balance_unit: 'mL',
-            expiry_date: '2099-01-01', // not expiring — we still expect it in "recent"
+            expiry_date: '2099-01-01',
           }),
         ],
       },
@@ -480,33 +522,271 @@ describe('InventoryDashboardPage', () => {
       screen.getByTestId('inventory-dashboard-metric-out_of_stock_lots-value'),
     ).toHaveTextContent('1');
     expect(screen.getByTestId('inventory-dashboard-attention-row-lot-out')).toBeInTheDocument();
-    // Recent activity should include all 3 lots.
-    expect(screen.getByTestId('inventory-dashboard-recent-count')).toHaveTextContent('3 lots');
-    // Tenant context surfaced.
-    expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Aegis');
+    // No ranked-activity list anywhere.
+    expect(screen.queryByTestId('inventory-dashboard-recent')).not.toBeInTheDocument();
+    // The deferred activity placeholder is shown instead.
+    expect(screen.getByTestId('inventory-dashboard-activity-placeholder')).toBeInTheDocument();
+    expect(screen.getByTestId('inventory-dashboard-activity-history-link')).toHaveAttribute(
+      'href',
+      '/inventory?organization_id=org-1&tab=history',
+    );
   });
 
-  it('surfaces a friendly ErrorBanner when the org bootstrap fails', async () => {
-    mockedApiFetch.mockRejectedValueOnce(new ApiError(500, { detail: 'downstream 500' }));
+  // ------------------------------------------------------------------- //
+  // Sprint 5.1 review fix #1 — organization preservation.
+  // ------------------------------------------------------------------- //
+
+  it('honours ?organization_id when it matches a real org for the caller', async () => {
+    primeApi({
+      orgs: [
+        { id: 'org-1', name: 'Aegis', slug: 'aegis' },
+        { id: 'org-2', name: 'Delta', slug: 'delta' },
+      ],
+      warehousesByOrg: { 'org-2': [WH_MAIN] },
+      itemsByOrg: { 'org-2': [ITEM_FEED] },
+      lotsByWh: { [WH_MAIN.id]: [makeLot({ id: 'lot-ok', balance: '5' })] },
+    });
+    setLocationSearch('?organization_id=org-2');
+    render(<InventoryDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-action-receive-stock')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Delta');
+    // Quick action retains the URL-selected org.
+    expect(screen.getByTestId('inventory-dashboard-action-receive-stock')).toHaveAttribute(
+      'href',
+      '/inventory?organization_id=org-2&tab=receive',
+    );
+  });
+
+  it('falls back to the first org when ?organization_id is unknown to the caller', async () => {
+    primeApi({
+      orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
+      warehousesByOrg: { 'org-1': [] },
+      itemsByOrg: { 'org-1': [] },
+    });
+    setLocationSearch('?organization_id=spoofed-org');
+    render(<InventoryDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Aegis'),
+    );
+  });
+
+  it('propagates the selected org into every functional quick-action link', async () => {
+    primeApi({
+      orgs: [{ id: 'org-9', name: 'Nine', slug: 'nine' }],
+      warehousesByOrg: { 'org-9': [WH_MAIN] },
+      itemsByOrg: { 'org-9': [ITEM_FEED] },
+      lotsByWh: { [WH_MAIN.id]: [] },
+    });
+    render(<InventoryDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-quick-actions')).toBeInTheDocument(),
+    );
+    const receive = screen.getByTestId('inventory-dashboard-action-receive-stock');
+    expect(receive).toHaveAttribute('href', '/inventory?organization_id=org-9&tab=receive');
+    const items = screen.getByTestId('inventory-dashboard-action-view-items');
+    expect(items).toHaveAttribute('href', '/inventory?organization_id=org-9&tab=items');
+  });
+
+  it('changes every link when the org selector switches', async () => {
+    primeApi({
+      orgs: [
+        { id: 'org-1', name: 'Aegis', slug: 'aegis' },
+        { id: 'org-2', name: 'Delta', slug: 'delta' },
+      ],
+      warehousesByOrg: { 'org-1': [], 'org-2': [] },
+      itemsByOrg: { 'org-1': [], 'org-2': [] },
+    });
+    render(<InventoryDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-org-selector')).toBeInTheDocument(),
+    );
+    const selector = screen.getByTestId('inventory-dashboard-org-selector') as HTMLSelectElement;
+    fireEvent.change(selector, { target: { value: 'org-2' } });
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-workspace-link')).toHaveAttribute(
+        'href',
+        '/inventory?organization_id=org-2',
+      ),
+    );
+  });
+
+  // ------------------------------------------------------------------- //
+  // Sprint 5.1 review fix #2 — stale-response guard.
+  // ------------------------------------------------------------------- //
+
+  it('ignores a late organization-A response when the user has switched to B', async () => {
+    // We deliberately gate the org-1 warehouses fetch behind a manual
+    // resolver so we can order the responses: B resolves first, then A.
+    let resolveOrgAWarehouses: ((v: DashboardWarehouse[]) => void) | null = null;
+    const orgAPromise = new Promise<DashboardWarehouse[]>((resolve) => {
+      resolveOrgAWarehouses = resolve;
+    });
+
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') {
+        return Promise.resolve([
+          { id: 'org-1', name: 'Aegis', slug: 'aegis' },
+          { id: 'org-2', name: 'Delta', slug: 'delta' },
+        ]);
+      }
+      if (path === '/v1/organizations/org-1/warehouses') {
+        return orgAPromise; // stalls until we manually resolve
+      }
+      if (path === '/v1/organizations/org-2/warehouses') {
+        return Promise.resolve([WH_COLD]);
+      }
+      if (path.endsWith('/inventory-items')) {
+        if (path.includes('org-1')) {
+          // Also stalls forever from A so we never accidentally set A's items.
+          return new Promise(() => {});
+        }
+        return Promise.resolve([ITEM_MED]);
+      }
+      if (path === `/v1/warehouses/${WH_COLD.id}/lots`) {
+        return Promise.resolve([
+          makeLot({
+            id: 'lot-b',
+            warehouse_id: WH_COLD.id,
+            item_id: 'item-2',
+            balance: '0',
+            balance_unit: 'mL',
+          }),
+        ]);
+      }
+      // Any lots call for A never resolves.
+      return new Promise(() => {});
+    });
+
+    render(<InventoryDashboardPage />);
+
+    // A is loading. Switch to B before A completes.
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-org-selector')).toBeInTheDocument(),
+    );
+    fireEvent.change(screen.getByTestId('inventory-dashboard-org-selector'), {
+      target: { value: 'org-2' },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Delta'),
+    );
+    // B rendered successfully.
+    expect(screen.getByTestId('inventory-dashboard-attention')).toBeInTheDocument();
+    expect(screen.getByText('Vaccine A')).toBeInTheDocument();
+
+    // Now let A finally return with a payload that would otherwise
+    // "win" and stomp on B if we were vulnerable to the race.
+    (resolveOrgAWarehouses as unknown as (v: DashboardWarehouse[]) => void)([WH_MAIN]);
+    // Give React a tick to flush the (now-stale) resolution.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // B's data must still be on-screen.
+    expect(screen.getByTestId('inventory-dashboard-org-name')).toHaveTextContent('Delta');
+    expect(screen.getByText('Vaccine A')).toBeInTheDocument();
+    expect(screen.queryByText('Starter feed')).not.toBeInTheDocument();
+  });
+
+  // ------------------------------------------------------------------- //
+  // Sprint 5.1 review fix #3 — fan-out 401 / 403 propagation.
+  // ------------------------------------------------------------------- //
+
+  it('redirects to /login when a lot fan-out request returns 401', async () => {
+    primeApi({
+      orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
+      warehousesByOrg: { 'org-1': [WH_MAIN, WH_COLD] },
+      itemsByOrg: { 'org-1': [ITEM_FEED] },
+      lotsByWh: {
+        [WH_MAIN.id]: [makeLot({ id: 'lot-ok', balance: '5' })],
+        [WH_COLD.id]: new ApiError(401, { detail: 'reauth' }),
+      },
+    });
+    render(<InventoryDashboardPage />);
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith('/login'));
+    // No partial projection should be visible.
+    expect(screen.queryByTestId('inventory-dashboard-summary')).not.toBeInTheDocument();
+  });
+
+  it('renders ForbiddenBanner when a lot fan-out request returns 403', async () => {
+    primeApi({
+      orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
+      warehousesByOrg: { 'org-1': [WH_MAIN, WH_COLD] },
+      itemsByOrg: { 'org-1': [ITEM_FEED] },
+      lotsByWh: {
+        [WH_MAIN.id]: [makeLot({ id: 'lot-ok', balance: '5' })],
+        [WH_COLD.id]: new ApiError(403, { detail: 'no access' }),
+      },
+    });
+    render(<InventoryDashboardPage />);
+    await waitFor(() => expect(screen.getByTestId('ape-forbidden')).toBeInTheDocument());
+    expect(screen.queryByTestId('inventory-dashboard-summary')).not.toBeInTheDocument();
+  });
+
+  it('only shows the "understated totals" warning for non-auth partial failures', async () => {
+    primeApi({
+      orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
+      warehousesByOrg: { 'org-1': [WH_MAIN, WH_COLD] },
+      itemsByOrg: { 'org-1': [ITEM_FEED] },
+      lotsByWh: {
+        [WH_MAIN.id]: [makeLot({ id: 'lot-ok', balance: '5' })],
+        [WH_COLD.id]: new ApiError(500, { detail: 'boom' }),
+      },
+    });
+    render(<InventoryDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-summary')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('ape-error')).toHaveTextContent(
+      /One or more warehouses could not be loaded/i,
+    );
+    expect(screen.queryByTestId('ape-forbidden')).not.toBeInTheDocument();
+  });
+
+  // ------------------------------------------------------------------- //
+  // Sprint 5.1 review fix #4 — 401 / 403 during bootstrap.
+  // ------------------------------------------------------------------- //
+
+  it('redirects to /login on 401 from the organization bootstrap', async () => {
+    primeApi({ throwOnOrgs: new ApiError(401, { detail: 'unauthenticated' }) });
+    render(<InventoryDashboardPage />);
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith('/login'));
+    expect(screen.queryByTestId('ape-forbidden')).not.toBeInTheDocument();
+  });
+
+  it('renders ForbiddenBanner on 403 from the organization bootstrap', async () => {
+    primeApi({ throwOnOrgs: new ApiError(403, { detail: 'forbidden' }) });
+    render(<InventoryDashboardPage />);
+    await waitFor(() => expect(screen.getByTestId('ape-forbidden')).toBeInTheDocument());
+    expect(routerPush).not.toHaveBeenCalledWith('/login');
+  });
+
+  it('surfaces a friendly ErrorBanner on a generic 500 during bootstrap', async () => {
+    primeApi({ throwOnOrgs: new ApiError(500, { detail: 'downstream 500' }) });
     render(<InventoryDashboardPage />);
     await waitFor(() => expect(screen.getByTestId('ape-error')).toBeInTheDocument());
   });
 
-  it('redirects to /login on a 401 from the org bootstrap', async () => {
-    mockedApiFetch.mockRejectedValueOnce(new ApiError(401, { detail: 'unauthenticated' }));
-    render(<InventoryDashboardPage />);
-    await waitFor(() => expect(routerPush).toHaveBeenCalledWith('/login'));
-  });
+  // ------------------------------------------------------------------- //
+  // Sprint 5.1 review fix #5 — activity placeholder replaces the list.
+  // ------------------------------------------------------------------- //
 
-  it('shows the forbidden banner when the API returns 403 on the org listing', async () => {
-    // First call resolves with an org, second call (warehouses) rejects 403.
-    mockedApiFetch.mockImplementation((path: string) => {
-      if (path === '/v1/organizations') {
-        return Promise.resolve([{ id: 'org-1', name: 'Aegis', slug: 'aegis' }]);
-      }
-      return Promise.reject(new ApiError(403, { detail: 'forbidden' }));
+  it('never renders a ranked lot-activity list, only the deferred panel', async () => {
+    primeApi({
+      orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
+      warehousesByOrg: { 'org-1': [WH_MAIN] },
+      itemsByOrg: { 'org-1': [ITEM_FEED] },
+      lotsByWh: { [WH_MAIN.id]: [makeLot({ id: 'lot-1', balance: '5' })] },
     });
     render(<InventoryDashboardPage />);
-    await waitFor(() => expect(screen.getByTestId('ape-forbidden')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId('inventory-dashboard-activity-placeholder')).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('inventory-dashboard-recent')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Recent lot activity/i)).not.toBeInTheDocument();
+    expect(screen.getByTestId('inventory-dashboard-activity-history-link')).toHaveAttribute(
+      'href',
+      '/inventory?organization_id=org-1&tab=history',
+    );
   });
 });

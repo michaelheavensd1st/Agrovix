@@ -7,6 +7,10 @@ corresponding slice is delivered.
 
 ## Sprint 5.1 — Inventory Dashboard
 
+Status: **implemented, in review under PR #6 (branch
+`feature/sprint-5-1-inventory-dashboard`). Not yet shipped or merged
+into `develop`.**
+
 ### AC-5.1.1 — Route exists and renders under the app shell
 
 - **Given** the user is authenticated and belongs to at least one organization,
@@ -40,25 +44,35 @@ corresponding slice is delivered.
 - **Empty state:** When no lots need attention, an "Everything looks
   healthy" card is rendered instead of a table.
 
-### AC-5.1.4 — Recent activity list
+### AC-5.1.4 — Recent activity is an honest deferral
 
-- Uses the top 10 most recently updated lots (from `lot.updated_at`)
-  as an honest proxy for cross-warehouse recent activity — the
-  limitation is documented in `API_MAPPING.md`.
-- Each row deep-links (via the "View full transaction history" link)
-  to `/inventory?tab=history` in the existing workspace.
-- **Empty state:** "No recent inventory activity" copy when the
-  organization has zero lots.
+- Sprint 5.1 does **not** render a ranked "recent lot activity" list.
+  Backend tracing confirmed that receipts, issues, transfers,
+  adjustments and reversals do NOT update `InventoryLot.updated_at`,
+  so ordering by that field would have been misleading.
+- Instead the dashboard renders an explicit deferred panel with the
+  copy:
+  > _"A cross-warehouse transaction feed is not yet available. Open
+  > transaction history in the inventory workspace to review
+  > lot-level records."_
+- The panel links to
+  `/inventory?organization_id=<orgId>&tab=history`, preserving the
+  currently selected organization.
 
 ### AC-5.1.5 — Quick actions never break navigation
 
-- The following actions link to existing routes:
-  - View inventory items → `/inventory?tab=items`
-  - View warehouses → `/inventory?tab=warehouses`
-  - Receive stock → `/inventory?tab=receive`
-  - Issue stock → `/inventory?tab=issue`
-  - Transfer stock → `/inventory?tab=transfer`
-  - Transaction history → `/inventory?tab=history`
+- The following actions link to existing routes and each carries the
+  currently selected `organization_id` as a query parameter:
+  - View inventory items → `/inventory?organization_id=<orgId>&tab=items`
+  - View warehouses → `/inventory?organization_id=<orgId>&tab=warehouses`
+  - Receive stock → `/inventory?organization_id=<orgId>&tab=receive`
+  - Issue stock → `/inventory?organization_id=<orgId>&tab=issue`
+  - Transfer stock → `/inventory?organization_id=<orgId>&tab=transfer`
+  - Transaction history → `/inventory?organization_id=<orgId>&tab=history`
+- The header "Open workspace" link uses
+  `/inventory?organization_id=<orgId>`.
+- The empty-state CTA uses
+  `/inventory?organization_id=<orgId>&tab=warehouses`.
 - Actions whose destination screen is deferred (Suppliers, Purchases)
   are rendered as non-interactive `div`s with `aria-disabled="true"`
   and a visible "Coming later in Sprint 5" badge.
@@ -68,28 +82,38 @@ corresponding slice is delivered.
 - **Loading:** During the initial data fetch, the shared
   `Loading` primitive from `@/components/ape-ui` is displayed.
 - **Empty:** When the organization has zero warehouses AND zero
-  items, an `EmptyStateCard` with a CTA to create a warehouse is
-  rendered instead of the panels.
+  items, an `EmptyStateCard` with an org-scoped CTA to create a
+  warehouse is rendered instead of the panels.
 - **Error (non-fatal):** If one or more warehouses fail to return
-  lots, the dashboard still renders and shows an `ErrorBanner`:
+  lots with a **non-authentication** error (e.g. 5xx or network),
+  the dashboard still renders and shows an `ErrorBanner`:
   _"One or more warehouses could not be loaded. Some totals may be
   understated."_
-- **401 unauthenticated:** Any 401 during dashboard load redirects
-  to `/login`.
-- **403 forbidden:** A 403 renders the shared `ForbiddenBanner`
-  primitive; no data is shown.
+- **401 unauthenticated:** Any 401 during dashboard load — including
+  a 401 raised from within the lot fan-out — redirects to `/login`
+  and does not surface a partial projection.
+- **403 forbidden:** A 403 — including one raised from within the
+  lot fan-out or from the organization bootstrap — renders the
+  shared `ForbiddenBanner` primitive and does not surface a partial
+  projection.
 
-### AC-5.1.7 — Tenant and farm context
+### AC-5.1.7 — Tenant and farm context, with URL-driven preservation
 
-- The dashboard only ever shows the currently selected organization.
+- The dashboard reads `?organization_id=…` from the URL on landing
+  and honours it **only** when it appears in the caller's
+  authenticated organizations list. Otherwise it falls back safely
+  to the first org.
+- The `/inventory` workspace performs the same validation on
+  `?organization_id=…`.
 - The organization selector (rendered only when the user belongs to
-  more than one org) re-fetches the dashboard on change.
+  more than one org) re-fetches the dashboard on change and stale
+  responses from a previous organization are ignored.
 - Warehouse visibility respects the backend's role-based filter in
   `list_warehouses` — the frontend does not attempt to re-filter.
 
 ### AC-5.1.8 — Accessibility
 
-- Every interactive control has a data-testid.
+- Every interactive control has a `data-testid`.
 - Every panel has a labelled heading (`aria-labelledby` on each section).
 - Statuses use both colour AND a text label ("Out of stock",
   "Expiring soon", "Expired") — colour is never the sole signal.
@@ -99,11 +123,27 @@ corresponding slice is delivered.
 ### AC-5.1.9 — Test coverage
 
 - Pure aggregation logic (`buildDashboardProjection`, `classifyLot`,
-  `parseBalance`, `daysBetween`) has deterministic unit tests.
+  `parseBalance`, `daysBetween`, `resolveOrganizationId`,
+  `buildWorkspaceHref`) has deterministic unit tests.
 - Each dashboard component has a rendering test covering both the
-  populated and the empty branch.
-- The page has integration tests covering: loading, empty,
-  populated, 401 redirect, 403 forbidden, and non-fatal error.
+  populated and the empty branch, plus the activity-placeholder link
+  behaviour.
+- The page has integration tests covering:
+  - loading, empty, populated;
+  - honouring a valid `?organization_id=`;
+  - falling back safely on an unknown `?organization_id=`;
+  - propagating the selected org into every functional quick action;
+  - re-projecting links when the selector changes;
+  - **stale-response protection** when the user switches org
+    mid-flight (org A's response cannot overwrite org B's state);
+  - fan-out 401 → `/login`;
+  - fan-out 403 → `ForbiddenBanner` (no partial projection);
+  - fan-out non-auth partial failure → "understated totals" warning;
+  - bootstrap 401 → `/login`;
+  - bootstrap 403 → `ForbiddenBanner`;
+  - bootstrap 500 → generic `ErrorBanner`;
+  - the deferred activity placeholder is rendered and its link
+    preserves the organization; no ranked lot list is ever rendered.
 
 ### AC-5.1.10 — Scope confinement
 
@@ -112,4 +152,7 @@ corresponding slice is delivered.
 - No transfer lifecycle states (draft, submitted, in-transit,
   received) were introduced — transfers remain immediate.
 - No supplier / procurement / purchase-order code was introduced.
-- Frontend lint, type-check, tests and production build all pass.
+- Frontend `prettier --check`, `next lint`, `tsc --noEmit`,
+  `vitest --run`, and `next build` all pass on the branch. Backend
+  regression `pytest` remains green (no backend files were touched
+  during this slice).

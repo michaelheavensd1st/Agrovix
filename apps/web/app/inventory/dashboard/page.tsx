@@ -16,9 +16,25 @@
  * Farm-scoped warehouses are filtered server-side according to the
  * caller's role assignments — this page trusts that filter and does
  * NOT re-implement tenancy client-side.
+ *
+ * Review-round fixes (Sprint 5.1):
+ *  1. Selected organization is propagated to every workspace link
+ *     via `?organization_id=…` so navigation preserves tenant context.
+ *  2. A monotonically-increasing request-generation ref guards the
+ *     dashboard against stale organization responses — only the
+ *     latest active fetch may write projection / warehouses / items /
+ *     lots / error / forbidden state.
+ *  3. 401 / 403 in the warehouse lot fan-out are propagated to
+ *     auth handling (redirect / ForbiddenBanner). Only ordinary
+ *     failures produce the "partial totals" warning.
+ *  4. 403 during the organization bootstrap renders ForbiddenBanner.
+ *  5. The old "Recent lot activity" list (ranked by `lot.updated_at`)
+ *     is gone — receipts / issues / transfers / adjustments do NOT
+ *     update the parent lot's timestamp, so that ordering was
+ *     misleading. It is replaced with an explicit deferred panel.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch, ApiError } from '@/lib/api';
@@ -26,6 +42,7 @@ import { ErrorBanner, ForbiddenBanner, Loading } from '@/components/ape-ui';
 import { EmptyStateCard, friendlyError } from '@/components/ui-polish';
 import {
   buildDashboardProjection,
+  resolveOrganizationId,
   type DashboardInventoryItem,
   type DashboardLot,
   type DashboardOrganization,
@@ -34,8 +51,11 @@ import {
 } from '@/lib/inventory-dashboard';
 import { InventoryDashboardSummaryCards } from '@/components/inventory-dashboard/summary-cards';
 import { InventoryDashboardAttentionPanel } from '@/components/inventory-dashboard/attention-panel';
-import { InventoryDashboardRecentActivity } from '@/components/inventory-dashboard/recent-activity';
-import { InventoryDashboardQuickActions } from '@/components/inventory-dashboard/quick-actions';
+import { InventoryDashboardActivityPlaceholder } from '@/components/inventory-dashboard/activity-placeholder';
+import {
+  InventoryDashboardQuickActions,
+  buildWorkspaceHref,
+} from '@/components/inventory-dashboard/quick-actions';
 
 interface DashboardState {
   loading: boolean;
@@ -59,13 +79,73 @@ const INITIAL_STATE: DashboardState = {
   nowIso: new Date().toISOString(),
 };
 
+/**
+ * Fan-out warehouse-lots outcome inspector.
+ *
+ * Distinguishes:
+ *   - "unauthenticated"  → surface 401 to the caller for /login redirect
+ *   - "forbidden"        → surface 403 for ForbiddenBanner
+ *   - "partial"          → at least one non-auth failure (500 / network)
+ *   - "ok"               → every fan-out request succeeded
+ */
+type LotFanOutOutcome =
+  | { kind: 'ok'; lots: DashboardLot[] }
+  | { kind: 'partial'; lots: DashboardLot[] }
+  | { kind: 'unauthenticated' }
+  | { kind: 'forbidden' };
+
+function inspectLotFanOut(results: PromiseSettledResult<DashboardLot[]>[]): LotFanOutOutcome {
+  // Auth failures take absolute precedence — never quietly downgrade.
+  for (const r of results) {
+    if (r.status === 'rejected' && r.reason instanceof ApiError) {
+      if (r.reason.status === 401) return { kind: 'unauthenticated' };
+      if (r.reason.status === 403) return { kind: 'forbidden' };
+    }
+  }
+  const lots: DashboardLot[] = [];
+  let hadFailure = false;
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      lots.push(...r.value);
+    } else {
+      hadFailure = true;
+    }
+  }
+  return { kind: hadFailure ? 'partial' : 'ok', lots };
+}
+
+/** Read a query parameter without pulling in useSearchParams (which
+ * would force this page into a Suspense boundary and duplicate the
+ * hydration bootstrap tests). */
+function readInitialOrganizationId(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return new URLSearchParams(window.location.search).get('organization_id');
+  } catch {
+    return null;
+  }
+}
+
 export default function InventoryDashboardPage() {
   const router = useRouter();
   const [orgs, setOrgs] = useState<DashboardOrganization[] | null>(null);
   const [orgId, setOrgId] = useState<string>('');
   const [state, setState] = useState<DashboardState>(INITIAL_STATE);
 
-  // Bootstrap: load organizations, pick the first.
+  // Sprint 5.1 review fix #2 — stale-response guard. Every time we
+  // begin a new dashboard load we bump the generation; only writes
+  // that carry the current generation may mutate `state`.
+  const activeGenerationRef = useRef(0);
+
+  // Sprint 5.1 review fix #1 — respect ?organization_id= in the URL
+  // when the user lands directly on the dashboard, but ONLY after
+  // validating it against the authenticated user's org list.
+  const requestedOrgIdRef = useRef<string | null>(null);
+  if (requestedOrgIdRef.current === null && typeof window !== 'undefined') {
+    requestedOrgIdRef.current = readInitialOrganizationId();
+  }
+
+  // Bootstrap: load organizations.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -77,14 +157,26 @@ export default function InventoryDashboardPage() {
           router.push('/onboarding');
           return;
         }
-        setOrgId(list[0].id);
+        // Validate ?organization_id=… against the caller's real orgs.
+        const requested = requestedOrgIdRef.current;
+        const validated = resolveOrganizationId(requested, list) ?? list[0].id;
+        setOrgId(validated);
       } catch (err) {
         if (cancelled) return;
-        if (err instanceof ApiError && err.status === 401) {
-          router.push('/login');
-          return;
+        // Sprint 5.1 review fix #4 — 401 and 403 both need dedicated
+        // paths at bootstrap. Everything else falls through to the
+        // regular error banner.
+        if (err instanceof ApiError) {
+          if (err.status === 401) {
+            router.push('/login');
+            return;
+          }
+          if (err.status === 403) {
+            setState({ ...INITIAL_STATE, loading: false, forbidden: true });
+            return;
+          }
         }
-        setState((s) => ({ ...s, loading: false, error: friendlyError(err) }));
+        setState({ ...INITIAL_STATE, loading: false, error: friendlyError(err) });
       }
     })();
     return () => {
@@ -94,53 +186,68 @@ export default function InventoryDashboardPage() {
 
   const loadDashboard = useCallback(
     async (organizationId: string) => {
-      setState((s) => ({
-        ...s,
+      const generation = ++activeGenerationRef.current;
+      const isStale = () => activeGenerationRef.current !== generation;
+
+      // Clear organization-specific data so we never render stale rows
+      // under a new organization heading while the fresh fetch is in
+      // flight.
+      setState({
         loading: true,
         forbidden: false,
         error: null,
-      }));
+        projection: null,
+        warehouses: [],
+        items: [],
+        lots: [],
+        nowIso: new Date().toISOString(),
+      });
+
       try {
         const [warehouses, items] = await Promise.all([
           apiFetch<DashboardWarehouse[]>(`/v1/organizations/${organizationId}/warehouses`),
           apiFetch<DashboardInventoryItem[]>(`/v1/organizations/${organizationId}/inventory-items`),
         ]);
+        if (isStale()) return;
 
-        // Fan out lot fetches; the endpoint returns balances already.
         const lotResults = await Promise.allSettled(
           warehouses.map((wh) => apiFetch<DashboardLot[]>(`/v1/warehouses/${wh.id}/lots`)),
         );
-        const lots: DashboardLot[] = [];
-        let hadLotError = false;
-        for (const r of lotResults) {
-          if (r.status === 'fulfilled') {
-            lots.push(...r.value);
-          } else {
-            hadLotError = true;
-          }
+        if (isStale()) return;
+
+        const outcome = inspectLotFanOut(lotResults);
+        if (outcome.kind === 'unauthenticated') {
+          router.push('/login');
+          return;
+        }
+        if (outcome.kind === 'forbidden') {
+          setState({ ...INITIAL_STATE, loading: false, forbidden: true });
+          return;
         }
 
         const nowIso = new Date().toISOString();
         const projection = buildDashboardProjection({
           warehouses,
           items,
-          lots,
+          lots: outcome.lots,
           nowIso,
         });
 
         setState({
           loading: false,
           forbidden: false,
-          error: hadLotError
-            ? 'One or more warehouses could not be loaded. Some totals may be understated.'
-            : null,
+          error:
+            outcome.kind === 'partial'
+              ? 'One or more warehouses could not be loaded. Some totals may be understated.'
+              : null,
           projection,
           warehouses,
           items,
-          lots,
+          lots: outcome.lots,
           nowIso,
         });
       } catch (err) {
+        if (isStale()) return;
         if (err instanceof ApiError) {
           if (err.status === 401) {
             router.push('/login');
@@ -167,6 +274,9 @@ export default function InventoryDashboardPage() {
   }, [orgId, loadDashboard]);
 
   const activeOrg = useMemo(() => orgs?.find((o) => o.id === orgId) ?? null, [orgs, orgId]);
+
+  const workspaceHref = buildWorkspaceHref(orgId || null, null);
+  const workspaceWarehousesHref = buildWorkspaceHref(orgId || null, 'warehouses');
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-10" data-testid="inventory-dashboard-page">
@@ -207,7 +317,7 @@ export default function InventoryDashboardPage() {
             </div>
           )}
           <Link
-            href="/inventory"
+            href={workspaceHref}
             data-testid="inventory-dashboard-workspace-link"
             className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary"
           >
@@ -233,7 +343,7 @@ export default function InventoryDashboardPage() {
                   description="Add a warehouse and a few items to start tracking stock."
                   action={
                     <Link
-                      href="/inventory?tab=warehouses"
+                      href={workspaceWarehousesHref}
                       data-testid="inventory-dashboard-empty-cta"
                       className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground"
                     >
@@ -244,13 +354,10 @@ export default function InventoryDashboardPage() {
               ) : (
                 <div className="grid gap-6 lg:grid-cols-2">
                   <InventoryDashboardAttentionPanel rows={state.projection.attention} />
-                  <InventoryDashboardRecentActivity
-                    rows={state.projection.recent_activity}
-                    nowIso={state.nowIso}
-                  />
+                  <InventoryDashboardActivityPlaceholder organizationId={orgId || null} />
                 </div>
               )}
-              <InventoryDashboardQuickActions />
+              <InventoryDashboardQuickActions organizationId={orgId || null} />
             </>
           )}
         </div>
