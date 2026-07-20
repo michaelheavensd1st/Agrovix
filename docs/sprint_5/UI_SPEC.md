@@ -237,9 +237,6 @@ Every adjustment must require:
 - A timestamp
 - An audit record
 
-
-
-
 ### Inventory Audit History
 
 The Audit History screen provides a tamper-resistant record of inventory activity.
