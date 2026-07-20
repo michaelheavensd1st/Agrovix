@@ -43,8 +43,18 @@ Branch: `feature/sprint-5-1-inventory-dashboard`.
 | R6  | Documentation corrections (API_MAPPING / ACCEPTANCE_CRITERIA / TASKS)                  | ✅                            |
 | R7  | New tests covering all six review findings                                             | ✅                            |
 | R8  | Run `format:check`, `lint`, `typecheck`, `test`, `build` and backend regression        | ✅                            |
-| R9  | Push review-fix commit to the existing branch so PR #6 updates                         | ⏳ user action                |
+| R9  | Push review-fix commit to the existing branch so PR #6 updates                         | ✅ (`ff855b3`)                |
 | R10 | Await final Codex review approval before merge                                         | ⏳                            |
+
+### Sprint 5.1 review round #2 — workspace organization-context retention
+
+| #   | Task                                                                                                                                              | State                                                                                                                |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| W1  | Clear every piece of org-dependent workspace state immediately when `orgId` changes (warehouses, items, selected wh, lots, selected lot, history) | ✅ (new `useEffect` on `[orgId]`)                                                                                    |
+| W2  | Reset every inventory form (Receive, Issue, Transfer, Adjust) on organization change                                                              | ✅ (via `key={orgId}` on each form-bearing panel — React remounts them)                                              |
+| W3  | Validate that the selected warehouse + item + lot still belong to the active organization before any write                                        | ✅ (new pure helpers `isWarehouseInCurrentOrg`, `isItemInCurrentOrg`, `isLotInCurrentOrg` guard every form's submit) |
+| W4  | Regression tests covering org switches while forms are populated                                                                                  | ✅ (`tests/inventory-workspace-org-context.test.tsx` + guard unit tests in `tests/inventory-dashboard.test.tsx`)     |
+| W5  | Leave concurrency optimization, malformed-data handling, and URL reactivity for later slices                                                      | ✅ (not touched)                                                                                                     |
 
 ## Sprint 5.2+ (not started)
 

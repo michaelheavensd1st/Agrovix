@@ -20,7 +20,12 @@
 import { FormEvent, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
-import { resolveOrganizationId } from '@/lib/inventory-dashboard';
+import {
+  isItemInCurrentOrg,
+  isLotInCurrentOrg,
+  isWarehouseInCurrentOrg,
+  resolveOrganizationId,
+} from '@/lib/inventory-dashboard';
 import {
   ConfirmDialog,
   EmptyStateCard,
@@ -162,13 +167,19 @@ function InventoryInner() {
       ]);
       setWarehouses(wh);
       setItems(it);
-      if (wh.length > 0 && !selectedWh) setSelectedWh(wh[0].id);
+      // Sprint 5.1 review round #2 — after an organization switch we
+      // want the workspace to auto-select a fresh warehouse from the
+      // new org. The prior `!selectedWh` guard only auto-selected on
+      // the initial load; the org-reset effect below clears
+      // selectedWh right before reloadOrg runs, so this branch now
+      // covers both first-load AND org-switch.
+      if (wh.length > 0) setSelectedWh((current) => (current ? current : wh[0].id));
     } catch (e) {
       toast(friendlyError(e), 'error');
     } finally {
       setLoadingOrg(false);
     }
-  }, [orgId, selectedWh]);
+  }, [orgId]);
 
   const reloadLots = useCallback(async () => {
     if (!selectedWh) return;
@@ -182,6 +193,27 @@ function InventoryInner() {
       setLoadingLots(false);
     }
   }, [selectedWh]);
+
+  // Sprint 5.1 review round #2 — organization context retention.
+  //
+  // When `orgId` changes we must IMMEDIATELY clear every piece of
+  // organization-dependent state so no data from the previous org
+  // is visible or actionable under the new org's heading. The
+  // reload effects below then re-populate the workspace with data
+  // from the newly selected org.
+  //
+  // Form-local state (Receive, Issue, Transfer, Adjust) is reset
+  // separately via `key={orgId}` on each form-bearing panel so
+  // React remounts the form components — see the panel wrappers
+  // further down in this file.
+  useEffect(() => {
+    setWarehouses([]);
+    setItems([]);
+    setSelectedWh('');
+    setLots([]);
+    setSelectedLot('');
+    setHistory([]);
+  }, [orgId]);
 
   useEffect(() => {
     void reloadOrg();
@@ -327,6 +359,7 @@ function InventoryInner() {
 
       {tab === 'receive' && (
         <ReceivePanel
+          key={orgId || 'no-org'}
           warehouses={warehouses}
           items={items}
           selectedWh={selectedWh}
@@ -336,11 +369,20 @@ function InventoryInner() {
       )}
 
       {tab === 'issue' && (
-        <TxPanel mode="issue" warehouse={currentWh} lots={lots} items={items} onDone={reloadLots} />
+        <TxPanel
+          key={orgId || 'no-org'}
+          mode="issue"
+          warehouse={currentWh}
+          lots={lots}
+          items={items}
+          warehouses={warehouses}
+          onDone={reloadLots}
+        />
       )}
 
       {tab === 'transfer' && (
         <TransferPanel
+          key={orgId || 'no-org'}
           warehouses={warehouses}
           warehouse={currentWh}
           lots={lots}
@@ -351,10 +393,12 @@ function InventoryInner() {
 
       {tab === 'adjust' && (
         <TxPanel
+          key={orgId || 'no-org'}
           mode="adjust"
           warehouse={currentWh}
           lots={lots}
           items={items}
+          warehouses={warehouses}
           onDone={reloadLots}
         />
       )}
@@ -968,6 +1012,19 @@ function ReceivePanel({
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (busy) return;
+    // Sprint 5.1 review round #2 — last-line-of-defence guard so a
+    // stale warehouse or item selection from a previous org cannot
+    // be POSTed. The backend still validates, but surfacing this in
+    // the UI avoids a confusing 403 / 404 round-trip and lets us
+    // clear the offending field.
+    if (!isWarehouseInCurrentOrg(selectedWh, warehouses)) {
+      toast('Selected warehouse no longer belongs to this organization.', 'error');
+      return;
+    }
+    if (!isItemInCurrentOrg(itemId, items)) {
+      toast('Selected item no longer belongs to this organization.', 'error');
+      return;
+    }
     setBusy(true);
     try {
       await postWithKey(
@@ -1099,12 +1156,14 @@ function TxPanel({
   warehouse,
   lots,
   items,
+  warehouses,
   onDone,
 }: {
   mode: 'issue' | 'adjust';
   warehouse: Warehouse | null;
   lots: Lot[];
   items: InventoryItem[];
+  warehouses: Warehouse[];
   onDone: () => void;
 }) {
   const [lotId, setLotId] = useState('');
@@ -1117,6 +1176,17 @@ function TxPanel({
 
   async function doSubmit() {
     if (!warehouse) return;
+    // Sprint 5.1 review round #2 — cross-org guardrails.
+    if (!isWarehouseInCurrentOrg(warehouse.id, warehouses)) {
+      toast('Selected warehouse no longer belongs to this organization.', 'error');
+      setPendingConfirm(false);
+      return;
+    }
+    if (!isLotInCurrentOrg(lotId, lots, warehouses, items)) {
+      toast('Selected lot no longer belongs to this organization.', 'error');
+      setPendingConfirm(false);
+      return;
+    }
     setBusy(true);
     try {
       if (mode === 'issue') {
@@ -1300,6 +1370,22 @@ function TransferPanel({
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (!warehouse || busy) return;
+    // Sprint 5.1 review round #2 — validate source, destination and
+    // lot all belong to the currently active organization before
+    // POSTing. Prevents a lingering post-org-switch selection from
+    // sending a cross-tenant reference to the backend.
+    if (!isWarehouseInCurrentOrg(warehouse.id, warehouses)) {
+      toast('Source warehouse no longer belongs to this organization.', 'error');
+      return;
+    }
+    if (!isWarehouseInCurrentOrg(dstWh, warehouses)) {
+      toast('Destination warehouse no longer belongs to this organization.', 'error');
+      return;
+    }
+    if (!isLotInCurrentOrg(lotId, lots, warehouses, items)) {
+      toast('Selected lot no longer belongs to this organization.', 'error');
+      return;
+    }
     setBusy(true);
     try {
       await postWithKey(

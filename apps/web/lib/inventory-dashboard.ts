@@ -149,6 +149,48 @@ export function resolveOrganizationId(
   return orgs[0].id;
 }
 
+/**
+ * Sprint 5.1 review round #2 — Inventory workspace organization
+ * context retention guards.
+ *
+ * These helpers exist so the same "does this thing belong to the
+ * current org?" question has a single, testable answer everywhere
+ * a write is about to happen. They intentionally do NOT hit the
+ * backend — they are last-line-of-defence UI checks that catch
+ * stale selections after an organization switch. The backend
+ * remains the ultimate authority.
+ */
+
+export function isWarehouseInCurrentOrg(
+  warehouseId: string | null | undefined,
+  warehouses: readonly { id: string }[],
+): boolean {
+  if (!warehouseId) return false;
+  return warehouses.some((w) => w.id === warehouseId);
+}
+
+export function isItemInCurrentOrg(
+  itemId: string | null | undefined,
+  items: readonly { id: string }[],
+): boolean {
+  if (!itemId) return false;
+  return items.some((i) => i.id === itemId);
+}
+
+export function isLotInCurrentOrg(
+  lotId: string | null | undefined,
+  lots: readonly { id: string; item_id: string; warehouse_id: string }[],
+  warehouses: readonly { id: string }[],
+  items: readonly { id: string }[],
+): boolean {
+  if (!lotId) return false;
+  const lot = lots.find((l) => l.id === lotId);
+  if (!lot) return false;
+  return (
+    isWarehouseInCurrentOrg(lot.warehouse_id, warehouses) && isItemInCurrentOrg(lot.item_id, items)
+  );
+}
+
 /** Whole calendar days between two ISO timestamps (UTC day boundaries).
  *
  * Uses UTC day-floor semantics so a lot expiring `2026-02-15T00:00:00Z`

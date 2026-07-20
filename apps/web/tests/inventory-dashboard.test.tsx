@@ -24,6 +24,9 @@ import {
   classifyLot,
   daysBetween,
   EXPIRING_SOON_DAYS,
+  isItemInCurrentOrg,
+  isLotInCurrentOrg,
+  isWarehouseInCurrentOrg,
   parseBalance,
   resolveOrganizationId,
   type DashboardInventoryItem,
@@ -258,6 +261,47 @@ describe('resolveOrganizationId', () => {
   });
   it('returns null when the caller has no organizations at all', () => {
     expect(resolveOrganizationId('anything', [])).toBeNull();
+  });
+});
+
+describe('inventory workspace cross-org guards', () => {
+  const orgAWarehouses = [{ id: 'wh-A1' }, { id: 'wh-A2' }];
+  const orgAItems = [{ id: 'item-A1' }, { id: 'item-A2' }];
+  const orgALots = [
+    { id: 'lot-A', item_id: 'item-A1', warehouse_id: 'wh-A1' },
+    { id: 'lot-cross', item_id: 'item-A1', warehouse_id: 'wh-Z' }, // corrupted
+  ];
+
+  it('isWarehouseInCurrentOrg rejects unknown / null / empty ids', () => {
+    expect(isWarehouseInCurrentOrg('wh-A1', orgAWarehouses)).toBe(true);
+    expect(isWarehouseInCurrentOrg('wh-B1', orgAWarehouses)).toBe(false);
+    expect(isWarehouseInCurrentOrg(null, orgAWarehouses)).toBe(false);
+    expect(isWarehouseInCurrentOrg('', orgAWarehouses)).toBe(false);
+    expect(isWarehouseInCurrentOrg('wh-A1', [])).toBe(false);
+  });
+
+  it('isItemInCurrentOrg rejects unknown / null / empty ids', () => {
+    expect(isItemInCurrentOrg('item-A1', orgAItems)).toBe(true);
+    expect(isItemInCurrentOrg('item-B1', orgAItems)).toBe(false);
+    expect(isItemInCurrentOrg(null, orgAItems)).toBe(false);
+    expect(isItemInCurrentOrg('', orgAItems)).toBe(false);
+    expect(isItemInCurrentOrg('item-A1', [])).toBe(false);
+  });
+
+  it('isLotInCurrentOrg requires the lot AND its warehouse AND its item to all be in-org', () => {
+    // Happy path.
+    expect(isLotInCurrentOrg('lot-A', orgALots, orgAWarehouses, orgAItems)).toBe(true);
+    // Lot references a warehouse not in this org → cross-tenant.
+    expect(isLotInCurrentOrg('lot-cross', orgALots, orgAWarehouses, orgAItems)).toBe(false);
+    // Unknown lot id.
+    expect(isLotInCurrentOrg('lot-missing', orgALots, orgAWarehouses, orgAItems)).toBe(false);
+    // Null / empty inputs.
+    expect(isLotInCurrentOrg(null, orgALots, orgAWarehouses, orgAItems)).toBe(false);
+    expect(isLotInCurrentOrg('', orgALots, orgAWarehouses, orgAItems)).toBe(false);
+    // Empty support collections.
+    expect(isLotInCurrentOrg('lot-A', [], orgAWarehouses, orgAItems)).toBe(false);
+    expect(isLotInCurrentOrg('lot-A', orgALots, [], orgAItems)).toBe(false);
+    expect(isLotInCurrentOrg('lot-A', orgALots, orgAWarehouses, [])).toBe(false);
   });
 });
 
