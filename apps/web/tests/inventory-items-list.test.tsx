@@ -10,28 +10,51 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { routerPush, routerReplace, stableRouter } = vi.hoisted(() => {
+const { routerPush, routerReplace, stableRouter, urlListeners } = vi.hoisted(() => {
   const push = vi.fn();
-  const replace = vi.fn();
+  // In the real App Router, `router.replace()` updates the URL and
+  // the next render sees the new value from `useSearchParams()`.
+  // The mock mirrors that by (a) updating `window.history` and
+  // (b) notifying every subscribed `useSearchParams` consumer so
+  // React schedules a re-render.
+  const listeners = new Set<() => void>();
+  const replace = vi.fn((url: string) => {
+    if (typeof url === 'string' && typeof window !== 'undefined') {
+      window.history.replaceState({}, '', url);
+      listeners.forEach((l) => l());
+    }
+  });
   return {
     routerPush: push,
     routerReplace: replace,
     stableRouter: { push, replace, back: vi.fn() },
+    urlListeners: listeners,
   };
 });
-vi.mock('next/navigation', () => ({
-  useRouter: () => stableRouter,
-  useParams: () => ({ itemId: '' }),
-  // Sprint 5.3 review: the list page reconciles the active org
-  // with the URL via `useSearchParams`. In test we read the
-  // current window.location so existing `window.history.replaceState`
-  // helpers keep working, and can also observe our own replaces.
-  useSearchParams: () =>
-    new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''),
-}));
+vi.mock('next/navigation', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  return {
+    useRouter: () => stableRouter,
+    useParams: () => ({ itemId: '' }),
+    usePathname: () => (typeof window !== 'undefined' ? window.location.pathname : '/'),
+    useSearchParams: () => {
+      const [search, setSearch] = React.useState(
+        typeof window !== 'undefined' ? window.location.search : '',
+      );
+      React.useEffect(() => {
+        const listener = () => setSearch(window.location.search);
+        urlListeners.add(listener);
+        return () => {
+          urlListeners.delete(listener);
+        };
+      }, []);
+      return new URLSearchParams(search);
+    },
+  };
+});
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api');
   return { ...actual, apiFetch: vi.fn() };
@@ -114,7 +137,7 @@ describe('InventoryItemListPage', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     window.history.replaceState({}, '', '/inventory/items');
   });
   afterEach(() => vi.clearAllMocks());
@@ -342,5 +365,92 @@ describe('InventoryItemListPage', () => {
     expect((screen.getByTestId('item-list-org-selector') as HTMLSelectElement).value).toBe(
       ORG_B.id,
     );
+  });
+
+  // ---- Sprint 5.3 routing round: Finding 2 (list normalization) - //
+  it('missing organization_id is normalized to the fallback and written into the URL', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([makeItem({ code: 'FEED-A' })]);
+      return Promise.resolve([]);
+    });
+    // No organization_id in the URL — reconciliation must pick the
+    // first accessible org and REWRITE the URL, not silently swap.
+    window.history.replaceState({}, '', '/inventory/items?keep=me');
+    render(<InventoryItemListPage />);
+    await waitFor(() => expect(screen.getByTestId('item-row-FEED-A')).toBeInTheDocument());
+    // The URL now carries the normalized organization_id.
+    expect(window.location.search).toContain(`organization_id=${ORG_A.id}`);
+    // Unrelated deep-link params survive normalization.
+    expect(window.location.search).toContain('keep=me');
+    // router.replace was invoked at least once — the raw URL was
+    // not the effective URL at load time.
+    expect(routerReplace).toHaveBeenCalled();
+  });
+
+  it('invalid / inaccessible organization_id is normalized to the fallback', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([makeItem({ code: 'FEED-A' })]);
+      return Promise.resolve([]);
+    });
+    window.history.replaceState({}, '', '/inventory/items?organization_id=ghost-org');
+    render(<InventoryItemListPage />);
+    await waitFor(() => expect(screen.getByTestId('item-row-FEED-A')).toBeInTheDocument());
+    // The invalid value was replaced with the fallback org.
+    expect(window.location.search).toContain(`organization_id=${ORG_A.id}`);
+    expect(window.location.search).not.toContain('ghost-org');
+    expect(routerReplace).toHaveBeenCalled();
+  });
+
+  it('a valid organization_id is never unnecessarily replaced (no loop)', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    window.history.replaceState({}, '', `/inventory/items?organization_id=${ORG_B.id}&x=y`);
+    render(<InventoryItemListPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-list-org-name')).toHaveTextContent('Beacon'),
+    );
+    // Allow a beat for any effects to settle.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    // The URL was already the fixed point of reconciliation, so
+    // router.replace() must not have been invoked — this is the
+    // loop-prevention invariant.
+    expect(routerReplace).not.toHaveBeenCalled();
+    // Unrelated params still there.
+    expect(window.location.search).toContain('x=y');
+  });
+
+  it('back / forward: URL change from ?organization_id=B to nothing reconciles to fallback', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    window.history.replaceState({}, '', `/inventory/items?organization_id=${ORG_B.id}`);
+    render(<InventoryItemListPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-list-org-name')).toHaveTextContent('Beacon'),
+    );
+    // Simulate the browser back / forward stack removing the
+    // organization_id parameter. The unified mock's routerReplace
+    // path — window.history + urlListeners.notify() — is the
+    // same code the reactive `useSearchParams` mock subscribes to.
+    await act(async () => {
+      routerReplace('/inventory/items');
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('item-list-org-name')).toHaveTextContent('Aegis'),
+    );
+    // Reconciliation wrote the fallback org back into the URL.
+    expect(window.location.search).toContain(`organization_id=${ORG_A.id}`);
   });
 });

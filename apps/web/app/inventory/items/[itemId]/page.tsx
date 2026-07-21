@@ -32,9 +32,9 @@
  *    bounded.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useParams, useRouter } from 'next/navigation';
+import { useParams, usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
 import {
   ACTIVITY_CONCURRENCY,
@@ -44,7 +44,6 @@ import {
   inspectFanOut,
   inspectWarehouseLotFanOut,
   mapWithConcurrency,
-  resolveOrganizationId,
   type InventoryItem,
   type ItemLedgerTx,
   type ItemLot,
@@ -68,21 +67,31 @@ import {
 
 type ForbiddenScope = 'org' | 'item' | 'availability' | 'activity';
 
-function readInitialOrganizationId(): string | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    return new URLSearchParams(window.location.search).get('organization_id');
-  } catch {
-    return null;
-  }
-}
-
 function apiErrorStatus(reason: unknown): number | null {
   return reason instanceof ApiError ? reason.status : null;
 }
 
+// `useSearchParams` requires the containing tree to sit inside a
+// Suspense boundary during static generation. The inner component
+// owns every piece of client state.
 export default function InventoryItemDetailPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="mx-auto max-w-6xl px-6 py-10" data-testid="item-detail-page-loading">
+          <SkeletonRows rows={8} />
+        </main>
+      }
+    >
+      <InventoryItemDetailInner />
+    </Suspense>
+  );
+}
+
+function InventoryItemDetailInner() {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const params = useParams<{ itemId: string }>();
   const itemId = params?.itemId ?? '';
 
@@ -120,10 +129,16 @@ export default function InventoryItemDetailPage() {
   useEffect(() => {
     currentItemIdRef.current = itemId;
   }, [itemId]);
-  const requestedOrgIdRef = useRef<string | null>(null);
-  if (requestedOrgIdRef.current === null && typeof window !== 'undefined') {
-    requestedOrgIdRef.current = readInitialOrganizationId();
-  }
+
+  // Read the URL organization_id reactively. `useSearchParams` is
+  // the single source of truth for the active org — the effect
+  // below reconciles it into local state and normalizes missing
+  // or invalid values back into the URL, so navigation between
+  //   /inventory/items/item-1?organization_id=org-A
+  //   /inventory/items/item-1?organization_id=org-B
+  // (same itemId, different org query) is fully reactive and
+  // clears org-A state before org-B data arrives.
+  const requestedOrgId = searchParams.get('organization_id');
 
   const handleAuthError = useCallback(
     (err: unknown, scope: ForbiddenScope, isCurrent: () => boolean): 'auth' | 'unhandled' => {
@@ -162,7 +177,9 @@ export default function InventoryItemDetailPage() {
     [router],
   );
 
-  // Bootstrap organizations.
+  // Bootstrap: load the list of accessible organizations. Selection
+  // itself is derived reactively from the URL — see the sync effect
+  // immediately after.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -174,8 +191,6 @@ export default function InventoryItemDetailPage() {
           router.push('/onboarding');
           return;
         }
-        const validated = resolveOrganizationId(requestedOrgIdRef.current, list) ?? list[0].id;
-        setOrgId(validated);
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -198,6 +213,26 @@ export default function InventoryItemDetailPage() {
       cancelled = true;
     };
   }, [router]);
+
+  // Unified URL ↔ state reconciliation.
+  //   1. Requested org is valid   → use it.
+  //   2. Requested org is missing → normalize URL to fallback.
+  //   3. Requested org is invalid → normalize URL to fallback.
+  // Loop prevention: only replace when the URL's raw parameter
+  // differs from the effective value.
+  useEffect(() => {
+    if (!orgs || orgs.length === 0) return;
+    const isRequestedOrgValid =
+      requestedOrgId !== null && orgs.some((o) => o.id === requestedOrgId);
+    const effectiveOrgId = isRequestedOrgValid ? requestedOrgId : (orgs[0]?.id ?? null);
+    if (!effectiveOrgId) return;
+    if (effectiveOrgId !== orgId) setOrgId(effectiveOrgId);
+    if (requestedOrgId !== effectiveOrgId) {
+      const next = new URLSearchParams(searchParams.toString());
+      next.set('organization_id', effectiveOrgId);
+      router.replace(`${pathname}?${next.toString()}`);
+    }
+  }, [requestedOrgId, orgs, orgId, pathname, router, searchParams]);
 
   // Load item (from list) + warehouses. Two independent guarded
   // fetches so a slow warehouses call cannot invalidate the item.

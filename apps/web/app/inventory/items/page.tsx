@@ -23,13 +23,12 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
 import {
   DEFAULT_ITEM_FILTERS,
   DEFAULT_ITEM_SORT,
   filterItems,
-  resolveOrganizationId,
   sortItems,
   type InventoryItem,
   type ItemListFilters,
@@ -69,6 +68,7 @@ export default function InventoryItemListPage() {
 
 function InventoryItemListInner() {
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
   const [orgs, setOrgs] = useState<ItemOrganization[] | null>(null);
   const [orgId, setOrgId] = useState<string>('');
@@ -89,18 +89,18 @@ function InventoryItemListInner() {
     currentOrgIdRef.current = orgId;
   }, [orgId]);
 
-  // Track which organization value we last wrote to the URL so the
-  // URL→state effect below can distinguish a genuine external URL
-  // change from an echo of our own `router.replace()`.
-  const lastWrittenOrgIdRef = useRef<string | null>(null);
-
   // Read the URL organization_id reactively. `useSearchParams`
-  // guarantees the component rerenders whenever this changes, so
-  // deep links (external navigation) update the selector too.
-  const urlOrgId = searchParams.get('organization_id');
+  // is the single source of truth for navigation context; the
+  // effect below reconciles it into local state and normalizes
+  // missing / invalid values back into the URL via
+  // `router.replace()` so every entry point (direct navigation,
+  // refresh, selector change, browser back/forward) converges
+  // on the same invariant: the URL organization_id matches the
+  // organization whose data is displayed.
+  const requestedOrgId = searchParams.get('organization_id');
 
-  // Bootstrap organizations. Runs once — the first URL org param
-  // is used to pick the initial selection.
+  // Bootstrap: load the list of accessible organizations. Selection
+  // itself is derived reactively from the URL — see the sync effect.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -112,9 +112,6 @@ function InventoryItemListInner() {
           router.push('/onboarding');
           return;
         }
-        const validated = resolveOrganizationId(urlOrgId, list) ?? list[0].id;
-        setOrgId(validated);
-        lastWrittenOrgIdRef.current = validated;
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -136,30 +133,35 @@ function InventoryItemListInner() {
     return () => {
       cancelled = true;
     };
-    // Intentionally excludes urlOrgId — bootstrap runs once. Later
-    // URL changes are handled by the sync effect below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
-  // Reconcile URL → state when the URL organization_id changes to
-  // a valid value that differs from the currently selected org.
-  // The `lastWrittenOrgIdRef` check ignores echoes of our own
-  // `router.replace()`, and we deliberately do NOT reconcile when
-  // the URL has no `organization_id` param — bootstrap already
-  // seeded the initial selection, and a subsequent selector change
-  // (which momentarily precedes the URL update in some routers)
-  // must not be overwritten by a stale null.
+  // Unified URL ↔ state reconciliation. Runs whenever the URL org
+  // parameter or the accessible orgs change (which is exactly when
+  // "the effective organization" might need to be recomputed —
+  // browser back/forward, direct navigation, selector changes, and
+  // 0-org → n-org bootstrap all funnel through here).
+  //
+  // Rules:
+  //   1. Requested org is valid   → use it.
+  //   2. Requested org is missing → normalize URL to the fallback.
+  //   3. Requested org is invalid → normalize URL to the fallback.
+  //
+  // Loop prevention: only replace when the URL's raw value differs
+  // from the effective normalized value. When they match, we are
+  // already at the fixed point and no replace fires.
   useEffect(() => {
     if (!orgs || orgs.length === 0) return;
-    if (!urlOrgId) return;
-    if (urlOrgId === lastWrittenOrgIdRef.current) return;
-    const validated = resolveOrganizationId(urlOrgId, orgs);
-    if (!validated) return;
-    if (validated !== orgId) {
-      setOrgId(validated);
-      lastWrittenOrgIdRef.current = validated;
+    const isRequestedOrgValid =
+      requestedOrgId !== null && orgs.some((o) => o.id === requestedOrgId);
+    const effectiveOrgId = isRequestedOrgValid ? requestedOrgId : (orgs[0]?.id ?? null);
+    if (!effectiveOrgId) return;
+    if (effectiveOrgId !== orgId) setOrgId(effectiveOrgId);
+    if (requestedOrgId !== effectiveOrgId) {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set('organization_id', effectiveOrgId);
+      router.replace(`${pathname}?${params.toString()}`);
     }
-  }, [urlOrgId, orgs, orgId]);
+  }, [requestedOrgId, orgs, orgId, pathname, router, searchParams]);
 
   // Refetch items whenever the active org changes.
   const reloadItems = useCallback(async () => {
@@ -230,18 +232,17 @@ function InventoryItemListInner() {
     router.push(`/inventory/items/${id}${q}`);
   }
 
-  // Selector change: update local state AND the URL. We preserve
-  // every other query parameter (unrelated deep-link state) and
-  // only rewrite `organization_id`. `router.replace()` avoids
-  // polluting the browser history stack for a mere org switch.
+  // Selector change: the URL is the single source of truth. We
+  // write the URL via `router.replace()` (preserving unrelated
+  // supported query parameters) and let the reconciliation effect
+  // above propagate the change into `orgId`. This keeps direct
+  // navigation, refresh, and selector changes on the same code path
+  // and guarantees the URL always matches the displayed org.
   function handleOrgSelect(nextOrgId: string) {
     if (!nextOrgId || nextOrgId === orgId) return;
-    setOrgId(nextOrgId);
     const next = new URLSearchParams(searchParams.toString());
     next.set('organization_id', nextOrgId);
-    lastWrittenOrgIdRef.current = nextOrgId;
-    const qs = next.toString();
-    router.replace(qs ? `/inventory/items?${qs}` : '/inventory/items');
+    router.replace(`${pathname}?${next.toString()}`);
   }
 
   async function submitCreate(payload: ItemFormPayload) {

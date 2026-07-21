@@ -17,22 +17,44 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { routerPush, routerReplace, stableRouter, useParamsMock } = vi.hoisted(() => {
+const { routerPush, routerReplace, stableRouter, useParamsMock, urlListeners } = vi.hoisted(() => {
   const push = vi.fn();
-  const replace = vi.fn();
+  const listeners = new Set<() => void>();
+  const replace = vi.fn((url: string) => {
+    if (typeof url === 'string' && typeof window !== 'undefined') {
+      window.history.replaceState({}, '', url);
+      listeners.forEach((l) => l());
+    }
+  });
   return {
     routerPush: push,
     routerReplace: replace,
     stableRouter: { push, replace, back: vi.fn() },
     useParamsMock: vi.fn(() => ({ itemId: '' })),
+    urlListeners: listeners,
   };
 });
-vi.mock('next/navigation', () => ({
-  useRouter: () => stableRouter,
-  useParams: () => useParamsMock(),
-  useSearchParams: () =>
-    new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''),
-}));
+vi.mock('next/navigation', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  return {
+    useRouter: () => stableRouter,
+    useParams: () => useParamsMock(),
+    usePathname: () => (typeof window !== 'undefined' ? window.location.pathname : '/'),
+    useSearchParams: () => {
+      const [search, setSearch] = React.useState(
+        typeof window !== 'undefined' ? window.location.search : '',
+      );
+      React.useEffect(() => {
+        const listener = () => setSearch(window.location.search);
+        urlListeners.add(listener);
+        return () => {
+          urlListeners.delete(listener);
+        };
+      }, []);
+      return new URLSearchParams(search);
+    },
+  };
+});
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api');
   return { ...actual, apiFetch: vi.fn() };
@@ -78,7 +100,7 @@ describe('Item create', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     toastSpy.mockReset();
     window.history.replaceState({}, '', '/inventory/items');
   });
@@ -242,7 +264,7 @@ describe('Item edit + lifecycle', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     useParamsMock.mockReturnValue({ itemId: 'item-1' });

@@ -17,22 +17,44 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { routerPush, routerReplace, stableRouter, useParamsMock } = vi.hoisted(() => {
+const { routerPush, routerReplace, stableRouter, useParamsMock, urlListeners } = vi.hoisted(() => {
   const push = vi.fn();
-  const replace = vi.fn();
+  const listeners = new Set<() => void>();
+  const replace = vi.fn((url: string) => {
+    if (typeof url === 'string' && typeof window !== 'undefined') {
+      window.history.replaceState({}, '', url);
+      listeners.forEach((l) => l());
+    }
+  });
   return {
     routerPush: push,
     routerReplace: replace,
     stableRouter: { push, replace, back: vi.fn() },
     useParamsMock: vi.fn(() => ({ itemId: '' })),
+    urlListeners: listeners,
   };
 });
-vi.mock('next/navigation', () => ({
-  useRouter: () => stableRouter,
-  useParams: () => useParamsMock(),
-  useSearchParams: () =>
-    new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''),
-}));
+vi.mock('next/navigation', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  return {
+    useRouter: () => stableRouter,
+    useParams: () => useParamsMock(),
+    usePathname: () => (typeof window !== 'undefined' ? window.location.pathname : '/'),
+    useSearchParams: () => {
+      const [search, setSearch] = React.useState(
+        typeof window !== 'undefined' ? window.location.search : '',
+      );
+      React.useEffect(() => {
+        const listener = () => setSearch(window.location.search);
+        urlListeners.add(listener);
+        return () => {
+          urlListeners.delete(listener);
+        };
+      }, []);
+      return new URLSearchParams(search);
+    },
+  };
+});
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api');
   return { ...actual, apiFetch: vi.fn() };
@@ -173,7 +195,7 @@ describe('InventoryItemListPage — authorization', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     toastSpy.mockReset();
     window.history.replaceState({}, '', '/inventory/items');
   });
@@ -238,7 +260,7 @@ describe('InventoryItemDetailPage — cross-tenant + stale + auth', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     useParamsMock.mockReturnValue({ itemId: 'item-x' });
@@ -310,7 +332,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     useParamsMock.mockReturnValue({ itemId: 'item-1' });
@@ -518,7 +540,7 @@ describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
-    routerReplace.mockReset();
+    routerReplace.mockClear();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     window.history.replaceState({}, '', '/');
@@ -696,6 +718,189 @@ describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
     });
     expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo');
     expect(toastSpy).not.toHaveBeenCalledWith('Item updated.', 'success');
+  });
+});
+
+// ------------------------------------------------------------------ //
+// Sprint 5.3 routing round — detail page reacts to URL organization
+// changes and normalizes missing / invalid params.
+// ------------------------------------------------------------------ //
+describe('InventoryItemDetailPage — reactive URL organization sync', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('changing only the URL organization_id (same itemId) clears org-A data and loads org-B', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?organization_id=org-A');
+    const itemInA = makeItem({ id: 'item-1', code: 'FEED-A', name: 'Alpha (A)' });
+    const itemInB = makeItem({
+      id: 'item-1',
+      organization_id: ORG_B.id,
+      code: 'FEED-B',
+      name: 'Bravo (B)',
+    });
+    // Defer the org-B item list so we can assert clearing of A's
+    // header happens *before* B's data arrives.
+    const dItemsB = deferred<InventoryItem[]>();
+    let bServed = false;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([itemInA]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) {
+        bServed = true;
+        return dItemsB.promise;
+      }
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-header-name')).toHaveTextContent('Alpha (A)'),
+    );
+    // Change only the query string — itemId stays 'item-1'. This
+    // is what a same-page navigation from org-A to org-B looks like.
+    await act(async () => {
+      routerReplace('/inventory/items/item-1?organization_id=org-B');
+    });
+    // Immediately after the URL flip, org-A data must be gone.
+    await waitFor(() => expect(screen.getByTestId('item-detail-loading')).toBeInTheDocument());
+    expect(screen.queryByText('Alpha (A)')).not.toBeInTheDocument();
+    expect(bServed).toBe(true);
+    // Now let org-B data arrive.
+    await act(async () => {
+      dItemsB.resolve([itemInB]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo (B)'),
+    );
+  });
+
+  it('stale org-A item-list response cannot overwrite org-B header after URL switch', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?organization_id=org-A');
+    const itemInA = makeItem({ id: 'item-1', code: 'FEED-A', name: 'Alpha (A)' });
+    const itemInB = makeItem({
+      id: 'item-1',
+      organization_id: ORG_B.id,
+      code: 'FEED-B',
+      name: 'Bravo (B)',
+    });
+    const dItemsA = deferred<InventoryItem[]>();
+    let firstAFetch = true;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) {
+        if (firstAFetch) {
+          firstAFetch = false;
+          return dItemsA.promise;
+        }
+        return Promise.resolve([itemInA]);
+      }
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`)
+        return Promise.resolve([itemInB]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    // Loading state visible while dItemsA is unresolved.
+    await waitFor(() => expect(screen.getByTestId('item-detail-loading')).toBeInTheDocument());
+    // Flip to org-B via URL — this bumps every generation ref.
+    await act(async () => {
+      routerReplace('/inventory/items/item-1?organization_id=org-B');
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo (B)'),
+    );
+    // Late-arriving org-A data must NOT overwrite the org-B header.
+    await act(async () => {
+      dItemsA.resolve([itemInA]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo (B)');
+    expect(screen.queryByText('Alpha (A)')).not.toBeInTheDocument();
+  });
+
+  it('missing organization_id on the detail page is normalized via router.replace', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?keep=me');
+    const itemInA = makeItem({ id: 'item-1', code: 'FEED-A', name: 'Alpha (A)' });
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([itemInA]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-header-name')).toHaveTextContent('Alpha (A)'),
+    );
+    // URL now carries the normalized fallback organization; the
+    // unrelated `keep=me` parameter is preserved.
+    expect(window.location.search).toContain(`organization_id=${ORG_A.id}`);
+    expect(window.location.search).toContain('keep=me');
+    expect(routerReplace).toHaveBeenCalled();
+  });
+
+  it('invalid / inaccessible organization_id on the detail page is normalized to the fallback', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?organization_id=ghost-org');
+    const itemInA = makeItem({ id: 'item-1', code: 'FEED-A', name: 'Alpha (A)' });
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([itemInA]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-header-name')).toHaveTextContent('Alpha (A)'),
+    );
+    expect(window.location.search).toContain(`organization_id=${ORG_A.id}`);
+    expect(window.location.search).not.toContain('ghost-org');
+    expect(routerReplace).toHaveBeenCalled();
+  });
+
+  it('a valid organization_id on the detail page is never unnecessarily replaced', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', `/inventory/items/item-1?organization_id=${ORG_B.id}&x=y`);
+    const itemInB = makeItem({
+      id: 'item-1',
+      organization_id: ORG_B.id,
+      code: 'FEED-B',
+      name: 'Bravo (B)',
+    });
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`)
+        return Promise.resolve([itemInB]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo (B)'),
+    );
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    // Fixed point: URL == effective. No replace occurred.
+    expect(routerReplace).not.toHaveBeenCalled();
+    expect(window.location.search).toContain('x=y');
   });
 });
 
