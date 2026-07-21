@@ -1,40 +1,56 @@
 import { useMemo, useState } from 'react';
 import type { ItemLedgerTx } from '@/lib/inventory-items';
+import { isReversibleTransaction } from '@/lib/stock-operations';
 
-const TX_TYPES = [
-  'receipt',
-  'issue',
-  'consumption',
-  'transfer_out',
-  'transfer_in',
-  'adjustment_increase',
-  'adjustment_decrease',
-  'reversal',
+// Sprint 5.4: filters and display now key off the exact backend
+// enum values. Only the five operation-level categories are shown
+// in the filter — TRANSFER lumps out+in so the operator sees a
+// single logical entry per operation regardless of side.
+const TX_FILTERS: Array<{ value: string; label: string; matches: (t: string) => boolean }> = [
+  { value: '', label: 'All types', matches: () => true },
+  { value: 'RECEIPT', label: 'Receipt', matches: (t) => t === 'receipt' },
+  { value: 'ISSUE', label: 'Issue', matches: (t) => t === 'issue' || t === 'consumption' },
+  {
+    value: 'TRANSFER',
+    label: 'Transfer',
+    matches: (t) => t === 'transfer_out' || t === 'transfer_in',
+  },
+  {
+    value: 'ADJUSTMENT',
+    label: 'Adjustment',
+    matches: (t) => t === 'adjustment_increase' || t === 'adjustment_decrease',
+  },
+  { value: 'REVERSAL', label: 'Reversal', matches: (t) => t === 'reversal' },
 ];
 
 /**
- * Sprint 5.3 — merged activity across every lot that references
- * this item. Data comes pre-capped at 100 from the caller's
- * bounded fan-out. `partial=true` when any lot's transactions
- * failed to load; we surface it inline so operators know the
- * list is understated.
+ * Sprint 5.3 + 5.4 — merged activity across every lot that
+ * references this item. Sprint 5.4 adds per-row reversal actions
+ * (only enabled on eligible transaction types) and operation-type
+ * filters keyed to the API enums.
+ *
+ * `partial=true` retains its Sprint 5.3 meaning: the merged list
+ * is understated.
  */
 export function InventoryItemActivity({
   transactions,
   partial = false,
+  onReverse,
 }: {
   transactions: readonly ItemLedgerTx[];
   partial?: boolean;
+  onReverse?: (tx: ItemLedgerTx) => void;
 }) {
   const [type, setType] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
 
   const filtered = useMemo(() => {
+    const filter = TX_FILTERS.find((f) => f.value === type) ?? TX_FILTERS[0];
     const from = dateFrom ? Date.parse(dateFrom) : Number.NEGATIVE_INFINITY;
     const to = dateTo ? Date.parse(dateTo) + 86_400_000 - 1 : Number.POSITIVE_INFINITY;
     return transactions.filter((tx) => {
-      if (type && tx.transaction_type !== type) return false;
+      if (!filter.matches(tx.transaction_type)) return false;
       const t = Date.parse(tx.performed_at);
       if (Number.isFinite(t) && (t < from || t > to)) return false;
       return true;
@@ -52,10 +68,9 @@ export function InventoryItemActivity({
             data-testid="item-activity-filter-type"
             className="rounded-md border border-border bg-background px-2 py-1"
           >
-            <option value="">All types</option>
-            {TX_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t.replace(/_/g, ' ')}
+            {TX_FILTERS.map((f) => (
+              <option key={f.value || 'all'} value={f.value}>
+                {f.label}
               </option>
             ))}
           </select>
@@ -106,6 +121,7 @@ export function InventoryItemActivity({
                 <th className="px-3 py-2 text-left">Type</th>
                 <th className="px-3 py-2 text-right">Qty</th>
                 <th className="px-3 py-2 text-left">Reason</th>
+                {onReverse && <th className="px-3 py-2 text-right">Action</th>}
               </tr>
             </thead>
             <tbody>
@@ -121,6 +137,22 @@ export function InventoryItemActivity({
                     {tx.quantity} {tx.unit}
                   </td>
                   <td className="px-3 py-2 text-xs">{tx.reason ?? '—'}</td>
+                  {onReverse && (
+                    <td className="px-3 py-2 text-right">
+                      {isReversibleTransaction(tx) ? (
+                        <button
+                          type="button"
+                          data-testid={`item-activity-reverse-${tx.id}`}
+                          onClick={() => onReverse(tx)}
+                          className="rounded-md border border-border px-2 py-0.5 text-xs hover:bg-secondary"
+                        >
+                          Reverse
+                        </button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
