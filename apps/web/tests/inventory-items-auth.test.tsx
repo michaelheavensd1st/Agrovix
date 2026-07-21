@@ -17,17 +17,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { routerPush, stableRouter, useParamsMock } = vi.hoisted(() => {
+const { routerPush, routerReplace, stableRouter, useParamsMock } = vi.hoisted(() => {
   const push = vi.fn();
+  const replace = vi.fn();
   return {
     routerPush: push,
-    stableRouter: { push, replace: push, back: vi.fn() },
+    routerReplace: replace,
+    stableRouter: { push, replace, back: vi.fn() },
     useParamsMock: vi.fn(() => ({ itemId: '' })),
   };
 });
 vi.mock('next/navigation', () => ({
   useRouter: () => stableRouter,
   useParams: () => useParamsMock(),
+  useSearchParams: () =>
+    new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''),
 }));
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api');
@@ -113,7 +117,7 @@ describe('Fan-out primitives', () => {
     expect(
       inspectFanOut(
         [
-          { status: 'fulfilled', value: { items: [] } },
+          { status: 'fulfilled', value: { items: [], next_cursor: null } },
           { status: 'rejected', reason: new ApiError(401, {}) },
         ],
         (r) => (r instanceof ApiError ? r.status : null),
@@ -122,7 +126,7 @@ describe('Fan-out primitives', () => {
     expect(
       inspectFanOut(
         [
-          { status: 'fulfilled', value: { items: [] } },
+          { status: 'fulfilled', value: { items: [], next_cursor: null } },
           { status: 'rejected', reason: new ApiError(403, {}) },
         ],
         (r) => (r instanceof ApiError ? r.status : null),
@@ -140,8 +144,9 @@ describe('Fan-out primitives', () => {
       reason: null,
       reference_type: null,
     }));
-    const outcome = inspectFanOut([{ status: 'fulfilled', value: { items: many } }], (r) =>
-      r instanceof ApiError ? r.status : null,
+    const outcome = inspectFanOut(
+      [{ status: 'fulfilled', value: { items: many, next_cursor: null } }],
+      (r) => (r instanceof ApiError ? r.status : null),
     );
     if (outcome.kind !== 'ok') throw new Error('expected ok');
     expect(outcome.transactions).toHaveLength(ACTIVITY_LIMIT);
@@ -168,6 +173,7 @@ describe('InventoryItemListPage — authorization', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    routerReplace.mockReset();
     toastSpy.mockReset();
     window.history.replaceState({}, '', '/inventory/items');
   });
@@ -232,6 +238,7 @@ describe('InventoryItemDetailPage — cross-tenant + stale + auth', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    routerReplace.mockReset();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     useParamsMock.mockReturnValue({ itemId: 'item-x' });
@@ -303,6 +310,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    routerReplace.mockReset();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     useParamsMock.mockReturnValue({ itemId: 'item-1' });
@@ -411,7 +419,8 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
         ]);
       // A generic (non-auth) failure — surfaces as partial-data.
       if (path === '/v1/warehouses/wh-2/lots') return Promise.reject(new ApiError(500, {}));
-      if (path === '/v1/lots/lot-1/transactions') return Promise.resolve({ items: [] });
+      if (path === '/v1/lots/lot-1/transactions?limit=100')
+        return Promise.resolve({ items: [], next_cursor: null });
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -446,7 +455,8 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
             balance_unit: 'kg',
           },
         ]);
-      if (path === '/v1/lots/lot-1/transactions') return Promise.reject(new ApiError(401, {}));
+      if (path === '/v1/lots/lot-1/transactions?limit=100')
+        return Promise.reject(new ApiError(401, {}));
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -482,7 +492,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
             balance_unit: 'kg',
           },
         ]);
-      if (path === '/v1/lots/lot-1/transactions') return dTx.promise;
+      if (path === '/v1/lots/lot-1/transactions?limit=100') return dTx.promise;
       return Promise.resolve([]);
     });
     const { unmount } = render(<InventoryItemDetailPage />);
@@ -497,6 +507,195 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
     // (there is no tree left to render into anyway) — the guard
     // simply drops the write.
     expect(routerPush).not.toHaveBeenCalledWith('/login');
+  });
+});
+
+// ------------------------------------------------------------------ //
+// Sprint 5.3 review — Finding 1 (route identity = orgId + itemId)
+// and Finding 2 (activity pagination: limit=100 + next_cursor).
+// ------------------------------------------------------------------ //
+describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockReset();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  // ---- Finding 2 ------------------------------------------------- //
+  it('activity fetch requests limit=100 on every lot transactions call', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?organization_id=org-A');
+    const item = makeItem({ id: 'item-1' });
+    const observed: string[] = [];
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+        return Promise.resolve([
+          { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
+        ]);
+      if (path === '/v1/warehouses/wh-1/lots')
+        return Promise.resolve([
+          {
+            id: 'lot-1',
+            item_id: 'item-1',
+            warehouse_id: 'wh-1',
+            storage_location_id: null,
+            lot_code: 'L1',
+            expiry_date: null,
+            balance: '10',
+            balance_unit: 'kg',
+          },
+        ]);
+      if (path.startsWith('/v1/lots/') && path.includes('/transactions')) {
+        observed.push(path);
+        return Promise.resolve({ items: [], next_cursor: null });
+      }
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    await waitFor(() => expect(observed.length).toBeGreaterThan(0));
+    // Every recorded transactions request must include the
+    // display-cap-matching limit param. Extra params are allowed
+    // (e.g., a future sort/order) but limit=100 must be there.
+    for (const url of observed) {
+      const qs = url.split('?')[1] ?? '';
+      const params = new URLSearchParams(qs);
+      expect(params.get('limit')).toBe('100');
+    }
+  });
+
+  it('a non-null next_cursor on any lot marks the activity list as partial', async () => {
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?organization_id=org-A');
+    const item = makeItem({ id: 'item-1' });
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+        return Promise.resolve([
+          { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
+        ]);
+      if (path === '/v1/warehouses/wh-1/lots')
+        return Promise.resolve([
+          {
+            id: 'lot-1',
+            item_id: 'item-1',
+            warehouse_id: 'wh-1',
+            storage_location_id: null,
+            lot_code: 'L1',
+            expiry_date: null,
+            balance: '10',
+            balance_unit: 'kg',
+          },
+        ]);
+      if (path.startsWith('/v1/lots/lot-1/transactions')) {
+        return Promise.resolve({
+          items: [
+            {
+              id: 'tx-1',
+              transaction_type: 'receipt',
+              quantity: '1',
+              unit: 'kg',
+              performed_at: '2026-02-01T00:00:00.000Z',
+              reason: null,
+              reference_type: null,
+            },
+          ],
+          // Backend indicates more transactions exist that we did
+          // not fetch — the list must be surfaced as partial.
+          next_cursor: 'opaque-cursor-value',
+        });
+      }
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemDetailPage />);
+    await waitFor(() => expect(screen.getByTestId('item-activity-partial')).toBeInTheDocument());
+  });
+
+  // ---- Finding 1 ------------------------------------------------- //
+  it('changing itemId in the same org resets item-scoped state and reloads', async () => {
+    // First render for item-A. Then update the URL + useParams to
+    // point at item-B (same org). The previous item's summary,
+    // lots, activity, and error/editing state must be cleared
+    // before item-B's data lands.
+    useParamsMock.mockReturnValue({ itemId: 'item-A' });
+    window.history.replaceState({}, '', '/inventory/items/item-A?organization_id=org-A');
+    const itemA = makeItem({ id: 'item-A', code: 'FEED-A', name: 'Alpha' });
+    const itemB = makeItem({ id: 'item-B', code: 'FEED-B', name: 'Bravo' });
+    // We defer the item-B fetch so we can assert that item-A's
+    // state has already been cleared BEFORE item-B lands.
+    const dItemsB = deferred<InventoryItem[]>();
+    let allowB = false;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) {
+        return allowB ? dItemsB.promise : Promise.resolve([itemA, itemB]);
+      }
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    const { rerender } = render(<InventoryItemDetailPage />);
+    await waitFor(() => expect(screen.getByTestId('item-header-name')).toHaveTextContent('Alpha'));
+    // Now switch itemId to item-B. Item-A's summary must be gone
+    // (loading skeleton, not a stale header), and once item-B's
+    // fetch resolves the new item is rendered.
+    allowB = true;
+    useParamsMock.mockReturnValue({ itemId: 'item-B' });
+    rerender(<InventoryItemDetailPage />);
+    // Immediately after the id changes, item-A's identity must be
+    // erased (no stale "Alpha" header on screen).
+    await waitFor(() => expect(screen.getByTestId('item-detail-loading')).toBeInTheDocument());
+    expect(screen.queryByText('Alpha')).not.toBeInTheDocument();
+    await act(async () => {
+      dItemsB.resolve([itemA, itemB]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo'));
+  });
+
+  it('a stale item-A PATCH response cannot mutate item-B after itemId change', async () => {
+    // Start editing item-A, defer the PATCH, switch to item-B,
+    // then resolve the PATCH. Item-B must remain untouched.
+    useParamsMock.mockReturnValue({ itemId: 'item-A' });
+    window.history.replaceState({}, '', '/inventory/items/item-A?organization_id=org-A');
+    const itemA = makeItem({ id: 'item-A', code: 'FEED-A', name: 'Alpha' });
+    const itemB = makeItem({ id: 'item-B', code: 'FEED-B', name: 'Bravo' });
+    const dPatch = deferred<InventoryItem>();
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([itemA, itemB]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/inventory-items/item-A` && init?.method === 'PATCH') return dPatch.promise;
+      return Promise.resolve([]);
+    });
+    const { rerender } = render(<InventoryItemDetailPage />);
+    await waitFor(() => expect(screen.getByTestId('item-header-name')).toHaveTextContent('Alpha'));
+    // Open edit form, submit a rename.
+    fireEvent.click(screen.getByTestId('item-header-edit'));
+    fireEvent.change(screen.getByTestId('item-form-edit-name'), {
+      target: { value: 'Alpha Renamed' },
+    });
+    fireEvent.click(screen.getByTestId('item-form-edit-submit'));
+    // Now navigate to item-B before the PATCH resolves.
+    useParamsMock.mockReturnValue({ itemId: 'item-B' });
+    rerender(<InventoryItemDetailPage />);
+    await waitFor(() => expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo'));
+    // Resolve the stale PATCH: it must be dropped, item-B header
+    // stays "Bravo", and no success toast fires for the wrong item.
+    await act(async () => {
+      dPatch.resolve({ ...itemA, name: 'Alpha Renamed' });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('item-header-name')).toHaveTextContent('Bravo');
+    expect(toastSpy).not.toHaveBeenCalledWith('Item updated.', 'success');
   });
 });
 

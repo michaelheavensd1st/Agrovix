@@ -345,12 +345,8 @@ export function inspectFanOut(
   }
   merged.sort((a, b) => new Date(b.performed_at).getTime() - new Date(a.performed_at).getTime());
   const capped = merged.slice(0, ACTIVITY_LIMIT);
-  // Also surface `partial` when the merged raw list exceeded the
-  // display cap — the operator otherwise cannot tell that older
-  // transactions are hidden below the cap.
-  const truncatedByCap = merged.length > ACTIVITY_LIMIT;
   return {
-    kind: hadFailure || truncatedByCursor || truncatedByCap ? 'partial' : 'ok',
+    kind: hadFailure || truncatedByCursor ? 'partial' : 'ok',
     transactions: capped,
   };
 }

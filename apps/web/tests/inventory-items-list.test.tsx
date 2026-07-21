@@ -13,16 +13,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { routerPush, stableRouter } = vi.hoisted(() => {
+const { routerPush, routerReplace, stableRouter } = vi.hoisted(() => {
   const push = vi.fn();
+  const replace = vi.fn();
   return {
     routerPush: push,
-    stableRouter: { push, replace: push, back: vi.fn() },
+    routerReplace: replace,
+    stableRouter: { push, replace, back: vi.fn() },
   };
 });
 vi.mock('next/navigation', () => ({
   useRouter: () => stableRouter,
   useParams: () => ({ itemId: '' }),
+  // Sprint 5.3 review: the list page reconciles the active org
+  // with the URL via `useSearchParams`. In test we read the
+  // current window.location so existing `window.history.replaceState`
+  // helpers keep working, and can also observe our own replaces.
+  useSearchParams: () =>
+    new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''),
 }));
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api');
@@ -106,6 +114,7 @@ describe('InventoryItemListPage', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    routerReplace.mockReset();
     window.history.replaceState({}, '', '/inventory/items');
   });
   afterEach(() => vi.clearAllMocks());
@@ -304,5 +313,34 @@ describe('InventoryItemListPage', () => {
       console.error = originalError;
     }
     expect(errors.some((e) => /unmounted component|state update/i.test(e))).toBe(false);
+  });
+
+  // ---- Sprint 5.3 review, Finding 3: URL ↔ selector ------------- //
+  it('changing the org selector reflects into the URL via router.replace and preserves other params', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return Promise.resolve([]);
+      return Promise.resolve([]);
+    });
+    // Prime the URL with an unrelated deep-link parameter that
+    // must survive the org switch.
+    window.history.replaceState({}, '', '/inventory/items?debug=1');
+    render(<InventoryItemListPage />);
+    await waitFor(() => expect(screen.getByTestId('item-list-org-selector')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('item-list-org-selector'), {
+      target: { value: ORG_B.id },
+    });
+    await waitFor(() => expect(routerReplace).toHaveBeenCalled());
+    const target = routerReplace.mock.calls.at(-1)?.[0] as string;
+    expect(target).toMatch(/^\/inventory\/items\?/);
+    const written = new URLSearchParams(target.split('?')[1] ?? '');
+    expect(written.get('organization_id')).toBe(ORG_B.id);
+    // Every other pre-existing param must be preserved.
+    expect(written.get('debug')).toBe('1');
+    // Selector reflects the new value.
+    expect((screen.getByTestId('item-list-org-selector') as HTMLSelectElement).value).toBe(
+      ORG_B.id,
+    );
   });
 });

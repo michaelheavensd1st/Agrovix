@@ -17,6 +17,19 @@
  * `/lots/{lotId}/transactions`. Partial failures show an
  * explicit "understated" indicator; 401 redirects to /login;
  * 403 shows a scoped banner and clears the affected slice.
+ *
+ * Sprint 5.3 review round:
+ *  - Finding 1 (route identity): the effective page identity is
+ *    `orgId + itemId`. Every async operation captures both at
+ *    start and guards its state write with a `sameRoute()` check
+ *    so a stale completion from a previous item can never write
+ *    into a newly-navigated item's context. Refs are bumped on
+ *    either dimension changing so obsolete fan-outs drop cleanly.
+ *  - Finding 2 (activity pagination): transactions requests
+ *    include `?limit=100` (the display cap). If any lot returns
+ *    a `next_cursor` we surface the activity list as `partial`
+ *    rather than following the cursor, keeping the fan-out
+ *    bounded.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -25,6 +38,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
 import {
   ACTIVITY_CONCURRENCY,
+  ACTIVITY_PER_LOT_LIMIT,
   WAREHOUSE_LOT_CONCURRENCY,
   buildItemAvailability,
   inspectFanOut,
@@ -36,6 +50,7 @@ import {
   type ItemLot,
   type ItemOrganization,
   type ItemWarehouse,
+  type TransactionPage,
 } from '@/lib/inventory-items';
 import { friendlyError, toast, ConfirmDialog, SkeletonRows } from '@/components/ui-polish';
 import { ErrorBanner } from '@/components/ape-ui';
@@ -99,9 +114,12 @@ export default function InventoryItemDetailPage() {
   useEffect(() => {
     currentOrgIdRef.current = orgId;
   }, [orgId]);
+  // Track the *route* itemId (not the resolved-item id) so
+  // mutation guards can detect a URL change even while the
+  // previous item's data is still being loaded.
   useEffect(() => {
-    currentItemIdRef.current = item?.id ?? '';
-  }, [item?.id]);
+    currentItemIdRef.current = itemId;
+  }, [itemId]);
   const requestedOrgIdRef = useRef<string | null>(null);
   if (requestedOrgIdRef.current === null && typeof window !== 'undefined') {
     requestedOrgIdRef.current = readInitialOrganizationId();
@@ -192,8 +210,8 @@ export default function InventoryItemDetailPage() {
     const isCurrent = () =>
       itemRef.current === gen &&
       availabilityRef.current === invGen &&
-      capturedOrgId === orgId &&
-      capturedItemId === itemId;
+      capturedOrgId === currentOrgIdRef.current &&
+      capturedItemId === currentItemIdRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -240,7 +258,9 @@ export default function InventoryItemDetailPage() {
     const capturedItemId = item.id;
     const gen = ++availabilityRef.current;
     const isCurrent = () =>
-      availabilityRef.current === gen && capturedOrgId === orgId && capturedItemId === item.id;
+      availabilityRef.current === gen &&
+      capturedOrgId === currentOrgIdRef.current &&
+      capturedItemId === currentItemIdRef.current;
     try {
       const settled = await mapWithConcurrency(warehouses, WAREHOUSE_LOT_CONCURRENCY, (wh) =>
         apiFetch<ItemLot[]>(`/v1/warehouses/${wh.id}/lots`),
@@ -271,7 +291,9 @@ export default function InventoryItemDetailPage() {
   }, [item, warehouses, orgId, router]);
 
   // Activity fan-out (bounded 5) over the lots that reference
-  // this item. Never over the full org's lots.
+  // this item. Never over the full org's lots. Each per-lot
+  // request explicitly requests `limit=100`; if any lot returns
+  // a `next_cursor` the merged activity is surfaced as `partial`.
   const loadActivity = useCallback(async () => {
     if (!item || lots.length === 0) {
       setActivity([]);
@@ -282,11 +304,15 @@ export default function InventoryItemDetailPage() {
     const capturedItemId = item.id;
     const gen = ++activityRef.current;
     const isCurrent = () =>
-      activityRef.current === gen && capturedOrgId === orgId && capturedItemId === item.id;
+      activityRef.current === gen &&
+      capturedOrgId === currentOrgIdRef.current &&
+      capturedItemId === currentItemIdRef.current;
     setLoadingActivity(true);
     try {
       const settled = await mapWithConcurrency(lots, ACTIVITY_CONCURRENCY, (lot) =>
-        apiFetch<{ items: ItemLedgerTx[] }>(`/v1/lots/${lot.id}/transactions`),
+        apiFetch<TransactionPage>(
+          `/v1/lots/${lot.id}/transactions?limit=${ACTIVITY_PER_LOT_LIMIT}`,
+        ),
       );
       if (!isCurrent()) return;
       const outcome = inspectFanOut(settled, apiErrorStatus);
@@ -311,7 +337,10 @@ export default function InventoryItemDetailPage() {
     }
   }, [item, lots, orgId, router]);
 
-  // Reset scoped state whenever org changes.
+  // Route identity is `orgId + itemId`. Reset every item-scoped
+  // piece of state whenever either dimension changes, and bump
+  // the generation refs so any in-flight fan-out from the
+  // previous identity is neutralised the moment it lands.
   useEffect(() => {
     itemRef.current += 1;
     availabilityRef.current += 1;
@@ -325,8 +354,13 @@ export default function InventoryItemDetailPage() {
     setForbidden(null);
     setError(null);
     setEditing(false);
+    setEditError(null);
+    setEditBusy(false);
     setPendingActive(null);
-  }, [orgId]);
+    setStatusBusy(false);
+    setLoading(true);
+    setLoadingActivity(false);
+  }, [orgId, itemId]);
 
   useEffect(() => {
     void loadDetail();
@@ -355,11 +389,15 @@ export default function InventoryItemDetailPage() {
   const activeOrg = useMemo(() => orgs?.find((o) => o.id === orgId) ?? null, [orgs, orgId]);
 
   // ---- Edit + status ------------------------------------------------ //
+  // Both mutations capture the full route identity (orgId + itemId)
+  // and guard every state write against `sameRoute()` so a stale
+  // completion from a previous item cannot patch a newly-loaded one.
   async function submitEdit(payload: ItemFormPayload) {
     if (payload.mode !== 'edit' || !item) return;
-    // Capture the org + item that owned this mutation.
     const mutationOrgId = orgId;
     const mutationItemId = item.id;
+    const sameRoute = () =>
+      mutationOrgId === currentOrgIdRef.current && mutationItemId === currentItemIdRef.current;
     setEditBusy(true);
     setEditError(null);
     try {
@@ -372,8 +410,7 @@ export default function InventoryItemDetailPage() {
           is_active: payload.is_active,
         }),
       });
-      if (mutationOrgId !== currentOrgIdRef.current || mutationItemId !== currentItemIdRef.current)
-        return;
+      if (!sameRoute()) return;
       setItem(updated);
       setEditing(false);
       toast('Item updated.', 'success');
@@ -382,16 +419,14 @@ export default function InventoryItemDetailPage() {
         router.push('/login');
         return;
       }
-      if (mutationOrgId !== currentOrgIdRef.current || mutationItemId !== currentItemIdRef.current)
-        return;
+      if (!sameRoute()) return;
       if (err instanceof ApiError && err.status === 403) {
         setEditError("You don't have permission to edit this item.");
         return;
       }
       setEditError(friendlyError(err));
     } finally {
-      if (mutationOrgId === currentOrgIdRef.current && mutationItemId === currentItemIdRef.current)
-        setEditBusy(false);
+      if (sameRoute()) setEditBusy(false);
     }
   }
 
@@ -399,16 +434,15 @@ export default function InventoryItemDetailPage() {
     if (!item || pendingActive === null) return;
     const mutationOrgId = orgId;
     const mutationItemId = item.id;
+    const sameRoute = () =>
+      mutationOrgId === currentOrgIdRef.current && mutationItemId === currentItemIdRef.current;
     setStatusBusy(true);
     try {
       const updated = await apiFetch<InventoryItem>(`/v1/inventory-items/${mutationItemId}`, {
         method: 'PATCH',
         body: JSON.stringify({ is_active: pendingActive }),
       });
-      if (
-        mutationOrgId !== currentOrgIdRef.current ||
-        mutationItemId !== currentItemIdRef.current
-      ) {
+      if (!sameRoute()) {
         setPendingActive(null);
         return;
       }
@@ -420,10 +454,7 @@ export default function InventoryItemDetailPage() {
         router.push('/login');
         return;
       }
-      if (
-        mutationOrgId !== currentOrgIdRef.current ||
-        mutationItemId !== currentItemIdRef.current
-      ) {
+      if (!sameRoute()) {
         setPendingActive(null);
         return;
       }
@@ -435,8 +466,7 @@ export default function InventoryItemDetailPage() {
       toast(friendlyError(err), 'error');
       setPendingActive(null);
     } finally {
-      if (mutationOrgId === currentOrgIdRef.current && mutationItemId === currentItemIdRef.current)
-        setStatusBusy(false);
+      if (sameRoute()) setStatusBusy(false);
     }
   }
 

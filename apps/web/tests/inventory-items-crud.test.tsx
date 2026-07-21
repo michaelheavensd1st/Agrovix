@@ -17,17 +17,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
-const { routerPush, stableRouter, useParamsMock } = vi.hoisted(() => {
+const { routerPush, routerReplace, stableRouter, useParamsMock } = vi.hoisted(() => {
   const push = vi.fn();
+  const replace = vi.fn();
   return {
     routerPush: push,
-    stableRouter: { push, replace: push, back: vi.fn() },
+    routerReplace: replace,
+    stableRouter: { push, replace, back: vi.fn() },
     useParamsMock: vi.fn(() => ({ itemId: '' })),
   };
 });
 vi.mock('next/navigation', () => ({
   useRouter: () => stableRouter,
   useParams: () => useParamsMock(),
+  useSearchParams: () =>
+    new URLSearchParams(typeof window !== 'undefined' ? window.location.search : ''),
 }));
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api');
@@ -74,6 +78,7 @@ describe('Item create', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    routerReplace.mockReset();
     toastSpy.mockReset();
     window.history.replaceState({}, '', '/inventory/items');
   });
@@ -237,6 +242,7 @@ describe('Item edit + lifecycle', () => {
   beforeEach(() => {
     mockedApiFetch.mockReset();
     routerPush.mockReset();
+    routerReplace.mockReset();
     toastSpy.mockReset();
     useParamsMock.mockReset();
     useParamsMock.mockReturnValue({ itemId: 'item-1' });

@@ -13,13 +13,17 @@
  *   - organization-aware navigation → the create form, "Open"
  *     button, and workspace link all carry organization_id.
  *
- * The list is client-side filtered / sorted / paginated because
- * the backend does not (yet) expose server-side facets for items.
+ * Sprint 5.3 review round (Finding 3): organization selection is
+ * reconciled with the URL via `useSearchParams` / `useRouter`. A
+ * change from the org selector writes `organization_id` into the
+ * URL through `router.replace()`, preserving every other query
+ * parameter, so a fresh load reproduces the same selection and a
+ * copied link points to the same organization.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { apiFetch, ApiError } from '@/lib/api';
 import {
   DEFAULT_ITEM_FILTERS,
@@ -46,17 +50,26 @@ import { SkeletonRows } from '@/components/ui-polish';
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
 
-function readInitialOrganizationId(): string | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    return new URLSearchParams(window.location.search).get('organization_id');
-  } catch {
-    return null;
-  }
+// `useSearchParams` requires the containing tree to be inside a
+// Suspense boundary during static generation. The inner component
+// owns all client state so the Suspense fallback stays simple.
+export default function InventoryItemListPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="mx-auto max-w-6xl px-6 py-10" data-testid="item-list-page-loading">
+          <SkeletonRows rows={6} />
+        </main>
+      }
+    >
+      <InventoryItemListInner />
+    </Suspense>
+  );
 }
 
-export default function InventoryItemListPage() {
+function InventoryItemListInner() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [orgs, setOrgs] = useState<ItemOrganization[] | null>(null);
   const [orgId, setOrgId] = useState<string>('');
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -75,12 +88,19 @@ export default function InventoryItemListPage() {
   useEffect(() => {
     currentOrgIdRef.current = orgId;
   }, [orgId]);
-  const requestedOrgIdRef = useRef<string | null>(null);
-  if (requestedOrgIdRef.current === null && typeof window !== 'undefined') {
-    requestedOrgIdRef.current = readInitialOrganizationId();
-  }
 
-  // Bootstrap organizations.
+  // Track which organization value we last wrote to the URL so the
+  // URL→state effect below can distinguish a genuine external URL
+  // change from an echo of our own `router.replace()`.
+  const lastWrittenOrgIdRef = useRef<string | null>(null);
+
+  // Read the URL organization_id reactively. `useSearchParams`
+  // guarantees the component rerenders whenever this changes, so
+  // deep links (external navigation) update the selector too.
+  const urlOrgId = searchParams.get('organization_id');
+
+  // Bootstrap organizations. Runs once — the first URL org param
+  // is used to pick the initial selection.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -92,8 +112,9 @@ export default function InventoryItemListPage() {
           router.push('/onboarding');
           return;
         }
-        const validated = resolveOrganizationId(requestedOrgIdRef.current, list) ?? list[0].id;
+        const validated = resolveOrganizationId(urlOrgId, list) ?? list[0].id;
         setOrgId(validated);
+        lastWrittenOrgIdRef.current = validated;
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -115,7 +136,30 @@ export default function InventoryItemListPage() {
     return () => {
       cancelled = true;
     };
+    // Intentionally excludes urlOrgId — bootstrap runs once. Later
+    // URL changes are handled by the sync effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
+
+  // Reconcile URL → state when the URL organization_id changes to
+  // a valid value that differs from the currently selected org.
+  // The `lastWrittenOrgIdRef` check ignores echoes of our own
+  // `router.replace()`, and we deliberately do NOT reconcile when
+  // the URL has no `organization_id` param — bootstrap already
+  // seeded the initial selection, and a subsequent selector change
+  // (which momentarily precedes the URL update in some routers)
+  // must not be overwritten by a stale null.
+  useEffect(() => {
+    if (!orgs || orgs.length === 0) return;
+    if (!urlOrgId) return;
+    if (urlOrgId === lastWrittenOrgIdRef.current) return;
+    const validated = resolveOrganizationId(urlOrgId, orgs);
+    if (!validated) return;
+    if (validated !== orgId) {
+      setOrgId(validated);
+      lastWrittenOrgIdRef.current = validated;
+    }
+  }, [urlOrgId, orgs, orgId]);
 
   // Refetch items whenever the active org changes.
   const reloadItems = useCallback(async () => {
@@ -186,6 +230,20 @@ export default function InventoryItemListPage() {
     router.push(`/inventory/items/${id}${q}`);
   }
 
+  // Selector change: update local state AND the URL. We preserve
+  // every other query parameter (unrelated deep-link state) and
+  // only rewrite `organization_id`. `router.replace()` avoids
+  // polluting the browser history stack for a mere org switch.
+  function handleOrgSelect(nextOrgId: string) {
+    if (!nextOrgId || nextOrgId === orgId) return;
+    setOrgId(nextOrgId);
+    const next = new URLSearchParams(searchParams.toString());
+    next.set('organization_id', nextOrgId);
+    lastWrittenOrgIdRef.current = nextOrgId;
+    const qs = next.toString();
+    router.replace(qs ? `/inventory/items?${qs}` : '/inventory/items');
+  }
+
   async function submitCreate(payload: ItemFormPayload) {
     if (payload.mode !== 'create' || !orgId) return;
     // Capture the org that owned this mutation. A stale completion
@@ -242,6 +300,10 @@ export default function InventoryItemListPage() {
     filters.unit !== 'all' ||
     filters.status !== 'all';
 
+  const workspaceHref = orgId
+    ? `/inventory?organization_id=${encodeURIComponent(orgId)}`
+    : '/inventory';
+
   return (
     <main className="mx-auto max-w-6xl px-6 py-10" data-testid="item-list-page">
       <header className="mb-6 flex flex-wrap items-start justify-between gap-3">
@@ -267,7 +329,7 @@ export default function InventoryItemListPage() {
                 data-testid="item-list-org-selector"
                 className="rounded-md border border-border bg-background px-2 py-1"
                 value={orgId}
-                onChange={(e) => setOrgId(e.target.value)}
+                onChange={(e) => handleOrgSelect(e.target.value)}
               >
                 {orgs.map((o) => (
                   <option key={o.id} value={o.id}>
@@ -278,7 +340,7 @@ export default function InventoryItemListPage() {
             </div>
           )}
           <Link
-            href={orgId ? `/inventory?organization_id=${encodeURIComponent(orgId)}` : '/inventory'}
+            href={workspaceHref}
             data-testid="item-list-workspace-link"
             className="rounded-md border border-border px-3 py-1.5 hover:bg-secondary"
           >
