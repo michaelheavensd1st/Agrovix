@@ -289,8 +289,21 @@ export function buildItemAvailability(input: {
 }
 
 // ------------------------------------------------------------------ //
-// Activity fan-out inspector (identical contract to Sprint 5.2's).
+// Activity fan-out inspector.
+//
+// Sprint 5.3 review round: the backend transactions endpoint is
+// cursor-paginated (`{ items, next_cursor, limit }`). If any lot's
+// response carries a non-null `next_cursor` we did NOT fetch every
+// transaction for that lot, so the merged activity list cannot be
+// treated as complete — surface it as partial the same way we do
+// for a failed lot request.
 // ------------------------------------------------------------------ //
+export interface TransactionPage {
+  items: ItemLedgerTx[];
+  next_cursor: string | null;
+  limit?: number;
+}
+
 export type ActivityFanOutOutcome =
   | { kind: 'ok'; transactions: ItemLedgerTx[] }
   | { kind: 'partial'; transactions: ItemLedgerTx[] }
@@ -299,10 +312,11 @@ export type ActivityFanOutOutcome =
 
 export const ACTIVITY_LIMIT = 100;
 export const ACTIVITY_CONCURRENCY = 5;
+export const ACTIVITY_PER_LOT_LIMIT = 100;
 export const WAREHOUSE_LOT_CONCURRENCY = 5;
 
 export function inspectFanOut(
-  results: PromiseSettledResult<{ items: ItemLedgerTx[] }>[],
+  results: PromiseSettledResult<TransactionPage>[],
   getStatus: (reason: unknown) => number | null,
 ): ActivityFanOutOutcome {
   for (const r of results) {
@@ -313,6 +327,7 @@ export function inspectFanOut(
     }
   }
   let hadFailure = false;
+  let truncatedByCursor = false;
   const merged: ItemLedgerTx[] = [];
   for (const r of results) {
     if (r.status === 'fulfilled') {
@@ -320,14 +335,23 @@ export function inspectFanOut(
       if (Array.isArray(items)) {
         for (const tx of items) merged.push(tx);
       }
+      // A lingering next_cursor means the lot has additional
+      // transactions we did not fetch. The merged/globally-sorted
+      // result therefore cannot be described as complete.
+      if (r.value?.next_cursor) truncatedByCursor = true;
     } else {
       hadFailure = true;
     }
   }
   merged.sort((a, b) => new Date(b.performed_at).getTime() - new Date(a.performed_at).getTime());
+  const capped = merged.slice(0, ACTIVITY_LIMIT);
+  // Also surface `partial` when the merged raw list exceeded the
+  // display cap — the operator otherwise cannot tell that older
+  // transactions are hidden below the cap.
+  const truncatedByCap = merged.length > ACTIVITY_LIMIT;
   return {
-    kind: hadFailure ? 'partial' : 'ok',
-    transactions: merged.slice(0, ACTIVITY_LIMIT),
+    kind: hadFailure || truncatedByCursor || truncatedByCap ? 'partial' : 'ok',
+    transactions: capped,
   };
 }
 
