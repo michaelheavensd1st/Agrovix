@@ -832,3 +832,284 @@ describe('StockOperationDialog — route/generation guards', () => {
     expect(toastSpy).not.toHaveBeenCalledWith('Receive stock succeeded.', 'success');
   });
 });
+
+// ------------------------------------------------------------------ //
+// Sprint 5.4.1 review fixes                                          //
+// ------------------------------------------------------------------ //
+describe('StockOperationDialog — focus management (Sprint 5.4.1)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('autofocus lands on the first tabbable control when the dialog opens', async () => {
+    await primeDetailPage();
+    const trigger = screen.getByTestId('item-detail-stock-receive') as HTMLButtonElement;
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.click(trigger);
+    // The dialog's first tabbable is the warehouse <select>. rAF
+    // resolves within a microtask flush of the assertion loop.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByTestId('stock-op-receive-warehouse')),
+    );
+  });
+
+  it('Tab wraps forward from the last control to the first (focus trap)', async () => {
+    await primeDetailPage();
+    fireEvent.click(screen.getByTestId('item-detail-stock-receive'));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByTestId('stock-op-receive-warehouse')),
+    );
+    const submit = screen.getByTestId('stock-op-receive-submit') as HTMLButtonElement;
+    submit.focus();
+    expect(document.activeElement).toBe(submit);
+    // Tab from the last focusable → wraps back to the first inside
+    // the dialog. The dialog listens for keydown on its own node.
+    fireEvent.keyDown(screen.getByTestId('stock-op-receive'), { key: 'Tab' });
+    expect(document.activeElement).toBe(screen.getByTestId('stock-op-receive-warehouse'));
+  });
+
+  it('Shift+Tab wraps backward from the first control to the last', async () => {
+    await primeDetailPage();
+    fireEvent.click(screen.getByTestId('item-detail-stock-receive'));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByTestId('stock-op-receive-warehouse')),
+    );
+    const warehouse = screen.getByTestId('stock-op-receive-warehouse') as HTMLSelectElement;
+    warehouse.focus();
+    fireEvent.keyDown(screen.getByTestId('stock-op-receive'), {
+      key: 'Tab',
+      shiftKey: true,
+    });
+    expect(document.activeElement).toBe(screen.getByTestId('stock-op-receive-submit'));
+  });
+
+  it('closing the dialog restores focus to the trigger', async () => {
+    await primeDetailPage();
+    const trigger = screen.getByTestId('item-detail-stock-receive') as HTMLButtonElement;
+    trigger.focus();
+    fireEvent.click(trigger);
+    await waitFor(() => expect(screen.getByTestId('stock-op-receive')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('stock-op-receive-cancel'));
+    await waitFor(() => expect(screen.queryByTestId('stock-op-receive')).not.toBeInTheDocument());
+    // Focus goes back to the button that opened the dialog.
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('ESC closes the dialog and restores focus (except while a POST is pending)', async () => {
+    await primeDetailPage();
+    const trigger = screen.getByTestId('item-detail-stock-receive') as HTMLButtonElement;
+    trigger.focus();
+    fireEvent.click(trigger);
+    await waitFor(() => expect(screen.getByTestId('stock-op-receive')).toBeInTheDocument());
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('stock-op-receive')).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(trigger);
+  });
+});
+
+describe('StockOperationDialog — unmount invalidation (Sprint 5.4.1)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('a POST that resolves *after* unmount cannot fire success toast, onClose, or refresh', async () => {
+    await primeDetailPage();
+    fireEvent.click(screen.getByTestId('item-detail-stock-issue'));
+    fireEvent.change(screen.getByTestId('stock-op-issue-warehouse'), {
+      target: { value: WH_1.id },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-issue-lot'), { target: { value: LOT_1.id } });
+    fireEvent.change(screen.getByTestId('stock-op-issue-quantity'), {
+      target: { value: '3' },
+    });
+    fireEvent.click(screen.getByTestId('stock-op-issue-submit'));
+    await waitFor(() => expect(screen.getByTestId('stock-op-issue-confirm')).toBeInTheDocument());
+    const dPost = deferred<{ id: string }>();
+    let refreshCalls = 0;
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return dPost.promise;
+      if (path === '/v1/warehouses/wh-1/lots') {
+        refreshCalls += 1;
+        return Promise.resolve([LOT_1]);
+      }
+      return Promise.resolve([]);
+    });
+    fireEvent.click(screen.getByTestId('stock-op-issue-confirm'));
+    // Flip org via URL — this triggers reset in the detail page,
+    // which closes the dialog and unmounts it.
+    await act(async () => {
+      routerReplace('/inventory/items/item-1?organization_id=org-B');
+    });
+    await waitFor(() => expect(screen.queryByTestId('stock-op-issue')).not.toBeInTheDocument());
+    const successToastCallsBefore = toastSpy.mock.calls.filter((c) =>
+      String(c[0]).includes('succeeded'),
+    ).length;
+    const refreshCallsBefore = refreshCalls;
+    // Late POST resolution: the guard must drop every side effect.
+    await act(async () => {
+      dPost.resolve({ id: 'tx-late' });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const successToastCallsAfter = toastSpy.mock.calls.filter((c) =>
+      String(c[0]).includes('succeeded'),
+    ).length;
+    expect(successToastCallsAfter).toBe(successToastCallsBefore);
+    // Refresh callback must NOT have fired for the stale mutation.
+    expect(refreshCalls).toBe(refreshCallsBefore);
+  });
+
+  it('a 401 that arrives after unmount does not trigger a login redirect', async () => {
+    await primeDetailPage();
+    fireEvent.click(screen.getByTestId('item-detail-stock-receive'));
+    fireEvent.change(screen.getByTestId('stock-op-receive-warehouse'), {
+      target: { value: WH_1.id },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-receive-lot-code'), {
+      target: { value: 'LOT-A' },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-receive-quantity'), {
+      target: { value: '5' },
+    });
+    fireEvent.click(screen.getByTestId('stock-op-receive-submit'));
+    await waitFor(() => expect(screen.getByTestId('stock-op-receive-confirm')).toBeInTheDocument());
+    const dPost = deferred<{ id: string }>();
+    mockedApiFetch.mockImplementation((_path: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return dPost.promise;
+      return Promise.resolve([]);
+    });
+    fireEvent.click(screen.getByTestId('stock-op-receive-confirm'));
+    // Unmount by flipping org.
+    await act(async () => {
+      routerReplace('/inventory/items/item-1?organization_id=org-B');
+    });
+    await waitFor(() => expect(screen.queryByTestId('stock-op-receive')).not.toBeInTheDocument());
+    routerPush.mockReset();
+    // Now the POST rejects with 401 — the stale completion must
+    // NOT push /login on the newly-navigated route.
+    await act(async () => {
+      dPost.reject(new ApiError(401, {}));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(routerPush).not.toHaveBeenCalledWith('/login');
+  });
+});
+
+describe('InventoryItemActivity — reversal eligibility (Sprint 5.4.1)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('a transaction already offset by a reversal row shows "Reversed" and no Reverse button', async () => {
+    await primeDetailPage({
+      transactions: [
+        {
+          id: 'tx-orig',
+          transaction_type: 'issue',
+          quantity: '2',
+          unit: 'kg',
+          performed_at: '2026-02-01T00:00:00.000Z',
+          reason: 'op',
+          reference_type: null,
+          lot_id: LOT_1.id,
+        },
+        // A reversal row referencing tx-orig — marks it consumed.
+        {
+          id: 'tx-rev',
+          transaction_type: 'reversal',
+          quantity: '2',
+          unit: 'kg',
+          performed_at: '2026-02-01T01:00:00.000Z',
+          reason: 'undo op',
+          reference_type: null,
+          lot_id: LOT_1.id,
+          reverses_transaction_id: 'tx-orig',
+        },
+      ],
+    });
+    await waitFor(() => expect(screen.getByTestId('item-activity')).toBeInTheDocument());
+    // Reverse button on the original row is gone; "Reversed" label
+    // is shown in its place.
+    expect(screen.queryByTestId('item-activity-reverse-tx-orig')).not.toBeInTheDocument();
+    expect(screen.getByTestId('item-activity-reversed-tx-orig')).toBeInTheDocument();
+    // The reversal row itself is never reversible (type filter).
+    expect(screen.queryByTestId('item-activity-reverse-tx-rev')).not.toBeInTheDocument();
+  });
+
+  it('an ordinary (non-reversed) tx still shows the Reverse button', async () => {
+    await primeDetailPage({
+      transactions: [
+        {
+          id: 'tx-plain',
+          transaction_type: 'receipt',
+          quantity: '10',
+          unit: 'kg',
+          performed_at: '2026-02-01T00:00:00.000Z',
+          reason: null,
+          reference_type: null,
+          lot_id: LOT_1.id,
+        },
+      ],
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('item-activity-reverse-tx-plain')).toBeInTheDocument(),
+    );
+  });
+});
+
+describe('InventoryItemActivity — filter accessibility (Sprint 5.4.1)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('operation type, start date, and end date filters carry accessible names', async () => {
+    await primeDetailPage({
+      transactions: [
+        {
+          id: 'tx-1',
+          transaction_type: 'receipt',
+          quantity: '1',
+          unit: 'kg',
+          performed_at: '2026-02-01T00:00:00.000Z',
+          reason: null,
+          reference_type: null,
+          lot_id: LOT_1.id,
+        },
+      ],
+    });
+    // Query by accessible name. Testing Library's `getByRole` with
+    // `name` resolves against the accessible name computation, which
+    // covers both aria-label and associated <label> elements.
+    expect(screen.getByRole('combobox', { name: /operation type/i })).toBeInTheDocument();
+    // Date inputs are `textbox` in accessible-name terms; use
+    // aria-label directly.
+    expect(screen.getByLabelText(/start date/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/end date/i)).toBeInTheDocument();
+  });
+});

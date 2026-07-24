@@ -90,6 +90,13 @@ export interface ItemLedgerTx {
   performed_by?: string | null;
   actor_display?: string | null;
   lot_id?: string;
+  /**
+   * Present on reversal transactions — the id of the transaction
+   * this row reverses. Sprint 5.4.1 uses this to compute reversal
+   * eligibility from activity state (a tx already offset by an
+   * inverse row must not be reversible again).
+   */
+  reverses_transaction_id?: string | null;
 }
 
 // ------------------------------------------------------------------ //

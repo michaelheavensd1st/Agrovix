@@ -37,6 +37,35 @@ import {
 import type { InventoryItem, ItemLedgerTx, ItemLot, ItemWarehouse } from '@/lib/inventory-items';
 
 // ------------------------------------------------------------------ //
+// Focus management helper                                            //
+// ------------------------------------------------------------------ //
+/**
+ * Sprint 5.4.1 — collect the tabbable elements inside a dialog.
+ * The heuristic is intentionally simple: it includes native form
+ * controls and links with `href`, excludes anything disabled or
+ * with `tabindex="-1"`. This is enough for our fields + footer
+ * buttons; we don't ship any custom widgets that need special
+ * handling.
+ */
+function getTabbableElements(root: HTMLElement): HTMLElement[] {
+  const selector = [
+    'button:not([disabled])',
+    '[href]',
+    'input:not([disabled])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(',');
+  return Array.from(root.querySelectorAll<HTMLElement>(selector)).filter((el) => {
+    // A `tabindex="-1"` on the element itself is caught above; but
+    // we also want to skip hidden-from-AT nodes.
+    if (el.hasAttribute('disabled')) return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    return true;
+  });
+}
+
+// ------------------------------------------------------------------ //
 // Types                                                              //
 // ------------------------------------------------------------------ //
 export interface StockOperationDialogProps {
@@ -121,6 +150,18 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  // Sprint 5.4.1 — bump the generation ref on unmount so any
+  // in-flight async completion (POST resolution, refresh callback)
+  // observes `!isCurrent()` and skips its state write. Without
+  // this, an unmount that happens between submit and resolve would
+  // leave the completion free to call `onClose` / `toast` /
+  // `onSuccess` / `onUnauthenticated` on a torn-down tree.
+  useEffect(() => {
+    return () => {
+      generationRef.current += 1;
+    };
+  }, []);
 
   // Available lots depend on the currently-selected warehouse (or
   // the reversal transaction's warehouse). For a reversal we don't
@@ -250,6 +291,12 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
+        // Sprint 5.4.1 — guard onUnauthenticated behind isCurrent
+        // so a stale POST completion from a torn-down / navigated-
+        // away dialog cannot trigger a login redirect on the new
+        // route. The parent's own auth guards will surface any
+        // genuine 401 on the current page.
+        if (!isCurrent()) return;
         onUnauthenticated();
         return;
       }
@@ -301,6 +348,74 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
     return () => window.removeEventListener('keydown', handler);
   }, [open, busy, onClose]);
 
+  // ---- Sprint 5.4.1 focus management -------------------------------- //
+  // We need to (a) autofocus a sensible first control when the
+  // dialog opens, (b) trap Tab / Shift+Tab within the dialog while
+  // it is open, and (c) restore focus to the element that owned it
+  // right before the dialog opened.
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    // Remember the trigger so we can restore focus on close.
+    previouslyFocusedRef.current =
+      typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    // Autofocus the first tabbable control inside the dialog.
+    const node = dialogRef.current;
+    if (node) {
+      const first = getTabbableElements(node)[0];
+      // rAF because focus can lose to layout on the same tick.
+      const raf = window.requestAnimationFrame(() => {
+        first?.focus();
+      });
+      return () => {
+        window.cancelAnimationFrame(raf);
+        // Restore focus to whatever owned it before we opened.
+        const previous = previouslyFocusedRef.current;
+        if (previous && typeof previous.focus === 'function') previous.focus();
+      };
+    }
+    return () => {
+      const previous = previouslyFocusedRef.current;
+      if (previous && typeof previous.focus === 'function') previous.focus();
+    };
+    // Rerun when the operation-type changes (the field surface is
+    // rebuilt, so we re-focus the first control) or on open toggle.
+  }, [open, type]);
+
+  useEffect(() => {
+    if (!open) return;
+    const node = dialogRef.current;
+    if (!node) return;
+    const trap = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return;
+      const focusables = getTabbableElements(node);
+      if (focusables.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      if (e.shiftKey) {
+        if (active === first || !node.contains(active)) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (active === last || !node.contains(active)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    };
+    node.addEventListener('keydown', trap);
+    return () => node.removeEventListener('keydown', trap);
+  }, [open, confirming, type]);
+
   if (!open) return null;
 
   const testIdRoot = `stock-op-${type}`;
@@ -308,6 +423,7 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
 
   return (
     <div
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
       aria-labelledby={`${testIdRoot}-title`}
