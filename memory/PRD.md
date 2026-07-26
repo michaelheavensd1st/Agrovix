@@ -913,3 +913,84 @@ balance still credited — stock effectively duplicated.
 - Branch: `feature/sprint-5-4-2-atomic-transfer-reversal`
 - Commit: `fix(inventory): reverse warehouse transfers atomically`
 - Awaiting engineering review.
+
+## Sprint 5.4.3 — Atomic Transfer Reversal Hardening (2026-02, delivered)
+
+### Problem
+Codex review of Sprint 5.4.2 flagged two P1 gaps in the atomic transfer
+reversal path:
+
+1. `reversal()` still fell back to the generic single-row reversal when
+   a `TRANSFER_OUT` / `TRANSFER_IN` row had missing or malformed
+   canonical linkage. A tampered pair could therefore be half-reversed.
+2. Authorization only covered the source warehouse; the reversal also
+   writes to the counterpart warehouse, so a caller could mutate a
+   scope they were never authorized against.
+
+### Solution
+**Backend `apps/api/app/services/inventory.py`**
+- `reversal()` now unconditionally treats `TRANSFER_OUT` / `TRANSFER_IN`
+  as paired. Missing `reference_type='transfer'` or `reference_id` →
+  `transfer_pair_incomplete`, no writes.
+- Pair validation before any write: exactly two rows, exactly one OUT
+  + one IN, same organization, same item, same unit, same quantity,
+  partner warehouse resolvable, non-CLOSED, distinct from source, and
+  partner lot belongs to partner warehouse. Each violation surfaces a
+  distinct diagnostic code (`transfer_pair_item_mismatch`,
+  `transfer_pair_quantity_mismatch`, `transfer_pair_unit_mismatch`,
+  `transfer_pair_cross_org`, `transfer_pair_warehouse_mismatch`,
+  `transfer_pair_lot_mismatch`, `warehouse_closed_no_writes`).
+- New helper `InventoryService.resolve_reversal_scopes()` enumerates
+  every `(organization_id, farm_id)` scope that must pass authorization
+  for a reversal request.
+
+**Backend `apps/api/app/api/v1/endpoints/inventory.py`**
+- `reverse_stock` now enforces `_enforce_prod_permission` for every
+  scope returned by `resolve_reversal_scopes()` — source AND
+  counterpart — BEFORE opening the write transaction.
+
+### Tests (`apps/api/tests/test_sprint_4_inventory.py`)
+New Sprint 5.4.3 block (16 tests):
+- Corrupted linkage: missing `reference_type`, missing `reference_id`,
+  unknown `reference_id`.
+- Invalid topology: two OUT rows, two IN rows.
+- Attribute mismatches: item, quantity, unit, cross-org, partner
+  warehouse resolves to source (topology).
+- Authorization: farm_manager scoped to source-only cannot reverse a
+  cross-farm transfer; same for destination-only.
+- Idempotency: no duplicate inverse / marker rows on same-key replay,
+  fresh key after successful reversal, or attempt via opposite side.
+- Audit integrity: exactly 4 rows added (2 inverse + 2 markers),
+  markers point at OUT and IN via `reverses_transaction_id`,
+  organization-total inventory unchanged before / after.
+- Postgres-only rollback: on `insufficient_stock`, ledger row count
+  unchanged, no inverse rows, no reversal markers, org-total unchanged.
+
+Full test posture: 53 pass (was 38) + 4 Postgres-only skips.
+
+### Frontend
+No functional changes required — the single-entry-point UX shipped in
+Sprint 5.4.2 already conforms to the hardened backend contract.
+
+### Files modified
+- `apps/api/app/services/inventory.py` (hardened `reversal()`, added
+  `resolve_reversal_scopes()`).
+- `apps/api/app/api/v1/endpoints/inventory.py` (dual-scope
+  authorization).
+- `apps/api/tests/test_sprint_4_inventory.py` (Sprint 5.4.3 test block).
+
+### Invariants introduced
+- A `TRANSFER_OUT` / `TRANSFER_IN` ledger row NEVER traverses the
+  single-row reversal path; the linkage is a hard prerequisite.
+- Reversal authorization always covers every warehouse that receives
+  a ledger write.
+- Any refused paired reversal is a perfect no-op — zero rows written
+  in the ledger, no marker, no inverse, org-total inventory
+  unchanged.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): harden atomic transfer reversal
+  (Sprint 5.4.3)`
+- Local validation only — no push, no PR per sprint brief.
+

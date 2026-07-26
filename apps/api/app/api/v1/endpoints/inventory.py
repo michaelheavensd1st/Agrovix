@@ -716,13 +716,24 @@ async def reverse_stock(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> InventoryTransactionPublic:
     wh, _ = await _load_warehouse(warehouse_id, user, session)
-    await _enforce_prod_permission(
-        user=user,
-        session=session,
-        code="inventory_transaction.create",
-        organization_id=wh.organization_id,
-        farm_id=wh.farm_id,
+    # Sprint 5.4.3 — dual-warehouse authorization for transfer
+    # reversals. `resolve_reversal_scopes` returns the source scope
+    # plus, for paired transfers, the counterpart's scope. Every
+    # scope must pass `_enforce_prod_permission` BEFORE the write
+    # transaction opens; a failure on either side rejects the request
+    # with no ledger effect.
+    scopes = await service.resolve_reversal_scopes(
+        warehouse=wh,
+        reverses_transaction_id=payload.reverses_transaction_id,
     )
+    for scope_org_id, scope_farm_id in scopes:
+        await _enforce_prod_permission(
+            user=user,
+            session=session,
+            code="inventory_transaction.create",
+            organization_id=scope_org_id,
+            farm_id=scope_farm_id,
+        )
     tx, is_replay = await service.reversal(
         actor=user,
         warehouse=wh,

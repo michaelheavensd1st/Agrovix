@@ -1064,6 +1064,89 @@ class InventoryService:
         InventoryTransactionType.ADJUSTMENT_DECREASE: InventoryTransactionType.ADJUSTMENT_INCREASE,
     }
 
+    async def resolve_reversal_scopes(
+        self,
+        *,
+        warehouse: Warehouse,
+        reverses_transaction_id: uuid.UUID,
+    ) -> list[tuple[uuid.UUID, uuid.UUID | None]]:
+        """Return the (organization_id, farm_id) scopes the caller must be
+        authorized against BEFORE :meth:`reversal` is invoked.
+
+        Sprint 5.4.3 — transfer reversal writes to two warehouses in
+        one atomic operation, so authorization MUST cover both
+        participating warehouse / farm scopes. The endpoint calls
+        this helper to enumerate scopes to check; the actual
+        permission enforcement stays in the endpoint layer where
+        :func:`_enforce_prod_permission` lives.
+
+        The lookup is read-only and short-circuits on the same
+        invariants :meth:`reversal` re-verifies (linkage present,
+        pair topology sound, same org). Any invariant break is
+        surfaced as an HTTPException so the endpoint can refuse
+        before opening a write transaction. Non-transfer reversals
+        return just the target warehouse's scope.
+        """
+        original = await self.tx_repo.get_by_id(reverses_transaction_id)
+        if original is None or original.warehouse_id != warehouse.id:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Original transaction not found.",
+            )
+        scopes: list[tuple[uuid.UUID, uuid.UUID | None]] = [
+            (warehouse.organization_id, warehouse.farm_id),
+        ]
+        if original.transaction_type not in (
+            InventoryTransactionType.TRANSFER_OUT,
+            InventoryTransactionType.TRANSFER_IN,
+        ):
+            return scopes
+        if original.reference_type != "transfer" or original.reference_id is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_incomplete",
+                    "message": ("Transfer ledger row is missing the canonical transfer linkage."),
+                    "original_transaction_id": str(original.id),
+                },
+            )
+        candidates = await self.tx_repo.list_by_reference("transfer", original.reference_id)
+        transfer_rows = [
+            t
+            for t in candidates
+            if t.transaction_type
+            in (
+                InventoryTransactionType.TRANSFER_OUT,
+                InventoryTransactionType.TRANSFER_IN,
+            )
+        ]
+        partners = [t for t in transfer_rows if t.id != original.id]
+        if len(transfer_rows) != 2 or len(partners) != 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_incomplete",
+                    "message": "Transfer pair is not exactly two rows.",
+                    "reference_id": str(original.reference_id),
+                },
+            )
+        partner = partners[0]
+        partner_warehouse = await self.warehouse_repo.get_by_id(partner.warehouse_id)
+        if (
+            partner_warehouse is None
+            or partner_warehouse.organization_id != warehouse.organization_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_cross_org",
+                    "message": ("Paired transfer belongs to a different organization."),
+                    "reference_id": str(original.reference_id),
+                },
+            )
+        scopes.append((partner_warehouse.organization_id, partner_warehouse.farm_id))
+        return scopes
+
     async def reversal(
         self,
         *,
@@ -1144,56 +1227,152 @@ class InventoryService:
             )
 
         # ------------------------------------------------------------ #
-        # Paired-transfer detection.
+        # Paired-transfer detection + hardening (Sprint 5.4.3).
         # ------------------------------------------------------------ #
         # A completed transfer is exactly two ledger rows sharing
         # ``reference_type='transfer'`` + a common ``reference_id``
-        # (set atomically by :meth:`transfer`). If the caller targets
-        # either side of a paired transfer, we MUST reverse both
-        # sides in the same DB transaction — otherwise inventory
-        # integrity breaks (one warehouse's balance moves without
-        # the counterpart's moving).
+        # (set atomically by :meth:`transfer`). The Sprint 5.4.3
+        # hardening tightens this into an inviolable business
+        # invariant:
+        #
+        #   A warehouse transfer is one atomic business operation
+        #   and must either be fully reversed or not reversed at
+        #   all. Any TRANSFER_OUT / TRANSFER_IN whose canonical
+        #   linkage cannot be verified is refused outright — the
+        #   generic single-row reversal path is never used for
+        #   transfer transactions.
         partner: InventoryTransaction | None = None
         partner_warehouse: Warehouse | None = None
-        if (
-            original.transaction_type
-            in (
-                InventoryTransactionType.TRANSFER_OUT,
-                InventoryTransactionType.TRANSFER_IN,
-            )
-            and original.reference_type == "transfer"
-            and original.reference_id is not None
+        if original.transaction_type in (
+            InventoryTransactionType.TRANSFER_OUT,
+            InventoryTransactionType.TRANSFER_IN,
         ):
-            candidates = await self.tx_repo.list_by_reference("transfer", original.reference_id)
-            partners = [
-                t
-                for t in candidates
-                if t.id != original.id
-                and t.transaction_type
-                in (
-                    InventoryTransactionType.TRANSFER_OUT,
-                    InventoryTransactionType.TRANSFER_IN,
-                )
-            ]
-            if len(partners) != 1:
-                # Defensive — :meth:`transfer` always inserts exactly
-                # two rows per transfer_ref. Reaching here means the
-                # database was manually mutated and we refuse rather
-                # than half-reverse.
+            # Refuse if the row is missing the canonical linkage.
+            # We never fall back to the single-row reversal path
+            # for transfer rows — inventory integrity comes first.
+            if original.reference_type != "transfer" or original.reference_id is None:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
                         "code": "transfer_pair_incomplete",
                         "message": (
-                            "Could not locate exactly one paired transfer "
-                            "transaction. Refusing to reverse to preserve "
-                            "inventory integrity."
+                            "Transfer ledger row is missing the canonical "
+                            "transfer linkage. Refusing to reverse to "
+                            "preserve inventory integrity."
                         ),
-                        "reference_id": str(original.reference_id),
-                        "matched": len(partners),
+                        "original_transaction_id": str(original.id),
+                        "reference_type": original.reference_type,
+                        "reference_id": (
+                            str(original.reference_id)
+                            if original.reference_id is not None
+                            else None
+                        ),
                     },
                 )
-            partner = partners[0]
+            candidates = await self.tx_repo.list_by_reference("transfer", original.reference_id)
+            # Topology: exactly two rows, exactly one OUT + one IN.
+            transfer_rows = [
+                t
+                for t in candidates
+                if t.transaction_type
+                in (
+                    InventoryTransactionType.TRANSFER_OUT,
+                    InventoryTransactionType.TRANSFER_IN,
+                )
+            ]
+            out_rows = [
+                t
+                for t in transfer_rows
+                if t.transaction_type == InventoryTransactionType.TRANSFER_OUT
+            ]
+            in_rows = [
+                t
+                for t in transfer_rows
+                if t.transaction_type == InventoryTransactionType.TRANSFER_IN
+            ]
+            if len(transfer_rows) != 2 or len(out_rows) != 1 or len(in_rows) != 1:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_incomplete",
+                        "message": (
+                            "Transfer pair does not have exactly one "
+                            "TRANSFER_OUT and one TRANSFER_IN. Refusing "
+                            "to reverse to preserve inventory integrity."
+                        ),
+                        "reference_id": str(original.reference_id),
+                        "matched_out": len(out_rows),
+                        "matched_in": len(in_rows),
+                    },
+                )
+            partner = (
+                out_rows[0]
+                if original.transaction_type == InventoryTransactionType.TRANSFER_IN
+                else in_rows[0]
+            )
+            if partner.id == original.id:
+                # Defensive — should be impossible given the OUT/IN
+                # split above, but keep the guard.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_incomplete",
+                        "message": "Partner row resolves to the original.",
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            # Pair-level attribute invariants: same org, same item,
+            # same unit, same quantity. A mismatch means the pair was
+            # tampered with post-write and we refuse to reverse.
+            if partner.organization_id != original.organization_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_cross_org",
+                        "message": (
+                            "Transfer pair spans multiple organizations; refusing to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            if partner.item_id != original.item_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_item_mismatch",
+                        "message": (
+                            "Transfer pair references different inventory "
+                            "items; refusing to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            if partner.unit != original.unit:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_unit_mismatch",
+                        "message": (
+                            "Transfer pair rows disagree on canonical unit; refusing to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            if Decimal(str(partner.quantity)) != Decimal(str(original.quantity)):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_quantity_mismatch",
+                        "message": (
+                            "Transfer pair rows disagree on quantity; refusing to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            # Partner warehouse must be resolvable and belong to the
+            # same organization AND must NOT be the same warehouse as
+            # the source (a transfer straddles two warehouses by
+            # definition).
             partner_warehouse = await self.warehouse_repo.get_by_id(partner.warehouse_id)
             if (
                 partner_warehouse is None
@@ -1207,6 +1386,20 @@ class InventoryService:
                             "Paired transfer belongs to a different "
                             "organization; refusing to reverse."
                         ),
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            if partner.warehouse_id == original.warehouse_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_warehouse_mismatch",
+                        "message": (
+                            "Transfer pair rows share a warehouse; a "
+                            "transfer must straddle two distinct "
+                            "warehouses. Refusing to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
                     },
                 )
             # CLOSED on either warehouse strictly blocks the reversal.
@@ -1221,6 +1414,20 @@ class InventoryService:
                             "reversing the transfer."
                         ),
                         "warehouse_id": str(partner_warehouse.id),
+                    },
+                )
+            # Partner lot must belong to the partner warehouse.
+            partner_lot_probe = await self.lot_repo.get_by_id(partner.lot_id)
+            if partner_lot_probe is None or partner_lot_probe.warehouse_id != partner.warehouse_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_lot_mismatch",
+                        "message": (
+                            "Paired transfer lot does not belong to the "
+                            "paired warehouse; refusing to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
                     },
                 )
 

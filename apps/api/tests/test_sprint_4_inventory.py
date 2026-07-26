@@ -26,7 +26,12 @@ from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func, select
+from sqlalchemy import update as sa_update
 
+from app.db import session as _db_session_module
+from app.models.inventory import InventoryTransaction as _InventoryTransaction
+from app.models.inventory import InventoryTransactionType as _InventoryTransactionType
 from tests._helpers import (
     create_org,
     create_verified_user,
@@ -1186,3 +1191,532 @@ async def test_transfer_reversal_replays_idempotency_key(client: AsyncClient) ->
     dst_lots = (await client.get(f"/api/v1/warehouses/{setup['dst']}/lots")).json()
     assert Decimal(str(src_lots[0]["balance"])) == Decimal("7.000000")
     assert Decimal(str(dst_lots[0]["balance"])) == Decimal("0")
+
+
+# ===================================================================== #
+# Sprint 5.4.3 — Atomic Transfer Reversal Hardening
+# ===================================================================== #
+#
+# Every test in this block exercises the invariant:
+#
+#   A warehouse transfer is one atomic business operation and must
+#   either be fully reversed or not reversed at all.
+#
+# The corruption tests reach into the DB directly to induce states
+# the API path cannot produce (missing linkage, mismatched pair
+# attributes, tampered topology) and prove the reversal service
+# refuses cleanly with a diagnostic error code and NO writes.
+_UUIDType = uuid4().__class__  # local alias — avoids reimporting UUID
+
+
+async def _sum_org_inventory(client: AsyncClient, org_id: str) -> Decimal:
+    """Return SUM(balance) across every lot in every warehouse of ``org_id``.
+
+    This is the "organization total inventory" invariant used by the
+    audit-integrity tests: a full transfer reversal must leave this
+    total unchanged (identical before / after), and a refused
+    reversal MUST leave it identical too (no partial writes).
+    """
+    wrs = (await client.get(f"/api/v1/organizations/{org_id}/warehouses")).json()
+    total = Decimal("0")
+    for wh in wrs:
+        lots = (await client.get(f"/api/v1/warehouses/{wh['id']}/lots")).json()
+        for lot in lots:
+            total += Decimal(str(lot["balance"]))
+    return total
+
+
+async def _count_tx_rows(lot_ids: list[str]) -> int:
+    """Return the total number of ledger rows across ``lot_ids``.
+
+    Reads directly from the DB so we can assert "no rows written"
+    even when a refused reversal never surfaces new API-visible
+    state.
+    """
+    async with _db_session_module.AsyncSessionLocal() as session:
+        stmt = select(func.count(_InventoryTransaction.id)).where(
+            _InventoryTransaction.lot_id.in_([_UUIDType(x) for x in lot_ids])
+        )
+        return (await session.execute(stmt)).scalar_one()
+
+
+async def _count_reversal_markers(lot_ids: list[str]) -> int:
+    async with _db_session_module.AsyncSessionLocal() as session:
+        stmt = select(func.count(_InventoryTransaction.id)).where(
+            _InventoryTransaction.lot_id.in_([_UUIDType(x) for x in lot_ids]),
+            _InventoryTransaction.transaction_type == _InventoryTransactionType.REVERSAL,
+        )
+        return (await session.execute(stmt)).scalar_one()
+
+
+async def _count_inverse_rows(lot_ids: list[str]) -> int:
+    """Rows written by the reversal-inverse path."""
+    async with _db_session_module.AsyncSessionLocal() as session:
+        stmt = select(func.count(_InventoryTransaction.id)).where(
+            _InventoryTransaction.lot_id.in_([_UUIDType(x) for x in lot_ids]),
+            _InventoryTransaction.reference_type == "reversal_inverse_of",
+        )
+        return (await session.execute(stmt)).scalar_one()
+
+
+async def _mutate_tx(tx_id: str, **updates) -> None:
+    """Directly update a transaction row for corruption-scenario tests."""
+    async with _db_session_module.AsyncSessionLocal() as session:
+        await session.execute(
+            sa_update(_InventoryTransaction)
+            .where(_InventoryTransaction.id == _UUIDType(tx_id))
+            .values(**updates)
+        )
+        await session.commit()
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.1 — Corrupted linkage: hard-refuse, never fall through.
+# --------------------------------------------------------------------- #
+async def test_transfer_reversal_refuses_when_reference_type_missing(
+    client: AsyncClient,
+) -> None:
+    """Missing reference_type MUST NOT fall back to single-row reversal."""
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before_tx_count = await _count_tx_rows(lot_ids)
+    before_total = await _sum_org_inventory(client, setup["ctx"]["org_id"])
+    # Corrupt the OUT row's reference_type.
+    await _mutate_tx(setup["out_tx"]["id"], reference_type=None)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "attempt"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    assert await _count_tx_rows(lot_ids) == before_tx_count
+    assert await _count_reversal_markers(lot_ids) == 0
+    assert await _count_inverse_rows(lot_ids) == 0
+    assert await _sum_org_inventory(client, setup["ctx"]["org_id"]) == before_total
+
+
+async def test_transfer_reversal_refuses_when_reference_id_missing(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    await _mutate_tx(setup["out_tx"]["id"], reference_id=None)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    assert await _count_tx_rows(lot_ids) == before
+    assert await _count_reversal_markers(lot_ids) == 0
+
+
+async def test_transfer_reversal_refuses_on_invalid_reference_id(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    # Point the OUT row at a reference_id no other row shares.
+    await _mutate_tx(setup["out_tx"]["id"], reference_id=uuid4())
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.2 — Invalid topology.
+# --------------------------------------------------------------------- #
+async def test_transfer_reversal_refuses_when_two_out_rows(client: AsyncClient) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    # Flip the IN row to OUT — pair becomes two OUTs.
+    await _mutate_tx(
+        setup["in_tx"]["id"],
+        transaction_type=_InventoryTransactionType.TRANSFER_OUT,
+    )
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+async def test_transfer_reversal_refuses_when_two_in_rows(client: AsyncClient) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    await _mutate_tx(
+        setup["out_tx"]["id"],
+        transaction_type=_InventoryTransactionType.TRANSFER_IN,
+    )
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.3 — Attribute mismatches on the pair.
+# --------------------------------------------------------------------- #
+async def test_transfer_reversal_refuses_when_pair_item_mismatch(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    # Create a second item and mutate the IN row's item_id to point at it.
+    other_item_id = await _create_feed_item(client, setup["ctx"]["org_id"])
+    await _mutate_tx(setup["in_tx"]["id"], item_id=_UUIDType(other_item_id))
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_item_mismatch"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+async def test_transfer_reversal_refuses_when_pair_quantity_mismatch(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=4.0, initial_qty=10.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    await _mutate_tx(setup["in_tx"]["id"], quantity=Decimal("3"))
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_quantity_mismatch"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+async def test_transfer_reversal_refuses_when_pair_unit_mismatch(
+    client: AsyncClient,
+) -> None:
+    from app.models.inventory import StockUnit as _StockUnit
+
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    await _mutate_tx(setup["in_tx"]["id"], unit=_StockUnit.G)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_unit_mismatch"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+async def test_transfer_reversal_refuses_when_pair_cross_org(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    # Create a real second organization so the FK on
+    # inventory_transactions.organization_id resolves; then point
+    # the IN row at that other org to induce the cross-org state.
+    other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(other_owner_email)
+    await switch_user(client, other_owner_email)
+    other_org_id = await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+    # Switch back to the original owner so the reversal call is
+    # authenticated against the source-side identity.
+    await switch_user(client, setup["ctx"]["owner"])
+    await _mutate_tx(setup["in_tx"]["id"], organization_id=_UUIDType(other_org_id))
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_cross_org"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+async def test_transfer_reversal_refuses_when_partner_warehouse_mismatch(
+    client: AsyncClient,
+) -> None:
+    """Partner row's lot_id must belong to its warehouse_id."""
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    # Reassign the IN row's warehouse_id to the source warehouse
+    # (still same org). The paired warehouse now matches the source
+    # — a transfer that "straddles" one warehouse is not a transfer.
+    await _mutate_tx(
+        setup["in_tx"]["id"],
+        warehouse_id=_UUIDType(setup["src"]),
+    )
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_warehouse_mismatch"
+    assert await _count_tx_rows(lot_ids) == before
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.4 — Dual-warehouse authorization.
+# --------------------------------------------------------------------- #
+async def _setup_two_farm_transfer(client: AsyncClient) -> dict:
+    """Two-farm transfer with the owner user; returns owner + setup info."""
+    owner = await _new_owner_org_farm(client)
+    owner_email = owner["owner"]
+    # Second farm on the same org.
+    r = await client.post(
+        f"/api/v1/organizations/{owner['org_id']}/farms",
+        json={"name": "Farm-B", "code": f"farm-b-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 201, r.text
+    farm_b_id = r.json()["id"]
+    src = await _create_warehouse(
+        client, owner["org_id"], farm_id=owner["farm_id"], code=f"SRC-{uuid4().hex[:4]}"
+    )
+    dst = await _create_warehouse(
+        client, owner["org_id"], farm_id=farm_b_id, code=f"DST-{uuid4().hex[:4]}"
+    )
+    item_id = await _create_feed_item(client, owner["org_id"])
+    await _receipt(client, src, item_id, quantity=20, unit="kg", lot_code="LX")
+    src_lot = await _lot_id_for(client, src)
+    r = await client.post(
+        f"/api/v1/warehouses/{src}/inventory:transfer",
+        json={
+            "lot_id": src_lot,
+            "destination_warehouse_id": dst,
+            "quantity": 5,
+            "unit": "kg",
+        },
+    )
+    assert r.status_code == 201, r.text
+    dst_lot = await _lot_id_for(client, dst)
+    out_tx = await _find_transfer_out_tx(client, src, src_lot)
+    in_tx = await _find_transfer_in_tx(client, dst_lot)
+    return {
+        "owner_email": owner_email,
+        "org_id": owner["org_id"],
+        "farm_a_id": owner["farm_id"],
+        "farm_b_id": farm_b_id,
+        "src": src,
+        "dst": dst,
+        "src_lot": src_lot,
+        "dst_lot": dst_lot,
+        "out_tx": out_tx,
+        "in_tx": in_tx,
+    }
+
+
+async def test_transfer_reversal_refused_when_only_source_permission(
+    client: AsyncClient,
+) -> None:
+    """Farm-A manager (source-only) cannot reverse a transfer that
+    touches Farm-B, even by targeting the OUT row on Farm-A.
+    """
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    operator = f"op-a-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(operator)
+    await invite_and_accept(
+        client,
+        inviter_email=setup["owner_email"],
+        invitee_email=operator,
+        org_id=setup["org_id"],
+        role_name="farm_manager",
+        farm_id=setup["farm_a_id"],
+    )
+    await switch_user(client, operator)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code in (403, 404), r.text
+    if r.status_code == 403:
+        assert "inventory_transaction.create" in r.json()["detail"]
+    assert await _count_tx_rows(lot_ids) == before
+
+
+async def test_transfer_reversal_refused_when_only_destination_permission(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    before = await _count_tx_rows(lot_ids)
+    operator = f"op-b-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(operator)
+    await invite_and_accept(
+        client,
+        inviter_email=setup["owner_email"],
+        invitee_email=operator,
+        org_id=setup["org_id"],
+        role_name="farm_manager",
+        farm_id=setup["farm_b_id"],
+    )
+    await switch_user(client, operator)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code in (403, 404), r.text
+    assert await _count_tx_rows(lot_ids) == before
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.5 — Idempotency + already-reversed via opposite side.
+# --------------------------------------------------------------------- #
+async def test_transfer_reversal_already_reversed_via_opposite_side_no_duplicates(
+    client: AsyncClient,
+) -> None:
+    """After a paired reversal is committed, a second call — from
+    either side, with any key — must not add another inverse row or
+    marker. This proves the "already_reversed" guard covers BOTH
+    sides of the pair.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    r1 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "first"},
+    )
+    assert r1.status_code == 201
+    inverse_count_after_first = await _count_inverse_rows(lot_ids)
+    marker_count_after_first = await _count_reversal_markers(lot_ids)
+    assert inverse_count_after_first == 2  # one per side
+    assert marker_count_after_first == 2
+    # Second attempt via the OPPOSITE side, fresh idempotency key.
+    r2 = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "opposite"},
+        headers={"Idempotency-Key": f"opp-{uuid4().hex[:8]}"},
+    )
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["code"] == "already_reversed"
+    assert await _count_inverse_rows(lot_ids) == inverse_count_after_first
+    assert await _count_reversal_markers(lot_ids) == marker_count_after_first
+
+
+async def test_transfer_reversal_different_key_after_success_rejected(
+    client: AsyncClient,
+) -> None:
+    """Same original + a FRESH idempotency key → 409 already_reversed."""
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    key1 = f"k1-{uuid4().hex[:8]}"
+    r1 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "first"},
+        headers={"Idempotency-Key": key1},
+    )
+    assert r1.status_code == 201
+    inverse_after = await _count_inverse_rows(lot_ids)
+    marker_after = await _count_reversal_markers(lot_ids)
+    r2 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "second"},
+        headers={"Idempotency-Key": f"k2-{uuid4().hex[:8]}"},
+    )
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["code"] == "already_reversed"
+    assert await _count_inverse_rows(lot_ids) == inverse_after
+    assert await _count_reversal_markers(lot_ids) == marker_after
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.6 — Audit integrity + org-total invariant on happy path.
+# --------------------------------------------------------------------- #
+async def test_transfer_reversal_audit_and_inventory_totals(
+    client: AsyncClient,
+) -> None:
+    """Full audit inspection of a happy-path paired reversal.
+
+    * Two REVERSAL markers exist, one per original.
+    * Each marker's ``reverses_transaction_id`` points at its
+      original (OUT / IN).
+    * Two ``reversal_inverse_of`` rows exist, one per original.
+    * Ledger row count matches the expected additions
+      (2 inverse + 2 markers = +4 rows).
+    * Organization-total inventory before == after.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    org_id = setup["ctx"]["org_id"]
+    before_total = await _sum_org_inventory(client, org_id)
+    before_tx = await _count_tx_rows(lot_ids)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "undo"},
+    )
+    assert r.status_code == 201, r.text
+    after_total = await _sum_org_inventory(client, org_id)
+    assert after_total == before_total
+    assert await _count_tx_rows(lot_ids) == before_tx + 4
+    assert await _count_inverse_rows(lot_ids) == 2
+    assert await _count_reversal_markers(lot_ids) == 2
+    # Inspect markers directly.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(_InventoryTransaction).where(
+                        _InventoryTransaction.transaction_type
+                        == _InventoryTransactionType.REVERSAL,
+                        _InventoryTransaction.lot_id.in_([_UUIDType(x) for x in lot_ids]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        marker_reverses = {str(m.reverses_transaction_id) for m in rows}
+    assert marker_reverses == {setup["out_tx"]["id"], setup["in_tx"]["id"]}
+
+
+# --------------------------------------------------------------------- #
+# 5.4.3.7 — Postgres rollback: extend prior test with row counts.
+# --------------------------------------------------------------------- #
+@_postgres_only
+async def test_transfer_reversal_postgres_rollback_leaves_no_writes(
+    client: AsyncClient,
+) -> None:
+    """Postgres-only end-to-end rollback proof.
+
+    Extends the balance-only rollback assertion with row-count
+    checks: on refusal the ledger must have gained ZERO rows.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=6.0, initial_qty=10.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    # Consume destination so any reversal must drive it negative.
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:issue",
+        json={"lot_id": setup["dst_lot"], "quantity": 6, "unit": "kg"},
+    )
+    assert r.status_code == 201
+    before_tx = await _count_tx_rows(lot_ids)
+    before_inverse = await _count_inverse_rows(lot_ids)
+    before_markers = await _count_reversal_markers(lot_ids)
+    before_total = await _sum_org_inventory(client, setup["ctx"]["org_id"])
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "refuse"},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "insufficient_stock"
+    assert await _count_tx_rows(lot_ids) == before_tx
+    assert await _count_inverse_rows(lot_ids) == before_inverse
+    assert await _count_reversal_markers(lot_ids) == before_markers
+    assert await _sum_org_inventory(client, setup["ctx"]["org_id"]) == before_total
