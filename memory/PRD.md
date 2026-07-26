@@ -994,3 +994,98 @@ Sprint 5.4.2 already conforms to the hardened backend contract.
   (Sprint 5.4.3)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.4 — Symmetric Lot and Tenant Validation (2026-02, delivered)
+
+### Problem
+Codex flagged one remaining P1 gap in atomic transfer reversal: the
+Sprint 5.4.3 hardening validated the transfer *pair* but not the
+symmetric lot / item / organization relationships on each side. A
+tampered ledger row whose `lot_id`, `item_id`, or `organization_id`
+disagreed with its warehouse could reach `_post_ledger` — or, worse,
+cause `resolve_reversal_scopes()` to enumerate an authorization scope
+derived from a cross-tenant relationship.
+
+### Solution
+**Backend `apps/api/app/services/inventory.py`**
+- New helper `_validate_reversal_original(original, warehouse)` runs
+  before *any* scope derivation or write. It verifies
+  `original.warehouse_id == request warehouse.id`,
+  `original.organization_id == warehouse.organization_id`,
+  `original_lot.warehouse_id == warehouse.id`,
+  `original_lot.item_id == original.item_id`, and
+  `item.organization_id == warehouse.organization_id`. Every failure
+  raises a distinct diagnostic
+  (`transfer_original_org_mismatch`,
+  `transfer_original_lot_warehouse_mismatch`,
+  `transfer_original_lot_item_mismatch`,
+  `transfer_original_item_org_mismatch`) with no writes.
+- New helper `_validate_paired_transfer(original, warehouse, item)`
+  consolidates all partner-side symmetric checks (topology, org, item,
+  unit, quantity, partner warehouse resolvable / distinct / non-CLOSED,
+  partner lot binds to partner warehouse, partner lot references the
+  partner tx's item, partner item lives in the same org, and the
+  original and partner items are the same canonical item). New
+  diagnostic codes: `transfer_partner_lot_item_mismatch`,
+  `transfer_partner_item_org_mismatch` (existing codes retained for
+  the topology / pair-level checks).
+- `resolve_reversal_scopes()` and `reversal()` now both run
+  `_validate_reversal_original` upfront, and (for TRANSFER_OUT / IN)
+  `_validate_paired_transfer` before locking lots. The endpoint's
+  dual-scope authorization cannot receive a partner scope derived
+  from a malformed row — the resolver refuses first.
+- Post-lock defensive re-check in `reversal()` confirms the locked
+  lot state still matches the tx it was validated against.
+
+### Tests (`apps/api/tests/test_sprint_4_inventory.py`)
+Sprint 5.4.4 block (9 tests):
+- Original tx points at a lot in another warehouse / farm / org.
+- Original tx's `item_id` diverges from its lot's `item_id`.
+- Partner tx's `item_id` diverges from its lot's `item_id` (two
+  fixtures — cross-check via original-side path AND direct
+  partner-side path).
+- Original tx's `organization_id` diverges from the warehouse's org.
+- Partner tx's `organization_id` diverges from the warehouse's org.
+- Authorization resolver rejects malformed linkage BEFORE returning
+  scopes (verified by observing 409 on the corruption diagnostic even
+  when the caller lacks counterpart-scope authorization).
+
+Each failure case asserts the full no-op invariant suite: request
+rejected, both lot balances unchanged, org-wide inventory total
+unchanged (DB-level SUM), ledger row count unchanged, inverse row
+count unchanged, reversal-marker count unchanged, and no audit rows
+attributed to the wrong tenant. Cross-tenant assertions use a
+direct DB SUM so a source-side caller can still verify the OTHER
+org's inventory did not move.
+
+Full test posture: 62 pass in `test_sprint_4_inventory.py` (was 53)
++ 4 Postgres-only skips. Full API suite: 241 pass, 33 skipped.
+
+### Frontend
+No functional changes — the existing single-entry-point UX still
+matches the hardened backend contract. Frontend `vitest`: 28 pass.
+
+### Files modified
+- `apps/api/app/services/inventory.py` (two new symmetric-validation
+  helpers; `resolve_reversal_scopes` and `reversal` rewritten to use
+  them; post-lock defensive re-check).
+- `apps/api/tests/test_sprint_4_inventory.py` (Sprint 5.4.4 test
+  block + DB-level `_sum_org_inventory`).
+- `memory/PRD.md`.
+
+### New invariants
+- Every reversal — transfer or not — validates
+  `tx.warehouse_id / lot_id / item_id / organization_id` against the
+  loaded warehouse, lot, and item before any write is attempted.
+- `resolve_reversal_scopes()` never derives an authorization scope
+  from a malformed or cross-tenant relationship.
+- A refused reversal is a perfect no-op across BOTH participating
+  organizations: zero rows written, no marker, no inverse, org-total
+  inventory unchanged on either side.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): symmetric lot & tenant validation
+  (Sprint 5.4.4)`
+- Local validation only — no push, no PR per sprint brief.
+

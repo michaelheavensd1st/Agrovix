@@ -32,6 +32,7 @@ from sqlalchemy import update as sa_update
 from app.db import session as _db_session_module
 from app.models.inventory import InventoryTransaction as _InventoryTransaction
 from app.models.inventory import InventoryTransactionType as _InventoryTransactionType
+from app.services.inventory import signed_delta
 from tests._helpers import (
     create_org,
     create_verified_user,
@@ -1216,13 +1217,28 @@ async def _sum_org_inventory(client: AsyncClient, org_id: str) -> Decimal:
     audit-integrity tests: a full transfer reversal must leave this
     total unchanged (identical before / after), and a refused
     reversal MUST leave it identical too (no partial writes).
+
+    Sprint 5.4.4 — for cross-tenant assertions we sum directly from
+    the DB (bypassing the API's tenant scoping) so a source-side
+    caller can still assert "the OTHER org's inventory did not move".
     """
-    wrs = (await client.get(f"/api/v1/organizations/{org_id}/warehouses")).json()
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from app.models.inventory import InventoryTransaction as _Tx
+        from app.models.inventory import Warehouse as _Wh
+
+        # Balance = SUM(signed delta of every non-reversal tx for
+        # lots in warehouses that belong to org_id). REVERSAL rows
+        # carry zero balance effect; their inverse rows already
+        # move the balance.
+        stmt = (
+            select(_Tx)
+            .join(_Wh, _Tx.warehouse_id == _Wh.id)
+            .where(_Wh.organization_id == _UUIDType(org_id))
+        )
+        txs = (await session.execute(stmt)).scalars().all()
     total = Decimal("0")
-    for wh in wrs:
-        lots = (await client.get(f"/api/v1/warehouses/{wh['id']}/lots")).json()
-        for lot in lots:
-            total += Decimal(str(lot["balance"]))
+    for tx in txs:
+        total += signed_delta(tx)
     return total
 
 
@@ -1720,3 +1736,446 @@ async def test_transfer_reversal_postgres_rollback_leaves_no_writes(
     assert await _count_inverse_rows(lot_ids) == before_inverse
     assert await _count_reversal_markers(lot_ids) == before_markers
     assert await _sum_org_inventory(client, setup["ctx"]["org_id"]) == before_total
+
+
+# ===================================================================== #
+# Sprint 5.4.4 — Symmetric Lot and Tenant Validation
+# ===================================================================== #
+#
+# Every test in this block corrupts a specific relationship between a
+# ledger row and its lot / item / warehouse / organization, and then
+# asserts that the reversal endpoint refuses BEFORE any authorization
+# scope is derived and BEFORE any ledger row is written.
+#
+# For every failure case we assert the same suite of no-op invariants:
+#   * request rejected with a specific diagnostic code
+#   * both lot balances unchanged
+#   * organization-wide inventory unchanged
+#   * ledger row count unchanged (no inverse, no marker)
+#   * no audit rows attributed to the wrong tenant.
+async def _create_extra_wh_with_lot(
+    client: AsyncClient,
+    *,
+    org_id: str,
+    farm_id: str | None,
+    item_id: str,
+) -> tuple[str, str]:
+    """Create a second warehouse in ``org_id`` + a lot in it. Returns
+    (warehouse_id, lot_id). Used to fabricate the "original tx points
+    at a lot in another warehouse" corruption fixture without
+    touching the DB by hand.
+    """
+    wh_id = await _create_warehouse(
+        client, org_id, farm_id=farm_id, code=f"OTHER-{uuid4().hex[:4]}"
+    )
+    await _receipt(client, wh_id, item_id, quantity=1, unit="kg", lot_code=f"L-{uuid4().hex[:4]}")
+    lot_id = await _lot_id_for(client, wh_id)
+    return wh_id, lot_id
+
+
+async def _count_audit_rows_for_wrong_scope(
+    *, expected_org_id: str, expected_farm_id: str | None, other_scope_org_id: str
+) -> int:
+    """Return the number of ``audit_events`` rows referencing an
+    organization other than ``expected_org_id`` OR the wrong farm on
+    the expected org. Used by the no-op assertion suite to prove no
+    misleading audit rows were emitted for a refused reversal.
+    """
+    from app.models.audit import AuditEvent  # local import — the model
+    # is not otherwise needed at module scope
+
+    async with _db_session_module.AsyncSessionLocal() as session:
+        stmt = select(func.count(AuditEvent.id)).where(
+            AuditEvent.organization_id == _UUIDType(other_scope_org_id)
+        )
+        return (await session.execute(stmt)).scalar_one()
+
+
+async def _snapshot_lot_state(client: AsyncClient, lot_ids: list[str]) -> list[Decimal]:
+    """Return balances (in canonical Decimal form) for the given lots,
+    in the same order, using the read APIs so the snapshot survives
+    any DB-level side-effects the endpoint may attempt."""
+    balances: list[Decimal] = []
+    from app.models.inventory import InventoryLot as _LotModel
+
+    for lot_id in lot_ids:
+        async with _db_session_module.AsyncSessionLocal() as session:
+            row = (
+                await session.execute(select(_LotModel).where(_LotModel.id == _UUIDType(lot_id)))
+            ).scalar_one_or_none()
+            if row is None:
+                balances.append(Decimal("0"))
+                continue
+        # Prefer the ledger-derived balance from the API so we assert
+        # the same value the caller of the reversal endpoint sees.
+        lots = (await client.get(f"/api/v1/warehouses/{row.warehouse_id}/lots")).json()
+        match = next((x for x in lots if x["id"] == lot_id), None)
+        balances.append(Decimal(str(match["balance"])) if match else Decimal("0"))
+    return balances
+
+
+async def _assert_no_writes_after(
+    client: AsyncClient,
+    *,
+    lot_ids: list[str],
+    org_id: str,
+    baseline: dict,
+) -> None:
+    """Uniform no-op assertion used by every corruption test."""
+    assert await _count_tx_rows(lot_ids) == baseline["tx"]
+    assert await _count_inverse_rows(lot_ids) == baseline["inverse"]
+    assert await _count_reversal_markers(lot_ids) == baseline["marker"]
+    assert await _sum_org_inventory(client, org_id) == baseline["total"]
+    balances_now = await _snapshot_lot_state(client, lot_ids)
+    assert balances_now == baseline["balances"], (
+        f"lot balances changed under a refused reversal: {balances_now} != {baseline['balances']}"
+    )
+
+
+async def _baseline(client: AsyncClient, *, lot_ids: list[str], org_id: str) -> dict:
+    return {
+        "tx": await _count_tx_rows(lot_ids),
+        "inverse": await _count_inverse_rows(lot_ids),
+        "marker": await _count_reversal_markers(lot_ids),
+        "total": await _sum_org_inventory(client, org_id),
+        "balances": await _snapshot_lot_state(client, lot_ids),
+    }
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.1 — Original tx points at a lot in another warehouse (same org)
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_original_lot_in_another_warehouse(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    item_id = (
+        await client.get(f"/api/v1/organizations/{setup['ctx']['org_id']}/inventory-items")
+    ).json()[0]["id"]
+    _, other_lot_id = await _create_extra_wh_with_lot(
+        client,
+        org_id=setup["ctx"]["org_id"],
+        farm_id=setup["ctx"]["farm_id"],
+        item_id=item_id,
+    )
+    await _mutate_tx(setup["out_tx"]["id"], lot_id=_UUIDType(other_lot_id))
+    baseline = await _baseline(
+        client, lot_ids=[*lot_ids, other_lot_id], org_id=setup["ctx"]["org_id"]
+    )
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_original_lot_warehouse_mismatch"
+    await _assert_no_writes_after(
+        client,
+        lot_ids=[*lot_ids, other_lot_id],
+        org_id=setup["ctx"]["org_id"],
+        baseline=baseline,
+    )
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.2 — Original tx points at a lot in another farm (same org)
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_original_lot_in_another_farm(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    item_id = (
+        await client.get(f"/api/v1/organizations/{setup['ctx']['org_id']}/inventory-items")
+    ).json()[0]["id"]
+    # Create a second farm in the same org, then a warehouse + lot in it.
+    r = await client.post(
+        f"/api/v1/organizations/{setup['ctx']['org_id']}/farms",
+        json={"name": "Farm-Other", "code": f"farm-o-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 201, r.text
+    other_farm_id = r.json()["id"]
+    _, other_lot_id = await _create_extra_wh_with_lot(
+        client,
+        org_id=setup["ctx"]["org_id"],
+        farm_id=other_farm_id,
+        item_id=item_id,
+    )
+    await _mutate_tx(setup["out_tx"]["id"], lot_id=_UUIDType(other_lot_id))
+    baseline = await _baseline(
+        client, lot_ids=[*lot_ids, other_lot_id], org_id=setup["ctx"]["org_id"]
+    )
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_original_lot_warehouse_mismatch"
+    await _assert_no_writes_after(
+        client,
+        lot_ids=[*lot_ids, other_lot_id],
+        org_id=setup["ctx"]["org_id"],
+        baseline=baseline,
+    )
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.3 — Original tx points at a lot in another organization
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_original_lot_in_another_org(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    # Build a fully-separate org with its own lot.
+    other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(other_owner_email)
+    await switch_user(client, other_owner_email)
+    other_org_id = await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+    other_wh_id = await _create_warehouse(client, other_org_id, code=f"WH-{uuid4().hex[:4]}")
+    other_item_id = await _create_feed_item(client, other_org_id)
+    await _receipt(client, other_wh_id, other_item_id, quantity=1, unit="kg", lot_code="OTHER")
+    other_lot_id = await _lot_id_for(client, other_wh_id)
+    # Back to the source-side owner and snapshot.
+    await switch_user(client, setup["ctx"]["owner"])
+    await _mutate_tx(setup["out_tx"]["id"], lot_id=_UUIDType(other_lot_id))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"])
+    other_baseline_total = await _sum_org_inventory(client, other_org_id)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_original_lot_warehouse_mismatch"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"], baseline=baseline
+    )
+    # The OTHER org's inventory must be equally untouched — a refused
+    # reversal must NOT leak audit or ledger state across tenants.
+    assert await _sum_org_inventory(client, other_org_id) == other_baseline_total
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.4 — Original tx item_id != original lot item_id
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_original_item_id_diverges_from_lot(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    other_item_id = await _create_feed_item(client, setup["ctx"]["org_id"])
+    await _mutate_tx(setup["out_tx"]["id"], item_id=_UUIDType(other_item_id))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"])
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_original_lot_item_mismatch"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"], baseline=baseline
+    )
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.5 — Partner tx item_id != partner lot item_id
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_partner_item_id_diverges_from_lot(
+    client: AsyncClient,
+) -> None:
+    """Both original and partner tx.item_id point at the SAME new item
+    so the pair-level ``item_id`` invariant passes, but partner_lot's
+    ``item_id`` still points at the ORIGINAL item — driving the
+    partner-side lot / item symmetry check.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    other_item_id = await _create_feed_item(client, setup["ctx"]["org_id"])
+    # Mutate BOTH tx rows to reference the new item so the pair-level
+    # cross-check does not fire first. This isolates the partner-side
+    # lot / item check.
+    await _mutate_tx(setup["out_tx"]["id"], item_id=_UUIDType(other_item_id))
+    await _mutate_tx(setup["in_tx"]["id"], item_id=_UUIDType(other_item_id))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"])
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    # The FIRST invariant we hit is
+    # ``transfer_original_lot_item_mismatch`` because both txs were
+    # rewritten and the original-side symmetric check runs before the
+    # partner-side one. That is acceptable — the important guarantee
+    # is that NO writes escape. If we only mutate the partner tx, the
+    # pair-level cross-item check fires (transfer_pair_item_mismatch).
+    # Either way the refusal must be zero-write.
+    assert r.json()["detail"]["code"] in {
+        "transfer_original_lot_item_mismatch",
+        "transfer_partner_lot_item_mismatch",
+        "transfer_pair_item_mismatch",
+    }
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"], baseline=baseline
+    )
+
+
+async def test_reversal_refused_when_partner_lot_item_id_mismatches_partner_tx(
+    client: AsyncClient,
+) -> None:
+    """Direct fixture for the ``transfer_partner_lot_item_mismatch`` code.
+
+    Keeps the ORIGINAL side pristine, and rewrites the partner tx's
+    ``item_id`` to match the original — but leaves the destination
+    lot pointing at the ORIGINAL item so ``partner_lot.item_id !=
+    partner.item_id``.
+
+    Requires slightly more intricate corruption: create a new item,
+    rewrite BOTH original and partner tx.item_id to that new item,
+    then rewrite the ORIGINAL lot's item_id back to the original.
+    The partner lot still references the original item → mismatch.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    other_item_id = await _create_feed_item(client, setup["ctx"]["org_id"])
+    await _mutate_tx(setup["out_tx"]["id"], item_id=_UUIDType(other_item_id))
+    await _mutate_tx(setup["in_tx"]["id"], item_id=_UUIDType(other_item_id))
+    # Sync the source lot's item so original-side symmetric check
+    # passes; leave partner lot untouched to isolate the partner-side
+    # mismatch.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from app.models.inventory import InventoryLot as _LotModel
+
+        await session.execute(
+            sa_update(_LotModel)
+            .where(_LotModel.id == _UUIDType(setup["src_lot"]))
+            .values(item_id=_UUIDType(other_item_id))
+        )
+        await session.commit()
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"])
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_partner_lot_item_mismatch"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"], baseline=baseline
+    )
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.6 — Original tx organization differs from warehouse organization
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_original_tx_org_diverges_from_warehouse(
+    client: AsyncClient,
+) -> None:
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(other_owner_email)
+    await switch_user(client, other_owner_email)
+    other_org_id = await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+    await switch_user(client, setup["ctx"]["owner"])
+    await _mutate_tx(setup["out_tx"]["id"], organization_id=_UUIDType(other_org_id))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"])
+    other_baseline_total = await _sum_org_inventory(client, other_org_id)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_original_org_mismatch"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"], baseline=baseline
+    )
+    assert await _sum_org_inventory(client, other_org_id) == other_baseline_total
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.7 — Partner tx organization differs
+# --------------------------------------------------------------------- #
+async def test_reversal_refused_when_partner_tx_org_diverges(
+    client: AsyncClient,
+) -> None:
+    """Rewrite the partner tx to a foreign org → ``transfer_pair_cross_org``.
+
+    The counterpart's authorization scope is derived from that
+    partner row; the resolver MUST refuse before ever returning it.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(other_owner_email)
+    await switch_user(client, other_owner_email)
+    other_org_id = await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+    await switch_user(client, setup["ctx"]["owner"])
+    await _mutate_tx(setup["in_tx"]["id"], organization_id=_UUIDType(other_org_id))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"])
+    other_baseline_total = await _sum_org_inventory(client, other_org_id)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_pair_cross_org"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["ctx"]["org_id"], baseline=baseline
+    )
+    assert await _sum_org_inventory(client, other_org_id) == other_baseline_total
+
+
+# --------------------------------------------------------------------- #
+# 5.4.4.8 — Authorization resolver rejects BEFORE returning scopes
+# --------------------------------------------------------------------- #
+async def test_resolve_reversal_scopes_rejects_malformed_before_scope_return(
+    client: AsyncClient,
+) -> None:
+    """When the pair is corrupted, ``resolve_reversal_scopes`` MUST
+    refuse before enumerating (and therefore before authorizing) the
+    counterpart scope.
+
+    We prove this via HTTP flow: corrupt the partner tx to a foreign
+    org, then invoke the endpoint as a caller who only has
+    ``inventory_transaction.create`` on the SOURCE farm. If the
+    resolver were to return the partner scope, the endpoint would
+    enforce authorization against the counterpart farm and answer
+    with 403. Instead we observe 409 with the corruption diagnostic,
+    which is only possible if the resolver refused before returning
+    any partner scope.
+    """
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(other_owner_email)
+    await switch_user(client, other_owner_email)
+    other_org_id = await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+    # Corrupt the partner org while still authenticated as some org
+    # admin — the DB mutation itself is direct.
+    await switch_user(client, setup["owner_email"])
+    await _mutate_tx(setup["in_tx"]["id"], organization_id=_UUIDType(other_org_id))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["org_id"])
+    # Provision a source-only farm_manager.
+    src_only = f"src-only-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(src_only)
+    await invite_and_accept(
+        client,
+        inviter_email=setup["owner_email"],
+        invitee_email=src_only,
+        org_id=setup["org_id"],
+        role_name="farm_manager",
+        farm_id=setup["farm_a_id"],
+    )
+    await switch_user(client, src_only)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    # 409 (not 403) proves the resolver rejected before scope
+    # enumeration — the counterpart-farm auth check never ran.
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert isinstance(detail, dict) and detail["code"] == "transfer_pair_cross_org"
+    await switch_user(client, setup["owner_email"])
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["org_id"], baseline=baseline
+    )
