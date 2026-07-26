@@ -1113,3 +1113,141 @@ describe('InventoryItemActivity — filter accessibility (Sprint 5.4.1)', () => 
     expect(screen.getByLabelText(/end date/i)).toBeInTheDocument();
   });
 });
+
+
+// ------------------------------------------------------------------ //
+// Sprint 5.4.2 — atomic warehouse-transfer reversal (UI contract)     //
+// ------------------------------------------------------------------ //
+describe('InventoryItemActivity — atomic transfer reversal (Sprint 5.4.2)', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('exposes the reversal action on transfer_out only — never on transfer_in', async () => {
+    // Bespoke mock: return the OUT row when the source lot is queried
+    // and the IN row when the destination lot is queried, so the
+    // merged activity list contains exactly one of each.
+    const LOT_2: ItemLot = {
+      id: 'lot-2',
+      item_id: 'item-1',
+      warehouse_id: 'wh-2',
+      storage_location_id: null,
+      lot_code: 'L1',
+      expiry_date: null,
+      balance: '8',
+      balance_unit: 'kg',
+    } as ItemLot;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([ITEM]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+        return Promise.resolve([WH_1, WH_2]);
+      if (path === '/v1/warehouses/wh-1/lots') return Promise.resolve([LOT_1]);
+      if (path === '/v1/warehouses/wh-2/lots') return Promise.resolve([LOT_2]);
+      if (path.startsWith(`/v1/lots/${LOT_1.id}/transactions`)) {
+        return Promise.resolve({
+          items: [
+            {
+              id: 'tx-out',
+              transaction_type: 'transfer_out',
+              quantity: '8',
+              unit: 'kg',
+              performed_at: '2026-02-01T00:00:00.000Z',
+              reason: null,
+              reference_type: 'transfer',
+              reference_id: 'transfer-ref-1',
+              lot_id: LOT_1.id,
+            },
+          ],
+          next_cursor: null,
+        });
+      }
+      if (path.startsWith(`/v1/lots/${LOT_2.id}/transactions`)) {
+        return Promise.resolve({
+          items: [
+            {
+              id: 'tx-in',
+              transaction_type: 'transfer_in',
+              quantity: '8',
+              unit: 'kg',
+              performed_at: '2026-02-01T00:00:00.000Z',
+              reason: null,
+              reference_type: 'transfer',
+              reference_id: 'transfer-ref-1',
+              lot_id: LOT_2.id,
+            },
+          ],
+          next_cursor: null,
+        });
+      }
+      return Promise.resolve([]);
+    });
+    useParamsMock.mockReturnValue({ itemId: 'item-1' });
+    window.history.replaceState({}, '', '/inventory/items/item-1?organization_id=org-A');
+    render(<InventoryItemDetailPage />);
+    await waitFor(() =>
+      expect(screen.getByTestId('item-detail-stock-actions')).toBeInTheDocument(),
+    );
+    // OUT row exposes the button, labelled "Reverse transfer".
+    await waitFor(() =>
+      expect(screen.getByTestId('item-activity-reverse-tx-out')).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId('item-activity-reverse-tx-out')).toHaveTextContent(
+      /reverse transfer/i,
+    );
+    // IN row does NOT expose the button — inventory integrity depends
+    // on the single-entry-point rule.
+    expect(screen.queryByTestId('item-activity-reverse-tx-in')).not.toBeInTheDocument();
+  });
+
+  it('reversing a transfer_out submits exactly ONE backend request', async () => {
+    await primeDetailPage({
+      transactions: [
+        {
+          id: 'tx-out',
+          transaction_type: 'transfer_out',
+          quantity: '4',
+          unit: 'kg',
+          performed_at: '2026-02-01T00:00:00.000Z',
+          reason: null,
+          reference_type: 'transfer',
+          reference_id: 'transfer-ref-2',
+          lot_id: LOT_1.id,
+        },
+      ],
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('item-activity-reverse-tx-out')).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId('item-activity-reverse-tx-out'));
+    fireEvent.change(screen.getByTestId('stock-op-reverse-reason'), {
+      target: { value: 'wrong destination' },
+    });
+    fireEvent.click(screen.getByTestId('stock-op-reverse-submit'));
+    await waitFor(() => expect(screen.getByTestId('stock-op-reverse-confirm')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('stock-op-reverse-confirm'));
+    await waitFor(() => {
+      const posts = mockedApiFetch.mock.calls.filter(
+        (c) => (c[1] as RequestInit | undefined)?.method === 'POST',
+      );
+      expect(posts.length).toBe(1);
+    });
+    // The single request targets the SOURCE warehouse and carries
+    // the transfer_out id — the backend fans out to both sides.
+    const post = mockedApiFetch.mock.calls.find(
+      (c) => (c[1] as RequestInit | undefined)?.method === 'POST',
+    ) as [string, RequestInit];
+    expect(post[0]).toBe(`/v1/warehouses/${WH_1.id}/inventory:reverse`);
+    expect(JSON.parse(post[1].body as string)).toMatchObject({
+      reverses_transaction_id: 'tx-out',
+      reason: 'wrong destination',
+    });
+  });
+});

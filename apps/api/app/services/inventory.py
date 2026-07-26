@@ -27,6 +27,7 @@ import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import ClassVar
 
 from fastapi import HTTPException, status
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
@@ -1050,6 +1051,19 @@ class InventoryService:
         )
         return tx, False
 
+    # Inverse type map used by :meth:`reversal`. Class-level so the
+    # paired-transfer branch can look up its partner's inverse
+    # without redeclaring the mapping.
+    _REVERSAL_INVERSE: ClassVar[dict[InventoryTransactionType, InventoryTransactionType]] = {
+        InventoryTransactionType.RECEIPT: InventoryTransactionType.ADJUSTMENT_DECREASE,
+        InventoryTransactionType.ISSUE: InventoryTransactionType.ADJUSTMENT_INCREASE,
+        InventoryTransactionType.CONSUMPTION: InventoryTransactionType.ADJUSTMENT_INCREASE,
+        InventoryTransactionType.TRANSFER_OUT: InventoryTransactionType.ADJUSTMENT_INCREASE,
+        InventoryTransactionType.TRANSFER_IN: InventoryTransactionType.ADJUSTMENT_DECREASE,
+        InventoryTransactionType.ADJUSTMENT_INCREASE: InventoryTransactionType.ADJUSTMENT_DECREASE,
+        InventoryTransactionType.ADJUSTMENT_DECREASE: InventoryTransactionType.ADJUSTMENT_INCREASE,
+    }
+
     async def reversal(
         self,
         *,
@@ -1073,6 +1087,36 @@ class InventoryService:
         replays the original 200 response even after the original
         successful call left an ``already_reversed`` state. Only
         callers with a fresh key hit the "already reversed" 409.
+
+        Sprint 5.4.2 — Atomic warehouse-transfer reversal. When the
+        caller targets one side of a paired ``TRANSFER_OUT`` /
+        ``TRANSFER_IN``, the reversal is treated as one atomic
+        business operation across BOTH warehouses. Rather than
+        assume a specific linkage column, we first inspected the
+        transfer creation flow (:meth:`transfer`) and determined
+        that both ledger rows are already atomically written with
+        ``reference_type='transfer'`` + a common ``reference_id``.
+        This method reuses that existing canonical transfer
+        linkage; a new linkage would only be introduced if none
+        currently existed — none was needed here, so no schema
+        change ships. Concretely:
+
+        * the paired transaction is located via the existing
+          ``reference_id`` (no new schema — the existing
+          identifier is the canonical link);
+        * an inverse ledger row is posted on BOTH lots (source AND
+          destination) and a REVERSAL marker is posted for BOTH
+          originals;
+        * every write happens inside the caller's DB transaction, so
+          a failure at any step (including
+          ``insufficient_stock`` on the destination side —
+          e.g. stock already moved on) rolls back both sides and
+          leaves the warehouse balances untouched.
+
+        Reversing either side (OUT or IN) produces the same
+        outcome; the frontend only exposes the reversal action on
+        the canonical ``transfer_out`` row but the backend accepts
+        either as the entry point.
         """
         # CLOSED strictly blocks reversals; MAINTENANCE allows them
         # (reversals are the audit-correction pathway). The inverse
@@ -1099,10 +1143,110 @@ class InventoryService:
                 },
             )
 
-        lot = await self._lock_lot(original.lot_id)
-        item = await self.item_repo.get_by_id(lot.item_id)
+        # ------------------------------------------------------------ #
+        # Paired-transfer detection.
+        # ------------------------------------------------------------ #
+        # A completed transfer is exactly two ledger rows sharing
+        # ``reference_type='transfer'`` + a common ``reference_id``
+        # (set atomically by :meth:`transfer`). If the caller targets
+        # either side of a paired transfer, we MUST reverse both
+        # sides in the same DB transaction — otherwise inventory
+        # integrity breaks (one warehouse's balance moves without
+        # the counterpart's moving).
+        partner: InventoryTransaction | None = None
+        partner_warehouse: Warehouse | None = None
+        if (
+            original.transaction_type
+            in (
+                InventoryTransactionType.TRANSFER_OUT,
+                InventoryTransactionType.TRANSFER_IN,
+            )
+            and original.reference_type == "transfer"
+            and original.reference_id is not None
+        ):
+            candidates = await self.tx_repo.list_by_reference("transfer", original.reference_id)
+            partners = [
+                t
+                for t in candidates
+                if t.id != original.id
+                and t.transaction_type
+                in (
+                    InventoryTransactionType.TRANSFER_OUT,
+                    InventoryTransactionType.TRANSFER_IN,
+                )
+            ]
+            if len(partners) != 1:
+                # Defensive — :meth:`transfer` always inserts exactly
+                # two rows per transfer_ref. Reaching here means the
+                # database was manually mutated and we refuse rather
+                # than half-reverse.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_incomplete",
+                        "message": (
+                            "Could not locate exactly one paired transfer "
+                            "transaction. Refusing to reverse to preserve "
+                            "inventory integrity."
+                        ),
+                        "reference_id": str(original.reference_id),
+                        "matched": len(partners),
+                    },
+                )
+            partner = partners[0]
+            partner_warehouse = await self.warehouse_repo.get_by_id(partner.warehouse_id)
+            if (
+                partner_warehouse is None
+                or partner_warehouse.organization_id != warehouse.organization_id
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_cross_org",
+                        "message": (
+                            "Paired transfer belongs to a different "
+                            "organization; refusing to reverse."
+                        ),
+                    },
+                )
+            # CLOSED on either warehouse strictly blocks the reversal.
+            if partner_warehouse.status == WarehouseStatus.CLOSED:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "warehouse_closed_no_writes",
+                        "message": (
+                            "The counterpart warehouse for this transfer "
+                            "is CLOSED and read-only. Reopen it before "
+                            "reversing the transfer."
+                        ),
+                        "warehouse_id": str(partner_warehouse.id),
+                    },
+                )
+
+        # ------------------------------------------------------------ #
+        # Lot locking. For paired transfers we lock BOTH lots in a
+        # deterministic order (sorted by id) so concurrent reversals
+        # of paired rows cannot deadlock.
+        # ------------------------------------------------------------ #
+        if partner is not None and partner.lot_id != original.lot_id:
+            first_id, second_id = sorted([original.lot_id, partner.lot_id], key=str)
+            lot_first = await self._lock_lot(first_id)
+            lot_second = await self._lock_lot(second_id)
+            original_lot = lot_first if lot_first.id == original.lot_id else lot_second
+            partner_lot = lot_first if lot_first.id == partner.lot_id else lot_second
+        else:
+            original_lot = await self._lock_lot(original.lot_id)
+            partner_lot = original_lot if partner is not None else None
+
+        item = await self.item_repo.get_by_id(original_lot.item_id)
         if item is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found.")
+        partner_item = None
+        if partner_lot is not None:
+            partner_item = await self.item_repo.get_by_id(partner_lot.item_id)
+            if partner_item is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Partner item not found.")
 
         p_hash = _payload_hash(
             {
@@ -1113,49 +1257,47 @@ class InventoryService:
         )
         # Idempotency replay — MUST come before the "already_reversed"
         # check so that a retried call with the same key returns the
-        # original successful response (200) instead of a 409.
+        # original successful response (200) instead of a 409. Keyed
+        # on the caller-selected lot even for paired transfers so
+        # the same client-side retry rules apply.
         replay = await self._check_idempotency(
-            lot_id=lot.id, key=idempotency_key, payload_hash=p_hash
+            lot_id=original_lot.id, key=idempotency_key, payload_hash=p_hash
         )
         if replay is not None:
             return replay, True
 
         # Only after the replay-lookup do we enforce the once-only
-        # rule for fresh reversals.
-        already = await self.tx_repo.list_by_reference("inventory_transaction", original.id)
-        if any(t.transaction_type == InventoryTransactionType.REVERSAL for t in already):
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {
-                    "code": "already_reversed",
-                    "message": "This transaction has already been reversed.",
-                    "original_transaction_id": str(original.id),
-                },
-            )
+        # rule for fresh reversals. For paired transfers BOTH sides
+        # must be un-reversed; otherwise refuse rather than leave the
+        # opposite side stranded.
+        for target in (original, partner) if partner is not None else (original,):
+            already = await self.tx_repo.list_by_reference("inventory_transaction", target.id)
+            if any(t.transaction_type == InventoryTransactionType.REVERSAL for t in already):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "already_reversed",
+                        "message": "This transaction has already been reversed.",
+                        "original_transaction_id": str(target.id),
+                    },
+                )
 
-        # Inverse type map.
-        _inverse: dict[InventoryTransactionType, InventoryTransactionType] = {
-            InventoryTransactionType.RECEIPT: InventoryTransactionType.ADJUSTMENT_DECREASE,
-            InventoryTransactionType.ISSUE: InventoryTransactionType.ADJUSTMENT_INCREASE,
-            InventoryTransactionType.CONSUMPTION: InventoryTransactionType.ADJUSTMENT_INCREASE,
-            InventoryTransactionType.TRANSFER_OUT: InventoryTransactionType.ADJUSTMENT_INCREASE,
-            InventoryTransactionType.TRANSFER_IN: InventoryTransactionType.ADJUSTMENT_DECREASE,
-            InventoryTransactionType.ADJUSTMENT_INCREASE: InventoryTransactionType.ADJUSTMENT_DECREASE,
-            InventoryTransactionType.ADJUSTMENT_DECREASE: InventoryTransactionType.ADJUSTMENT_INCREASE,
-        }
-        inverse_type = _inverse[original.transaction_type]
-
-        # 1) Inverse row (carries the balance effect). Bypasses the
-        # MAINTENANCE gate so a correction can be posted even while
-        # the warehouse is under maintenance. CLOSED still blocks.
-        inverse_tx = await self._post_ledger(
+        # ------------------------------------------------------------ #
+        # Post inverse + marker rows. Every _post_ledger call runs
+        # inside the caller's session; a failure at any step raises
+        # HTTPException and SQLAlchemy rolls the whole transaction
+        # back, so warehouse balances remain unchanged. This is the
+        # atomic guarantee for paired transfer reversals.
+        # ------------------------------------------------------------ #
+        # 1a) Inverse row on the caller-selected side.
+        await self._post_ledger(
             actor=actor,
             organization_id=warehouse.organization_id,
             farm_id=warehouse.farm_id,
             warehouse=warehouse,
             item=item,
-            lot=lot,
-            tx_type=inverse_type,
+            lot=original_lot,
+            tx_type=self._REVERSAL_INVERSE[original.transaction_type],
             quantity_canonical=Decimal(str(original.quantity)),
             reason=f"Reversal of {original.id}: {payload['reason']}",
             idempotency_key=None,
@@ -1165,16 +1307,39 @@ class InventoryService:
             request_ctx=request_ctx,
             bypass_maintenance_gate=True,
         )
-        # 2) REVERSAL marker (audit only — zero balance effect). The
-        # REVERSAL type is on the MAINTENANCE allow-list so we don't
-        # need to bypass the gate here.
+        # 1b) Inverse row on the partner side (paired-transfer only).
+        if partner is not None:
+            assert partner_warehouse is not None
+            assert partner_lot is not None
+            assert partner_item is not None
+            await self._post_ledger(
+                actor=actor,
+                organization_id=partner_warehouse.organization_id,
+                farm_id=partner_warehouse.farm_id,
+                warehouse=partner_warehouse,
+                item=partner_item,
+                lot=partner_lot,
+                tx_type=self._REVERSAL_INVERSE[partner.transaction_type],
+                quantity_canonical=Decimal(str(partner.quantity)),
+                reason=f"Reversal of {partner.id}: {payload['reason']}",
+                idempotency_key=None,
+                payload_hash=p_hash,
+                reference_type="reversal_inverse_of",
+                reference_id=partner.id,
+                request_ctx=request_ctx,
+                bypass_maintenance_gate=True,
+            )
+        # 2a) REVERSAL marker on the caller-selected side. Carries the
+        # caller's Idempotency-Key so the partial unique index on
+        # (lot_id, idempotency_key) still enforces exactly-once
+        # semantics for the request as a whole.
         marker = await self._post_ledger(
             actor=actor,
             organization_id=warehouse.organization_id,
             farm_id=warehouse.farm_id,
             warehouse=warehouse,
             item=item,
-            lot=lot,
+            lot=original_lot,
             tx_type=InventoryTransactionType.REVERSAL,
             quantity_canonical=Decimal(str(original.quantity)),
             reason=payload["reason"],
@@ -1185,7 +1350,31 @@ class InventoryService:
             reverses_transaction_id=original.id,
             request_ctx=request_ctx,
         )
-        del inverse_tx
+        # 2b) REVERSAL marker on the partner side (paired-transfer only).
+        # No idempotency key — the caller-selected side owns the key so
+        # the partial index still upholds one-key-per-lot uniqueness
+        # even if the two lots happen to collide in the future.
+        if partner is not None:
+            assert partner_warehouse is not None
+            assert partner_lot is not None
+            assert partner_item is not None
+            await self._post_ledger(
+                actor=actor,
+                organization_id=partner_warehouse.organization_id,
+                farm_id=partner_warehouse.farm_id,
+                warehouse=partner_warehouse,
+                item=partner_item,
+                lot=partner_lot,
+                tx_type=InventoryTransactionType.REVERSAL,
+                quantity_canonical=Decimal(str(partner.quantity)),
+                reason=payload["reason"],
+                idempotency_key=None,
+                payload_hash=p_hash,
+                reference_type="inventory_transaction",
+                reference_id=partner.id,
+                reverses_transaction_id=partner.id,
+                request_ctx=request_ctx,
+            )
         return marker, False
 
     # ---------------------------------------------------------------- #

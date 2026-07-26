@@ -974,3 +974,215 @@ async def test_update_item_is_audited(client: AsyncClient) -> None:
         if e.get("entity_id") == item_id and e.get("action") == "inventory_item.update"
     ]
     assert matches, f"expected inventory_item.update audit row for {item_id}"
+
+
+# --------------------------------------------------------------------- #
+# Sprint 5.4.2 — Atomic warehouse-transfer reversal
+# --------------------------------------------------------------------- #
+async def _find_transfer_out_tx(client: AsyncClient, wh_id: str, lot_id: str) -> dict:
+    """Return the TRANSFER_OUT row for the source lot after a transfer."""
+    r = await client.get(f"/api/v1/lots/{lot_id}/transactions")
+    assert r.status_code == 200, r.text
+    rows = r.json()["items"]
+    outs = [t for t in rows if t["transaction_type"] == "transfer_out"]
+    assert outs, f"expected TRANSFER_OUT on lot {lot_id}, got {rows}"
+    return outs[0]
+
+
+async def _find_transfer_in_tx(client: AsyncClient, lot_id: str) -> dict:
+    r = await client.get(f"/api/v1/lots/{lot_id}/transactions")
+    assert r.status_code == 200, r.text
+    rows = r.json()["items"]
+    ins = [t for t in rows if t["transaction_type"] == "transfer_in"]
+    assert ins, f"expected TRANSFER_IN on lot {lot_id}, got {rows}"
+    return ins[0]
+
+
+async def _setup_transfer_pair(
+    client: AsyncClient, *, transfer_qty: float = 8.0, initial_qty: float = 20.0
+) -> dict:
+    ctx = await _new_owner_org_farm(client)
+    src = await _create_warehouse(client, ctx["org_id"], code=f"SRC-{uuid4().hex[:4]}")
+    dst = await _create_warehouse(client, ctx["org_id"], code=f"DST-{uuid4().hex[:4]}")
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    await _receipt(client, src, item_id, quantity=initial_qty, unit="kg", lot_code="L1")
+    src_lot = await _lot_id_for(client, src)
+    r = await client.post(
+        f"/api/v1/warehouses/{src}/inventory:transfer",
+        json={
+            "lot_id": src_lot,
+            "destination_warehouse_id": dst,
+            "quantity": transfer_qty,
+            "unit": "kg",
+        },
+    )
+    assert r.status_code == 201, r.text
+    dst_lot = await _lot_id_for(client, dst)
+    out_tx = await _find_transfer_out_tx(client, src, src_lot)
+    in_tx = await _find_transfer_in_tx(client, dst_lot)
+    return {
+        "ctx": ctx,
+        "src": src,
+        "dst": dst,
+        "src_lot": src_lot,
+        "dst_lot": dst_lot,
+        "out_tx": out_tx,
+        "in_tx": in_tx,
+        "initial_qty": initial_qty,
+        "transfer_qty": transfer_qty,
+    }
+
+
+async def test_transfer_reversal_atomic_via_transfer_out(client: AsyncClient) -> None:
+    """Reversing a TRANSFER_OUT atomically undoes BOTH sides.
+
+    Sprint 5.4.2 — the destination warehouse must also see the
+    inbound stock removed, not just the source-side credit-back.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=8.0, initial_qty=20.0)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={
+            "reverses_transaction_id": setup["out_tx"]["id"],
+            "reason": "wrong destination",
+        },
+    )
+    assert r.status_code == 201, r.text
+    src_lots = (await client.get(f"/api/v1/warehouses/{setup['src']}/lots")).json()
+    dst_lots = (await client.get(f"/api/v1/warehouses/{setup['dst']}/lots")).json()
+    # Source recovers the 8 kg it lent.
+    assert Decimal(str(src_lots[0]["balance"])) == Decimal("20.000000")
+    # Destination gives back the 8 kg it received.
+    assert Decimal(str(dst_lots[0]["balance"])) == Decimal("0")
+
+
+async def test_transfer_reversal_atomic_via_transfer_in(client: AsyncClient) -> None:
+    """Reversing a TRANSFER_IN atomically undoes BOTH sides too.
+
+    The frontend only exposes reversal on the ``transfer_out`` row,
+    but the backend must accept either side as the entry point and
+    produce the same outcome. Otherwise a hostile client that hits
+    the API directly could induce the half-reversal state the fix
+    exists to prevent.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=5.0, initial_qty=12.0)
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+        json={
+            "reverses_transaction_id": setup["in_tx"]["id"],
+            "reason": "duplicate submission",
+        },
+    )
+    assert r.status_code == 201, r.text
+    src_lots = (await client.get(f"/api/v1/warehouses/{setup['src']}/lots")).json()
+    dst_lots = (await client.get(f"/api/v1/warehouses/{setup['dst']}/lots")).json()
+    assert Decimal(str(src_lots[0]["balance"])) == Decimal("12.000000")
+    assert Decimal(str(dst_lots[0]["balance"])) == Decimal("0")
+
+
+@_postgres_only
+async def test_transfer_reversal_rolls_back_when_destination_short(
+    client: AsyncClient,
+) -> None:
+    """All-or-nothing: destination shortage aborts BOTH inverse writes.
+
+    If the destination warehouse has already moved the transferred
+    stock along (e.g. issued it to production), reversing the
+    original transfer would need to decrease the destination lot
+    below zero. The service must refuse with ``insufficient_stock``
+    and leave the SOURCE balance untouched too — otherwise the two
+    warehouses' balances diverge.
+
+    Postgres-only: SQLite's DBAPI does not honour outer ``ROLLBACK``
+    after an inner ``RELEASE SAVEPOINT`` when the connection runs
+    under SQLAlchemy's deferred-transaction mode, so the nested
+    savepoint's rows leak through. Real transaction rollback is
+    verified against the production Postgres engine.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=6.0, initial_qty=10.0)
+    # Consume the destination stock before attempting the reversal.
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:issue",
+        json={"lot_id": setup["dst_lot"], "quantity": 6, "unit": "kg"},
+    )
+    assert r.status_code == 201, r.text
+    # Reverse — must be refused; NOTHING lands on either side.
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={
+            "reverses_transaction_id": setup["out_tx"]["id"],
+            "reason": "should refuse",
+        },
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "insufficient_stock"
+    src_lots = (await client.get(f"/api/v1/warehouses/{setup['src']}/lots")).json()
+    dst_lots = (await client.get(f"/api/v1/warehouses/{setup['dst']}/lots")).json()
+    # Source stayed at post-transfer (initial - transfer) — did NOT
+    # rise back. Destination stayed at zero — did NOT go negative.
+    assert Decimal(str(src_lots[0]["balance"])) == Decimal("4.000000")
+    assert Decimal(str(dst_lots[0]["balance"])) == Decimal("0")
+
+
+async def test_transfer_reversal_second_call_returns_already_reversed(
+    client: AsyncClient,
+) -> None:
+    """Once a paired transfer is reversed, either side is refused as
+    ``already_reversed``. The marker is posted on BOTH sides by the
+    first reversal, so hitting the OUT again OR the IN afterwards
+    consistently hits the guard.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    r1 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "first"},
+    )
+    assert r1.status_code == 201, r1.text
+    # Re-attempt from the OUT side.
+    r2 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "again"},
+    )
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["code"] == "already_reversed"
+    # And from the IN side — must also refuse.
+    r3 = await client.post(
+        f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "again"},
+    )
+    assert r3.status_code == 409
+    assert r3.json()["detail"]["code"] == "already_reversed"
+
+
+async def test_transfer_reversal_replays_idempotency_key(client: AsyncClient) -> None:
+    """Same Idempotency-Key + same payload → 200 replay on the second call.
+
+    The atomic-transfer branch reuses the caller-selected side's
+    lot for the key, so the replay contract still applies.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=7.0)
+    key = f"rev-xfer-{uuid4().hex[:8]}"
+    body = {
+        "reverses_transaction_id": setup["out_tx"]["id"],
+        "reason": "duplicate submit",
+    }
+    r1 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json=body,
+        headers={"Idempotency-Key": key},
+    )
+    assert r1.status_code == 201, r1.text
+    marker_id = r1.json()["id"]
+    r2 = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json=body,
+        headers={"Idempotency-Key": key},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    assert r2.json()["id"] == marker_id
+    # Balances landed exactly once.
+    src_lots = (await client.get(f"/api/v1/warehouses/{setup['src']}/lots")).json()
+    dst_lots = (await client.get(f"/api/v1/warehouses/{setup['dst']}/lots")).json()
+    assert Decimal(str(src_lots[0]["balance"])) == Decimal("7.000000")
+    assert Decimal(str(dst_lots[0]["balance"])) == Decimal("0")

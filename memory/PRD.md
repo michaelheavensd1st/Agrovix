@@ -842,3 +842,74 @@ sales/finance costing methods remain in the backlog.
   fallback covers dev).
 - No changes to environment variables or CORS defaults.
 
+
+
+## Sprint 5.4 — Stock Operations UI (accepted 2026-02)
+- Frontend for the Sprint 4 inventory kernel: Receive / Issue / Transfer
+  / Adjust / Reverse dialogs with shared idempotency-key discipline,
+  route + generation guards, and post-mutation refresh.
+- Regression tests in `apps/web/tests/stock-operations.test.tsx`.
+
+## Sprint 5.4.1 — Review fixes (accepted 2026-02)
+- Focus trap + focus restoration inside stock-operation dialogs.
+- Unmount / URL-flip invalidation across every dialog side-effect
+  (toasts, refresh, /login redirect).
+- Activity component derives reversal eligibility from loaded
+  reversal rows so an in-flight double-click cannot show a stale
+  Reverse action.
+
+## Sprint 5.4.2 — Atomic Warehouse Transfer Reversal (2026-02, delivered)
+
+### Problem
+Codex identified a P1 inventory-integrity bug: a warehouse transfer
+lands as two ledger rows (`TRANSFER_OUT` + `TRANSFER_IN`) that share
+`reference_type='transfer'` + a `reference_id`, but the existing
+`reversal` path only inverted whichever row the caller pointed at. The
+frontend also exposed the reversal action on `transfer_out` only, so a
+paired reversal from the UI reliably left the destination-side
+`TRANSFER_IN` intact. Result: source balance restored, destination
+balance still credited — stock effectively duplicated.
+
+### Solution
+**Backend (`apps/api/app/services/inventory.py`)**
+- Inspected the existing transfer creation flow (`InventoryService.transfer`)
+  and confirmed that both ledger rows are already atomically linked by
+  `reference_type='transfer'` + a common `reference_id` set inside a single
+  DB transaction. `reversal()` now determines and reuses this existing
+  canonical transfer linkage (reference_id or equivalent) after inspecting
+  the transfer creation flow; a new linkage would only be introduced if
+  none currently existed — none was needed, so no DB migration ships.
+- Locates the partner row via that linkage, asserts same-org + non-CLOSED
+  counterpart, and refuses (`transfer_pair_incomplete` /
+  `transfer_pair_cross_org` / `warehouse_closed_no_writes`) rather than
+  half-reverse.
+- Posts inverse ledger rows AND `REVERSAL` markers on BOTH sides
+  inside the caller's DB transaction. Any failure (`insufficient_stock`
+  on the destination, integrity violation, etc.) rolls back the whole
+  operation and leaves both warehouse balances unchanged.
+- Idempotency-Key discipline preserved (keyed on the caller-selected
+  lot); the partial unique index still enforces exactly-once semantics
+  for the request as a whole.
+- Reversing either OUT or IN reaches the same atomic outcome.
+
+**Frontend (`apps/web/components/inventory-items/inventory-item-activity.tsx`)**
+- Exactly one reversal entry point: the canonical `transfer_out` row
+  now shows a `Reverse transfer` action. The paired `transfer_in`
+  row remains unreversible.
+- Single backend request per user click (the service fans out to both
+  sides).
+
+### Tests
+- `apps/api/tests/test_sprint_4_inventory.py` (Sprint 5.4.2 block):
+  paired reversal via OUT, paired reversal via IN, idempotent replay,
+  already-reversed guard blocks re-reversal from either side, and a
+  Postgres-only rollback test asserting the source balance stays put
+  when reversing would drive the destination negative.
+- `apps/web/tests/stock-operations.test.tsx` (Sprint 5.4.2 block):
+  the reversal action is exposed on `transfer_out` only; a click
+  fires exactly one POST to the source warehouse endpoint.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-2-atomic-transfer-reversal`
+- Commit: `fix(inventory): reverse warehouse transfers atomically`
+- Awaiting engineering review.
