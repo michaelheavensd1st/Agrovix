@@ -1108,6 +1108,23 @@ class InventoryService:
                     "original_transaction_id": str(original.id),
                 },
             )
+        # Sprint 5.4.5 — farm-consistency invariant. A ledger row's
+        # farm_id MUST match its warehouse's farm_id. A concurrent
+        # UPDATE that changed the tx's farm_id would move
+        # authorization scope out from under the caller if we did
+        # not verify this every time.
+        if original.farm_id != warehouse.farm_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_original_farm_mismatch",
+                    "message": (
+                        "Original transaction farm does not match its "
+                        "warehouse; refusing to reverse."
+                    ),
+                    "original_transaction_id": str(original.id),
+                },
+            )
         original_lot = await self.lot_repo.get_by_id(original.lot_id)
         if original_lot is None:
             raise HTTPException(
@@ -1309,6 +1326,23 @@ class InventoryService:
                     "reference_id": str(original.reference_id),
                 },
             )
+        # Sprint 5.4.5 — partner-side farm-consistency invariant.
+        # The partner tx's ``farm_id`` MUST match its warehouse's
+        # ``farm_id``. Blocks a hostile / bug-driven UPDATE that
+        # tries to move the counterpart transaction under a
+        # different farm's authorization scope.
+        if partner.farm_id != partner_warehouse.farm_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_partner_farm_mismatch",
+                    "message": (
+                        "Partner transaction farm does not match its "
+                        "warehouse; refusing to reverse."
+                    ),
+                    "reference_id": str(original.reference_id),
+                },
+            )
         if partner_warehouse.status == WarehouseStatus.CLOSED:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -1385,6 +1419,242 @@ class InventoryService:
             )
         return partner, partner_warehouse, partner_lot, partner_item
 
+    async def _acquire_reversal_context(
+        self,
+        *,
+        warehouse: Warehouse,
+        reverses_transaction_id: uuid.UUID,
+    ) -> dict:
+        """Acquire the authoritative locked reversal context.
+
+        Sprint 5.4.5 — the race-safe backbone of atomic transfer
+        reversal. Every caller (:meth:`resolve_reversal_scopes` and
+        :meth:`reversal`) routes through here so that authorization
+        decisions and ledger writes both operate against the SAME
+        locked row state.
+
+        Locking sequence (deterministic — ascending transaction id
+        prevents deadlock between two callers reversing the same
+        pair from opposite sides):
+
+          1.  ``SELECT ... FOR UPDATE`` the target transaction. If
+              its type is not TRANSFER_OUT / TRANSFER_IN we return
+              immediately; otherwise:
+          2.  Read the pair via ``reference_id`` (unlocked list read
+              — the tx rows are immutable in schema but their
+              foreign-key columns are not, so we lock them next).
+          3.  Sort the two transaction ids ascending, then
+              ``SELECT ... FOR UPDATE`` each in that order. This
+              deterministic order eliminates cross-caller deadlocks
+              even when caller A targets OUT and caller B targets IN.
+          4.  Re-read the two locked rows via
+              ``get_by_id_for_update`` (with ``populate_existing``)
+              so the identity map reflects the LOCKED authoritative
+              state, and re-load the referenced warehouses / items.
+          5.  Run the full symmetric + farm + pair validation suite
+              against that locked state. If ANYTHING has changed
+              since the pre-lock read — even the intermediate list
+              step in (2) — the validation now refuses with the
+              relevant diagnostic and no writes are attempted.
+
+        The returned dict carries the locked ``original`` /
+        ``partner`` tx rows, the re-loaded warehouses / items, and
+        the authorization scopes derived exclusively from the
+        validated locked state. Lot rows are NOT locked here —
+        that's a write-phase concern and lives in :meth:`reversal`.
+
+        Idempotency within a session: subsequent calls under the
+        same session return the same locked rows without releasing
+        the locks; ``populate_existing`` re-syncs the identity map
+        but the DB-level FOR UPDATE lock is per-transaction, not
+        per-statement, so it holds until the outer transaction
+        commits or rolls back.
+        """
+        # (1) Lock the target row first — cheapest sanity check
+        # before we spend any time enumerating partners.
+        original = await self.tx_repo.get_by_id_for_update(reverses_transaction_id)
+        if original is None or original.warehouse_id != warehouse.id:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Original transaction not found.",
+            )
+        if original.transaction_type == InventoryTransactionType.REVERSAL:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "cannot_reverse_a_reversal",
+                    "message": "A REVERSAL row cannot itself be reversed.",
+                },
+            )
+
+        # For non-transfer reversals we're done locking — validate
+        # and return.
+        if original.transaction_type not in (
+            InventoryTransactionType.TRANSFER_OUT,
+            InventoryTransactionType.TRANSFER_IN,
+        ):
+            _, item = await self._validate_reversal_original(original=original, warehouse=warehouse)
+            return {
+                "original": original,
+                "warehouse": warehouse,
+                "item": item,
+                "partner": None,
+                "partner_warehouse": None,
+                "partner_item": None,
+                "scopes": [(warehouse.organization_id, warehouse.farm_id)],
+            }
+
+        # (2) Enumerate the pair via the shared reference_id. The
+        # linkage MUST be present on the target row — if it isn't we
+        # refuse before locking anything else.
+        if original.reference_type != "transfer" or original.reference_id is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_incomplete",
+                    "message": ("Transfer ledger row is missing the canonical transfer linkage."),
+                    "original_transaction_id": str(original.id),
+                },
+            )
+        candidates = await self.tx_repo.list_by_reference("transfer", original.reference_id)
+        transfer_rows = [
+            t
+            for t in candidates
+            if t.transaction_type
+            in (
+                InventoryTransactionType.TRANSFER_OUT,
+                InventoryTransactionType.TRANSFER_IN,
+            )
+        ]
+        if len(transfer_rows) != 2:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_incomplete",
+                    "message": "Transfer pair is not exactly two rows.",
+                    "reference_id": str(original.reference_id),
+                },
+            )
+        partner_candidate = next(t for t in transfer_rows if t.id != original.id)
+
+        # (3) Lock BOTH rows in deterministic order (ascending
+        # transaction id). If we already hold the target's lock
+        # (case A: target had the lower id) then the second lock is
+        # the partner; if the target had the higher id we lock the
+        # partner first, which happens transparently because we
+        # already own the target's exclusive lock and no one else
+        # can be sitting on both.
+        ordered_ids = sorted([original.id, partner_candidate.id], key=str)
+        locked: dict[uuid.UUID, InventoryTransaction] = {}
+        for tx_id in ordered_ids:
+            row = await self.tx_repo.get_by_id_for_update(tx_id)
+            if row is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_pair_changed_during_reversal",
+                        "message": (
+                            "Transfer pair row disappeared between "
+                            "validation and lock acquisition; refusing "
+                            "to reverse."
+                        ),
+                        "reference_id": str(original.reference_id),
+                    },
+                )
+            locked[tx_id] = row
+
+        # (4) Adopt the LOCKED rows as authoritative. Any relationship
+        # column change since step (2) is now visible here — and
+        # everything that follows is guarded against further change
+        # by the FOR UPDATE locks we now hold.
+        original_locked = locked[original.id]
+        partner_locked = locked[partner_candidate.id]
+
+        # Sanity: reference_type / reference_id must still form a
+        # valid pair post-lock. A concurrent UPDATE could have
+        # rewritten these between step (2) and step (3).
+        if (
+            original_locked.reference_type != "transfer"
+            or original_locked.reference_id is None
+            or partner_locked.reference_type != "transfer"
+            or partner_locked.reference_id != original_locked.reference_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": (
+                        "Transfer pair linkage changed between initial "
+                        "read and lock acquisition; refusing to reverse."
+                    ),
+                },
+            )
+        # NOTE: we intentionally do NOT re-check the OUT/IN topology
+        # here; :meth:`_validate_paired_transfer` runs the full
+        # topology check under lock and refuses with the correct
+        # ``transfer_pair_incomplete`` diagnostic for pre-existing
+        # corruption. The ``changed_during_reversal`` code is
+        # reserved for state that ACTUALLY changed between our
+        # unlocked read and our post-lock re-read.
+
+        # (4b) Re-fetch the source warehouse from the locked
+        # transaction. The endpoint originally loaded ``warehouse``
+        # from the URL path; but ``original_locked.warehouse_id`` is
+        # the authoritative reference now. If they disagree —
+        # e.g. because a concurrent UPDATE moved the tx to a
+        # different warehouse — refuse.
+        if original_locked.warehouse_id != warehouse.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": (
+                        "Original transaction warehouse changed between "
+                        "initial read and lock acquisition."
+                    ),
+                    "original_transaction_id": str(original_locked.id),
+                },
+            )
+
+        # (5) Run the full validation suite against the locked rows.
+        _, item = await self._validate_reversal_original(
+            original=original_locked, warehouse=warehouse
+        )
+        (
+            partner,
+            partner_warehouse,
+            _partner_lot_probe,
+            partner_item,
+        ) = await self._validate_paired_transfer(
+            original=original_locked, warehouse=warehouse, item=item
+        )
+        # Post-validation sanity: the partner we validated MUST be
+        # the same row we locked. If the OUT/IN topology flipped
+        # between our pre-lock enumeration and re-fetch, this guard
+        # trips.
+        if partner.id != partner_locked.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": "Partner row identity changed under lock.",
+                },
+            )
+
+        scopes: list[tuple[uuid.UUID, uuid.UUID | None]] = [
+            (warehouse.organization_id, warehouse.farm_id),
+            (partner_warehouse.organization_id, partner_warehouse.farm_id),
+        ]
+        return {
+            "original": original_locked,
+            "warehouse": warehouse,
+            "item": item,
+            "partner": partner_locked,
+            "partner_warehouse": partner_warehouse,
+            "partner_item": partner_item,
+            "scopes": scopes,
+        }
+
     async def resolve_reversal_scopes(
         self,
         *,
@@ -1406,33 +1676,20 @@ class InventoryService:
         for transfer rows, :meth:`_validate_paired_transfer`). Under
         NO circumstances does this method surface a scope derived
         from malformed or cross-tenant linkage.
+
+        Sprint 5.4.5 — scope resolution now runs through
+        :meth:`_acquire_reversal_context`, which acquires row-level
+        FOR UPDATE locks on both transfer transaction rows BEFORE
+        deriving any scope. The locks persist for the remainder of
+        the request transaction, so a concurrent UPDATE cannot
+        change the ledger row's ``farm_id`` / ``item_id`` /
+        ``reference_id`` between this call and :meth:`reversal`.
         """
-        original = await self.tx_repo.get_by_id(reverses_transaction_id)
-        if original is None or original.warehouse_id != warehouse.id:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
-                "Original transaction not found.",
-            )
-        # Symmetric original-side validation runs for every reversal.
-        # Only after it passes do we begin composing authorization
-        # scopes.
-        _, item = await self._validate_reversal_original(original=original, warehouse=warehouse)
-        scopes: list[tuple[uuid.UUID, uuid.UUID | None]] = [
-            (warehouse.organization_id, warehouse.farm_id),
-        ]
-        if original.transaction_type not in (
-            InventoryTransactionType.TRANSFER_OUT,
-            InventoryTransactionType.TRANSFER_IN,
-        ):
-            return scopes
-        # Paired-transfer reversals additionally require the full
-        # partner-side symmetric validation before we surface the
-        # counterpart's scope.
-        _, partner_warehouse, _, _ = await self._validate_paired_transfer(
-            original=original, warehouse=warehouse, item=item
+        context = await self._acquire_reversal_context(
+            warehouse=warehouse,
+            reverses_transaction_id=reverses_transaction_id,
         )
-        scopes.append((partner_warehouse.organization_id, partner_warehouse.farm_id))
-        return scopes
+        return list(context["scopes"])
 
     async def reversal(
         self,
@@ -1501,60 +1758,26 @@ class InventoryService:
                     "warehouse_id": str(warehouse.id),
                 },
             )
-        original = await self.tx_repo.get_by_id(payload["reverses_transaction_id"])
-        if original is None or original.warehouse_id != warehouse.id:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Original transaction not found.")
-        if original.transaction_type == InventoryTransactionType.REVERSAL:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {
-                    "code": "cannot_reverse_a_reversal",
-                    "message": "A REVERSAL row cannot itself be reversed.",
-                },
-            )
-
         # ------------------------------------------------------------ #
-        # Symmetric original-side validation (Sprint 5.4.4).
+        # Race-safe context acquisition (Sprint 5.4.5).
         # ------------------------------------------------------------ #
-        # Verify original.warehouse_id / lot_id / item_id /
-        # organization_id agree with the loaded warehouse, lot and
-        # item BEFORE we consider paired-transfer semantics or
-        # locking. Any mismatch is refused with a specific diagnostic
-        # code and NO writes are attempted.
-        _, item = await self._validate_reversal_original(original=original, warehouse=warehouse)
-
-        # ------------------------------------------------------------ #
-        # Paired-transfer detection + hardening
-        # (Sprint 5.4.3, extended in Sprint 5.4.4).
-        # ------------------------------------------------------------ #
-        # A completed transfer is exactly two ledger rows sharing
-        # ``reference_type='transfer'`` + a common ``reference_id``
-        # (set atomically by :meth:`transfer`). The Sprint 5.4.3
-        # hardening tightened this into an inviolable business
-        # invariant, and Sprint 5.4.4 added full symmetric
-        # lot / tenant validation on BOTH sides:
-        #
-        #   A warehouse transfer is one atomic business operation
-        #   and must either be fully reversed or not reversed at
-        #   all. Any TRANSFER_OUT / TRANSFER_IN whose canonical
-        #   linkage cannot be verified is refused outright — the
-        #   generic single-row reversal path is never used for
-        #   transfer transactions.
-        partner: InventoryTransaction | None = None
-        partner_warehouse: Warehouse | None = None
-        partner_item: InventoryItem | None = None
-        if original.transaction_type in (
-            InventoryTransactionType.TRANSFER_OUT,
-            InventoryTransactionType.TRANSFER_IN,
-        ):
-            (
-                partner,
-                partner_warehouse,
-                _partner_lot_probe,
-                partner_item,
-            ) = await self._validate_paired_transfer(
-                original=original, warehouse=warehouse, item=item
-            )
+        # ``_acquire_reversal_context`` locks the transaction row(s)
+        # FOR UPDATE, re-fetches authoritative state, and re-runs
+        # the full symmetric + farm-consistency validation. If the
+        # endpoint already invoked ``resolve_reversal_scopes`` in
+        # the same request, the locks it acquired are still held
+        # here (same session / same DB transaction), so this call is
+        # effectively a validated re-hydration of the shared locked
+        # context.
+        context = await self._acquire_reversal_context(
+            warehouse=warehouse,
+            reverses_transaction_id=payload["reverses_transaction_id"],
+        )
+        original = context["original"]
+        item = context["item"]
+        partner: InventoryTransaction | None = context["partner"]
+        partner_warehouse: Warehouse | None = context["partner_warehouse"]
+        partner_item: InventoryItem | None = context["partner_item"]
 
         # ------------------------------------------------------------ #
         # Lot locking. For paired transfers we lock BOTH lots in a

@@ -1089,3 +1089,142 @@ matches the hardened backend contract. Frontend `vitest`: 28 pass.
   (Sprint 5.4.4)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.5 — Farm Consistency + Race-Safe Transfer Reversal (2026-02, delivered)
+
+### Problem
+Two P1 gaps remained after Sprint 5.4.4:
+1. Farm-consistency was not enforced on either transfer side —
+   `original.farm_id` / `partner.farm_id` were never compared against
+   the owning warehouse. A tampered `farm_id` would silently move
+   authorization scope across farms.
+2. Validation ran against UNLOCKED ledger rows. Between the
+   pre-lock validation and the write phase a concurrent UPDATE
+   could rewrite `farm_id` / `item_id` / `reference_id` etc.,
+   letting a partial reversal escape past the invariants under
+   PostgreSQL READ COMMITTED.
+
+### Solution
+**Backend `apps/api/app/repositories/inventory.py`**
+- New `InventoryTransactionRepository.get_by_id_for_update(tx_id)`
+  emits `SELECT ... FOR UPDATE` with `populate_existing=True` so
+  the identity map refreshes from the LOCKED authoritative state.
+
+**Backend `apps/api/app/services/inventory.py`**
+- New helper `_acquire_reversal_context()` — the race-safe backbone.
+  Locking sequence (Pattern A, deterministic):
+  1. `SELECT ... FOR UPDATE` the target transaction.
+  2. If it is a `TRANSFER_OUT` / `TRANSFER_IN` row, enumerate the
+     pair via `reference_id` (unlocked list read).
+  3. Sort the two transaction ids ascending, then
+     `SELECT ... FOR UPDATE` each in that order — deterministic
+     ordering eliminates the AB / BA deadlock between two callers
+     targeting opposite sides.
+  4. Re-fetch the locked rows via `get_by_id_for_update`
+     (populate_existing) so the identity map holds the AUTHORITATIVE
+     locked state; re-verify `reference_type` / `reference_id`
+     still match between OUT and IN — a discrepancy raises
+     `transfer_pair_changed_during_reversal`.
+  5. Run `_validate_reversal_original` + `_validate_paired_transfer`
+     against the locked rows. If ANYTHING changed since step (2),
+     validation refuses with the relevant diagnostic and no writes
+     are attempted.
+- Both `resolve_reversal_scopes()` and `reversal()` now route
+  through `_acquire_reversal_context()`. The endpoint's dual-auth
+  scope enumeration and the write phase share the SAME locked
+  state (locks persist for the outer request transaction).
+- Added farm-consistency checks:
+  - `_validate_reversal_original`: `original.farm_id != warehouse.farm_id`
+    → `transfer_original_farm_mismatch`.
+  - `_validate_paired_transfer`: `partner.farm_id != partner_warehouse.farm_id`
+    → `transfer_partner_farm_mismatch`.
+
+### Exact locking sequence
+```
+BEGIN TRANSACTION (per HTTP request, managed by DBSession dependency)
+
+  # Endpoint: resolve_reversal_scopes()
+  SELECT ... FOR UPDATE  inventory_transactions WHERE id = :target_tx
+  SELECT                 inventory_transactions WHERE reference_type='transfer'
+                                                 AND reference_id = :ref
+  -- deterministic order:
+  SELECT ... FOR UPDATE  inventory_transactions WHERE id = MIN(target, partner)
+  SELECT ... FOR UPDATE  inventory_transactions WHERE id = MAX(target, partner)
+  -- validate; derive scopes.
+
+  # Endpoint: enforce permission on each returned scope.
+
+  # Endpoint: reversal()
+  -- context re-hydrates from the identity map (locks still held).
+  SELECT ... FOR UPDATE  inventory_lots WHERE id = MIN(src_lot, dst_lot)
+  SELECT ... FOR UPDATE  inventory_lots WHERE id = MAX(src_lot, dst_lot)
+  -- defensive post-lock re-check of lot ↔ tx invariants.
+  INSERT inventory_transactions ...  (inverse source-side)
+  INSERT inventory_transactions ...  (inverse partner-side)
+  INSERT inventory_transactions ...  (REVERSAL marker source)
+  INSERT inventory_transactions ...  (REVERSAL marker partner)
+
+COMMIT
+```
+
+### New diagnostics
+- `transfer_original_farm_mismatch`
+- `transfer_partner_farm_mismatch`
+- `transfer_pair_changed_during_reversal`
+
+### PostgreSQL concurrency-test design
+Three `_postgres_only` tests in `apps/api/tests/test_sprint_4_inventory.py`:
+
+1. `test_reversal_serialises_concurrent_writers_on_same_pair`
+   Fires two `asyncio.gather` reversal calls on the same OUT row
+   with different idempotency keys. FOR UPDATE serialises them:
+   exactly one wins (201), the other refuses (`already_reversed`).
+   Ledger row count = baseline + 4 (one paired reversal executed).
+
+2. `test_reversal_serialises_concurrent_writers_via_opposite_sides`
+   Same, but caller A targets OUT and caller B targets IN.
+   Deterministic ORDER BY tx.id ASC lock acquisition prevents the
+   classic AB / BA deadlock. Exactly one wins.
+
+3. `test_reversal_detects_relationship_change_between_read_and_lock`
+   A "mutator" coroutine holds FOR UPDATE on the partner tx,
+   rewrites its `farm_id`, then commits. Concurrently the API
+   reversal request blocks on that lock; once the mutator commits
+   the API re-reads the (now-corrupted) row under its own lock and
+   refuses with `transfer_partner_farm_mismatch`. Zero-write
+   invariant asserted.
+
+These tests exercise real DB-level lock semantics and MUST NOT be
+skipped in Postgres CI.
+
+### Files modified
+- `apps/api/app/repositories/inventory.py`
+- `apps/api/app/services/inventory.py`
+- `apps/api/tests/test_sprint_4_inventory.py`
+- `memory/PRD.md`
+
+### Test results
+- `apps/api/tests/test_sprint_4_inventory.py`: 64 pass (was 62) +
+  7 Postgres-only skips (was 4).
+- Full API suite: 243 pass, 36 skipped, 0 failures.
+- Frontend `vitest`: 28 pass (unchanged).
+- Ruff check + format: clean on modified files.
+
+### New invariants
+- Every reversal — transfer or not — validates
+  `tx.farm_id == warehouse.farm_id` (in addition to the earlier
+  organization / lot / item / warehouse symmetry).
+- Both transfer transaction rows are held under
+  `SELECT ... FOR UPDATE` (deterministic order) from before any
+  scope enumeration through commit. Concurrent UPDATEs to the
+  pair's relationship columns cannot slip between validation and
+  write.
+- A paired reversal is inventory-neutral across BOTH warehouses:
+  `SUM(balance)` unchanged before / after.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): farm consistency + race-safe transfer
+  reversal (Sprint 5.4.5)`
+- Local validation only — no push, no PR per sprint brief.
+

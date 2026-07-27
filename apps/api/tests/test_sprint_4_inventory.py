@@ -2179,3 +2179,209 @@ async def test_resolve_reversal_scopes_rejects_malformed_before_scope_return(
     await _assert_no_writes_after(
         client, lot_ids=lot_ids, org_id=setup["org_id"], baseline=baseline
     )
+
+
+# ===================================================================== #
+# Sprint 5.4.5 — Farm consistency + race-safe transfer reversal
+# ===================================================================== #
+async def test_reversal_refused_when_original_farm_id_diverges_from_warehouse(
+    client: AsyncClient,
+) -> None:
+    """Direct mutation of the ORIGINAL tx's farm_id — must refuse
+    with ``transfer_original_farm_mismatch`` and write nothing.
+    Uses ``_setup_two_farm_transfer`` so ``farm_id`` values differ
+    between the two warehouses and a swap actually changes state.
+    """
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    # Repoint the source tx's farm_id to farm-B (the destination's
+    # farm). This is a corruption we cannot produce via the API.
+    await _mutate_tx(setup["out_tx"]["id"], farm_id=_UUIDType(setup["farm_b_id"]))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["org_id"])
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_original_farm_mismatch"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["org_id"], baseline=baseline
+    )
+
+
+async def test_reversal_refused_when_partner_farm_id_diverges_from_warehouse(
+    client: AsyncClient,
+) -> None:
+    """Direct mutation of the PARTNER tx's farm_id."""
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    await _mutate_tx(setup["in_tx"]["id"], farm_id=_UUIDType(setup["farm_a_id"]))
+    baseline = await _baseline(client, lot_ids=lot_ids, org_id=setup["org_id"])
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_partner_farm_mismatch"
+    await _assert_no_writes_after(
+        client, lot_ids=lot_ids, org_id=setup["org_id"], baseline=baseline
+    )
+
+
+# --------------------------------------------------------------------- #
+# 5.4.5 — Postgres concurrency proofs.
+# --------------------------------------------------------------------- #
+# All tests below acquire the tx-row locks that Sprint 5.4.5 introduces
+# and demand real DB-level lock semantics. On SQLite the locks are
+# silent no-ops (StaticPool serialises everything anyway), so these
+# tests are pinned to Postgres CI.
+@_postgres_only
+async def test_reversal_serialises_concurrent_writers_on_same_pair(
+    client: AsyncClient,
+) -> None:
+    """Two concurrent reversal HTTP calls on the same transfer pair.
+
+    The FOR UPDATE lock on the transaction rows must serialise the
+    two attempts: exactly one wins with 201, the other blocks until
+    the first commits and then answers 409 ``already_reversed``.
+    Neither may produce a half-reversed state.
+    """
+    import asyncio as _asyncio
+
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_total = await _sum_org_inventory(client, setup["ctx"]["org_id"])
+
+    async def _fire(key: str) -> tuple[int, dict]:
+        r = await client.post(
+            f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+            json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": key},
+            headers={"Idempotency-Key": key},
+        )
+        return r.status_code, r.json()
+
+    r1, r2 = await _asyncio.gather(_fire("racer-a"), _fire("racer-b"))
+    codes = sorted([r1[0], r2[0]])
+    assert codes == [201, 409], f"unexpected outcome pair: {codes}"
+    losing = r1 if r1[0] == 409 else r2
+    assert losing[1]["detail"]["code"] == "already_reversed"
+    # Exactly one paired reversal ran: +2 inverse + 2 markers = +4 rows.
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    assert await _count_inverse_rows(lot_ids) == 2
+    assert await _count_reversal_markers(lot_ids) == 2
+    # Inventory total unchanged: a paired reversal is inventory-neutral.
+    assert await _sum_org_inventory(client, setup["ctx"]["org_id"]) == baseline_total
+
+
+@_postgres_only
+async def test_reversal_serialises_concurrent_writers_via_opposite_sides(
+    client: AsyncClient,
+) -> None:
+    """Same as above but the two writers reverse from OPPOSITE ends
+    of the pair (one targets TRANSFER_OUT, the other TRANSFER_IN).
+
+    Sprint 5.4.5's deterministic ``ORDER BY tx.id ASC`` lock
+    acquisition MUST prevent the classic AB / BA deadlock. Exactly
+    one writer wins.
+    """
+    import asyncio as _asyncio
+
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+
+    async def _from_out() -> tuple[int, dict]:
+        r = await client.post(
+            f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+            json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "out"},
+            headers={"Idempotency-Key": "opp-out"},
+        )
+        return r.status_code, r.json()
+
+    async def _from_in() -> tuple[int, dict]:
+        r = await client.post(
+            f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+            json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "in"},
+            headers={"Idempotency-Key": "opp-in"},
+        )
+        return r.status_code, r.json()
+
+    r1, r2 = await _asyncio.gather(_from_out(), _from_in())
+    codes = sorted([r1[0], r2[0]])
+    assert codes == [201, 409], f"unexpected outcome pair: {codes}"
+    losing = r1 if r1[0] == 409 else r2
+    assert losing[1]["detail"]["code"] == "already_reversed"
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+
+
+@_postgres_only
+async def test_reversal_detects_relationship_change_between_read_and_lock(
+    client: AsyncClient,
+) -> None:
+    """Force a race: reversal begins, and a concurrent UPDATE
+    changes ``farm_id`` on the partner tx BEFORE the reversal
+    acquires its FOR UPDATE lock.
+
+    We drive this by starting a session that opens a transaction,
+    holds a FOR UPDATE lock on the partner tx, then mutates its
+    farm_id; concurrently the API request tries to reverse. When
+    the mutating session commits, the API acquires the lock,
+    re-reads the (now-changed) partner row, and refuses with
+    ``transfer_partner_farm_mismatch`` — no writes, no partial
+    state.
+    """
+    import asyncio as _asyncio
+
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_total = await _sum_org_inventory(client, setup["org_id"])
+
+    started = _asyncio.Event()
+    finished = _asyncio.Event()
+
+    async def _mutator() -> None:
+        # Hold the partner row's write lock, mutate its farm_id,
+        # signal the reader, sleep briefly to make sure the API
+        # request is actively waiting on the FOR UPDATE lock, and
+        # commit — releasing the row in a corrupted state.
+        async with _db_session_module.AsyncSessionLocal() as session:
+            from app.models.inventory import InventoryTransaction as _Tx
+
+            await session.execute(
+                select(_Tx).where(_Tx.id == _UUIDType(setup["in_tx"]["id"])).with_for_update()
+            )
+            await session.execute(
+                sa_update(_Tx)
+                .where(_Tx.id == _UUIDType(setup["in_tx"]["id"]))
+                .values(farm_id=_UUIDType(setup["farm_a_id"]))
+            )
+            started.set()
+            # Give the API request time to enqueue on the lock.
+            await _asyncio.sleep(0.5)
+            await session.commit()
+            finished.set()
+
+    async def _reverser() -> tuple[int, dict]:
+        await started.wait()
+        # Fire the reversal while the mutator is still holding the
+        # lock — the request will block inside FOR UPDATE and only
+        # proceed after the mutator commits its farm_id change.
+        r = await client.post(
+            f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+            json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "race"},
+        )
+        return r.status_code, r.json()
+
+    r_reverser, _ = await _asyncio.gather(_reverser(), _mutator())
+    assert finished.is_set()
+    assert r_reverser[0] == 409, r_reverser
+    # The reversal refused because it re-read the row under lock and
+    # saw the mutated farm_id.
+    assert r_reverser[1]["detail"]["code"] == "transfer_partner_farm_mismatch"
+    # Zero-write guarantee.
+    assert await _count_tx_rows(lot_ids) == baseline_tx
+    assert await _count_inverse_rows(lot_ids) == 0
+    assert await _count_reversal_markers(lot_ids) == 0
+    assert await _sum_org_inventory(client, setup["org_id"]) == baseline_total

@@ -196,6 +196,30 @@ class InventoryTransactionRepository:
         stmt = select(InventoryTransaction).where(InventoryTransaction.id == tx_id)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_by_id_for_update(self, tx_id: uuid.UUID) -> InventoryTransaction | None:
+        """Row-lock a ledger row inside the current transaction.
+
+        Sprint 5.4.5 — paired-transfer reversal MUST hold locks on
+        BOTH participating transaction rows before trusting their
+        relationship fields, otherwise a concurrent update to
+        ``farm_id`` / ``item_id`` / ``reference_id`` between our
+        unlocked validation and the write phase would leak a
+        partial reversal past the invariants.
+
+        Postgres emits ``SELECT ... FOR UPDATE``; SQLite silently
+        no-ops (StaticPool serialises writers). ``populate_existing``
+        forces the identity map to refresh from the DB even if the
+        row was previously loaded — so callers always see the
+        authoritative locked state.
+        """
+        stmt = (
+            select(InventoryTransaction)
+            .where(InventoryTransaction.id == tx_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def get_by_lot_and_key(
         self, lot_id: uuid.UUID, idempotency_key: str
     ) -> InventoryTransaction | None:
