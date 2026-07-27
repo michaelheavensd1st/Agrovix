@@ -1350,39 +1350,37 @@ async def test_transfer_reversal_refuses_on_invalid_reference_id(
 # 5.4.3.2 — Invalid topology.
 # --------------------------------------------------------------------- #
 async def test_transfer_reversal_refuses_when_two_out_rows(client: AsyncClient) -> None:
+    """Sprint 5.4.8 — the DB partial unique index
+    ``uq_inventory_tx_transfer_role`` REJECTS the mutation itself,
+    proving topology enforcement at the database layer. Application
+    code never sees a two-OUT topology.
+    """
+    from sqlalchemy.exc import IntegrityError
+
     setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
     lot_ids = [setup["src_lot"], setup["dst_lot"]]
     before = await _count_tx_rows(lot_ids)
-    # Flip the IN row to OUT — pair becomes two OUTs.
-    await _mutate_tx(
-        setup["in_tx"]["id"],
-        transaction_type=_InventoryTransactionType.TRANSFER_OUT,
-    )
-    r = await client.post(
-        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
-        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
-    )
-    assert r.status_code == 409, r.text
-    # Sprint 5.4.7 — two OUT rows is malformed topology.
-    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
+    with pytest.raises(IntegrityError):
+        await _mutate_tx(
+            setup["in_tx"]["id"],
+            transaction_type=_InventoryTransactionType.TRANSFER_OUT,
+        )
+    # No rows changed because the constraint fired.
     assert await _count_tx_rows(lot_ids) == before
 
 
 async def test_transfer_reversal_refuses_when_two_in_rows(client: AsyncClient) -> None:
+    """Sprint 5.4.8 — mirror of the two-OUT proof."""
+    from sqlalchemy.exc import IntegrityError
+
     setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
     lot_ids = [setup["src_lot"], setup["dst_lot"]]
     before = await _count_tx_rows(lot_ids)
-    await _mutate_tx(
-        setup["out_tx"]["id"],
-        transaction_type=_InventoryTransactionType.TRANSFER_IN,
-    )
-    r = await client.post(
-        f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
-        json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "x"},
-    )
-    assert r.status_code == 409, r.text
-    # Sprint 5.4.7 — two IN rows is malformed topology.
-    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
+    with pytest.raises(IntegrityError):
+        await _mutate_tx(
+            setup["out_tx"]["id"],
+            transaction_type=_InventoryTransactionType.TRANSFER_IN,
+        )
     assert await _count_tx_rows(lot_ids) == before
 
 
@@ -2841,15 +2839,23 @@ async def test_reference_mutation_blocks_on_advisory_lock(
     lock the reverser holds.
     """
     from app.services._transfer_locks import (
-        advisory_lock_key_for_transfer,
+        advisory_lock_key_for_transfer_group,
     )
 
     setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
-    ref_id = setup["out_tx"]["reference_id"]
-    org_id = setup["ctx"]["org_id"]
-    key = advisory_lock_key_for_transfer(
-        _UUIDType(org_id), "transfer", _UUIDType(ref_id)
-    )
+    # Sprint 5.4.8 — advisory key is derived from the immutable
+    # transfer_group_id column (backfilled from reference_id during
+    # migration; test setup writes both to the same value).
+    async with _db_session_module.AsyncSessionLocal() as session:
+        row = (
+            await session.execute(
+                select(_InventoryTransaction).where(
+                    _InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"])
+                )
+            )
+        ).scalar_one()
+        group_id = row.transfer_group_id or row.reference_id
+    key = advisory_lock_key_for_transfer_group(group_id)
 
     # Hold the advisory lock in an external session so we can prove
     # the mutator blocks on THE SAME KEY the reverser uses. This
@@ -3160,4 +3166,251 @@ async def test_reversal_opposite_sides_two_party_barrier(
     assert await _count_tx_rows(lot_ids) == baseline_tx + 4
     assert await _count_inverse_rows(lot_ids) == 2
     assert await _count_reversal_markers(lot_ids) == 2
+
+
+# ===================================================================== #
+# Sprint 5.4.8 — Adversarial concurrency proofs (PostgreSQL only).      #
+# ===================================================================== #
+
+# ---- SQLite domain proofs (NOT locking / concurrency) ---------------- #
+async def test_sprint_5_4_8_require_exactly_one_helper() -> None:
+    """SQLite domain-safe: cardinality helper never destructures."""
+    from fastapi import HTTPException
+
+    from app.services._transfer_locks import require_exactly_one, require_set_equality
+
+    class _Row:
+        def __init__(self, rid: str) -> None:
+            self.id = _UUIDType(rid)
+
+    good = require_exactly_one(
+        [_Row("11111111-1111-1111-1111-111111111111")],
+        resource="lot",
+        identifier=_UUIDType("11111111-1111-1111-1111-111111111111"),
+    )
+    assert good.id == _UUIDType("11111111-1111-1111-1111-111111111111")
+
+    # Zero rows → 404 with stable code.
+    with pytest.raises(HTTPException) as ei:
+        require_exactly_one([], resource="lot", identifier=uuid4())
+    assert ei.value.status_code == 404
+    assert ei.value.detail["code"] == "lot_not_found"
+
+    # Duplicate rows → 409 integrity.
+    with pytest.raises(HTTPException) as ei:
+        require_exactly_one(
+            [_Row("11111111-1111-1111-1111-111111111111"),
+             _Row("11111111-1111-1111-1111-111111111111")],
+            resource="lot",
+            identifier=uuid4(),
+        )
+    assert ei.value.status_code == 409
+    assert ei.value.detail["code"] == "lot_integrity_violation"
+
+    # Set-equality mismatch surfaces missing + unexpected ids.
+    a = _UUIDType("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    b = _UUIDType("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    with pytest.raises(HTTPException) as ei:
+        require_set_equality(
+            [_Row(str(a))], resource="lot", requested_ids={a, b}
+        )
+    assert ei.value.status_code == 409
+    assert str(b) in ei.value.detail["missing_ids"]
+
+
+async def test_sprint_5_4_8_transfer_uses_immutable_group_id(
+    client: AsyncClient,
+) -> None:
+    """SQLite domain-safe: transfer creation writes a non-null
+    ``transfer_group_id`` on both OUT and IN rows, and both share
+    the same id — the advisory-key anchor.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    async with _db_session_module.AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(_InventoryTransaction).where(
+                    _InventoryTransaction.id.in_(
+                        [
+                            _UUIDType(setup["out_tx"]["id"]),
+                            _UUIDType(setup["in_tx"]["id"]),
+                        ]
+                    )
+                )
+            )
+        ).scalars().all()
+    assert len(rows) == 2
+    group_ids = {r.transfer_group_id for r in rows}
+    assert None not in group_ids, "transfer_group_id must be set on both rows"
+    assert len(group_ids) == 1, "both rows must share the same transfer_group_id"
+
+
+# ---- Adversarial PostgreSQL proofs ---------------------------------- #
+
+# Test A — opposite-direction transfer deadlock (no AB/BA deadlock).
+@_postgres_only
+async def test_sprint_5_4_8_opposite_direction_transfers_no_deadlock(
+    client: AsyncClient,
+) -> None:
+    """Two transfers A→B and B→A racing simultaneously must serialise
+    without a PostgreSQL deadlock. Deterministic lot lock order
+    (sorted ascending id) makes both racers lock the SAME lowest-id
+    lot first.
+    """
+    ctx = await _new_owner_org_farm(client)
+    org_id, farm_id = ctx["org_id"], ctx["farm_id"]
+    wh_a = await _create_warehouse(client, org_id, farm_id=farm_id, code=f"WA-{uuid4().hex[:4]}")
+    wh_b = await _create_warehouse(client, org_id, farm_id=farm_id, code=f"WB-{uuid4().hex[:4]}")
+    item_id = await _create_feed_item(client, org_id)
+    # Pre-load both warehouses with the SAME lot code so we transfer
+    # into an existing lot on both sides.
+    await _receipt(client, wh_a, item_id, quantity=20, unit="kg", lot_code="LK")
+    await _receipt(client, wh_b, item_id, quantity=20, unit="kg", lot_code="LK")
+    lot_a = await _lot_id_for(client, wh_a)
+    lot_b = await _lot_id_for(client, wh_b)
+
+    async def _fire(src: str, lot: str, dst: str, key: str) -> tuple[int, dict]:
+        r = await client.post(
+            f"/api/v1/warehouses/{src}/inventory:transfer",
+            json={
+                "lot_id": lot,
+                "destination_warehouse_id": dst,
+                "quantity": 1,
+                "unit": "kg",
+            },
+            headers={"Idempotency-Key": key},
+        )
+        return r.status_code, r.json()
+
+    # Use ``return_exceptions=True`` so an ORM-level integrity error
+    # (e.g. concurrent lot upsert) surfaces as an exception object
+    # rather than propagating cancellation into the sibling task.
+    result = await asyncio.gather(
+        _fire(wh_a, lot_a, wh_b, f"opp-a-{uuid4().hex[:6]}"),
+        _fire(wh_b, lot_b, wh_a, f"opp-b-{uuid4().hex[:6]}"),
+        return_exceptions=True,
+    )
+    # Neither racer surfaced a Postgres deadlock as a 500. Any
+    # SQLAlchemy exception at the ORM layer is acceptable so long
+    # as no unhandled deadlock reached the API surface — the
+    # canonical Sprint 5.4.8 guarantee.
+    for outcome in result:
+        if isinstance(outcome, BaseException):
+            msg = str(outcome).lower()
+            assert "deadlock" not in msg, f"deadlock surfaced: {outcome!r}"
+        else:
+            code, body = outcome
+            assert code != 500, f"unexpected 500: {body}"
+            assert code in (201, 409), (code, body)
+
+
+# Test B — DB constraint rejects phantom topology row without advisory.
+@_postgres_only
+async def test_sprint_5_4_8_db_constraint_rejects_phantom_transfer_row(
+    client: AsyncClient,
+) -> None:
+    """A raw SQL INSERT that would add a third TRANSFER_OUT with the
+    same ``transfer_group_id`` MUST be rejected by the DB partial
+    unique index, regardless of any advisory lock.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from sqlalchemy import text as _text
+
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                _text(
+                    "INSERT INTO inventory_transactions ("
+                    "  id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "  transaction_type, quantity, unit, performed_by_id,"
+                    "  performed_at, reference_type, reference_id,"
+                    "  transfer_group_id"
+                    ") SELECT :new_id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "         transaction_type, quantity, unit, performed_by_id,"
+                    "         performed_at, reference_type, reference_id,"
+                    "         transfer_group_id"
+                    "    FROM inventory_transactions WHERE id = :src_id"
+                ),
+                {
+                    "new_id": uuid4(),
+                    "src_id": _UUIDType(setup["out_tx"]["id"]),
+                },
+            )
+            await session.commit()
+
+
+# Test F — advisory key immutability under tenant-field mutation.
+@_postgres_only
+async def test_sprint_5_4_8_advisory_key_immutable_under_org_mutation(
+    client: AsyncClient,
+) -> None:
+    """The Sprint 5.4.8 advisory key is derived solely from the
+    ``transfer_group_id`` column, which the DB trigger makes
+    immutable-once-set. Any attempt to change it must be REJECTED
+    at the DB layer, guaranteeing the same key is used forever.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    async with _db_session_module.AsyncSessionLocal() as session:
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                sa_update(_InventoryTransaction)
+                .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
+                .values(transfer_group_id=uuid4())
+            )
+            await session.commit()
+
+
+# Test G — non-transfer reversal missing lot → controlled 404, zero writes.
+@_postgres_only
+async def test_sprint_5_4_8_non_transfer_reversal_missing_lot(
+    client: AsyncClient,
+) -> None:
+    """Soft-delete the lot between reversal-request dispatch and
+    the locked reread. The service must raise a controlled 404 /
+    409 domain error via ``require_exactly_one`` — never a
+    ``ValueError`` from destructuring — and write zero rows.
+    """
+    from app.models.inventory import InventoryLot as _Lot
+
+    ctx = await _new_owner_org_farm(client)
+    wh = await _create_warehouse(client, ctx["org_id"], farm_id=ctx["farm_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    await _receipt(client, wh, item_id, quantity=5, unit="kg", lot_code="LM")
+    lot_id = await _lot_id_for(client, wh)
+    txs = (
+        await client.get(f"/api/v1/lots/{lot_id}/transactions")
+    ).json()["items"]
+    receipt_tx = txs[0]
+    before_tx = await _count_tx_rows([lot_id])
+    # Soft-delete the lot BEFORE the reversal attempt.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
+
+        await session.execute(
+            sa_update(_Lot)
+            .where(_Lot.id == _UUIDType(lot_id))
+            .values(deleted_at=_dt.now(_UTC))
+        )
+        await session.commit()
+
+    r = await client.post(
+        f"/api/v1/warehouses/{wh}/inventory:reverse",
+        json={"reverses_transaction_id": receipt_tx["id"], "reason": "x"},
+    )
+    # Controlled response — either 404 (not found) or 409
+    # (integrity violation). Must NOT be 500.
+    assert r.status_code in (404, 409), r.text
+    body = r.json()
+    if isinstance(body.get("detail"), dict):
+        assert body["detail"]["code"] in (
+            "inventory_lot_not_found",
+            "inventory_lot_integrity_violation",
+        )
+    # Zero-write guarantee.
+    assert await _count_tx_rows([lot_id]) == before_tx
 

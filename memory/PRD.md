@@ -1556,3 +1556,198 @@ continued" no longer rely on plain `asyncio.Event`.
 - Commit: `fix(inventory): serialized transfer topology + full authorization locking (Sprint 5.4.7)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.8 — Single Deterministic Locking Model + DB Topology Enforcement (2026-02, delivered)
+
+### Problem
+Sprint 5.4.7 closed topology drift under the ADVISORY lock, but:
+
+1. Transfer CREATION still locked source and destination lots
+   SEQUENTIALLY (`_lock_lot(src)` then `_get_or_create_lot_safe`
+   for dst). Under a real A→B / B→A race the lock order was
+   request-direction-dependent and PostgreSQL detected a genuine
+   AB/BA deadlock, surfacing to the API as an unhandled DBAPI
+   error.
+2. The advisory-lock key was derived from the MUTABLE tuple
+   `(organization_id, reference_type, reference_id)` read from an
+   unlocked transaction row. A concurrent UPDATE of tenant fields
+   would change the key. Two writers could then serialise on
+   DIFFERENT keys for the same topology.
+3. Non-transfer reversals (`RECEIPT`, `ISSUE`, `ADJUSTMENT_*`,
+   `CONSUMPTION`) locked only the transaction, warehouse, item,
+   and lot rows — org and farm rows were never locked. A
+   concurrent org/farm mutation could slip between authorization
+   and write.
+4. Unsafe destructuring (`[row] = repo.list_by_ids_for_update([id])`)
+   raised `ValueError` on 0 or ≥ 2 rows, producing 500s rather
+   than controlled domain errors.
+5. Topology invariants ("exactly one OUT and one IN per transfer
+   identity", "transfer identity never changes") were enforced
+   only in application code. Raw SQL could bypass them.
+
+### Design
+
+#### New immutable transfer identity column
+`inventory_transactions.transfer_group_id UUID NULL` (indexed) —
+assigned once at transfer creation, NEVER updateable. Immutability
+enforced by a PostgreSQL `BEFORE UPDATE` trigger
+(`trg_inventory_tx_group_immutable`) that raises
+`integrity_constraint_violation` if a non-NULL value is changed.
+Migration 0009 installs the column, backfills it from
+`reference_id` for pre-existing transfer pairs, and creates the
+trigger. The trigger is ALSO installed automatically by
+`Base.metadata.create_all` via a SQLAlchemy DDL event so the
+hermetic Postgres test path observes the same enforcement without
+running migrations.
+
+#### DB topology constraint
+Partial unique index `uq_inventory_tx_transfer_role` on
+`(transfer_group_id, transaction_type)` WHERE
+`transfer_group_id IS NOT NULL AND transaction_type IN
+('transfer_out', 'transfer_in')`. Enforces at most one
+`TRANSFER_OUT` and one `TRANSFER_IN` per group at the DB layer —
+any INSERT / UPDATE that would produce a duplicate is rejected
+with a raw `IntegrityError`.
+
+#### New advisory-lock key derivation
+`advisory_lock_key_for_transfer_group(transfer_group_id) → int`
+in `apps/api/app/services/_transfer_locks.py`:
+
+```
+canonical = f"inventory-transfer-group:{transfer_group_id}"
+digest    = SHA-256(canonical)
+key64     = int.from_bytes(digest[:8], 'big', unsigned)
+signed    = key64 - 2**64 if key64 >= 2**63 else key64
+```
+
+Emitted as `SELECT pg_advisory_xact_lock(:key)`. Derived solely
+from the IMMUTABLE `transfer_group_id` — no tenant field
+participates. The legacy Sprint 5.4.7 key derivation is retained
+as `advisory_lock_key_for_transfer` for the unit test that pins
+the exact algorithm.
+
+#### Canonical lock order (creation AND reversal)
+1. Immutable transfer serialization key (advisory lock)
+2. Transaction IDs (sorted ASC, `FOR UPDATE`)
+3. Warehouse IDs (sorted ASC, `FOR UPDATE`)
+4. Farm IDs (sorted ASC, `FOR UPDATE`)
+5. Organization ID (`FOR UPDATE`)
+6. Item IDs (sorted ASC, `FOR UPDATE`)
+7. Lot IDs (sorted ASC, `FOR UPDATE`)
+
+`transfer()` now:
+* Resolves source lot with plain `get_by_id` (NO `FOR UPDATE`) —
+  locking it first would make lock order request-direction-
+  dependent.
+* Calls `_get_or_create_lot_safe` for destination lot (savepoint
+  + insert-or-select, no `FOR UPDATE`).
+* Bulk-locks BOTH lots in one query, sorted ASC by id:
+  `lot_repo.list_by_ids_for_update(sorted({src.id, dst.id}))`.
+  Both racers therefore lock the SAME lowest-id lot first — no
+  AB/BA deadlock possible.
+* Verifies exact set equality via `require_set_equality`.
+* Post-lock re-validates warehouse / item associations
+  (`lot_association_changed` on drift).
+* Generates `transfer_group_id = uuid4()`, stamps both ledger
+  rows, uses it as the advisory-lock key.
+
+#### `_acquire_reversal_context` update
+Uses `original_probe.transfer_group_id` (falling back to
+`reference_id` for pre-Sprint-5.4.8 rows) as the advisory-lock
+key. Non-transfer reversals now ALSO lock the referenced farm
+and organization, refusing with the Sprint 5.4.7 diagnostic set
+(`transfer_farm_deleted` / `transfer_farm_inactive` /
+`transfer_organization_deleted` / `transfer_organization_inactive`)
+on any deviation. Uses `require_exactly_one` throughout — no
+`ValueError` from destructuring can escape.
+
+#### Safe cardinality helpers
+`require_exactly_one(rows, resource, identifier)` — 404 on empty,
+409 integrity on duplicates, returns the row on exactly one.
+`require_set_equality(rows, resource, requested_ids)` — 409 with
+missing + unexpected id lists on mismatch.
+
+### Files modified
+- `apps/api/app/models/inventory.py` (new column, partial unique
+  index, DDL events installing the immutability trigger)
+- `apps/api/alembic/versions/0009_transfer_group_id.py` (new
+  migration: column, backfill, partial index, trigger)
+- `apps/api/app/services/_transfer_locks.py` (new advisory-key
+  function, `require_exactly_one`, `require_set_equality`,
+  updated `acquire_transfer_advisory_lock` signature)
+- `apps/api/app/services/inventory.py` (bulk lot lock in
+  `transfer()`, non-transfer reversal org+farm locking, use of
+  the immutable transfer_group_id in `_acquire_reversal_context`,
+  `require_exactly_one` throughout, `_post_ledger` accepts
+  `transfer_group_id`)
+- `apps/api/tests/test_sprint_4_inventory.py` (Sprint 5.4.8 tests
+  — SQLite domain proofs and Postgres adversarial tests; updated
+  reference-mutation test to use the new key)
+- `memory/PRD.md`
+
+### Validation
+- `ruff check` — clean on all modified files.
+- **SQLite** (`sqlite+aiosqlite:///:memory:`) — non-locking
+  coverage: validation, domain-error mapping, topology parsing,
+  cardinality helpers, immutable-group-id column presence.
+  `pytest -q apps/api/tests/test_sprint_4_inventory.py` →
+  **67 passed, 22 skipped**. All Postgres-only concurrency tests
+  skip cleanly on SQLite.
+- **PostgreSQL 15** — locking, deadlock avoidance, DB constraint
+  and trigger enforcement.
+  `pytest -q apps/api/tests/test_sprint_4_inventory.py` →
+  **89 passed**.
+  Adversarial tests included:
+  * `test_sprint_5_4_8_opposite_direction_transfers_no_deadlock`
+    — real A→B / B→A race, `return_exceptions=True`, asserts no
+    `deadlock` string leaks anywhere.
+  * `test_sprint_5_4_8_db_constraint_rejects_phantom_transfer_row`
+    — raw SQL INSERT that would create a third TRANSFER_OUT in
+    the same group is rejected by
+    `uq_inventory_tx_transfer_role`.
+  * `test_sprint_5_4_8_advisory_key_immutable_under_org_mutation`
+    — raw SQL UPDATE of `transfer_group_id` on an existing row
+    is rejected by `trg_inventory_tx_group_immutable`.
+  * `test_sprint_5_4_8_non_transfer_reversal_missing_lot` —
+    soft-deleting the lot before receipt reversal returns a
+    controlled 404/409 via `require_exactly_one`, never a
+    `ValueError` / 500. Zero writes verified.
+  * `test_transfer_reversal_refuses_when_two_out_rows` /
+    `test_transfer_reversal_refuses_when_two_in_rows` —
+    Sprint 5.4.8 proves the DB partial unique index REJECTS the
+    corrupting `UPDATE` at the database layer.
+  Full backend suite:
+  `pytest -q apps/api/tests/` → **274 passed, 23 skipped**
+  (skips are the `:8055` live-API suites).
+
+### Behavioural outcomes (one per required use case)
+1. **Normal transfer** — locks org, farms, warehouses, item, lots
+   in canonical order under advisory lock; validates all
+   associations under lock; posts exactly one topology; balances
+   consistent.
+2. **Opposite-direction transfers** — verified by
+   `test_sprint_5_4_8_opposite_direction_transfers_no_deadlock`.
+   No AB/BA deadlock; deterministic outcome; no 500.
+3. **Warehouse closure during creation** — warehouse row is
+   `FOR UPDATE`'d; closure waits or transfer sees the closed
+   status (409 `warehouse_state_forbidden`).
+4. **Tenant reassignment** — warehouse row locked; scopes
+   derived only from locked rows; stale org/farm scope never used.
+5. **Item deletion** — item row locked; deletion waits or
+   transfer sees the deleted state and refuses.
+6. **Phantom topology insertion** — DB partial unique index
+   rejects. Verified.
+7. **Transfer reversal** — same canonical lock order as
+   creation; advisory key from immutable `transfer_group_id`;
+   `transfer_topology_malformed` on any deviation.
+8. **Non-transfer reversal** — org + farm locked; missing/
+   deleted lot returns controlled 404/409 via
+   `require_exactly_one`. Zero writes verified.
+9. **Malformed state** — `_integrity_violation` diagnostic
+   with 409; never `ValueError` / 500.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): single deterministic locking model + DB topology enforcement (Sprint 5.4.8)`
+- Local validation only — no push, no PR per sprint brief.
+

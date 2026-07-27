@@ -56,7 +56,11 @@ from app.repositories.inventory import (
     WarehouseRepository,
 )
 from app.repositories.org_repo import FarmRepository, OrganizationRepository
-from app.services._transfer_locks import acquire_transfer_advisory_lock
+from app.services._transfer_locks import (
+    acquire_transfer_advisory_lock,
+    require_exactly_one,
+    require_set_equality,
+)
 
 _INCREASE_TYPES = {
     InventoryTransactionType.RECEIPT,
@@ -667,6 +671,7 @@ class InventoryService:
         reference_type: str | None = None,
         reference_id: uuid.UUID | None = None,
         reverses_transaction_id: uuid.UUID | None = None,
+        transfer_group_id: uuid.UUID | None = None,
         request_ctx: dict,
         metadata_json: dict | None = None,
         bypass_maintenance_gate: bool = False,
@@ -728,6 +733,7 @@ class InventoryService:
             reason=reason,
             reference_type=reference_type,
             reference_id=reference_id,
+            transfer_group_id=transfer_group_id,
             reverses_transaction_id=reverses_transaction_id,
             idempotency_key=idempotency_key,
             payload_hash=payload_hash if idempotency_key is not None else None,
@@ -945,7 +951,15 @@ class InventoryService:
             )
         self._assert_warehouse_status_allows(dst_warehouse, InventoryTransactionType.TRANSFER_IN)
 
-        src_lot = await self._lock_lot(payload["lot_id"])
+        # Sprint 5.4.8 — resolve the source lot WITHOUT FOR UPDATE.
+        # Locking the caller-specified lot first would make lock
+        # order request-direction-dependent (A→B locks A first, B→A
+        # locks B first) and reintroduce the AB/BA deadlock. The
+        # authoritative bulk FOR UPDATE below acquires both lot rows
+        # in ascending id order — the SAME order for every caller.
+        src_lot = await self.lot_repo.get_by_id(payload["lot_id"])
+        if src_lot is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Source lot not found.")
         if src_lot.warehouse_id != warehouse.id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -975,24 +989,62 @@ class InventoryService:
             unit_cost_amount=src_lot.unit_cost_amount,
             unit_cost_currency=src_lot.unit_cost_currency,
         )
-        dst_lot = await self._lock_lot(dst_lot.id)
+        # Sprint 5.4.8 — deterministic bulk lot lock in ascending id
+        # order. Request direction (A→B vs B→A) MUST NOT determine
+        # lock order — both callers must lock the same lowest-id lot
+        # first, so AB/BA deadlocks are eliminated entirely. If both
+        # ids collide (self-transfer), the single-element bulk lock
+        # is a no-op set.
+        lot_ids_sorted = sorted({src_lot.id, dst_lot.id}, key=str)
+        locked_lots = await self.lot_repo.list_by_ids_for_update(lot_ids_sorted)
+        require_set_equality(
+            locked_lots, resource="lot", requested_ids=set(lot_ids_sorted)
+        )
+        lots_by_id = {lot.id: lot for lot in locked_lots}
+        src_lot = lots_by_id[src_lot.id]
+        dst_lot = lots_by_id[dst_lot.id]
+        # Post-lock re-validation of the source lot's authoritative
+        # warehouse / item association — a concurrent UPDATE between
+        # the initial resolve and this lock would trip this.
+        if src_lot.warehouse_id != warehouse.id or src_lot.item_id != item.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "lot_association_changed",
+                    "message": (
+                        "Source lot's warehouse or item association "
+                        "changed under lock; refusing to transfer."
+                    ),
+                    "lot_id": str(src_lot.id),
+                },
+            )
+        if dst_lot.warehouse_id != dst_warehouse.id or dst_lot.item_id != item.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "lot_association_changed",
+                    "message": (
+                        "Destination lot's warehouse or item association "
+                        "changed under lock; refusing to transfer."
+                    ),
+                    "lot_id": str(dst_lot.id),
+                },
+            )
 
-        # Shared reference id groups the paired ledger rows.
-        transfer_ref = uuid.uuid4()
+        # Sprint 5.4.8 — immutable transfer-group identity. Same value
+        # as the legacy ``reference_id`` today (both are freshly
+        # generated UUIDs) but the transfer_group_id is column-level
+        # immutable via a Postgres trigger, so a hostile UPDATE
+        # cannot change the advisory-lock key for this pair.
+        transfer_group = uuid.uuid4()
+        transfer_ref = transfer_group
 
-        # Sprint 5.4.7 — acquire the transfer-topology advisory lock
-        # BEFORE writing either side of the pair. This makes the
-        # (organization_id, reference_type, reference_id) namespace
-        # single-writer across ANY code path that inserts / updates
-        # rows into a transfer identity. It also blocks any concurrent
-        # reversal targeting the same identity from progressing past
-        # its own advisory-lock boundary until we commit — no phantom
-        # third row can ever slip in.
+        # Sprint 5.4.7/5.4.8 — acquire the transfer-topology advisory
+        # lock BEFORE writing either side of the pair. Keyed on the
+        # IMMUTABLE ``transfer_group_id`` (Sprint 5.4.8), which
+        # cannot drift under concurrent tenant mutation.
         await acquire_transfer_advisory_lock(
-            self.session,
-            organization_id=warehouse.organization_id,
-            reference_type="transfer",
-            reference_id=transfer_ref,
+            self.session, transfer_group_id=transfer_group
         )
 
         p_hash = _payload_hash(
@@ -1034,6 +1086,7 @@ class InventoryService:
             payload_hash=p_hash,
             reference_type="transfer",
             reference_id=transfer_ref,
+            transfer_group_id=transfer_group,
             request_ctx=request_ctx,
             metadata_json=payload.get("metadata_json"),
         )
@@ -1053,6 +1106,7 @@ class InventoryService:
             payload_hash=p_hash,
             reference_type="transfer",
             reference_id=transfer_ref,
+            transfer_group_id=transfer_group,
             request_ctx=request_ctx,
             metadata_json=payload.get("metadata_json"),
         )
@@ -1560,21 +1614,101 @@ class InventoryService:
             )
 
         # For non-transfer reversals we still lock the single target
-        # row so the write phase sees an authoritative view.
+        # row so the write phase sees an authoritative view. Sprint
+        # 5.4.8 extends this path with organization + farm locking so
+        # authorization is decided from a fully locked graph, and
+        # replaces destructuring with the safe `require_exactly_one`
+        # helper (no ValueError leaks on 0 / ≥ 2 rows).
         if original_probe.transaction_type not in (
             InventoryTransactionType.TRANSFER_OUT,
             InventoryTransactionType.TRANSFER_IN,
         ):
-            [original_locked] = await self.tx_repo.list_by_ids_for_update([original_probe.id])
-            # Lock the warehouse + item + lot in ascending id order.
-            [locked_wh] = await self.warehouse_repo.list_by_ids_for_update(
+            locked_txs = await self.tx_repo.list_by_ids_for_update([original_probe.id])
+            original_locked = require_exactly_one(
+                locked_txs,
+                resource="inventory_transaction",
+                identifier=original_probe.id,
+            )
+            locked_whs = await self.warehouse_repo.list_by_ids_for_update(
                 [original_locked.warehouse_id]
             )
-            [locked_item] = await self.item_repo.list_by_ids_for_update(
+            locked_wh = require_exactly_one(
+                locked_whs,
+                resource="warehouse",
+                identifier=original_locked.warehouse_id,
+            )
+            # Sprint 5.4.8 — lock the farm (if any) and the owning org.
+            farm_ids_single = (
+                [locked_wh.farm_id] if locked_wh.farm_id is not None else []
+            )
+            locked_farms_single = await self.farm_repo.list_by_ids_for_update(
+                farm_ids_single
+            )
+            if farm_ids_single:
+                locked_farm = require_exactly_one(
+                    locked_farms_single,
+                    resource="farm",
+                    identifier=farm_ids_single[0],
+                )
+                if locked_farm.deleted_at is not None:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        {
+                            "code": "transfer_farm_deleted",
+                            "message": "Referenced farm is soft-deleted.",
+                            "farm_id": str(locked_farm.id),
+                        },
+                    )
+                if not locked_farm.is_active:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        {
+                            "code": "transfer_farm_inactive",
+                            "message": "Referenced farm is inactive.",
+                            "farm_id": str(locked_farm.id),
+                        },
+                    )
+            locked_orgs_single = await self.org_repo.list_by_ids_for_update(
+                [locked_wh.organization_id]
+            )
+            locked_org_single = require_exactly_one(
+                locked_orgs_single,
+                resource="organization",
+                identifier=locked_wh.organization_id,
+            )
+            if locked_org_single.deleted_at is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_organization_deleted",
+                        "message": "Organization is soft-deleted.",
+                        "organization_id": str(locked_org_single.id),
+                    },
+                )
+            if not locked_org_single.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_organization_inactive",
+                        "message": "Organization is inactive.",
+                        "organization_id": str(locked_org_single.id),
+                    },
+                )
+            locked_items_single = await self.item_repo.list_by_ids_for_update(
                 [original_locked.item_id]
             )
-            [locked_lot] = await self.lot_repo.list_by_ids_for_update(
+            locked_item = require_exactly_one(
+                locked_items_single,
+                resource="inventory_item",
+                identifier=original_locked.item_id,
+            )
+            locked_lots_single = await self.lot_repo.list_by_ids_for_update(
                 [original_locked.lot_id]
+            )
+            locked_lot = require_exactly_one(
+                locked_lots_single,
+                resource="inventory_lot",
+                identifier=original_locked.lot_id,
             )
             _, item_v = await self._validate_reversal_original(
                 original=original_locked, warehouse=locked_wh
@@ -1589,6 +1723,9 @@ class InventoryService:
                 "partner_warehouse": None,
                 "partner_item": None,
                 "partner_lot": None,
+                "organization": locked_org_single,
+                "original_farm": locked_farms_single[0] if locked_farms_single else None,
+                "partner_farm": None,
                 "scopes": [(locked_wh.organization_id, locked_wh.farm_id)],
             }
 
@@ -1619,19 +1756,21 @@ class InventoryService:
                 if hasattr(res, "__await__"):
                     await res
 
-        # Sprint 5.4.7 — (2a) Acquire the transfer-topology advisory
-        # lock on (organization_id, "transfer", reference_id) BEFORE
-        # authoritative topology discovery. This serialises any
-        # concurrent code path that would add / remove / mutate rows
-        # into this transfer identity (transfer creation, another
-        # reversal, a hostile UPDATE re-parenting an unrelated row).
-        # The lock is transaction-scoped: it releases automatically
-        # at commit / rollback.
+        # Sprint 5.4.7/5.4.8 — (2a) Acquire the transfer-topology
+        # advisory lock BEFORE authoritative topology discovery.
+        # Sprint 5.4.8 keys the lock on the IMMUTABLE
+        # ``transfer_group_id`` column (backfilled from
+        # ``reference_id`` at migration time for legacy rows). This
+        # serialises any concurrent code path that would add /
+        # remove / mutate rows into this transfer identity. The
+        # lock releases automatically at commit / rollback.
+        group_key = (
+            original_probe.transfer_group_id
+            if original_probe.transfer_group_id is not None
+            else original_probe.reference_id
+        )
         await acquire_transfer_advisory_lock(
-            self.session,
-            organization_id=original_probe.organization_id,
-            reference_type="transfer",
-            reference_id=original_probe.reference_id,
+            self.session, transfer_group_id=group_key
         )
 
         # (2b) Re-read the target transaction after acquiring the
