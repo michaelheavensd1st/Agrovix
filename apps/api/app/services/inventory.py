@@ -93,6 +93,24 @@ class InventoryService:
     lock + insert. Do NOT instantiate one per operation.
     """
 
+    # Sprint 5.4.6 — deterministic-locking test hook. When set (by a
+    # PostgreSQL concurrency test), :meth:`_acquire_reversal_context`
+    # waits on this event AFTER the unlocked pair-discovery step and
+    # BEFORE acquiring transaction-row FOR UPDATE locks. Two racers
+    # can register the same event, discover their pair independently,
+    # then release the barrier simultaneously — guaranteeing the two
+    # requests contend for the transaction locks concurrently. Never
+    # set in production code paths.
+    _reversal_lock_barrier: ClassVar[object | None] = None
+
+    # Sprint 5.4.6 — one-way "warehouse locks acquired" signal. The
+    # reverser calls ``.set()`` on this event immediately AFTER it has
+    # acquired the bulk FOR UPDATE lock on every warehouse row in the
+    # reversal context. Mutation-race tests use this signal to know
+    # exactly when it is safe to fire a concurrent UPDATE that MUST
+    # block on the reverser's row lock. Never set in production.
+    _reversal_after_warehouse_locks_signal: ClassVar[object | None] = None
+
     def __init__(
         self,
         session: AsyncSession,
@@ -1433,35 +1451,39 @@ class InventoryService:
         decisions and ledger writes both operate against the SAME
         locked row state.
 
-        Locking sequence (deterministic — ascending transaction id
-        prevents deadlock between two callers reversing the same
-        pair from opposite sides):
+        Sprint 5.4.6 — the ORIGINAL sequence locked the caller's
+        target row before pair order was known, which under
+        PostgreSQL creates the classic AB / BA deadlock between two
+        callers reversing the same pair from opposite ends. The
+        corrected sequence never locks a caller-selected side before
+        the pair has been ordered:
 
-          1.  ``SELECT ... FOR UPDATE`` the target transaction. If
-              its type is not TRANSFER_OUT / TRANSFER_IN we return
-              immediately; otherwise:
-          2.  Read the pair via ``reference_id`` (unlocked list read
-              — the tx rows are immutable in schema but their
-              foreign-key columns are not, so we lock them next).
-          3.  Sort the two transaction ids ascending, then
-              ``SELECT ... FOR UPDATE`` each in that order. This
-              deterministic order eliminates cross-caller deadlocks
-              even when caller A targets OUT and caller B targets IN.
-          4.  Re-read the two locked rows via
-              ``get_by_id_for_update`` (with ``populate_existing``)
-              so the identity map reflects the LOCKED authoritative
-              state, and re-load the referenced warehouses / items.
-          5.  Run the full symmetric + farm + pair validation suite
-              against that locked state. If ANYTHING has changed
-              since the pre-lock read — even the intermediate list
-              step in (2) — the validation now refuses with the
-              relevant diagnostic and no writes are attempted.
+          1.  Read the target transaction UNLOCKED (via
+              ``get_by_id``) — purely to learn its type and, for
+              transfer rows, its ``reference_id``.
+          2.  Enumerate the pair via ``list_by_reference`` (unlocked).
+          3.  Sort the two transaction ids ascending and acquire
+              BOTH row locks in a single deterministic query
+              (``WHERE id IN (:sorted_ids) ORDER BY id ASC
+              FOR UPDATE``). Two racers therefore always contend
+              for the SAME lock first.
+          4.  Adopt the locked rows as authoritative; re-verify
+              reference / topology / warehouse invariants against
+              the locked state.
+          5.  Collect the referenced warehouse and item ids from
+              the locked rows, sort them ascending, and lock those
+              too via bulk FOR UPDATE queries. Authorization
+              scopes are derived EXCLUSIVELY from the locked
+              warehouse rows (never from pre-lock ORM objects).
+          6.  Sort lot ids ascending; bulk-lock lots FOR UPDATE.
+              The write phase re-uses these already-locked rows.
+          7.  Run the full symmetric + farm + pair validation
+              suite against the fully locked context.
 
-        The returned dict carries the locked ``original`` /
-        ``partner`` tx rows, the re-loaded warehouses / items, and
-        the authorization scopes derived exclusively from the
-        validated locked state. Lot rows are NOT locked here —
-        that's a write-phase concern and lives in :meth:`reversal`.
+        The returned dict carries the LOCKED ``original`` /
+        ``partner`` transactions, LOCKED warehouses, LOCKED items,
+        LOCKED lots, and the authorization scopes derived
+        exclusively from the locked warehouse state.
 
         Idempotency within a session: subsequent calls under the
         same session return the same locked rows without releasing
@@ -1470,15 +1492,17 @@ class InventoryService:
         per-statement, so it holds until the outer transaction
         commits or rolls back.
         """
-        # (1) Lock the target row first — cheapest sanity check
-        # before we spend any time enumerating partners.
-        original = await self.tx_repo.get_by_id_for_update(reverses_transaction_id)
-        if original is None or original.warehouse_id != warehouse.id:
+        # (1) UNLOCKED read of the target — just to discover pair
+        # identity. Locking here would defeat the ascending-id
+        # ordering below whenever the caller's target has the
+        # higher id.
+        original_probe = await self.tx_repo.get_by_id(reverses_transaction_id)
+        if original_probe is None or original_probe.warehouse_id != warehouse.id:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 "Original transaction not found.",
             )
-        if original.transaction_type == InventoryTransactionType.REVERSAL:
+        if original_probe.transaction_type == InventoryTransactionType.REVERSAL:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
@@ -1487,36 +1511,54 @@ class InventoryService:
                 },
             )
 
-        # For non-transfer reversals we're done locking — validate
-        # and return.
-        if original.transaction_type not in (
+        # For non-transfer reversals we still lock the single target
+        # row so the write phase sees an authoritative view.
+        if original_probe.transaction_type not in (
             InventoryTransactionType.TRANSFER_OUT,
             InventoryTransactionType.TRANSFER_IN,
         ):
-            _, item = await self._validate_reversal_original(original=original, warehouse=warehouse)
+            [original_locked] = await self.tx_repo.list_by_ids_for_update([original_probe.id])
+            # Lock the warehouse + item + lot in ascending id order.
+            [locked_wh] = await self.warehouse_repo.list_by_ids_for_update(
+                [original_locked.warehouse_id]
+            )
+            [locked_item] = await self.item_repo.list_by_ids_for_update(
+                [original_locked.item_id]
+            )
+            [locked_lot] = await self.lot_repo.list_by_ids_for_update(
+                [original_locked.lot_id]
+            )
+            _, item_v = await self._validate_reversal_original(
+                original=original_locked, warehouse=locked_wh
+            )
+            assert item_v.id == locked_item.id
             return {
-                "original": original,
-                "warehouse": warehouse,
-                "item": item,
+                "original": original_locked,
+                "warehouse": locked_wh,
+                "item": locked_item,
+                "original_lot": locked_lot,
                 "partner": None,
                 "partner_warehouse": None,
                 "partner_item": None,
-                "scopes": [(warehouse.organization_id, warehouse.farm_id)],
+                "partner_lot": None,
+                "scopes": [(locked_wh.organization_id, locked_wh.farm_id)],
             }
 
         # (2) Enumerate the pair via the shared reference_id. The
         # linkage MUST be present on the target row — if it isn't we
         # refuse before locking anything else.
-        if original.reference_type != "transfer" or original.reference_id is None:
+        if original_probe.reference_type != "transfer" or original_probe.reference_id is None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
                     "code": "transfer_pair_incomplete",
                     "message": ("Transfer ledger row is missing the canonical transfer linkage."),
-                    "original_transaction_id": str(original.id),
+                    "original_transaction_id": str(original_probe.id),
                 },
             )
-        candidates = await self.tx_repo.list_by_reference("transfer", original.reference_id)
+        candidates = await self.tx_repo.list_by_reference(
+            "transfer", original_probe.reference_id
+        )
         transfer_rows = [
             t
             for t in candidates
@@ -1532,47 +1574,48 @@ class InventoryService:
                 {
                     "code": "transfer_pair_incomplete",
                     "message": "Transfer pair is not exactly two rows.",
-                    "reference_id": str(original.reference_id),
+                    "reference_id": str(original_probe.reference_id),
                 },
             )
-        partner_candidate = next(t for t in transfer_rows if t.id != original.id)
+        partner_candidate = next(t for t in transfer_rows if t.id != original_probe.id)
 
-        # (3) Lock BOTH rows in deterministic order (ascending
-        # transaction id). If we already hold the target's lock
-        # (case A: target had the lower id) then the second lock is
-        # the partner; if the target had the higher id we lock the
-        # partner first, which happens transparently because we
-        # already own the target's exclusive lock and no one else
-        # can be sitting on both.
-        ordered_ids = sorted([original.id, partner_candidate.id], key=str)
-        locked: dict[uuid.UUID, InventoryTransaction] = {}
-        for tx_id in ordered_ids:
-            row = await self.tx_repo.get_by_id_for_update(tx_id)
-            if row is None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_pair_changed_during_reversal",
-                        "message": (
-                            "Transfer pair row disappeared between "
-                            "validation and lock acquisition; refusing "
-                            "to reverse."
-                        ),
-                        "reference_id": str(original.reference_id),
-                    },
-                )
-            locked[tx_id] = row
+        # (2b) Test-only barrier — Sprint 5.4.6 concurrency proofs
+        # need both racers to have completed unlocked discovery
+        # before either enters the lock-acquisition phase. Production
+        # never sets this attribute; production callers walk straight
+        # through.
+        barrier = type(self)._reversal_lock_barrier
+        if barrier is not None:
+            wait = getattr(barrier, "wait", None)
+            if wait is not None:
+                res = wait()
+                if hasattr(res, "__await__"):
+                    await res
 
-        # (4) Adopt the LOCKED rows as authoritative. Any relationship
-        # column change since step (2) is now visible here — and
-        # everything that follows is guarded against further change
-        # by the FOR UPDATE locks we now hold.
-        original_locked = locked[original.id]
-        partner_locked = locked[partner_candidate.id]
+        # (3) Bulk-lock BOTH transaction rows in a single query,
+        # ordered by id ASC. This is the ONLY place we acquire the
+        # transaction locks — deterministic across every caller.
+        ordered_tx_ids = sorted([original_probe.id, partner_candidate.id], key=str)
+        locked_txs = await self.tx_repo.list_by_ids_for_update(ordered_tx_ids)
+        if len(locked_txs) != 2:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": (
+                        "Transfer pair row disappeared between initial "
+                        "read and lock acquisition; refusing to reverse."
+                    ),
+                    "reference_id": str(original_probe.reference_id),
+                },
+            )
+        by_id = {t.id: t for t in locked_txs}
+        original_locked = by_id[original_probe.id]
+        partner_locked = by_id[partner_candidate.id]
 
-        # Sanity: reference_type / reference_id must still form a
-        # valid pair post-lock. A concurrent UPDATE could have
-        # rewritten these between step (2) and step (3).
+        # (4) Post-lock relationship revalidation — reference_type /
+        # reference_id must still form the same pair. A concurrent
+        # UPDATE between steps (2) and (3) would trip this.
         if (
             original_locked.reference_type != "transfer"
             or original_locked.reference_id is None
@@ -1589,20 +1632,6 @@ class InventoryService:
                     ),
                 },
             )
-        # NOTE: we intentionally do NOT re-check the OUT/IN topology
-        # here; :meth:`_validate_paired_transfer` runs the full
-        # topology check under lock and refuses with the correct
-        # ``transfer_pair_incomplete`` diagnostic for pre-existing
-        # corruption. The ``changed_during_reversal`` code is
-        # reserved for state that ACTUALLY changed between our
-        # unlocked read and our post-lock re-read.
-
-        # (4b) Re-fetch the source warehouse from the locked
-        # transaction. The endpoint originally loaded ``warehouse``
-        # from the URL path; but ``original_locked.warehouse_id`` is
-        # the authoritative reference now. If they disagree —
-        # e.g. because a concurrent UPDATE moved the tx to a
-        # different warehouse — refuse.
         if original_locked.warehouse_id != warehouse.id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -1616,9 +1645,85 @@ class InventoryService:
                 },
             )
 
-        # (5) Run the full validation suite against the locked rows.
-        _, item = await self._validate_reversal_original(
-            original=original_locked, warehouse=warehouse
+        # (5) Lock the two warehouses referenced by the locked
+        # transactions, in ascending id order. Scopes are derived
+        # ONLY from these locked rows; the endpoint's pre-lock
+        # ``warehouse`` object is used solely for path identity
+        # matching (and its .id must match ``original_locked.warehouse_id``,
+        # already asserted above).
+        wh_ids = sorted(
+            {original_locked.warehouse_id, partner_locked.warehouse_id}, key=str
+        )
+        locked_whs = await self.warehouse_repo.list_by_ids_for_update(wh_ids)
+        wh_by_id = {w.id: w for w in locked_whs}
+        if (
+            original_locked.warehouse_id not in wh_by_id
+            or partner_locked.warehouse_id not in wh_by_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": "A referenced warehouse disappeared under lock.",
+                },
+            )
+        original_warehouse = wh_by_id[original_locked.warehouse_id]
+        partner_warehouse_locked = wh_by_id[partner_locked.warehouse_id]
+
+        # Sprint 5.4.6 test hook — signal that all warehouse row
+        # locks are now held by this transaction. Mutation-race
+        # tests use this to know it is safe to fire a competing
+        # UPDATE that MUST block on our lock. Production leaves the
+        # signal unset and pays no cost.
+        wh_signal = type(self)._reversal_after_warehouse_locks_signal
+        if wh_signal is not None:
+            wh_set = getattr(wh_signal, "set", None)
+            if wh_set is not None:
+                wh_set()
+
+        # (5b) Lock the referenced items. Both sides should reference
+        # the same canonical item; still lock both ids defensively in
+        # case a caller supplies a tampered row.
+        item_ids = sorted({original_locked.item_id, partner_locked.item_id}, key=str)
+        locked_items = await self.item_repo.list_by_ids_for_update(item_ids)
+        item_by_id = {it.id: it for it in locked_items}
+        if (
+            original_locked.item_id not in item_by_id
+            or partner_locked.item_id not in item_by_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": "A referenced item disappeared under lock.",
+                },
+            )
+        original_item_locked = item_by_id[original_locked.item_id]
+        partner_item_locked = item_by_id[partner_locked.item_id]
+
+        # (6) Lock the two lot rows in ascending id order. The
+        # reversal write phase re-uses these already-locked rows —
+        # no additional lot lock is needed downstream.
+        lot_ids = sorted({original_locked.lot_id, partner_locked.lot_id}, key=str)
+        locked_lots = await self.lot_repo.list_by_ids_for_update(lot_ids)
+        lot_by_id = {lot.id: lot for lot in locked_lots}
+        if (
+            original_locked.lot_id not in lot_by_id
+            or partner_locked.lot_id not in lot_by_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": "A referenced lot disappeared under lock.",
+                },
+            )
+        original_lot_locked = lot_by_id[original_locked.lot_id]
+        partner_lot_locked = lot_by_id[partner_locked.lot_id]
+
+        # (7) Full validation against the fully locked context.
+        _, item_v = await self._validate_reversal_original(
+            original=original_locked, warehouse=original_warehouse
         )
         (
             partner,
@@ -1626,12 +1731,8 @@ class InventoryService:
             _partner_lot_probe,
             partner_item,
         ) = await self._validate_paired_transfer(
-            original=original_locked, warehouse=warehouse, item=item
+            original=original_locked, warehouse=original_warehouse, item=item_v
         )
-        # Post-validation sanity: the partner we validated MUST be
-        # the same row we locked. If the OUT/IN topology flipped
-        # between our pre-lock enumeration and re-fetch, this guard
-        # trips.
         if partner.id != partner_locked.id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -1640,18 +1741,27 @@ class InventoryService:
                     "message": "Partner row identity changed under lock.",
                 },
             )
+        # The validation helpers loaded item/lot rows via the
+        # standard repos — those calls hit the identity map and
+        # returned the LOCKED entities. Assert we validated the same
+        # authoritative rows we're about to write against.
+        assert item_v.id == original_item_locked.id
+        assert partner_item.id == partner_item_locked.id
+        assert partner_warehouse.id == partner_warehouse_locked.id
 
         scopes: list[tuple[uuid.UUID, uuid.UUID | None]] = [
-            (warehouse.organization_id, warehouse.farm_id),
-            (partner_warehouse.organization_id, partner_warehouse.farm_id),
+            (original_warehouse.organization_id, original_warehouse.farm_id),
+            (partner_warehouse_locked.organization_id, partner_warehouse_locked.farm_id),
         ]
         return {
             "original": original_locked,
-            "warehouse": warehouse,
-            "item": item,
+            "warehouse": original_warehouse,
+            "item": original_item_locked,
+            "original_lot": original_lot_locked,
             "partner": partner_locked,
-            "partner_warehouse": partner_warehouse,
-            "partner_item": partner_item,
+            "partner_warehouse": partner_warehouse_locked,
+            "partner_item": partner_item_locked,
+            "partner_lot": partner_lot_locked,
             "scopes": scopes,
         }
 
@@ -1773,26 +1883,22 @@ class InventoryService:
             warehouse=warehouse,
             reverses_transaction_id=payload["reverses_transaction_id"],
         )
+        # Sprint 5.4.6 — adopt the LOCKED warehouse from the context
+        # as authoritative. The endpoint's ``warehouse`` object was
+        # only used to identify the URL path; every downstream
+        # write and audit row is now anchored to the locked row.
+        warehouse = context["warehouse"]
         original = context["original"]
         item = context["item"]
+        original_lot = context["original_lot"]
         partner: InventoryTransaction | None = context["partner"]
         partner_warehouse: Warehouse | None = context["partner_warehouse"]
         partner_item: InventoryItem | None = context["partner_item"]
-
-        # ------------------------------------------------------------ #
-        # Lot locking. For paired transfers we lock BOTH lots in a
-        # deterministic order (sorted by id) so concurrent reversals
-        # of paired rows cannot deadlock.
-        # ------------------------------------------------------------ #
-        if partner is not None and partner.lot_id != original.lot_id:
-            first_id, second_id = sorted([original.lot_id, partner.lot_id], key=str)
-            lot_first = await self._lock_lot(first_id)
-            lot_second = await self._lock_lot(second_id)
-            original_lot = lot_first if lot_first.id == original.lot_id else lot_second
-            partner_lot = lot_first if lot_first.id == partner.lot_id else lot_second
-        else:
-            original_lot = await self._lock_lot(original.lot_id)
-            partner_lot = original_lot if partner is not None else None
+        partner_lot = context["partner_lot"]
+        # ``_acquire_reversal_context`` already locked the lot rows
+        # in ascending id order via ``list_by_ids_for_update``.
+        # Nothing further to lock here — the write phase re-uses
+        # the already-locked, revalidated lot rows.
 
         # Defensive re-check after locking: locked lots must still
         # match the tx warehouse / item they were validated against.

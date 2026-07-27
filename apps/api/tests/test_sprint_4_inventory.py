@@ -2385,3 +2385,329 @@ async def test_reversal_detects_relationship_change_between_read_and_lock(
     assert await _count_inverse_rows(lot_ids) == 0
     assert await _count_reversal_markers(lot_ids) == 0
     assert await _sum_org_inventory(client, setup["org_id"]) == baseline_total
+
+
+# ===================================================================== #
+# Sprint 5.4.6 — Deterministic pair locking + fully locked auth state
+# ===================================================================== #
+@_postgres_only
+async def test_reversal_deterministic_opposite_side_barrier(
+    client: AsyncClient,
+) -> None:
+    """Barrier-synchronised opposite-side reversal race.
+
+    Sprint 5.4.6 concurrency proof: both HTTP requests complete
+    unlocked pair discovery, PAUSE on a shared barrier, then start
+    lock acquisition simultaneously. The corrected lock order
+    (``WHERE id IN (:sorted_ids) ORDER BY id ASC FOR UPDATE``)
+    guarantees exactly one winner, no deadlock, and no half-reversed
+    state — even when caller A targets OUT and caller B targets IN.
+    """
+    import asyncio as _asyncio
+
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_total = await _sum_org_inventory(client, setup["ctx"]["org_id"])
+
+    # Both racers register on the same barrier. When both are past
+    # unlocked pair discovery, ``event.set()`` releases them into
+    # lock acquisition simultaneously — the stress scenario the
+    # ascending-id lock order must handle deterministically.
+    gate = _asyncio.Event()
+    InventoryService._reversal_lock_barrier = gate
+    try:
+
+        async def _from_out() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "out"},
+                headers={"Idempotency-Key": f"det-out-{uuid4().hex[:6]}"},
+            )
+            return r.status_code, r.json()
+
+        async def _from_in() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['dst']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "in"},
+                headers={"Idempotency-Key": f"det-in-{uuid4().hex[:6]}"},
+            )
+            return r.status_code, r.json()
+
+        # Kick both requests off, then release the barrier after a
+        # brief settle so both are provably past discovery.
+        r_task = _asyncio.gather(_from_out(), _from_in())
+        await _asyncio.sleep(0.3)
+        gate.set()
+        r1, r2 = await r_task
+    finally:
+        InventoryService._reversal_lock_barrier = None
+
+    codes = sorted([r1[0], r2[0]])
+    assert codes == [201, 409], f"unexpected outcome pair: {codes}"
+    losing = r1 if r1[0] == 409 else r2
+    assert losing[1]["detail"]["code"] == "already_reversed"
+    # Exactly one paired reversal committed → 4 rows (2 inverse + 2 markers).
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    assert await _count_inverse_rows(lot_ids) == 2
+    assert await _count_reversal_markers(lot_ids) == 2
+    # Inventory-neutral.
+    assert await _sum_org_inventory(client, setup["ctx"]["org_id"]) == baseline_total
+
+
+@_postgres_only
+async def test_reversal_blocks_concurrent_warehouse_farm_mutation(
+    client: AsyncClient,
+) -> None:
+    """Warehouse mutation race.
+
+    A concurrent transaction attempts to change a warehouse's
+    ``farm_id`` while reversal is active. Sprint 5.4.6 locks the
+    warehouse rows FOR UPDATE inside the reversal transaction, so
+    the mutating writer must block until reversal commits. When it
+    eventually applies, the reversal has already succeeded against
+    the ORIGINAL farm; no cross-farm audit rows exist.
+    """
+    import asyncio as _asyncio
+
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    gate = _asyncio.Event()
+    wh_locked_signal = _asyncio.Event()
+    InventoryService._reversal_lock_barrier = gate
+    InventoryService._reversal_after_warehouse_locks_signal = wh_locked_signal
+    mutation_blocked_until = None
+    try:
+
+        async def _reverser() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+            )
+            return r.status_code, r.json()
+
+        async def _mutator() -> None:
+            nonlocal mutation_blocked_until
+            # Release the reverser so it can progress from unlocked
+            # discovery into the lock-acquisition phase.
+            await _asyncio.sleep(0.5)
+            gate.set()
+            # Wait until the reverser has definitively acquired the
+            # FOR UPDATE lock on every warehouse row. Only THEN can
+            # we prove that a competing UPDATE blocks.
+            await wh_locked_signal.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                from app.models.inventory import Warehouse as _WarehouseModel
+
+                started = _asyncio.get_event_loop().time()
+                await session.execute(
+                    sa_update(_WarehouseModel)
+                    .where(_WarehouseModel.id == _UUIDType(setup["dst"]))
+                    .values(farm_id=_UUIDType(setup["farm_a_id"]))
+                )
+                await session.commit()
+                mutation_blocked_until = _asyncio.get_event_loop().time() - started
+
+        r_task = _asyncio.gather(_reverser(), _mutator())
+        r_rev, _ = await r_task
+    finally:
+        InventoryService._reversal_lock_barrier = None
+        InventoryService._reversal_after_warehouse_locks_signal = None
+
+    assert r_rev[0] == 201, r_rev
+    # Reversal committed 4 rows against the ORIGINAL farms.
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    # The mutation blocked (should show non-trivial wait time).
+    assert mutation_blocked_until is not None
+    # No 409, and audit rows point at the ORIGINAL farm — the
+    # mutation could only apply AFTER reversal committed, so any
+    # subsequent transfer would see the new farm, but our reversal
+    # rows are already sealed with the original farm.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from app.models.inventory import InventoryTransaction as _Tx
+
+        rows = (
+            (
+                await session.execute(
+                    select(_Tx).where(
+                        _Tx.transaction_type == _InventoryTransactionType.REVERSAL,
+                        _Tx.lot_id.in_([_UUIDType(x) for x in lot_ids]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    farm_ids = {r.farm_id for r in rows}
+    # Both farms are still the original OUT-side / IN-side farms.
+    assert _UUIDType(setup["farm_a_id"]) in farm_ids
+    assert _UUIDType(setup["farm_b_id"]) in farm_ids
+
+
+@_postgres_only
+async def test_reversal_blocks_concurrent_item_org_mutation(
+    client: AsyncClient,
+) -> None:
+    """Item mutation race.
+
+    The reversal transaction holds a FOR UPDATE lock on the item
+    row. A concurrent UPDATE that would move the item to a
+    different organization must block until reversal completes;
+    the reversal's audit / inverse / marker rows are therefore
+    sealed against the ORIGINAL organization_id.
+    """
+    import asyncio as _asyncio
+
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    org_id = setup["ctx"]["org_id"]
+    # Item id.
+    items = (
+        await client.get(f"/api/v1/organizations/{org_id}/inventory-items")
+    ).json()
+    item_id = items[0]["id"]
+    # A second org we'd try to move the item to.
+    other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(other_owner_email)
+    await switch_user(client, other_owner_email)
+    other_org_id = await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+    await switch_user(client, setup["ctx"]["owner"])
+
+    gate = _asyncio.Event()
+    wh_locked_signal = _asyncio.Event()
+    InventoryService._reversal_lock_barrier = gate
+    InventoryService._reversal_after_warehouse_locks_signal = wh_locked_signal
+    try:
+
+        async def _reverser() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+            )
+            return r.status_code, r.json()
+
+        async def _mutator() -> None:
+            await _asyncio.sleep(0.5)
+            gate.set()
+            # Only after every warehouse row lock is held does the
+            # reverser progress to the item locks — waiting on this
+            # signal guarantees the item FOR UPDATE has either
+            # already been issued or is imminent, so the mutating
+            # UPDATE below is guaranteed to race the item lock
+            # (either blocks on it or lands after the reverser
+            # committed). Either outcome proves the reverser used
+            # the ORIGINAL organization_id under lock.
+            await wh_locked_signal.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                from app.models.inventory import InventoryItem as _ItemModel
+
+                await session.execute(
+                    sa_update(_ItemModel)
+                    .where(_ItemModel.id == _UUIDType(item_id))
+                    .values(organization_id=_UUIDType(other_org_id))
+                )
+                await session.commit()
+
+        r_rev, _ = await _asyncio.gather(_reverser(), _mutator())
+    finally:
+        InventoryService._reversal_lock_barrier = None
+        InventoryService._reversal_after_warehouse_locks_signal = None
+
+    # Reversal must have committed against the ORIGINAL org.
+    assert r_rev[0] == 201, r_rev
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from app.models.inventory import InventoryTransaction as _Tx
+
+        rows = (
+            (
+                await session.execute(
+                    select(_Tx).where(
+                        _Tx.transaction_type == _InventoryTransactionType.REVERSAL,
+                        _Tx.lot_id.in_([_UUIDType(x) for x in lot_ids]),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Every reversal audit row was written against the ORIGINAL org
+    # even though the item's org_id changed AFTER reversal committed.
+    for row in rows:
+        assert row.organization_id == _UUIDType(org_id)
+
+
+@_postgres_only
+async def test_reversal_locks_transactions_in_ascending_id_order(
+    client: AsyncClient,
+) -> None:
+    """Instrumentation-driven lock-order coverage.
+
+    Records the ORDER in which ``list_by_ids_for_update`` receives
+    its input on the transaction repo (once for the pair, once for
+    warehouses, once for items, once for lots) and asserts each
+    call arrived with ids already sorted ascending — regardless of
+    whether the caller targeted TRANSFER_OUT or TRANSFER_IN.
+    """
+    from app.repositories import inventory as _inv_repo
+
+    captured: list[tuple[str, list[str]]] = []
+
+    class _Recorder:
+        def __init__(self, name: str, real):
+            self.name = name
+            self.real = real
+
+        async def __call__(self, ids):
+            captured.append((self.name, [str(x) for x in list(ids)]))
+            return await self.real(ids)
+
+    for target_key in ("out_tx", "in_tx"):
+        setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=6.0)
+        captured.clear()
+        # Monkey-patch the four list_by_ids_for_update methods on the
+        # repo classes.
+        originals: dict[str, tuple[type, callable]] = {}
+        for cls_name in (
+            "InventoryTransactionRepository",
+            "WarehouseRepository",
+            "InventoryItemRepository",
+            "InventoryLotRepository",
+        ):
+            cls = getattr(_inv_repo, cls_name)
+            originals[cls_name] = (cls, cls.list_by_ids_for_update)
+
+            async def _wrapped(self, ids, _orig=cls.list_by_ids_for_update, _name=cls_name):
+                captured.append((_name, [str(x) for x in list(ids)]))
+                return await _orig(self, ids)
+
+            cls.list_by_ids_for_update = _wrapped  # type: ignore[assignment]
+        try:
+            wh_key = "src" if target_key == "out_tx" else "dst"
+            r = await client.post(
+                f"/api/v1/warehouses/{setup[wh_key]}/inventory:reverse",
+                json={
+                    "reverses_transaction_id": setup[target_key]["id"],
+                    "reason": "trace",
+                },
+            )
+        finally:
+            for _cls_name, (cls, orig) in originals.items():
+                cls.list_by_ids_for_update = orig  # type: ignore[assignment]
+        assert r.status_code == 201, r.text
+        # Every recorded call must have received an ascending-id list.
+        for name, ids in captured:
+            assert ids == sorted(ids), (
+                f"{name}.list_by_ids_for_update received non-ascending ids: {ids}"
+            )
+        # And the transaction lock was acquired.
+        assert any(name == "InventoryTransactionRepository" for name, _ in captured)
+

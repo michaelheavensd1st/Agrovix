@@ -1228,3 +1228,121 @@ skipped in Postgres CI.
   reversal (Sprint 5.4.5)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.6 — Deterministic Pair Locking + Fully Locked Auth State (2026-02, delivered)
+
+### Problem
+Sprint 5.4.5 already ordered `SELECT … FOR UPDATE` by ascending
+`tx.id`, but the caller's own target transaction row was locked
+FIRST — before the pair was discovered. Under PostgreSQL, two
+concurrent reversals targeting opposite ends of the same transfer
+pair therefore acquired their locks in opposite orders and could
+deadlock (`ProcessA locks OUT then IN; ProcessB locks IN then OUT`).
+Additionally, authorization and relationship validation still ran
+against ORM entities loaded WITHOUT `FOR UPDATE` (the endpoint
+resolved the caller warehouse and, indirectly, the item + partner
+warehouse from unlocked reads), so a concurrent `UPDATE` could
+change `warehouse.farm_id` / `item.organization_id` between
+authorization and write.
+
+### Design
+`_acquire_reversal_context` was rebuilt around a strictly
+"never lock a caller-selected row before the pair is ordered"
+sequence:
+
+1. **Unlocked probe.** Read the target transaction row with plain
+   `get_by_id` — solely to learn its `transaction_type` and, for
+   transfers, its `reference_id`. NO `FOR UPDATE` yet.
+2. **Unlocked pair enumeration** via
+   `list_by_reference("transfer", reference_id)`; enforce that
+   exactly two `TRANSFER_OUT`/`TRANSFER_IN` rows exist.
+3. **Bulk deterministic transaction lock.**
+   `list_by_ids_for_update(sorted([out.id, in.id]))` — a single
+   `SELECT … WHERE id IN (…) ORDER BY id ASC FOR UPDATE`. Both
+   racers contend for the SAME lowest-id row first. Deadlock-free.
+4. **Post-lock relationship revalidation.** `reference_type`,
+   `reference_id`, and the caller's `warehouse_id` must still
+   match under lock — any concurrent `UPDATE` between step (2)
+   and step (3) trips `transfer_pair_changed_during_reversal`.
+5. **Bulk deterministic warehouse lock.**
+   `warehouse_repo.list_by_ids_for_update(sorted(wh_ids))`.
+   Authorization scopes (`(organization_id, farm_id)`) are
+   derived EXCLUSIVELY from these locked rows, never from the
+   endpoint's pre-lock warehouse ORM object.
+6. **Bulk deterministic item lock.**
+   `item_repo.list_by_ids_for_update(sorted(item_ids))`.
+7. **Bulk deterministic lot lock.**
+   `lot_repo.list_by_ids_for_update(sorted(lot_ids))`. The write
+   phase re-uses these already-locked rows — no additional lot
+   lock is issued downstream.
+8. **Full symmetric + farm + pair validation** against the fully
+   locked context; assertions confirm the locked entities and the
+   validation helpers' identity-mapped entities are the SAME rows.
+
+### New repository methods
+| Repository | Method |
+| --- | --- |
+| `WarehouseRepository` | `list_by_ids_for_update(ids)` |
+| `InventoryItemRepository` | `list_by_ids_for_update(ids)` |
+| `InventoryLotRepository` | `list_by_ids_for_update(ids)` |
+| `InventoryTransactionRepository` | `list_by_ids_for_update(ids, org_ids=None)` |
+
+All four issue `SELECT … WHERE id IN (:ids) ORDER BY id ASC
+FOR UPDATE`, use `populate_existing()` so the identity map
+adopts the locked row, and are the ONLY sanctioned way to
+acquire the reversal-path row locks.
+
+### Test-only instrumentation on `InventoryService`
+Two class-level hooks (both default `None` in production):
+
+- `_reversal_lock_barrier` — an `asyncio.Event` the service
+  awaits AFTER unlocked pair-discovery and BEFORE the bulk
+  transaction lock. Two racers can register the same event,
+  finish discovery independently, then race for the bulk lock
+  simultaneously.
+- `_reversal_after_warehouse_locks_signal` — an `asyncio.Event`
+  the service `.set()`s immediately AFTER the bulk warehouse
+  `FOR UPDATE` completes. Mutation-race tests wait on this
+  signal so their competing `UPDATE` fires only when the
+  reverser is provably holding the warehouse row locks.
+
+### Postgres-only concurrency proofs (test_sprint_4_inventory.py)
+| Test | What it proves |
+| --- | --- |
+| `test_reversal_deterministic_opposite_side_barrier` | Two HTTP reversals targeting OUT and IN sides simultaneously never deadlock — bulk-sorted lock acquisition serialises to `[201, 409]`. |
+| `test_reversal_blocks_concurrent_warehouse_farm_mutation` | With reverser holding warehouse FOR UPDATE, a mutating `UPDATE warehouses SET farm_id = …` blocks; reversal audit rows are sealed with the ORIGINAL farm ids. |
+| `test_reversal_blocks_concurrent_item_org_mutation` | With reverser holding item FOR UPDATE, a mutating `UPDATE inventory_items SET organization_id = …` blocks; reversal REVERSAL rows are sealed with the ORIGINAL organization_id. |
+| `test_reversal_uses_locked_warehouse_state_for_authz` | Even if the caller's warehouse row was updated to a different farm between HTTP dispatch and the reversal transaction, authorization is decided against the LOCKED post-`FOR UPDATE` state. |
+
+All eleven `@_postgres_only` concurrency tests in this file
+skip cleanly on SQLite (`sqlite+aiosqlite:///:memory:`) and
+pass under PostgreSQL 15.
+
+### Validation
+- `ruff check apps/api/app/repositories/inventory.py apps/api/app/services/inventory.py apps/api/tests/test_sprint_4_inventory.py` — clean.
+- **SQLite**: `pytest -q apps/api/tests/test_sprint_4_inventory.py` — `64 passed, 11 skipped` (all Postgres-only tests skip cleanly).
+- **PostgreSQL 15** (`postgresql+asyncpg://…/agrovix_test`):
+  - `pytest -q apps/api/tests/test_sprint_4_inventory.py` — `75 passed`.
+  - `pytest -q apps/api/tests/` (full backend suite) — `260 passed, 23 skipped` (skips are live-API / SPRINT4_API_BASE suites).
+
+### Guarantees now enforced
+- No lock is ever acquired before the transfer pair has been
+  fully enumerated and its ids sorted. Deterministic acquisition
+  order across transactions, transaction rows, warehouses,
+  items, and lots eliminates the opposite-side deadlock.
+- Authorization scopes are derived from the LOCKED warehouse
+  rows returned by `list_by_ids_for_update`, never from the
+  endpoint's initially resolved ORM entity.
+- Item / warehouse `organization_id` and `farm_id` used for
+  audit rows and inverse ledger entries come from LOCKED rows —
+  a concurrent `UPDATE` cannot slip in between authorization
+  and write.
+- A paired reversal remains inventory-neutral across both
+  warehouses and produces exactly 4 rows (2 inverse + 2 REVERSAL
+  markers) or zero rows on refusal.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): deterministic pair locking (Sprint 5.4.6)`
+- Local validation only — no push, no PR per sprint brief.
+
