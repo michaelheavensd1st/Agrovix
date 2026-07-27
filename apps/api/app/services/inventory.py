@@ -55,6 +55,8 @@ from app.repositories.inventory import (
     StorageLocationRepository,
     WarehouseRepository,
 )
+from app.repositories.org_repo import FarmRepository, OrganizationRepository
+from app.services._transfer_locks import acquire_transfer_advisory_lock
 
 _INCREASE_TYPES = {
     InventoryTransactionType.RECEIPT,
@@ -111,6 +113,29 @@ class InventoryService:
     # block on the reverser's row lock. Never set in production.
     _reversal_after_warehouse_locks_signal: ClassVar[object | None] = None
 
+    # Sprint 5.4.7 — one-way "farm + organization locks acquired"
+    # signal. Set after both the referenced farm rows and the owning
+    # organization row are held FOR UPDATE. Mutation-race tests for
+    # farm.organization_id / farm.is_active / farm.deleted_at and
+    # organization.is_active / organization.deleted_at wait on this
+    # before firing their competing UPDATE.
+    _reversal_after_farm_org_locks_signal: ClassVar[object | None] = None
+
+    # Sprint 5.4.7 — reverser HOLD gate. When set (asyncio.Event),
+    # the reverser awaits this event AFTER signalling that farm +
+    # organization row locks are held and BEFORE proceeding. Tests
+    # use this to keep the reverser transaction OPEN while asserting
+    # a competing UPDATE is genuinely blocked. Never set in
+    # production.
+    _reversal_hold_after_farm_org_locks_gate: ClassVar[object | None] = None
+
+    # Sprint 5.4.7 — one-way "item locks acquired" signal. Set after
+    # the bulk FOR UPDATE on the referenced item rows completes.
+    # Item mutation-race tests wait on this before firing their
+    # competing UPDATE on ``inventory_items.organization_id`` /
+    # ``inventory_items.deleted_at``.
+    _reversal_after_item_locks_signal: ClassVar[object | None] = None
+
     def __init__(
         self,
         session: AsyncSession,
@@ -121,6 +146,8 @@ class InventoryService:
         tx_repo: InventoryTransactionRepository,
         location_repo: StorageLocationRepository,
         audit_repo: AuditRepository,
+        farm_repo: FarmRepository | None = None,
+        org_repo: OrganizationRepository | None = None,
     ) -> None:
         self.session = session
         self.warehouse_repo = warehouse_repo
@@ -129,6 +156,11 @@ class InventoryService:
         self.tx_repo = tx_repo
         self.location_repo = location_repo
         self.audit_repo = audit_repo
+        # Sprint 5.4.7 — farm + organization repositories are required
+        # by the reversal locking sequence. Instantiate lazily from the
+        # session when the caller did not inject them (older tests).
+        self.farm_repo = farm_repo or FarmRepository(session)
+        self.org_repo = org_repo or OrganizationRepository(session)
 
     # ---------------------------------------------------------------- #
     # Warehouse / item creation helpers
@@ -947,6 +979,22 @@ class InventoryService:
 
         # Shared reference id groups the paired ledger rows.
         transfer_ref = uuid.uuid4()
+
+        # Sprint 5.4.7 — acquire the transfer-topology advisory lock
+        # BEFORE writing either side of the pair. This makes the
+        # (organization_id, reference_type, reference_id) namespace
+        # single-writer across ANY code path that inserts / updates
+        # rows into a transfer identity. It also blocks any concurrent
+        # reversal targeting the same identity from progressing past
+        # its own advisory-lock boundary until we commit — no phantom
+        # third row can ever slip in.
+        await acquire_transfer_advisory_lock(
+            self.session,
+            organization_id=warehouse.organization_id,
+            reference_type="transfer",
+            reference_id=transfer_ref,
+        )
+
         p_hash = _payload_hash(
             {
                 "op": "transfer",
@@ -1556,6 +1604,63 @@ class InventoryService:
                     "original_transaction_id": str(original_probe.id),
                 },
             )
+
+        # Sprint 5.4.6 / 5.4.7 — test-only barrier at the advisory-lock
+        # boundary. Concurrency proofs use this hook to force BOTH
+        # racers to reach the SAME synchronization point (immediately
+        # before the transfer-topology advisory lock) so the race that
+        # follows is deterministic. Production never sets this; the
+        # attribute is ``None`` and the pre-advisory path is a no-op.
+        barrier = type(self)._reversal_lock_barrier
+        if barrier is not None:
+            wait = getattr(barrier, "wait", None)
+            if wait is not None:
+                res = wait()
+                if hasattr(res, "__await__"):
+                    await res
+
+        # Sprint 5.4.7 — (2a) Acquire the transfer-topology advisory
+        # lock on (organization_id, "transfer", reference_id) BEFORE
+        # authoritative topology discovery. This serialises any
+        # concurrent code path that would add / remove / mutate rows
+        # into this transfer identity (transfer creation, another
+        # reversal, a hostile UPDATE re-parenting an unrelated row).
+        # The lock is transaction-scoped: it releases automatically
+        # at commit / rollback.
+        await acquire_transfer_advisory_lock(
+            self.session,
+            organization_id=original_probe.organization_id,
+            reference_type="transfer",
+            reference_id=original_probe.reference_id,
+        )
+
+        # (2b) Re-read the target transaction after acquiring the
+        # advisory lock — an earlier concurrent reversal may have
+        # committed already (`already_reversed`) and we want the
+        # freshest view before we begin locking rows.
+        refreshed_target = await self.tx_repo.get_by_id(reverses_transaction_id)
+        if refreshed_target is None or refreshed_target.warehouse_id != warehouse.id:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                "Original transaction not found.",
+            )
+        if (
+            refreshed_target.reference_type != "transfer"
+            or refreshed_target.reference_id != original_probe.reference_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_topology_changed",
+                    "message": (
+                        "Transfer identity of the target changed between "
+                        "the initial read and advisory-lock acquisition."
+                    ),
+                    "original_transaction_id": str(refreshed_target.id),
+                },
+            )
+        original_probe = refreshed_target
+
         candidates = await self.tx_repo.list_by_reference(
             "transfer", original_probe.reference_id
         )
@@ -1569,28 +1674,46 @@ class InventoryService:
             )
         ]
         if len(transfer_rows) != 2:
+            # Sprint 5.4.7 — a topology of anything other than exactly
+            # one OUT + one IN under the advisory lock is malformed
+            # and refused with a distinct diagnostic. Zero writes,
+            # zero markers, zero audits.
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
-                    "code": "transfer_pair_incomplete",
-                    "message": "Transfer pair is not exactly two rows.",
+                    "code": "transfer_topology_malformed",
+                    "message": (
+                        "Transfer identity contains an invalid number of "
+                        "TRANSFER_OUT/TRANSFER_IN rows; refusing to reverse."
+                    ),
                     "reference_id": str(original_probe.reference_id),
+                    "row_count": len(transfer_rows),
+                },
+            )
+        # Exactly one OUT and one IN.
+        out_rows = [
+            t for t in transfer_rows
+            if t.transaction_type == InventoryTransactionType.TRANSFER_OUT
+        ]
+        in_rows = [
+            t for t in transfer_rows
+            if t.transaction_type == InventoryTransactionType.TRANSFER_IN
+        ]
+        if len(out_rows) != 1 or len(in_rows) != 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_topology_malformed",
+                    "message": (
+                        "Transfer identity must contain exactly one "
+                        "TRANSFER_OUT and one TRANSFER_IN row."
+                    ),
+                    "reference_id": str(original_probe.reference_id),
+                    "out_count": len(out_rows),
+                    "in_count": len(in_rows),
                 },
             )
         partner_candidate = next(t for t in transfer_rows if t.id != original_probe.id)
-
-        # (2b) Test-only barrier — Sprint 5.4.6 concurrency proofs
-        # need both racers to have completed unlocked discovery
-        # before either enters the lock-acquisition phase. Production
-        # never sets this attribute; production callers walk straight
-        # through.
-        barrier = type(self)._reversal_lock_barrier
-        if barrier is not None:
-            wait = getattr(barrier, "wait", None)
-            if wait is not None:
-                res = wait()
-                if hasattr(res, "__await__"):
-                    await res
 
         # (3) Bulk-lock BOTH transaction rows in a single query,
         # ordered by id ASC. This is the ONLY place we acquire the
@@ -1645,6 +1768,41 @@ class InventoryService:
                 },
             )
 
+        # Sprint 5.4.7 — (4b) Repeat the topology discovery WHILE
+        # holding both the advisory lock and the two transaction row
+        # locks. Under the advisory lock no writer can add / mutate
+        # a third row, but this re-check catches any pre-existing
+        # malformed state (e.g. a third row that was inserted before
+        # any advisory locking was in place). Any deviation → 409.
+        recheck = await self.tx_repo.list_by_reference(
+            "transfer", original_locked.reference_id
+        )
+        recheck_transfers = [
+            t
+            for t in recheck
+            if t.transaction_type
+            in (
+                InventoryTransactionType.TRANSFER_OUT,
+                InventoryTransactionType.TRANSFER_IN,
+            )
+        ]
+        if len(recheck_transfers) != 2 or {t.id for t in recheck_transfers} != {
+            original_locked.id,
+            partner_locked.id,
+        }:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_topology_malformed",
+                    "message": (
+                        "Transfer identity topology changed under lock; "
+                        "refusing to reverse."
+                    ),
+                    "reference_id": str(original_locked.reference_id),
+                    "row_count": len(recheck_transfers),
+                },
+            )
+
         # (5) Lock the two warehouses referenced by the locked
         # transactions, in ascending id order. Scopes are derived
         # ONLY from these locked rows; the endpoint's pre-lock
@@ -1681,6 +1839,169 @@ class InventoryService:
             if wh_set is not None:
                 wh_set()
 
+        # Sprint 5.4.7 — (5a) Lock the referenced farm rows FOR
+        # UPDATE in ascending id order. Authorization scopes and
+        # farm-consistency invariants are derived from these locked
+        # rows so a concurrent UPDATE of ``farm.organization_id`` /
+        # ``farm.is_active`` / ``farm.deleted_at`` cannot slip
+        # between authorization and write.
+        farm_ids_set: set[uuid.UUID] = set()
+        for wh in (original_warehouse, partner_warehouse_locked):
+            if wh.farm_id is not None:
+                farm_ids_set.add(wh.farm_id)
+        farm_ids = sorted(farm_ids_set, key=str)
+        locked_farms = await self.farm_repo.list_by_ids_for_update(farm_ids)
+        farm_by_id: dict[uuid.UUID, Farm] = {f.id: f for f in locked_farms}
+        # Every referenced farm_id MUST resolve to a locked row.
+        missing_farms = [fid for fid in farm_ids if fid not in farm_by_id]
+        if missing_farms:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": "A referenced farm disappeared under lock.",
+                    "missing_farm_ids": [str(fid) for fid in missing_farms],
+                },
+            )
+        # Refuse if any referenced farm is soft-deleted / inactive
+        # UNDER LOCK. Diagnostics are distinct so callers can
+        # distinguish 'deleted' from 'deactivated'.
+        for f in locked_farms:
+            if f.deleted_at is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_deleted",
+                        "message": (
+                            "Referenced farm is soft-deleted; refusing to "
+                            "reverse."
+                        ),
+                        "farm_id": str(f.id),
+                    },
+                )
+            if not f.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_inactive",
+                        "message": (
+                            "Referenced farm is inactive; refusing to "
+                            "reverse."
+                        ),
+                        "farm_id": str(f.id),
+                    },
+                )
+
+        # Sprint 5.4.7 — (5b) Lock the owning organization row FOR
+        # UPDATE. Both warehouses MUST belong to the same
+        # organization (validated below); we therefore lock exactly
+        # one org row per reversal.
+        org_ids = sorted(
+            {original_warehouse.organization_id, partner_warehouse_locked.organization_id},
+            key=str,
+        )
+        locked_orgs = await self.org_repo.list_by_ids_for_update(org_ids)
+        org_by_id = {o.id: o for o in locked_orgs}
+        if any(oid not in org_by_id for oid in org_ids):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": "A referenced organization disappeared under lock.",
+                },
+            )
+        # Under the locked view, both warehouses must share ONE org.
+        if (
+            original_warehouse.organization_id
+            != partner_warehouse_locked.organization_id
+        ):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_pair_changed_during_reversal",
+                    "message": (
+                        "Transfer pair spans multiple organizations under "
+                        "lock; refusing to reverse."
+                    ),
+                },
+            )
+        locked_org = org_by_id[original_warehouse.organization_id]
+        if locked_org.deleted_at is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_organization_deleted",
+                    "message": (
+                        "Organization is soft-deleted; refusing to reverse."
+                    ),
+                    "organization_id": str(locked_org.id),
+                },
+            )
+        if not locked_org.is_active:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_organization_inactive",
+                    "message": (
+                        "Organization is inactive; refusing to reverse."
+                    ),
+                    "organization_id": str(locked_org.id),
+                },
+            )
+
+        # Sprint 5.4.7 test hook — signal that farm + organization
+        # row locks are now held. Farm / org mutation tests wait on
+        # this signal before firing their competing UPDATE.
+        farm_org_signal = type(self)._reversal_after_farm_org_locks_signal
+        if farm_org_signal is not None:
+            fo_set = getattr(farm_org_signal, "set", None)
+            if fo_set is not None:
+                fo_set()
+
+        # Sprint 5.4.7 test hook — hold the reverser transaction OPEN
+        # (still holding every lock acquired so far) until the test
+        # explicitly releases it. Production leaves this ``None`` and
+        # never pauses.
+        hold = type(self)._reversal_hold_after_farm_org_locks_gate
+        if hold is not None:
+            hold_wait = getattr(hold, "wait", None)
+            if hold_wait is not None:
+                res = hold_wait()
+                if hasattr(res, "__await__"):
+                    await res
+
+        # Sprint 5.4.7 — (5c) Farm ⟷ Organization ⟷ Warehouse
+        # invariants against the fully locked state. Any deviation
+        # returns 409 with a distinct diagnostic — Zero writes.
+        for f in locked_farms:
+            if f.organization_id != locked_org.id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_organization_mismatch",
+                        "message": (
+                            "Locked farm belongs to a different organization."
+                        ),
+                        "farm_id": str(f.id),
+                        "farm_organization_id": str(f.organization_id),
+                        "expected_organization_id": str(locked_org.id),
+                    },
+                )
+        for wh in (original_warehouse, partner_warehouse_locked):
+            if wh.farm_id is not None and wh.farm_id not in farm_by_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_warehouse_farm_mismatch",
+                        "message": (
+                            "Warehouse references a farm that could not "
+                            "be locked; refusing to reverse."
+                        ),
+                        "warehouse_id": str(wh.id),
+                        "warehouse_farm_id": str(wh.farm_id),
+                    },
+                )
+
         # (5b) Lock the referenced items. Both sides should reference
         # the same canonical item; still lock both ids defensively in
         # case a caller supplies a tampered row.
@@ -1700,6 +2021,32 @@ class InventoryService:
             )
         original_item_locked = item_by_id[original_locked.item_id]
         partner_item_locked = item_by_id[partner_locked.item_id]
+
+        # Sprint 5.4.7 — item ⟷ organization invariant against the
+        # locked state.
+        for it in locked_items:
+            if it.organization_id != locked_org.id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_item_organization_mismatch",
+                        "message": (
+                            "Item belongs to a different organization "
+                            "under lock; refusing to reverse."
+                        ),
+                        "item_id": str(it.id),
+                        "item_organization_id": str(it.organization_id),
+                        "expected_organization_id": str(locked_org.id),
+                    },
+                )
+
+        # Sprint 5.4.7 test hook — item locks acquired. Item
+        # mutation-race tests wait on this signal before firing.
+        item_signal = type(self)._reversal_after_item_locks_signal
+        if item_signal is not None:
+            it_set = getattr(item_signal, "set", None)
+            if it_set is not None:
+                it_set()
 
         # (6) Lock the two lot rows in ascending id order. The
         # reversal write phase re-uses these already-locked rows —
@@ -1762,6 +2109,9 @@ class InventoryService:
             "partner_warehouse": partner_warehouse_locked,
             "partner_item": partner_item_locked,
             "partner_lot": partner_lot_locked,
+            "organization": locked_org,
+            "original_farm": farm_by_id.get(original_warehouse.farm_id),
+            "partner_farm": farm_by_id.get(partner_warehouse_locked.farm_id),
             "scopes": scopes,
         }
 

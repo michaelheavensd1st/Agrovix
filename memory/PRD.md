@@ -1346,3 +1346,213 @@ pass under PostgreSQL 15.
 - Commit: `fix(inventory): deterministic pair locking (Sprint 5.4.6)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.7 — Serialized Transfer Topology + Full Authorization Locking (2026-02, delivered)
+
+### Problem
+Sprint 5.4.6 already row-locked the two participating transactions
+of a transfer pair in ascending id order, closing the opposite-side
+deadlock. But under PostgreSQL READ COMMITTED there remained two
+unclosed holes:
+
+1. **Topology serialization.** A concurrent `INSERT` (or a hostile
+   `UPDATE` re-parenting an unrelated row) could still add a THIRD
+   transaction into the same logical transfer identity between our
+   unlocked discovery step and the write phase. Row-level locks on
+   two rows do not prevent a NEW row appearing.
+2. **Farm + organization authoritative state.** Authorization ran
+   against warehouse ORM entities that carried `farm_id` /
+   `organization_id`, but the referenced `farms` / `organizations`
+   rows themselves were never locked. A concurrent `UPDATE` to
+   `farm.organization_id`, `farm.is_active`, `farm.deleted_at`,
+   `organization.is_active`, or `organization.deleted_at` could
+   slip between authorization and write.
+
+### Design
+#### Advisory-lock key
+Deterministic PostgreSQL transaction-scoped advisory lock keyed on
+the LOGICAL transfer identity:
+
+```
+canonical = f"inventory-transfer:{organization_id}:{reference_type}:{reference_id}"
+digest    = SHA-256(canonical)          # 32 bytes
+key64     = int.from_bytes(digest[:8], big-endian, unsigned)
+signed    = key64 - 2**64 if key64 >= 2**63 else key64  # PG BIGINT
+```
+
+Emitted as `SELECT pg_advisory_xact_lock(:key)`. Transaction-scoped
+(released automatically at commit / rollback), deterministic,
+independent of Python's `hash()`, ~2^32 identities before birthday
+collision (a collision would merely serialise two unrelated
+transfers, never corrupt state). No-op on SQLite (StaticPool
+already serialises writers).
+
+Helper module: `apps/api/app/services/_transfer_locks.py` exposes
+`advisory_lock_key_for_transfer(org, ref_type, ref_id)` and
+`acquire_transfer_advisory_lock(session, ...)`.
+
+#### Code paths using the advisory lock
+| Path | When acquired |
+| --- | --- |
+| `InventoryService.transfer()` — creates TRANSFER_OUT + TRANSFER_IN | Immediately after `transfer_ref = uuid4()`; BEFORE either row is inserted. |
+| `InventoryService._acquire_reversal_context()` — reversal of a transfer | Immediately after the unlocked probe reads `reference_id` from the target; BEFORE any FOR UPDATE. |
+
+Both writers thus contend for the SAME key. No topology mutation
+for `(organization_id, "transfer", reference_id)` can occur while
+any writer holds the lock.
+
+#### Deterministic lock order (final, `_acquire_reversal_context`)
+1. **Unlocked probe** of the target transaction (`tx_repo.get_by_id`).
+2. **Test barrier hook** (`_reversal_lock_barrier`) — a two-party
+   sync point placed BEFORE the advisory lock so both racers reach
+   the advisory-lock boundary before either acquires it.
+3. **Advisory lock** on `(organization_id, "transfer", reference_id)`.
+4. **Re-read target** post-advisory (`get_by_id`) and verify
+   `reference_id` unchanged; refuse `transfer_topology_changed`
+   otherwise.
+5. **Unlocked topology enumeration** (`list_by_reference("transfer", ref_id)`).
+   Refuse `transfer_topology_malformed` unless exactly one
+   TRANSFER_OUT + one TRANSFER_IN exists.
+6. **Bulk FOR UPDATE** on the two transaction ids, sorted ASC.
+7. **Post-lock relationship revalidation** — refuse
+   `transfer_pair_changed_during_reversal` on any drift.
+8. **Repeat topology enumeration under lock** — belt-and-braces
+   check for a pre-existing malformed row.
+9. **Bulk FOR UPDATE** on the two warehouse ids, sorted ASC.
+10. **Bulk FOR UPDATE** on the referenced farm ids, sorted ASC.
+    Refuse `transfer_farm_deleted` / `transfer_farm_inactive`.
+11. **Bulk FOR UPDATE** on the owning organization id.
+    Refuse `transfer_organization_deleted` /
+    `transfer_organization_inactive`.
+12. **Farm ⟷ Org ⟷ Warehouse invariants** —
+    `transfer_farm_organization_mismatch` /
+    `transfer_warehouse_farm_mismatch`.
+13. **Bulk FOR UPDATE** on the referenced item ids, sorted ASC.
+    Refuse `transfer_item_organization_mismatch`.
+14. **Bulk FOR UPDATE** on the referenced lot ids, sorted ASC.
+15. **Full symmetric + farm + pair validation** against the fully
+    locked context.
+16. **Return locked context** carrying the LOCKED original / partner
+    transactions, warehouses, farms, organization, items, lots, and
+    the authorization scopes derived EXCLUSIVELY from the locked
+    state.
+
+Authorization (via `resolve_reversal_scopes`) is decided AFTER
+every lock is held and every validation has passed; scopes come
+only from `context["scopes"]` which are derived from the locked
+warehouse rows.
+
+#### New repository methods
+| Repository | Method (Sprint 5.4.7 additions) |
+| --- | --- |
+| `FarmRepository` | `list_by_ids_for_update(ids)` — includes soft-deleted |
+| `OrganizationRepository` | `list_by_ids_for_update(ids)` — includes soft-deleted |
+
+Both use `WHERE id IN (:ids) ORDER BY id ASC FOR UPDATE` +
+`populate_existing()`. Soft-deleted rows are DELIBERATELY
+included: the reversal path must observe `deleted_at` under the
+lock to refuse with the correct diagnostic.
+
+#### New error diagnostics (all 409)
+`transfer_topology_changed`, `transfer_topology_malformed`,
+`transfer_organization_inactive`, `transfer_organization_deleted`,
+`transfer_farm_inactive`, `transfer_farm_deleted`,
+`transfer_farm_organization_mismatch`,
+`transfer_warehouse_farm_mismatch`,
+`transfer_item_organization_mismatch`.
+Existing codes preserved: `transfer_pair_changed_during_reversal`,
+`already_reversed`.
+
+#### PostgreSQL test infrastructure
+Two new class-level test hooks on `InventoryService` (default
+`None` in production):
+
+- `_reversal_after_farm_org_locks_signal` — set immediately after
+  the bulk FOR UPDATE on farm rows AND the org row completes.
+  Farm / org mutation-race tests wait on this before firing.
+- `_reversal_hold_after_farm_org_locks_gate` — the reverser awaits
+  this event AFTER signalling farm+org locks are held and BEFORE
+  proceeding. Tests use this to keep the reverser transaction OPEN
+  (still holding every lock) while asserting a competing UPDATE is
+  genuinely blocked (`mut_task.done() is False`).
+
+Plus a bounded two-party barrier utility in the test module
+(`_TwoPartyBarrier` — counter + `asyncio.Condition`) so proofs of
+"both racers reached the same synchronization point before either
+continued" no longer rely on plain `asyncio.Event`.
+
+### Locked-context structure
+```python
+{
+    "original":       InventoryTransaction,  # locked
+    "warehouse":      Warehouse,             # locked
+    "item":           InventoryItem,         # locked
+    "original_lot":   InventoryLot,          # locked
+    "partner":        InventoryTransaction,  # locked
+    "partner_warehouse": Warehouse,          # locked
+    "partner_item":   InventoryItem,         # locked
+    "partner_lot":    InventoryLot,          # locked
+    "organization":   Organization,          # locked
+    "original_farm":  Farm | None,           # locked
+    "partner_farm":   Farm | None,           # locked
+    "scopes":         list[(org_id, farm_id | None)],  # from locked rows
+}
+```
+
+### Files modified
+- `apps/api/app/services/_transfer_locks.py` (new)
+- `apps/api/app/services/inventory.py`
+- `apps/api/app/repositories/org_repo.py`
+- `apps/api/app/api/v1/endpoints/inventory.py`
+- `apps/api/tests/test_sprint_4_inventory.py`
+- `memory/PRD.md`
+
+### Validation
+- `ruff check` — clean on all modified files.
+- **SQLite** (`sqlite+aiosqlite:///:memory:`)
+  `pytest -q apps/api/tests/test_sprint_4_inventory.py` →
+  **65 passed, 18 skipped** (Postgres-only concurrency proofs
+  skip cleanly).
+- **PostgreSQL 15** (`postgresql+asyncpg://.../agrovix_test`)
+  - `pytest -q apps/api/tests/test_sprint_4_inventory.py` →
+    **83 passed** (75 pre-existing + 8 Sprint 5.4.7 additions:
+    advisory-key determinism, pre-existing 3-row rejection,
+    reference-mutation blocking on advisory lock, org
+    deactivation blocking, org deletion pre-refusal, farm
+    deactivation blocking, farm deletion pre-refusal,
+    two-party-barrier opposite-side race).
+  - `pytest -q apps/api/tests/` (full backend suite) →
+    **268 passed, 23 skipped** (skips are live-API `:8055`
+    suites requiring a running server).
+
+### Guarantees now enforced
+- **Topology serialisation.** No writer can add / remove / mutate
+  a row into a transfer identity while any other writer holds the
+  advisory lock on that identity. Under-lock topology re-checks
+  refuse `transfer_topology_malformed` on any pre-existing
+  malformed state.
+- **Full authoritative locking.** Farm, organization, warehouse,
+  item, and lot rows are all held FOR UPDATE before authorization
+  or validation runs. A concurrent UPDATE to
+  `farm.organization_id`, `is_active`, `deleted_at`, or the
+  organization equivalents blocks on our lock and cannot slip
+  between authorization and write.
+- **Authorization from locked state only.** Scopes returned by
+  `resolve_reversal_scopes` are derived exclusively from the
+  locked warehouse / farm / organization rows. Pre-lock ORM
+  entities are never used for permission decisions.
+- **Zero-write refusal.** Every rejection path returns 409 (or
+  the pre-existing 403 for authorization failures) with a distinct
+  diagnostic code AND asserts unchanged `_count_tx_rows` /
+  `_count_inverse_rows` / `_count_reversal_markers` /
+  `_sum_org_inventory` in tests.
+- **Non-transfer reversals unaffected.** Single-row reversals for
+  RECEIPT / ISSUE / CONSUMPTION / ADJUSTMENT_* still use the
+  simple locked path — no advisory lock, no farm/org lock, no
+  regression.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): serialized transfer topology + full authorization locking (Sprint 5.4.7)`
+- Local validation only — no push, no PR per sprint brief.
+

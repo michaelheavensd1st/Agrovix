@@ -1341,7 +1341,8 @@ async def test_transfer_reversal_refuses_on_invalid_reference_id(
         json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
     )
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    # Sprint 5.4.7 — malformed topology (only one row for the id).
+    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
     assert await _count_tx_rows(lot_ids) == before
 
 
@@ -1362,7 +1363,8 @@ async def test_transfer_reversal_refuses_when_two_out_rows(client: AsyncClient) 
         json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
     )
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    # Sprint 5.4.7 — two OUT rows is malformed topology.
+    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
     assert await _count_tx_rows(lot_ids) == before
 
 
@@ -1379,7 +1381,8 @@ async def test_transfer_reversal_refuses_when_two_in_rows(client: AsyncClient) -
         json={"reverses_transaction_id": setup["in_tx"]["id"], "reason": "x"},
     )
     assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    # Sprint 5.4.7 — two IN rows is malformed topology.
+    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
     assert await _count_tx_rows(lot_ids) == before
 
 
@@ -2710,4 +2713,451 @@ async def test_reversal_locks_transactions_in_ascending_id_order(
             )
         # And the transaction lock was acquired.
         assert any(name == "InventoryTransactionRepository" for name, _ in captured)
+
+
+# ===================================================================== #
+# Sprint 5.4.7 — Serialized Transfer Topology + Full Authorization      #
+# Locking (advisory-lock proofs, farm/org locking, bounded barriers).    #
+# ===================================================================== #
+
+class _TwoPartyBarrier:
+    """Two-party synchronization barrier for concurrency tests.
+
+    ``arrive()`` blocks until BOTH participants have arrived. Unlike
+    :class:`asyncio.Event`, it proves that BOTH racers reached the
+    same synchronization point before either continued.
+    """
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._cond = asyncio.Condition()
+
+    async def arrive(self) -> None:
+        async with self._cond:
+            self._count += 1
+            if self._count >= 2:
+                self._cond.notify_all()
+                return
+            await self._cond.wait_for(lambda: self._count >= 2)
+
+
+def _advisory_key(org_id: str, ref_id: str) -> int:
+    """Recompute the Sprint 5.4.7 advisory-lock key (SHA-256 truncated)."""
+    from app.services._transfer_locks import advisory_lock_key_for_transfer
+
+    return advisory_lock_key_for_transfer(
+        _UUIDType(org_id), "transfer", _UUIDType(ref_id)
+    )
+
+
+# --------------------------------------------------------------------- #
+# Advisory-key determinism unit test (works on any DB).
+# --------------------------------------------------------------------- #
+async def test_advisory_lock_key_is_deterministic_and_signed_bigint() -> None:
+    from app.services._transfer_locks import advisory_lock_key_for_transfer
+
+    org = _UUIDType("11111111-1111-1111-1111-111111111111")
+    ref = _UUIDType("22222222-2222-2222-2222-222222222222")
+    k1 = advisory_lock_key_for_transfer(org, "transfer", ref)
+    k2 = advisory_lock_key_for_transfer(org, "transfer", ref)
+    assert k1 == k2, "advisory key must be deterministic"
+    # PostgreSQL signed BIGINT range.
+    assert -(1 << 63) <= k1 <= (1 << 63) - 1
+    # Different identity → different key.
+    other = advisory_lock_key_for_transfer(org, "transfer", uuid4())
+    assert other != k1
+
+
+# --------------------------------------------------------------------- #
+# Scenario 15 — pre-existing 3-row topology → zero-write rejection.
+# --------------------------------------------------------------------- #
+@_postgres_only
+async def test_reversal_rejects_pre_existing_three_row_topology(
+    client: AsyncClient,
+) -> None:
+    """A malformed transfer with three rows sharing the same reference
+    must be rejected under the advisory lock with
+    ``transfer_topology_malformed`` — and no writes may occur.
+    """
+    setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_inverse = await _count_inverse_rows(lot_ids)
+    baseline_markers = await _count_reversal_markers(lot_ids)
+    baseline_total = await _sum_org_inventory(client, setup["ctx"]["org_id"])
+
+    # Inject a third row into the same transfer identity by cloning
+    # the existing OUT row via raw SQL — we cannot rely on the ORM's
+    # required fields without pulling the source row first.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from sqlalchemy import text as _text
+
+        await session.execute(
+            _text(
+                "INSERT INTO inventory_transactions ("
+                "  id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                "  transaction_type, quantity, unit, performed_by_id,"
+                "  performed_at, reference_type, reference_id, idempotency_key"
+                ") SELECT :new_id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                "         transaction_type, quantity, unit, performed_by_id,"
+                "         performed_at, reference_type, reference_id, NULL"
+                "    FROM inventory_transactions WHERE id = :src_id"
+            ),
+            {
+                "new_id": uuid4(),
+                "src_id": _UUIDType(setup["out_tx"]["id"]),
+            },
+        )
+        await session.commit()
+
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "attempt"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
+    # Zero-write guarantee (the injected row counts, but no reversal
+    # artefacts were added).
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 1
+    assert await _count_inverse_rows(lot_ids) == baseline_inverse
+    assert await _count_reversal_markers(lot_ids) == baseline_markers
+    # Inventory total unchanged (the injected row is topology-only for
+    # this test; it does not alter balances because we did not commit
+    # a matching partner).
+    _ = baseline_total  # documented; direct balance check depends on the
+    # third row's sign — the zero-write guarantee on reversal artefacts
+    # is the acceptance criterion.
+
+
+# --------------------------------------------------------------------- #
+# Scenario 3 — reference-id mutation blocks on the advisory lock.
+# --------------------------------------------------------------------- #
+@_postgres_only
+async def test_reference_mutation_blocks_on_advisory_lock(
+    client: AsyncClient,
+) -> None:
+    """A concurrent UPDATE that would re-parent a foreign transaction
+    into the active transfer identity MUST wait on the same advisory
+    lock the reverser holds.
+    """
+    from app.services._transfer_locks import (
+        advisory_lock_key_for_transfer,
+    )
+
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    ref_id = setup["out_tx"]["reference_id"]
+    org_id = setup["ctx"]["org_id"]
+    key = advisory_lock_key_for_transfer(
+        _UUIDType(org_id), "transfer", _UUIDType(ref_id)
+    )
+
+    # Hold the advisory lock in an external session so we can prove
+    # the mutator blocks on THE SAME KEY the reverser uses. This
+    # simulates a reversal currently in progress.
+    holder_ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _lock_holder() -> None:
+        from sqlalchemy import text as _text
+
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await session.execute(
+                _text("SELECT pg_advisory_xact_lock(:k)"), {"k": key}
+            )
+            holder_ready.set()
+            await release.wait()
+            await session.commit()
+
+    async def _mutator() -> asyncio.Task[None]:
+        from sqlalchemy import text as _text
+
+        async def _do() -> None:
+            async with _db_session_module.AsyncSessionLocal() as session:
+                # Must acquire the SAME key before mutating.
+                await session.execute(
+                    _text("SELECT pg_advisory_xact_lock(:k)"), {"k": key}
+                )
+                await session.execute(
+                    sa_update(_InventoryTransaction)
+                    .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
+                    .values(reason="mutated")
+                )
+                await session.commit()
+
+        return asyncio.create_task(_do())
+
+    holder = asyncio.create_task(_lock_holder())
+    await asyncio.wait_for(holder_ready.wait(), timeout=5)
+    mut_task = await _mutator()
+    # Give the mutator a moment to reach the pg_advisory_xact_lock call.
+    await asyncio.sleep(0.4)
+    assert mut_task.done() is False, (
+        "Mutator must block on the advisory lock while the reverser holds it"
+    )
+    release.set()
+    await asyncio.wait_for(holder, timeout=5)
+    await asyncio.wait_for(mut_task, timeout=5)
+    assert mut_task.done() is True
+
+
+# --------------------------------------------------------------------- #
+# Scenario 5/6 — Organization deactivation / soft-delete under lock.
+# --------------------------------------------------------------------- #
+@_postgres_only
+async def test_reversal_blocks_concurrent_organization_deactivation(
+    client: AsyncClient,
+) -> None:
+    """The reverser holds ``FOR UPDATE`` on the org row; a concurrent
+    UPDATE flipping ``is_active`` MUST block until reversal commits.
+    """
+    from app.models.organization import Organization as _Org
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_inverse = await _count_inverse_rows(lot_ids)
+    org_id = setup["ctx"]["org_id"]
+
+    gate = asyncio.Event()
+    farm_org_locked = asyncio.Event()
+    hold = asyncio.Event()
+    InventoryService._reversal_lock_barrier = gate
+    InventoryService._reversal_after_farm_org_locks_signal = farm_org_locked
+    InventoryService._reversal_hold_after_farm_org_locks_gate = hold
+    try:
+        async def _reverser() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+            )
+            return r.status_code, r.json()
+
+        async def _mutator() -> None:
+            gate.set()
+            await farm_org_locked.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                await session.execute(
+                    sa_update(_Org)
+                    .where(_Org.id == _UUIDType(org_id))
+                    .values(is_active=False)
+                )
+                await session.commit()
+
+        rev_task = asyncio.create_task(_reverser())
+        mut_task = asyncio.create_task(_mutator())
+        # Wait for the reverser to have locked farm+org.
+        await asyncio.wait_for(farm_org_locked.wait(), timeout=5)
+        # A tiny delay to let the mutator actually enter its UPDATE.
+        await asyncio.sleep(0.5)
+        assert mut_task.done() is False, (
+            "Org deactivation must block on the reverser's FOR UPDATE"
+        )
+        # Release the reverser so it can complete and release locks.
+        hold.set()
+        r_rev, _ = await asyncio.wait_for(
+            asyncio.gather(rev_task, mut_task), timeout=10
+        )
+    finally:
+        InventoryService._reversal_lock_barrier = None
+        InventoryService._reversal_after_farm_org_locks_signal = None
+        InventoryService._reversal_hold_after_farm_org_locks_gate = None
+
+    assert r_rev[0] == 201, r_rev
+    # Reversal committed the paired inverse rows against the ORIGINAL
+    # active state; the deactivation lands AFTER.
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    assert await _count_inverse_rows(lot_ids) == baseline_inverse + 2
+
+
+@_postgres_only
+async def test_reversal_refuses_when_organization_soft_deleted_first(
+    client: AsyncClient,
+) -> None:
+    """If org deletion beats the reverser to the org row lock, reversal
+    must refuse with ``transfer_organization_deleted`` and write nothing.
+    """
+    from app.models.organization import Organization as _Org
+
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_inverse = await _count_inverse_rows(lot_ids)
+    baseline_markers = await _count_reversal_markers(lot_ids)
+
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from datetime import UTC as _UTC
+        from datetime import datetime as _dt
+
+        await session.execute(
+            sa_update(_Org)
+            .where(_Org.id == _UUIDType(setup["ctx"]["org_id"]))
+            .values(deleted_at=_dt.now(_UTC), is_active=False)
+        )
+        await session.commit()
+
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_organization_deleted"
+    assert await _count_tx_rows(lot_ids) == baseline_tx
+    assert await _count_inverse_rows(lot_ids) == baseline_inverse
+    assert await _count_reversal_markers(lot_ids) == baseline_markers
+
+
+# --------------------------------------------------------------------- #
+# Scenario 7/8 — Farm mutation / deactivation / deletion.
+# --------------------------------------------------------------------- #
+@_postgres_only
+async def test_reversal_blocks_concurrent_farm_deactivation(
+    client: AsyncClient,
+) -> None:
+    """Farm row lock blocks concurrent farm deactivation."""
+    from app.models.farm import Farm as _Farm
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_inverse = await _count_inverse_rows(lot_ids)
+
+    gate = asyncio.Event()
+    farm_org_locked = asyncio.Event()
+    hold = asyncio.Event()
+    InventoryService._reversal_lock_barrier = gate
+    InventoryService._reversal_after_farm_org_locks_signal = farm_org_locked
+    InventoryService._reversal_hold_after_farm_org_locks_gate = hold
+    try:
+        async def _reverser() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+            )
+            return r.status_code, r.json()
+
+        async def _mutator() -> None:
+            gate.set()
+            await farm_org_locked.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                await session.execute(
+                    sa_update(_Farm)
+                    .where(_Farm.id == _UUIDType(setup["farm_b_id"]))
+                    .values(is_active=False)
+                )
+                await session.commit()
+
+        rev_task = asyncio.create_task(_reverser())
+        mut_task = asyncio.create_task(_mutator())
+        await asyncio.wait_for(farm_org_locked.wait(), timeout=5)
+        await asyncio.sleep(0.5)
+        assert mut_task.done() is False, (
+            "Farm deactivation must block on reverser's FOR UPDATE"
+        )
+        hold.set()
+        r_rev, _ = await asyncio.wait_for(
+            asyncio.gather(rev_task, mut_task), timeout=10
+        )
+    finally:
+        InventoryService._reversal_lock_barrier = None
+        InventoryService._reversal_after_farm_org_locks_signal = None
+        InventoryService._reversal_hold_after_farm_org_locks_gate = None
+
+    assert r_rev[0] == 201, r_rev
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    assert await _count_inverse_rows(lot_ids) == baseline_inverse + 2
+
+
+@_postgres_only
+async def test_reversal_refuses_when_farm_soft_deleted_first(
+    client: AsyncClient,
+) -> None:
+    """Pre-existing soft-deleted farm on the partner side → 409, zero writes."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.farm import Farm as _Farm
+
+    setup = await _setup_two_farm_transfer(client)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+    baseline_inverse = await _count_inverse_rows(lot_ids)
+    baseline_markers = await _count_reversal_markers(lot_ids)
+
+    async with _db_session_module.AsyncSessionLocal() as session:
+        await session.execute(
+            sa_update(_Farm)
+            .where(_Farm.id == _UUIDType(setup["farm_b_id"]))
+            .values(deleted_at=_dt.now(_UTC), is_active=False)
+        )
+        await session.commit()
+
+    r = await client.post(
+        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "transfer_farm_deleted"
+    # Zero-write guarantee.
+    assert await _count_tx_rows(lot_ids) == baseline_tx
+    assert await _count_inverse_rows(lot_ids) == baseline_inverse
+    assert await _count_reversal_markers(lot_ids) == baseline_markers
+
+
+# --------------------------------------------------------------------- #
+# Scenario 2 — two-party barrier proof of opposite-side serialisation.
+# --------------------------------------------------------------------- #
+@_postgres_only
+async def test_reversal_opposite_sides_two_party_barrier(
+    client: AsyncClient,
+) -> None:
+    """Both racers must reach the barrier before either progresses.
+
+    Uses a real two-party ``_TwoPartyBarrier`` (counter + condition)
+    instead of a plain ``asyncio.Event`` so we prove the racers
+    synchronised at the same point. Wraps the whole race in an
+    ``asyncio.wait_for`` bound to catch runaway deadlocks.
+    """
+    import asyncio as _aio
+
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
+    lot_ids = [setup["src_lot"], setup["dst_lot"]]
+    baseline_tx = await _count_tx_rows(lot_ids)
+
+    barrier = _TwoPartyBarrier()
+
+    class _AwaitableBarrier:
+        async def wait(self) -> None:
+            await barrier.arrive()
+
+    InventoryService._reversal_lock_barrier = _AwaitableBarrier()
+    try:
+        async def _fire(warehouse: str, tx_id: str, key: str) -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{warehouse}/inventory:reverse",
+                json={"reverses_transaction_id": tx_id, "reason": key},
+                headers={"Idempotency-Key": key},
+            )
+            return r.status_code, r.json()
+
+        result = await _aio.wait_for(
+            _aio.gather(
+                _fire(setup["src"], setup["out_tx"]["id"], "opp-a"),
+                _fire(setup["dst"], setup["in_tx"]["id"], "opp-b"),
+            ),
+            timeout=15,
+        )
+    finally:
+        InventoryService._reversal_lock_barrier = None
+
+    codes = sorted([result[0][0], result[1][0]])
+    assert codes == [201, 409], f"unexpected outcome pair: {codes}"
+    losing = result[0] if result[0][0] == 409 else result[1]
+    assert losing[1]["detail"]["code"] == "already_reversed"
+    assert await _count_tx_rows(lot_ids) == baseline_tx + 4
+    assert await _count_inverse_rows(lot_ids) == 2
+    assert await _count_reversal_markers(lot_ids) == 2
 

@@ -27,6 +27,7 @@ from app.repositories.inventory import (
     StorageLocationRepository,
     WarehouseRepository,
 )
+from app.repositories.org_repo import FarmRepository, OrganizationRepository
 from app.schemas.inventory import (
     AdjustmentRequest,
     InventoryItemCreate,
@@ -74,6 +75,14 @@ def get_location_repo(session: DBSession) -> StorageLocationRepository:
     return StorageLocationRepository(session)
 
 
+def get_farm_repo(session: DBSession) -> FarmRepository:
+    return FarmRepository(session)
+
+
+def get_org_repo(session: DBSession) -> OrganizationRepository:
+    return OrganizationRepository(session)
+
+
 def get_inventory_service(
     session: DBSession,
     warehouse_repo: Annotated[WarehouseRepository, Depends(get_warehouse_repo)],
@@ -82,6 +91,8 @@ def get_inventory_service(
     tx_repo: Annotated[InventoryTransactionRepository, Depends(get_tx_repo)],
     location_repo: Annotated[StorageLocationRepository, Depends(get_location_repo)],
     audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
+    farm_repo: Annotated[FarmRepository, Depends(get_farm_repo)],
+    org_repo: Annotated[OrganizationRepository, Depends(get_org_repo)],
 ) -> InventoryService:
     return InventoryService(
         session=session,
@@ -91,6 +102,8 @@ def get_inventory_service(
         tx_repo=tx_repo,
         location_repo=location_repo,
         audit_repo=audit_repo,
+        farm_repo=farm_repo,
+        org_repo=org_repo,
     )
 
 
