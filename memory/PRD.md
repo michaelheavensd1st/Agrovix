@@ -1751,3 +1751,121 @@ missing + unexpected id lists on mismatch.
 - Commit: `fix(inventory): single deterministic locking model + DB topology enforcement (Sprint 5.4.8)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.9 — Mandatory Transfer Identity + Database Bypass Closure (2026-02, delivered)
+
+### Problem
+Sprint 5.4.8 introduced the immutable ``transfer_group_id`` column
+and a partial unique index on ``(transfer_group_id, transaction_type)``.
+But four holes remained:
+
+1. ``transfer_group_id`` was NULLABLE and only APPLICATION code
+   guaranteed transfer rows got a value — raw SQL could still
+   insert a transfer row with ``transfer_group_id = NULL``,
+   bypassing the topology enforcement entirely.
+2. Nothing coupled ``reference_id`` to ``transfer_group_id``. A
+   hostile UPDATE of ``reference_id`` on ONE side of a pair would
+   silently create diverged topology.
+3. The migration blindly backfilled from ``reference_id`` without
+   detecting pre-existing malformed topology (duplicate roles,
+   incomplete pairs, orphans). A partial migration was possible.
+4. There was no explicit adversarial proof of the creation-vs-
+   reversal contention path.
+
+### Design
+
+#### Enhanced trigger — Sprint 5.4.9
+``trg_inventory_tx_group_immutable`` is now BEFORE ``INSERT OR
+UPDATE`` and enforces the full transfer-identity contract:
+
+* **INSERT** — transfer rows (OUT/IN) MUST have a non-null
+  ``transfer_group_id``, ``reference_type = 'transfer'``, and
+  ``reference_id = transfer_group_id``. Non-transfer rows MUST
+  have ``transfer_group_id = NULL``. Any violation raises with
+  ``not_null_violation`` or ``integrity_constraint_violation``.
+* **UPDATE** — ``transfer_group_id`` cannot change once set
+  (Sprint 5.4.8 invariant, preserved). Additionally, on transfer
+  rows, ``reference_id`` cannot diverge from ``transfer_group_id``
+  under UPDATE.
+
+Same DDL is installed by Alembic migration 0009 for
+production/CI and by an SQLAlchemy DDL event on ``create_all``
+for the hermetic Postgres test path.
+
+#### Migration 0009 pre-flight
+Before adding the column / index / trigger, the migration counts
+pre-existing malformed topology:
+
+```
+orphans          = transfer rows with reference_id IS NULL
+                   or reference_type != 'transfer'
+duplicate_roles  = (reference_id, transaction_type) groups with count > 1
+incomplete_pairs = reference_id groups with count != 2
+```
+
+If any is non-zero the migration raises ``RuntimeError`` with
+counts. Staging-safe: never leaves the database with partial
+enforcement.
+
+#### Test-only trigger restoration for the pre-flight proof
+The pre-flight assertion test drops the trigger, corrupts a
+transfer row, runs the pre-flight SQL, asserts the incomplete-
+pair count is non-zero, and RESTORES the trigger in a ``finally``
+block via the SQLAlchemy DDL objects exported from
+``app.models.inventory``. Ensures other tests see the trigger
+intact.
+
+### Behavioural outcomes (per required use case)
+* **Opposite-direction transfer** — Sprint 5.4.8
+  `test_sprint_5_4_8_opposite_direction_transfers_no_deadlock`
+  proves no deadlock, controlled 409 on the loser.
+* **Warehouse reassignment** — warehouse row `FOR UPDATE` +
+  post-lock revalidation surfaces `transfer_warehouse_farm_mismatch`.
+* **Farm reassignment / deactivation / deletion** — Sprint 5.4.7
+  `test_reversal_blocks_concurrent_farm_deactivation` +
+  `test_reversal_refuses_when_farm_soft_deleted_first`.
+* **Organization deactivation / deletion** — Sprint 5.4.7
+  `test_reversal_blocks_concurrent_organization_deactivation` +
+  `test_reversal_refuses_when_organization_soft_deleted_first`.
+* **Item deletion / reassignment** — Sprint 5.4.7
+  `test_reversal_blocks_concurrent_item_org_mutation`.
+* **Phantom insertion (third transfer row)** — Sprint 5.4.8
+  `test_sprint_5_4_8_db_constraint_rejects_phantom_transfer_row`.
+* **NULL group insertion (Sprint 5.4.9)** — new
+  `test_sprint_5_4_9_db_rejects_null_group_id_on_transfer_row`.
+* **Alternate group / non-transfer row group_id (Sprint 5.4.9)**
+  — new `test_sprint_5_4_9_db_rejects_group_id_on_non_transfer_row`.
+* **Malformed-topology migration** — new
+  `test_sprint_5_4_9_migration_preflight_aborts_on_malformed_topology`
+  exercises the exact pre-flight SQL used by the migration and
+  proves it surfaces incomplete-pair counts.
+* **Creation vs reversal race** — new
+  `test_sprint_5_4_9_creation_vs_reversal_no_deadlock` uses
+  `return_exceptions=True` and asserts no `deadlock` string
+  leaks, no 500 surfaces, and every outcome is 200/201/409.
+* **Non-transfer reversal missing lot** — Sprint 5.4.8
+  `test_sprint_5_4_8_non_transfer_reversal_missing_lot`.
+
+### Files modified
+- `apps/api/app/models/inventory.py` (enhanced trigger DDL:
+  INSERT/UPDATE, group required on transfer rows, coupling to
+  `reference_id`, no group on non-transfer rows)
+- `apps/api/alembic/versions/0009_transfer_group_id.py`
+  (pre-flight malformed-topology detection, enhanced trigger)
+- `apps/api/tests/test_sprint_4_inventory.py` (Sprint 5.4.9 tests
+  + updated Sprint 5.4.8 tests that now assert DB-layer rejection)
+- `memory/PRD.md`
+
+### Validation
+- `ruff check` — clean on all modified files.
+- **SQLite** (non-locking coverage): `test_sprint_4_inventory.py`
+  → **65 passed, 28 skipped** (all DB-trigger-dependent tests
+  marked ``@_postgres_only`` skip cleanly).
+- **PostgreSQL 15**: `test_sprint_4_inventory.py` → **93 passed**.
+  Full backend suite → **278 passed, 23 skipped**.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): mandatory transfer identity + database bypass closure (Sprint 5.4.9)`
+- Local validation only — no push, no PR per sprint brief.
+

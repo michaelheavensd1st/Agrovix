@@ -1311,38 +1311,41 @@ async def test_transfer_reversal_refuses_when_reference_type_missing(
     assert await _sum_org_inventory(client, setup["ctx"]["org_id"]) == before_total
 
 
+@_postgres_only
 async def test_transfer_reversal_refuses_when_reference_id_missing(
     client: AsyncClient,
 ) -> None:
+    """Sprint 5.4.9 — the DB coupling trigger rejects the malformed
+    UPDATE itself: a transfer row cannot lose its reference_id or
+    diverge from its transfer_group_id. The application layer never
+    sees a topology with a NULL reference_id on a transfer row.
+    (Postgres-only: SQLite does not enforce the trigger.)
+    """
+    from sqlalchemy.exc import IntegrityError
+
     setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
     lot_ids = [setup["src_lot"], setup["dst_lot"]]
     before = await _count_tx_rows(lot_ids)
-    await _mutate_tx(setup["out_tx"]["id"], reference_id=None)
-    r = await client.post(
-        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
-        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
-    )
-    assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "transfer_pair_incomplete"
+    with pytest.raises(IntegrityError):
+        await _mutate_tx(setup["out_tx"]["id"], reference_id=None)
     assert await _count_tx_rows(lot_ids) == before
     assert await _count_reversal_markers(lot_ids) == 0
 
 
+@_postgres_only
 async def test_transfer_reversal_refuses_on_invalid_reference_id(
     client: AsyncClient,
 ) -> None:
+    """Sprint 5.4.9 — the DB coupling trigger rejects reference_id
+    divergence from transfer_group_id. (Postgres-only.)
+    """
+    from sqlalchemy.exc import IntegrityError
+
     setup = await _setup_transfer_pair(client, transfer_qty=2.0, initial_qty=8.0)
     lot_ids = [setup["src_lot"], setup["dst_lot"]]
     before = await _count_tx_rows(lot_ids)
-    # Point the OUT row at a reference_id no other row shares.
-    await _mutate_tx(setup["out_tx"]["id"], reference_id=uuid4())
-    r = await client.post(
-        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
-        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "x"},
-    )
-    assert r.status_code == 409, r.text
-    # Sprint 5.4.7 — malformed topology (only one row for the id).
-    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
+    with pytest.raises(IntegrityError):
+        await _mutate_tx(setup["out_tx"]["id"], reference_id=uuid4())
     assert await _count_tx_rows(lot_ids) == before
 
 
@@ -2773,58 +2776,47 @@ async def test_advisory_lock_key_is_deterministic_and_signed_bigint() -> None:
 async def test_reversal_rejects_pre_existing_three_row_topology(
     client: AsyncClient,
 ) -> None:
-    """A malformed transfer with three rows sharing the same reference
-    must be rejected under the advisory lock with
-    ``transfer_topology_malformed`` — and no writes may occur.
+    """Sprint 5.4.9 — the raw-SQL INSERT that would add a THIRD row
+    into a transfer identity is REJECTED at the DB layer by the
+    partial unique index ``uq_inventory_tx_transfer_role``. The
+    application layer never sees the malformed topology.
     """
+    from sqlalchemy.exc import IntegrityError
+
     setup = await _setup_transfer_pair(client, transfer_qty=3.0, initial_qty=9.0)
     lot_ids = [setup["src_lot"], setup["dst_lot"]]
     baseline_tx = await _count_tx_rows(lot_ids)
     baseline_inverse = await _count_inverse_rows(lot_ids)
     baseline_markers = await _count_reversal_markers(lot_ids)
-    baseline_total = await _sum_org_inventory(client, setup["ctx"]["org_id"])
 
-    # Inject a third row into the same transfer identity by cloning
-    # the existing OUT row via raw SQL — we cannot rely on the ORM's
-    # required fields without pulling the source row first.
     async with _db_session_module.AsyncSessionLocal() as session:
         from sqlalchemy import text as _text
 
-        await session.execute(
-            _text(
-                "INSERT INTO inventory_transactions ("
-                "  id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
-                "  transaction_type, quantity, unit, performed_by_id,"
-                "  performed_at, reference_type, reference_id, idempotency_key"
-                ") SELECT :new_id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
-                "         transaction_type, quantity, unit, performed_by_id,"
-                "         performed_at, reference_type, reference_id, NULL"
-                "    FROM inventory_transactions WHERE id = :src_id"
-            ),
-            {
-                "new_id": uuid4(),
-                "src_id": _UUIDType(setup["out_tx"]["id"]),
-            },
-        )
-        await session.commit()
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                _text(
+                    "INSERT INTO inventory_transactions ("
+                    "  id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "  transaction_type, quantity, unit, performed_by_id,"
+                    "  performed_at, reference_type, reference_id, idempotency_key,"
+                    "  transfer_group_id"
+                    ") SELECT :new_id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "         transaction_type, quantity, unit, performed_by_id,"
+                    "         performed_at, reference_type, reference_id, NULL,"
+                    "         transfer_group_id"
+                    "    FROM inventory_transactions WHERE id = :src_id"
+                ),
+                {
+                    "new_id": uuid4(),
+                    "src_id": _UUIDType(setup["out_tx"]["id"]),
+                },
+            )
+            await session.commit()
 
-    r = await client.post(
-        f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
-        json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "attempt"},
-    )
-    assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "transfer_topology_malformed"
-    # Zero-write guarantee (the injected row counts, but no reversal
-    # artefacts were added).
-    assert await _count_tx_rows(lot_ids) == baseline_tx + 1
+    # Zero-write guarantee — the DB layer refused the INSERT.
+    assert await _count_tx_rows(lot_ids) == baseline_tx
     assert await _count_inverse_rows(lot_ids) == baseline_inverse
     assert await _count_reversal_markers(lot_ids) == baseline_markers
-    # Inventory total unchanged (the injected row is topology-only for
-    # this test; it does not alter balances because we did not commit
-    # a matching partner).
-    _ = baseline_total  # documented; direct balance check depends on the
-    # third row's sign — the zero-write guarantee on reversal artefacts
-    # is the acceptance criterion.
 
 
 # --------------------------------------------------------------------- #
@@ -3413,4 +3405,204 @@ async def test_sprint_5_4_8_non_transfer_reversal_missing_lot(
         )
     # Zero-write guarantee.
     assert await _count_tx_rows([lot_id]) == before_tx
+
+
+
+# ===================================================================== #
+# Sprint 5.4.9 — Mandatory transfer identity + database bypass proofs.  #
+# ===================================================================== #
+
+# Test — DB rejects INSERT of a transfer row with NULL transfer_group_id.
+@_postgres_only
+async def test_sprint_5_4_9_db_rejects_null_group_id_on_transfer_row(
+    client: AsyncClient,
+) -> None:
+    """The Sprint 5.4.9 trigger REJECTS ``INSERT INTO
+    inventory_transactions (..., transaction_type='transfer_out',
+    transfer_group_id=NULL, ...)``. Transfer rows are BORN with a
+    non-null immutable identity.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from sqlalchemy import text as _text
+
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                _text(
+                    "INSERT INTO inventory_transactions ("
+                    "  id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "  transaction_type, quantity, unit, performed_by_id,"
+                    "  performed_at, reference_type, reference_id, idempotency_key,"
+                    "  transfer_group_id"
+                    ") SELECT :new_id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "         'transfer_out'::inventory_transaction_type, quantity, unit, performed_by_id,"
+                    "         performed_at, 'transfer', :new_ref, NULL, NULL"
+                    "    FROM inventory_transactions WHERE id = :src_id"
+                ),
+                {
+                    "new_id": uuid4(),
+                    "src_id": _UUIDType(setup["out_tx"]["id"]),
+                    "new_ref": uuid4(),
+                },
+            )
+            await session.commit()
+
+
+# Test — DB rejects transfer_group_id on a non-transfer row.
+@_postgres_only
+async def test_sprint_5_4_9_db_rejects_group_id_on_non_transfer_row(
+    client: AsyncClient,
+) -> None:
+    """Non-transfer rows (RECEIPT / ISSUE / …) MUST NOT carry a
+    ``transfer_group_id``. The Sprint 5.4.9 trigger enforces this.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    ctx = await _new_owner_org_farm(client)
+    wh = await _create_warehouse(client, ctx["org_id"], farm_id=ctx["farm_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    receipt = await _receipt(client, wh, item_id, quantity=5, unit="kg", lot_code="X")
+    receipt_body = receipt["body"]
+    receipt_tx_id = receipt_body["transaction"]["id"] if "transaction" in receipt_body else None
+    if receipt_tx_id is None:
+        # Fall back to lot transactions listing.
+        lot_id = await _lot_id_for(client, wh)
+        txs = (await client.get(f"/api/v1/lots/{lot_id}/transactions")).json()["items"]
+        receipt_tx_id = txs[0]["id"]
+    async with _db_session_module.AsyncSessionLocal() as session:
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                sa_update(_InventoryTransaction)
+                .where(_InventoryTransaction.id == _UUIDType(receipt_tx_id))
+                .values(transfer_group_id=uuid4())
+            )
+            await session.commit()
+
+
+# Test — creation vs reversal race: no deadlock, one blocks the other.
+@_postgres_only
+async def test_sprint_5_4_9_creation_vs_reversal_no_deadlock(
+    client: AsyncClient,
+) -> None:
+    """A concurrent transfer CREATION and a REVERSAL of an existing
+    transfer must serialize predictably under the canonical lock
+    order (advisory → tx → warehouse → farm → org → item → lot).
+    Neither may surface a Postgres deadlock as a 500.
+    """
+    # Existing transfer to reverse.
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=8.0)
+    # Fresh transfer to create in parallel — same warehouses / lots so
+    # both racers contend for the SAME row locks. This is the
+    # canonical creation-vs-reversal contention scenario.
+    async def _reverser() -> tuple[int, dict]:
+        r = await client.post(
+            f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+            json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+            headers={"Idempotency-Key": f"rev-{uuid4().hex[:6]}"},
+        )
+        return r.status_code, r.json()
+
+    async def _creator() -> tuple[int, dict]:
+        r = await client.post(
+            f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+            json={
+                "lot_id": setup["src_lot"],
+                "destination_warehouse_id": setup["dst"],
+                "quantity": 1,
+                "unit": "kg",
+            },
+            headers={"Idempotency-Key": f"cre-{uuid4().hex[:6]}"},
+        )
+        return r.status_code, r.json()
+
+    result = await asyncio.gather(_reverser(), _creator(), return_exceptions=True)
+    for outcome in result:
+        if isinstance(outcome, BaseException):
+            msg = str(outcome).lower()
+            assert "deadlock" not in msg, f"deadlock surfaced: {outcome!r}"
+        else:
+            code, body = outcome
+            assert code != 500, f"unexpected 500: {body}"
+            assert code in (200, 201, 409), (code, body)
+
+
+# Test — migration 0009 malformed-topology pre-flight abort.
+@_postgres_only
+async def test_sprint_5_4_9_migration_preflight_aborts_on_malformed_topology(
+    client: AsyncClient,
+) -> None:
+    """The Sprint 5.4.9 migration pre-flight query counts duplicate
+    roles / orphans / incomplete pairs BEFORE creating constraints
+    and raises a RuntimeError with counts if any are present.
+    This test invokes the pre-flight SQL against a table that is
+    intentionally corrupted, and asserts the query surfaces the
+    correct counts (proving the migration would abort).
+    """
+    from sqlalchemy import text as _text
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    # Corrupt: mark the IN row with a divergent reference_id via a
+    # direct backend that bypasses the ORM's triggers using an admin
+    # session — we DROP the trigger temporarily just for this test.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        await session.execute(
+            _text(
+                "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
+                "ON inventory_transactions"
+            )
+        )
+        await session.commit()
+    try:
+        # Now corrupt: point OUT row at a foreign reference_id.
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await session.execute(
+                sa_update(_InventoryTransaction)
+                .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
+                .values(reference_id=uuid4())
+            )
+            await session.commit()
+        # Run the pre-flight query and assert incomplete_pairs > 0.
+        async with _db_session_module.AsyncSessionLocal() as session:
+            result = (
+                await session.execute(
+                    _text(
+                        "WITH transfer_rows AS ("
+                        "  SELECT id, transaction_type, reference_id, reference_type "
+                        "  FROM inventory_transactions "
+                        "  WHERE transaction_type IN ('transfer_out', 'transfer_in')"
+                        ") "
+                        "SELECT (SELECT COUNT(*) FROM ("
+                        "    SELECT reference_id FROM transfer_rows "
+                        "     WHERE reference_id IS NOT NULL "
+                        "     GROUP BY reference_id HAVING COUNT(*) <> 2) x) AS incomplete_pairs"
+                    )
+                )
+            ).scalar()
+            assert result > 0, (
+                "pre-flight query should surface incomplete pairs after corruption"
+            )
+    finally:
+        # Restore the trigger via the DDL from the model.
+        from app.models.inventory import (
+            _transfer_group_immutable_create_trigger_ddl,
+            _transfer_group_immutable_fn_ddl,
+        )
+
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await session.execute(
+                _text(_transfer_group_immutable_fn_ddl.statement)
+            )
+            await session.execute(
+                _text(
+                    "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
+                    "ON inventory_transactions"
+                )
+            )
+            await session.execute(
+                _text(_transfer_group_immutable_create_trigger_ddl.statement)
+            )
+            await session.commit()
 

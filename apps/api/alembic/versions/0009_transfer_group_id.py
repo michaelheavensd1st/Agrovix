@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from alembic import op
+from sqlalchemy import text as _sa_text
 
 revision: str = "0009_transfer_group_id"
 down_revision: str | None = "0008_wh_maintenance"
@@ -30,6 +31,42 @@ depends_on: Sequence[str] | None = None
 def upgrade() -> None:
     bind = op.get_bind()
     dialect = bind.dialect.name
+
+    # Sprint 5.4.9 — pre-flight malformed-topology detection. If
+    # pre-existing rows would violate the constraints we are about
+    # to create, abort with an explicit diagnostic. Never leave a
+    # partially migrated topology behind.
+    if dialect == "postgresql":
+        malformed = bind.execute(
+            _sa_text(
+                "WITH transfer_rows AS ("
+                "  SELECT id, transaction_type, reference_id, reference_type "
+                "  FROM inventory_transactions "
+                "  WHERE transaction_type IN ('transfer_out', 'transfer_in')"
+                ") "
+                "SELECT "
+                "  (SELECT COUNT(*) FROM transfer_rows "
+                "    WHERE reference_id IS NULL "
+                "       OR reference_type IS DISTINCT FROM 'transfer') AS orphans, "
+                "  (SELECT COUNT(*) FROM ("
+                "    SELECT reference_id, transaction_type, COUNT(*) c "
+                "      FROM transfer_rows WHERE reference_id IS NOT NULL "
+                "      GROUP BY reference_id, transaction_type "
+                "     HAVING COUNT(*) > 1) x) AS duplicate_roles, "
+                "  (SELECT COUNT(*) FROM ("
+                "    SELECT reference_id FROM transfer_rows "
+                "     WHERE reference_id IS NOT NULL "
+                "     GROUP BY reference_id HAVING COUNT(*) <> 2) x) AS incomplete_pairs"
+            )
+        ).one()
+        orphans, dup_roles, incomplete = malformed
+        if orphans or dup_roles or incomplete:
+            raise RuntimeError(
+                "Sprint 5.4.9 migration 0009 aborted: malformed transfer "
+                f"topology present — orphan_transfer_rows={orphans}, "
+                f"duplicate_roles={dup_roles}, incomplete_pairs={incomplete}. "
+                "Repair the offending rows before re-running the migration."
+            )
 
     # 1. Column.
     op.execute(
@@ -62,24 +99,49 @@ def upgrade() -> None:
             "WHERE transfer_group_id IS NOT NULL "
             "  AND transaction_type IN ('transfer_out', 'transfer_in')"
         )
-        # 4. Immutability trigger — after a transfer_group_id is
-        #    set, it cannot be UPDATEd. Insertions with any value
-        #    (including NULL) are allowed.
+        # 4. Sprint 5.4.9 comprehensive trigger — enforces:
+        #    - transfer rows are BORN with a non-null group_id;
+        #    - non-transfer rows must NOT carry a group_id;
+        #    - reference_id must equal transfer_group_id on transfer
+        #      rows (coupling; prevents divergence);
+        #    - reference_type must be 'transfer' on transfer rows;
+        #    - transfer_group_id is immutable after INSERT.
         op.execute(
-            """
-            CREATE OR REPLACE FUNCTION inventory_transactions_group_immutable()
-            RETURNS TRIGGER AS $$
-            BEGIN
-                IF OLD.transfer_group_id IS NOT NULL
-                   AND NEW.transfer_group_id IS DISTINCT FROM OLD.transfer_group_id
-                THEN
-                    RAISE EXCEPTION 'transfer_group_id is immutable once set'
-                        USING ERRCODE = 'integrity_constraint_violation';
-                END IF;
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-            """
+            "CREATE OR REPLACE FUNCTION inventory_transactions_group_immutable() "
+            "RETURNS TRIGGER AS $$ "
+            "BEGIN "
+            "  IF TG_OP = 'INSERT' THEN "
+            "    IF NEW.transaction_type IN ('transfer_out', 'transfer_in') THEN "
+            "      IF NEW.transfer_group_id IS NULL THEN "
+            "        RAISE EXCEPTION 'transfer_group_id is required for transfer rows' "
+            "          USING ERRCODE = 'not_null_violation'; "
+            "      END IF; "
+            "      IF NEW.reference_type IS DISTINCT FROM 'transfer' THEN "
+            "        RAISE EXCEPTION 'transfer rows must have reference_type=transfer' "
+            "          USING ERRCODE = 'integrity_constraint_violation'; "
+            "      END IF; "
+            "      IF NEW.reference_id IS NULL OR NEW.reference_id != NEW.transfer_group_id THEN "
+            "        RAISE EXCEPTION 'transfer_group_id must equal reference_id' "
+            "          USING ERRCODE = 'integrity_constraint_violation'; "
+            "      END IF; "
+            "    ELSIF NEW.transfer_group_id IS NOT NULL THEN "
+            "      RAISE EXCEPTION 'transfer_group_id may only be set on transfer rows' "
+            "        USING ERRCODE = 'integrity_constraint_violation'; "
+            "    END IF; "
+            "    RETURN NEW; "
+            "  END IF; "
+            "  IF OLD.transfer_group_id IS DISTINCT FROM NEW.transfer_group_id THEN "
+            "    RAISE EXCEPTION 'transfer_group_id is immutable once set' "
+            "      USING ERRCODE = 'integrity_constraint_violation'; "
+            "  END IF; "
+            "  IF NEW.transaction_type IN ('transfer_out', 'transfer_in') "
+            "     AND NEW.reference_id IS DISTINCT FROM NEW.transfer_group_id THEN "
+            "    RAISE EXCEPTION 'transfer reference_id and transfer_group_id must match' "
+            "      USING ERRCODE = 'integrity_constraint_violation'; "
+            "  END IF; "
+            "  RETURN NEW; "
+            "END; "
+            "$$ LANGUAGE plpgsql"
         )
         op.execute(
             "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
@@ -87,7 +149,7 @@ def upgrade() -> None:
         )
         op.execute(
             "CREATE TRIGGER trg_inventory_tx_group_immutable "
-            "BEFORE UPDATE ON inventory_transactions "
+            "BEFORE INSERT OR UPDATE ON inventory_transactions "
             "FOR EACH ROW EXECUTE FUNCTION inventory_transactions_group_immutable()"
         )
     else:
