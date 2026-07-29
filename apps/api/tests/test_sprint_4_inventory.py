@@ -4077,13 +4077,44 @@ async def test_sprint_5_4_11_transfer_rejects_permission_revocation_under_lock(
             )
         )
 
-    status_code, body = await _run_transfer_under_pre_lock_race(
-        client, setup=setup, mutator_body=_mutator_body
-    )
-    assert status_code == 403, (status_code, body)
-    assert "inventory_transaction.create" in str(body.get("detail", "")), body
-    # No ledger row landed on either warehouse.
-    assert await _tx_baseline_count(setup) == baseline
+    try:
+        status_code, body = await _run_transfer_under_pre_lock_race(
+            client, setup=setup, mutator_body=_mutator_body
+        )
+        assert status_code == 403, (status_code, body)
+        assert "inventory_transaction.create" in str(body.get("detail", "")), body
+        # No ledger row landed on either warehouse.
+        assert await _tx_baseline_count(setup) == baseline
+    finally:
+        # Sprint 5.4.11 → 5.4.12 — restore the shared
+        # role↔permission link so subsequent tests in this session
+        # do not inherit a globally-broken authorization graph.
+        async with _db_session_module.AsyncSessionLocal() as session:
+            role_id = (
+                await session.execute(
+                    select(_Role.id).where(_Role.name == "farm_director")
+                )
+            ).scalar_one()
+            perm_id = (
+                await session.execute(
+                    select(_Perm.id).where(
+                        _Perm.code == "inventory_transaction.create"
+                    )
+                )
+            ).scalar_one()
+            existing = (
+                await session.execute(
+                    select(_rp).where(
+                        _rp.c.role_id == role_id,
+                        _rp.c.permission_id == perm_id,
+                    )
+                )
+            ).first()
+            if existing is None:
+                await session.execute(
+                    _rp.insert().values(role_id=role_id, permission_id=perm_id)
+                )
+                await session.commit()
 
 
 @_postgres_only
@@ -4316,3 +4347,570 @@ async def test_sprint_5_4_11_transfer_rejects_organization_deactivation_under_lo
         body.get("detail", {}).get("code") == "transfer_organization_inactive"
     ), body
     assert await _tx_baseline_count(setup) == baseline
+
+
+# ===================================================================== #
+# Sprint 5.4.12 — Real two-transaction proof that authorization
+# mutations BLOCK on the per-organization authorization advisory
+# lock while a transfer holds it, and RESUME after the transfer
+# commits or rolls back.
+#
+# Every test in this block:
+#   1. Starts a transfer coroutine that holds all its row locks
+#      + the per-org authorization advisory lock, paused at
+#      ``_transfer_hold_before_authorize_gate``.
+#   2. In a SEPARATE Postgres connection, attempts an
+#      authorization mutation that FIRST acquires the SAME
+#      per-org authorization advisory lock (matching the
+#      protocol every real revocation / assignment path now
+#      follows via :mod:`app.services._authorization_lock`).
+#   3. Asserts the mutation task is genuinely blocked
+#      (``mut_task.done() is False``) — no timing assumptions,
+#      only deterministic ``asyncio.Event`` signals.
+#   4. Releases the transfer hold gate.
+#   5. Asserts the mutation task then completes.
+#
+# Additional coverage:
+#   * revocation-wins-first — mutation commits BEFORE transfer,
+#     transfer resolves against the post-mutation state and
+#     refuses.
+#   * rollback releases the lock — if the transfer rolls back,
+#     the mutation resumes and commits.
+#   * unrelated organizations do NOT block each other.
+#   * deterministic UUID ordering prevents AB / BA deadlocks.
+#
+# Every test is ``@_postgres_only`` — SQLite lacks
+# ``pg_advisory_xact_lock``.
+# ===================================================================== #
+
+
+async def _acquire_org_auth_lock_via_sql(session, org_id: str) -> None:
+    """Emit ``SELECT pg_advisory_xact_lock`` for the per-org
+    authorization key, matching what
+    :mod:`app.services._authorization_lock` does. Used by the
+    mutator coroutines in the tests below so they participate in
+    the exact same lock protocol as production services.
+    """
+    from app.services._authorization_lock import (
+        advisory_lock_key_for_org_authorization,
+    )
+
+    key = advisory_lock_key_for_org_authorization(_UUIDType(org_id))
+    from sqlalchemy import text as _text
+
+    await session.execute(_text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+
+
+@_postgres_only
+async def test_sprint_5_4_12_transfer_blocks_authorization_mutation_while_holding_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.12 — real two-transaction blocking proof.
+
+    Transfer acquires the per-org authorization advisory lock and
+    pauses at the hold gate. A concurrent authorization mutator
+    coroutine (in a separate DB connection) attempts to acquire
+    the SAME lock and MUST block. Once the transfer completes,
+    the mutator resumes and commits.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.role_assignment import RoleAssignment as _RoleAssn
+    from app.models.user import User as _User
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    locks_signal = asyncio.Event()
+    hold = asyncio.Event()
+    mutator_started = asyncio.Event()
+    InventoryService._transfer_after_locks_signal = locks_signal
+    InventoryService._transfer_hold_before_authorize_gate = hold
+    try:
+
+        async def _transferer() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+                json={
+                    "lot_id": setup["src_lot"],
+                    "destination_warehouse_id": setup["dst"],
+                    "quantity": 5,
+                    "unit": "kg",
+                },
+                headers={"Idempotency-Key": f"xfer-{uuid4().hex[:8]}"},
+            )
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, {"text": r.text}
+
+        mut_committed = asyncio.Event()
+
+        async def _mutator() -> None:
+            # Wait until transfer has locked warehouses / farms / orgs.
+            await locks_signal.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                mutator_started.set()
+                # Acquire the SAME per-org authorization advisory lock.
+                # This MUST block while the transfer holds it.
+                await _acquire_org_auth_lock_via_sql(session, setup["org_id"])
+                # Once we get the lock, revoke THIS operator's role
+                # assignment (per-user; does not pollute shared roles).
+                op_id = (
+                    await session.execute(
+                        select(_User.id).where(_User.email == setup["operator"])
+                    )
+                ).scalar_one()
+                await session.execute(
+                    sa_update(_RoleAssn)
+                    .where(
+                        _RoleAssn.user_id == op_id,
+                        _RoleAssn.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=_dt.now(_UTC))
+                )
+                await session.commit()
+                mut_committed.set()
+
+        rev_task = asyncio.create_task(_transferer())
+        mut_task = asyncio.create_task(_mutator())
+
+        # Wait until the mutator has actually issued the advisory-lock
+        # SELECT — it will be blocked inside pg_advisory_xact_lock().
+        await asyncio.wait_for(mutator_started.wait(), timeout=5)
+        # Give Postgres a moment to receive the lock request; assert
+        # the mutator is genuinely blocked.
+        await asyncio.sleep(0.5)
+        assert mut_task.done() is False, (
+            "authorization mutator must block on the advisory lock while "
+            "the transfer holds it"
+        )
+        assert mut_committed.is_set() is False
+
+        # Release the transfer — it will resolve authorization AFTER
+        # the mutation would have committed. Since we've BLOCKED the
+        # mutation until the transfer commits, the transfer sees
+        # the ORIGINAL (still-authorized) state and commits (201).
+        hold.set()
+        transfer_result, _ = await asyncio.wait_for(
+            asyncio.gather(rev_task, mut_task), timeout=15
+        )
+    finally:
+        InventoryService._transfer_after_locks_signal = None
+        InventoryService._transfer_hold_before_authorize_gate = None
+
+    # Transfer committed under the ORIGINAL authorization.
+    status_code, body = transfer_result
+    assert status_code == 201, (status_code, body)
+    # Mutation ultimately committed AFTER the transfer released its
+    # advisory lock — proving the mutation was queued, not lost.
+    assert mut_committed.is_set() is True
+    # Ledger: exactly 2 rows added (OUT + IN).
+    assert await _tx_baseline_count(setup) == baseline + 2
+
+
+@_postgres_only
+async def test_sprint_5_4_12_revocation_wins_first_transfer_refused(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.12 — reverse ordering.
+
+    Mutation commits BEFORE the transfer acquires the advisory
+    lock. The transfer's fresh permission read observes the
+    revoked state and refuses with 403. Zero ledger writes.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.role_assignment import RoleAssignment as _RoleAssn
+    from app.models.user import User as _User
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    async def _mutator_body(session) -> None:
+        # Mutator itself acquires the advisory lock (production
+        # revocation paths do the same via
+        # RoleAssignmentService.revoke).
+        await _acquire_org_auth_lock_via_sql(session, setup["org_id"])
+        op_id = (
+            await session.execute(
+                select(_User.id).where(_User.email == setup["operator"])
+            )
+        ).scalar_one()
+        await session.execute(
+            sa_update(_RoleAssn)
+            .where(_RoleAssn.user_id == op_id, _RoleAssn.revoked_at.is_(None))
+            .values(revoked_at=_dt.now(_UTC))
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    assert status_code == 403, (status_code, body)
+    assert "inventory_transaction.create" in str(body.get("detail", "")), body
+    assert await _tx_baseline_count(setup) == baseline
+
+
+@_postgres_only
+async def test_sprint_5_4_12_rollback_releases_authorization_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.12 — rollback releases the advisory lock.
+
+    Cause the transfer to raise (invalid quantity → 422 or an
+    engineered post-lock validation failure). Once the transfer's
+    outer transaction rolls back, the per-org advisory lock is
+    released and a queued mutation completes.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.role_assignment import RoleAssignment as _RoleAssn
+    from app.models.user import User as _User
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_locked_auth_operator(client)
+
+    locks_signal = asyncio.Event()
+    hold = asyncio.Event()
+    InventoryService._transfer_after_locks_signal = locks_signal
+    InventoryService._transfer_hold_before_authorize_gate = hold
+    try:
+
+        async def _transferer() -> tuple[int, dict]:
+            # Request an insufficient-stock transfer so authorization
+            # succeeds but the ledger insert fails → rollback.
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+                json={
+                    "lot_id": setup["src_lot"],
+                    "destination_warehouse_id": setup["dst"],
+                    "quantity": 99999,  # far exceeds baseline
+                    "unit": "kg",
+                },
+                headers={"Idempotency-Key": f"xfer-{uuid4().hex[:8]}"},
+            )
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, {"text": r.text}
+
+        mut_committed = asyncio.Event()
+
+        async def _mutator() -> None:
+            await locks_signal.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                await _acquire_org_auth_lock_via_sql(session, setup["org_id"])
+                op_id = (
+                    await session.execute(
+                        select(_User.id).where(_User.email == setup["operator"])
+                    )
+                ).scalar_one()
+                await session.execute(
+                    sa_update(_RoleAssn)
+                    .where(
+                        _RoleAssn.user_id == op_id,
+                        _RoleAssn.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=_dt.now(_UTC))
+                )
+                await session.commit()
+                mut_committed.set()
+
+        rev_task = asyncio.create_task(_transferer())
+        mut_task = asyncio.create_task(_mutator())
+        await asyncio.wait_for(locks_signal.wait(), timeout=5)
+        # Release the hold — transfer will fail on insufficient_stock
+        # and roll back, releasing the advisory lock.
+        hold.set()
+        transfer_result, _ = await asyncio.wait_for(
+            asyncio.gather(rev_task, mut_task), timeout=15
+        )
+    finally:
+        InventoryService._transfer_after_locks_signal = None
+        InventoryService._transfer_hold_before_authorize_gate = None
+
+    status_code, body = transfer_result
+    # Insufficient stock triggers a 409 rollback.
+    assert status_code == 409, (status_code, body)
+    # The mutation completed AFTER rollback — proving the advisory
+    # lock is released on rollback, not held indefinitely.
+    assert mut_committed.is_set() is True
+
+
+@_postgres_only
+async def test_sprint_5_4_12_unrelated_organizations_do_not_block(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.12 — per-org isolation.
+
+    Transfer holds the advisory lock for org A. A mutation
+    against org B acquires org B's advisory lock without blocking.
+    Two organizations are independent.
+    """
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_locked_auth_operator(client)
+    # Create a second, unrelated organization + user.
+    unrelated_owner = f"un-{uuid4().hex[:6]}@agrovix.dev"
+    await create_verified_user(unrelated_owner)
+    await switch_user(client, unrelated_owner)
+    unrelated_org_id = await create_org(client, slug=f"un-{uuid4().hex[:6]}")
+    await switch_user(client, setup["operator"])
+
+    locks_signal = asyncio.Event()
+    hold = asyncio.Event()
+    InventoryService._transfer_after_locks_signal = locks_signal
+    InventoryService._transfer_hold_before_authorize_gate = hold
+    try:
+
+        async def _transferer() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+                json={
+                    "lot_id": setup["src_lot"],
+                    "destination_warehouse_id": setup["dst"],
+                    "quantity": 5,
+                    "unit": "kg",
+                },
+                headers={"Idempotency-Key": f"xfer-{uuid4().hex[:8]}"},
+            )
+            return r.status_code, r.json()
+
+        mut_acquired = asyncio.Event()
+
+        async def _mutator_other_org() -> None:
+            await locks_signal.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                # Acquire the advisory lock for the UNRELATED org.
+                # This must succeed immediately.
+                await _acquire_org_auth_lock_via_sql(session, unrelated_org_id)
+                mut_acquired.set()
+                await session.commit()
+
+        rev_task = asyncio.create_task(_transferer())
+        mut_task = asyncio.create_task(_mutator_other_org())
+        # The unrelated-org mutator must complete WITHOUT waiting
+        # on the transfer's org-A lock.
+        await asyncio.wait_for(mut_acquired.wait(), timeout=5)
+        # Release the transfer and let it finish.
+        hold.set()
+        transfer_result, _ = await asyncio.wait_for(
+            asyncio.gather(rev_task, mut_task), timeout=15
+        )
+    finally:
+        InventoryService._transfer_after_locks_signal = None
+        InventoryService._transfer_hold_before_authorize_gate = None
+
+    status_code, body = transfer_result
+    assert status_code == 201, (status_code, body)
+
+
+@_postgres_only
+async def test_sprint_5_4_12_advisory_lock_key_is_deterministic() -> None:
+    """Sprint 5.4.12 — deterministic key derivation.
+
+    The advisory-lock key MUST NOT depend on Python's randomised
+    ``hash()`` — same input UUID must produce the same signed
+    BIGINT across processes. This is the invariant that keeps two
+    callers coordinating on the SAME org from ever computing
+    different keys and defeating the serialisation.
+    """
+    from app.services._authorization_lock import (
+        advisory_lock_key_for_org_authorization,
+    )
+
+    oid = uuid4()
+    k1 = advisory_lock_key_for_org_authorization(oid)
+    k2 = advisory_lock_key_for_org_authorization(oid)
+    assert k1 == k2
+    # Signed BIGINT range.
+    assert -(1 << 63) <= k1 < (1 << 63)
+    # Different UUIDs produce different keys (with overwhelming
+    # probability — 63-bit truncated SHA-256).
+    other = uuid4()
+    while other == oid:  # pragma: no cover - astronomically unlikely
+        other = uuid4()
+    assert advisory_lock_key_for_org_authorization(other) != k1
+
+
+@_postgres_only
+async def test_sprint_5_4_12_deterministic_ordering_no_deadlock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.12 — multi-org acquisition never deadlocks.
+
+    Two callers each acquire the authorization advisory lock for
+    the SAME pair of orgs, from opposite request directions. The
+    ``acquire_org_authorization_locks`` helper sorts by UUID
+    ascending, so both callers acquire the same lower-id lock
+    first. Under Postgres the two coroutines therefore serialise
+    cleanly instead of deadlocking.
+    """
+    from app.services._authorization_lock import acquire_org_authorization_locks
+
+    setup = await _setup_locked_auth_operator(client)
+    # Create a second org.
+    other_owner = f"oth-{uuid4().hex[:6]}@agrovix.dev"
+    await create_verified_user(other_owner)
+    await switch_user(client, other_owner)
+    other_org_id = await create_org(client, slug=f"oth-{uuid4().hex[:6]}")
+    await switch_user(client, setup["operator"])
+
+    org_a = _UUIDType(setup["org_id"])
+    org_b = _UUIDType(other_org_id)
+
+    barrier = asyncio.Event()
+    done_a = asyncio.Event()
+    done_b = asyncio.Event()
+
+    async def _worker(order: list) -> None:
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await barrier.wait()
+            await acquire_org_authorization_locks(session, order)
+            await session.commit()
+
+    barrier.set()
+    a_task = asyncio.create_task(_worker([org_a, org_b]))
+    b_task = asyncio.create_task(_worker([org_b, org_a]))
+    result = await asyncio.wait_for(
+        asyncio.gather(a_task, b_task, return_exceptions=True), timeout=15
+    )
+    for outcome in result:
+        if isinstance(outcome, BaseException):
+            msg = str(outcome).lower()
+            assert "deadlock" not in msg, f"deadlock surfaced: {outcome!r}"
+            raise AssertionError(f"unexpected exception: {outcome!r}")
+    # Suppress unused-name warnings.
+    del done_a, done_b
+
+
+@_postgres_only
+async def test_sprint_5_4_12_role_assignment_service_participates_in_advisory_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.12 — production ``RoleAssignmentService.revoke``
+    path (not a raw SQL DELETE) blocks while a transfer holds the
+    per-org authorization advisory lock.
+
+    This is the integration proof: the same protocol every real
+    revocation endpoint follows. If this test can be made to
+    pass, every service-layer authorization mutation path is
+    participating in the serialization contract.
+    """
+    from app.models.role_assignment import RoleAssignment as _RoleAssn
+    from app.models.user import User as _User
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_locked_auth_operator(client)
+    op_id = (
+        await (
+            await _db_session_module.AsyncSessionLocal().__aenter__()
+        ).execute(select(_User.id).where(_User.email == setup["operator"]))
+    ).scalar_one()
+    async with _db_session_module.AsyncSessionLocal() as s:
+        assignment_id = (
+            await s.execute(
+                select(_RoleAssn.id).where(
+                    _RoleAssn.user_id == op_id, _RoleAssn.revoked_at.is_(None)
+                )
+            )
+        ).scalar_one()
+
+    locks_signal = asyncio.Event()
+    hold = asyncio.Event()
+    InventoryService._transfer_after_locks_signal = locks_signal
+    InventoryService._transfer_hold_before_authorize_gate = hold
+    try:
+
+        async def _transferer() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+                json={
+                    "lot_id": setup["src_lot"],
+                    "destination_warehouse_id": setup["dst"],
+                    "quantity": 5,
+                    "unit": "kg",
+                },
+                headers={"Idempotency-Key": f"xfer-{uuid4().hex[:8]}"},
+            )
+            try:
+                return r.status_code, r.json()
+            except Exception:
+                return r.status_code, {"text": r.text}
+
+        mut_started = asyncio.Event()
+        mut_completed = asyncio.Event()
+
+        async def _mutator_via_service() -> None:
+            from app.repositories.audit_repo import AuditRepository
+            from app.repositories.org_repo import OrganizationRepository
+            from app.repositories.role_repo import (
+                RoleAssignmentRepository,
+                RoleRepository,
+            )
+            from app.services.invitation_service import RoleAssignmentService
+
+            await locks_signal.wait()
+            async with _db_session_module.AsyncSessionLocal() as session:
+                mut_started.set()
+                service = RoleAssignmentService(
+                    role_repo=RoleRepository(session),
+                    role_assign_repo=RoleAssignmentRepository(session),
+                    farm_mem_repo=None,  # not used by revoke path
+                    org_mem_repo=None,  # not used by revoke path
+                    org_repo=OrganizationRepository(session),
+                    audit_repo=AuditRepository(session),
+                )
+                assignment = (
+                    await session.execute(
+                        select(_RoleAssn).where(_RoleAssn.id == assignment_id)
+                    )
+                ).scalar_one()
+                # Faux actor (superuser) — audit will use the actor.id.
+                from app.models.user import User
+
+                superuser = User(
+                    id=assignment.granted_by_id,
+                    email="sys@x",
+                    hashed_password="x",
+                    full_name="x",
+                    is_active=True,
+                    is_verified=True,
+                    is_superuser=True,
+                )
+                await service.revoke(
+                    actor=superuser,
+                    assignment=assignment,
+                    request_ctx={"ip_address": None, "user_agent": None, "request_id": None},
+                )
+                await session.commit()
+                mut_completed.set()
+
+        rev_task = asyncio.create_task(_transferer())
+        mut_task = asyncio.create_task(_mutator_via_service())
+        await asyncio.wait_for(mut_started.wait(), timeout=5)
+        # Give the service's advisory-lock acquisition a moment to
+        # queue up on Postgres. It must block until we release the
+        # transfer's hold gate.
+        await asyncio.sleep(0.5)
+        assert mut_task.done() is False, (
+            "RoleAssignmentService.revoke must block on the per-org "
+            "authorization advisory lock while the transfer holds it"
+        )
+        assert mut_completed.is_set() is False
+
+        hold.set()
+        transfer_result, _ = await asyncio.wait_for(
+            asyncio.gather(rev_task, mut_task), timeout=15
+        )
+    finally:
+        InventoryService._transfer_after_locks_signal = None
+        InventoryService._transfer_hold_before_authorize_gate = None
+
+    status_code, _ = transfer_result
+    assert status_code == 201
+    assert mut_completed.is_set() is True

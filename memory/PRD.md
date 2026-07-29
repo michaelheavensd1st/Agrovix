@@ -2201,3 +2201,221 @@ error code in the response body, and (c)
 - Branch: `feature/sprint-5-4-stock-operations-review`
 - Commit: `fix(inventory): locked authorization and authoritative permission resolution (Sprint 5.4.11)`
 - Local validation only — no push, no PR per sprint brief.
+
+## Sprint 5.4.12 — Final Authorization Serialization & Database Hardening (2026-02, delivered)
+
+### Objective
+Close the remaining transfer-authorization race by serialising every
+read AND write of authoritative authorization state
+(`organization_memberships`, `farm_memberships`, `role_assignments`,
+`roles`, `role_permissions`) under a shared **per-organization
+transaction-scoped PostgreSQL advisory lock**. Also reconcile the
+canonical DDL install path against a latent psycopg2/`text()`
+escaping bug in migration 0009 that made `alembic upgrade head`
+fail on a fresh Postgres database.
+
+### Part 1 — Authorization Serialization (Option B: advisory-lock protocol)
+New canonical helper `apps/api/app/services/_authorization_lock.py`:
+
+* `advisory_lock_key_for_org_authorization(org_id) -> int`
+  — deterministic signed BIGINT derived from
+  `SHA-256("authorization-org:<uuid>")`. Namespace-disjoint from
+  the transfer-group advisory keys (different string prefix).
+* `acquire_org_authorization_lock(session, org_id)` — issues
+  `SELECT pg_advisory_xact_lock(:key)`; no-op on SQLite (StaticPool
+  already serialises writers).
+* `acquire_org_authorization_locks(session, org_ids)` — sorts by
+  UUID ascending before acquiring (defensive against AB / BA
+  deadlocks when a future caller needs multiple org locks).
+
+Every authorization reader / writer now participates:
+
+| Path | File | Position |
+| --- | --- | --- |
+| `InventoryService.transfer` (reader) | `app/services/inventory.py` | step (6), before authorization decision |
+| `RoleAssignmentService.assign` (writer) | `app/services/invitation_service.py` | top of `assign()` before `role_assign_repo.create` |
+| `RoleAssignmentService.revoke` (writer) | `app/services/invitation_service.py` | top of `revoke()` before FOR UPDATE row lock |
+| `InvitationService.accept` (writer) | `app/services/invitation_service.py` | before membership + role writes |
+| `OrganizationService.create` (writer) | `app/services/organization_service.py` | before initial owner assignment |
+| `OrganizationService.create_farm` (writer) | `app/services/organization_service.py` | before farm-membership write |
+
+Transaction-scoped semantics: the lock releases automatically on
+`COMMIT` or `ROLLBACK` — no manual release, no leak on error.
+Two organizations are independent (a transfer in org A does not
+block authorization work on org B).
+
+### Part 2 — Database Transfer Invariants
+Already present from Sprint 5.4.9 + 5.4.10:
+
+* Immutable-identity trigger (`trg_inventory_tx_group_immutable`)
+  — rejects UPDATE that changes `transfer_group_id`,
+  `reference_type`, transfer direction, transfer↔non-transfer
+  reclassification, `reference_id`.
+* Deferred pair-completeness trigger
+  (`trg_inventory_tx_pair_complete`, DEFERRABLE INITIALLY
+  DEFERRED) — at COMMIT time asserts exactly one OUT + one IN
+  per `transfer_group_id`, single organization, single item.
+* Canonical DDL source: `apps/api/app/db/inventory_transfer_ddl.py`
+  is consumed by BOTH `Base.metadata.create_all` (via
+  `event.listen(after_create, DDL(stmt))`) and Alembic migrations
+  0009 / 0010 (via `bind.exec_driver_sql`).
+
+### Part 3 — Migration Hardening
+Migration `0010_sprint_5_4_12_reconcile_ddl.py`:
+
+* `down_revision = "0009_transfer_group_id"`, `revision =
+  "0010_sprint_5_4_12_reconcile_ddl"` — linear, no history
+  rewrite.
+* `LOCK TABLE inventory_transactions IN ACCESS EXCLUSIVE MODE`
+  before re-installing `install_all_sql()`. Idempotent: `CREATE
+  OR REPLACE FUNCTION` + drop-then-create triggers.
+* Fixes a latent bug in `0009`: SQLAlchemy `text()` on psycopg2
+  double-escapes the `%%` in `RAISE EXCEPTION '... %'` format
+  strings to `%%%%`, causing Postgres to report "too many
+  parameters specified for RAISE". Both `0009` and `0010` now
+  invoke DDL via `bind.exec_driver_sql(stmt)` so psycopg2
+  correctly collapses `%%` → `%` at the driver layer.
+* Downgrade re-applies the same canonical install — no
+  destructive DDL because Sprint 5.4.12 does not alter the DDL
+  content, only reconciles drift.
+
+Preflight coverage (already present from 0009): invalid
+`reference_type`, mixed organizations, mixed inventory items,
+incomplete transfer groups, illegal transfer classification —
+all raise `MigrationBlocked` before any backfill/DDL runs.
+
+### Part 4 — Tenancy Error Semantics
+`InventoryService.transfer` now emits an **identical** `HTTP 404
+"Warehouse not found."` for BOTH source and destination when the
+warehouse is missing or soft-deleted. Previously the destination
+side returned `"Destination warehouse not found."` — an
+informational leak that let a caller distinguish source-vs-
+destination existence. `403` remains reserved for the case where
+authoritative locked membership succeeded but the actor lacks
+`inventory_transaction.create` on either scope.
+
+### Part 5 — PostgreSQL Concurrency Proofs (7 new `@_postgres_only` tests)
+1. **`test_sprint_5_4_12_transfer_blocks_authorization_mutation_while_holding_lock`**
+   — mutator uses a separate connection, acquires the same
+   per-org advisory lock, and MUST block until transfer commits.
+   Asserts `mut_task.done() is False` while transfer paused +
+   `mut_committed.is_set() is True` after transfer commits. Zero
+   ledger writes reversed.
+2. **`test_sprint_5_4_12_revocation_wins_first_transfer_refused`**
+   — reverse ordering: mutator commits BEFORE transfer, transfer
+   observes revoked state under lock and returns 403.
+3. **`test_sprint_5_4_12_rollback_releases_authorization_lock`**
+   — transfer rolls back on insufficient-stock 409, mutation
+   resumes and commits (advisory lock released on rollback).
+4. **`test_sprint_5_4_12_unrelated_organizations_do_not_block`**
+   — transfer holds org A's advisory lock; mutation against org
+   B acquires org B's lock IMMEDIATELY.
+5. **`test_sprint_5_4_12_advisory_lock_key_is_deterministic`** —
+   `advisory_lock_key_for_org_authorization` is a pure function
+   of the UUID (no Python-hash randomness).
+6. **`test_sprint_5_4_12_deterministic_ordering_no_deadlock`** —
+   two workers each acquire the advisory lock for the same pair
+   of orgs from OPPOSITE request directions; `acquire_org_authorization_locks`
+   sorts ascending → no AB / BA deadlock.
+7. **`test_sprint_5_4_12_role_assignment_service_participates_in_advisory_lock`**
+   — integration proof: `RoleAssignmentService.revoke` (real
+   production path) blocks while the transfer holds the advisory
+   lock, and completes after release. Confirms every service-layer
+   authorization mutation path participates in the serialization.
+
+Every test uses `asyncio.Event` gates + `asyncio.wait_for(...,
+timeout=15)` — no naked `sleep()` loops, no timing assumptions.
+
+### Part 6 — Regression Protection
+Every prior invariant preserved:
+
+* Deterministic warehouse / farm / organization row-lock ordering
+  (unchanged).
+* Deterministic lot locking (unchanged).
+* Transfer-group advisory locking (unchanged, key namespace
+  disjoint from the new authorization key namespace).
+* Transfer idempotency (idempotency-key path unchanged).
+* Reversal behavior (`resolve_reversal_scopes` /
+  `_acquire_reversal_context` / `reversal` unchanged — Sprint
+  5.4.12 is scoped to the transfer path only).
+* Transfer audit integrity (unchanged).
+* Atomic ledger creation (unchanged).
+* Database topology validation (immutable + deferred triggers
+  unchanged; only the DDL install mechanism was hardened).
+* Cross-tenant isolation (strengthened — destination-side error
+  message no longer leaks).
+
+### Validation
+```
+$ ruff check apps/api/app apps/api/tests apps/api/alembic
+All checks passed!
+
+$ pytest apps/api  (SQLite)                → 244 passed, 77 skipped
+$ DATABASE_URL=postgres…  pytest apps/api   → 289 passed, 32 skipped
+
+$ alembic upgrade head                      → 0001 → 0010, clean
+$ alembic downgrade base                    → 0010 → base, clean
+$ alembic upgrade head                      → 0001 → 0010, clean
+$ alembic history                           → linear, no branches
+$ alembic current                           → 0010_sprint_5_4_12_reconcile_ddl (head)
+```
+
+### Files added
+* `apps/api/app/services/_authorization_lock.py` — canonical
+  advisory-lock helper module.
+* `apps/api/alembic/versions/0010_sprint_5_4_12_reconcile_ddl.py`
+  — forward migration that re-installs canonical DDL under
+  `ACCESS EXCLUSIVE` via `exec_driver_sql`.
+
+### Files modified
+* `apps/api/app/services/inventory.py` — advisory-lock
+  acquisition in `transfer()`; normalised tenancy 404 message;
+  hold-gate reordered so it fires AFTER the advisory lock is
+  held (concurrency tests can now prove real blocking).
+* `apps/api/app/services/invitation_service.py` —
+  `RoleAssignmentService.assign` / `.revoke` / `.accept` acquire
+  the advisory lock before mutating memberships / assignments.
+* `apps/api/app/services/organization_service.py` —
+  `OrganizationService.create` / `.create_farm` acquire the
+  advisory lock before writing initial memberships.
+* `apps/api/alembic/versions/0009_transfer_group_id.py` — switch
+  DDL install from `op.execute(text)` to
+  `bind.exec_driver_sql(stmt)` so psycopg2 correctly collapses
+  `%%` → `%` (latent-bug fix, no semantic change).
+* `apps/api/tests/test_sprint_4_inventory.py` — 7 new
+  Sprint 5.4.12 concurrency proofs; Sprint 5.4.11 test 1 now
+  restores the global role↔permission link in `finally` to
+  preserve test-suite state.
+* `memory/PRD.md`.
+
+### Database objects touched (net change: 0)
+Migration 0010 re-runs `install_all_sql()` which is idempotent:
+
+* `FUNCTION inventory_transactions_group_immutable()` — recreated
+  from canonical DDL.
+* `TRIGGER trg_inventory_tx_group_immutable ON
+  inventory_transactions` — dropped + recreated.
+* `FUNCTION inventory_transactions_pair_complete()` — recreated.
+* `TRIGGER trg_inventory_tx_pair_complete ON
+  inventory_transactions` — dropped + recreated (DEFERRABLE
+  INITIALLY DEFERRED, unchanged).
+
+No new columns, indexes, or constraints; content byte-identical
+to the canonical Python constants.
+
+### Known limitations
+* On SQLite the advisory-lock helper is a no-op — StaticPool
+  already serialises writers, so the contract holds by virtue of
+  the pool discipline, not the lock. The Sprint 5.4.12
+  concurrency proofs are therefore `@_postgres_only`.
+* If a NEW authorization-mutation path is added in a future
+  sprint (e.g. a direct SQL bulk revocation script), it MUST
+  call `acquire_org_authorization_lock` before mutating. A
+  static-analysis check would harden this at review time — not
+  in scope for this sprint.
+
+### Branch / commit
+* Branch: `feature/sprint-5-4-stock-operations-review`
+* Commit: `fix(inventory): final authorization serialization + DB hardening (Sprint 5.4.12)`
+* Local validation only — no push, no PR per sprint brief.
+

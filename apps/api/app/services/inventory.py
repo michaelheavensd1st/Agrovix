@@ -59,6 +59,7 @@ from app.repositories.inventory import (
 )
 from app.repositories.org_repo import FarmRepository, OrganizationRepository
 from app.security.authorize import has_permission, resolve_permissions
+from app.services._authorization_lock import acquire_org_authorization_locks
 from app.services._transfer_locks import (
     acquire_transfer_advisory_lock,
     require_exactly_one,
@@ -1138,6 +1139,10 @@ class InventoryService:
         locked_whs = await self.warehouse_repo.list_by_ids_for_update(wh_ids_sorted)
         wh_by_id = {w.id: w for w in locked_whs}
         # Missing / soft-deleted warehouse ⇒ tenancy-safe 404.
+        # Sprint 5.4.12 — the message is the SAME for source and
+        # destination so a caller cannot distinguish "the warehouse
+        # I named exists but I lack access to it" from "no such
+        # warehouse" from the destination-side response alone.
         if warehouse_id not in wh_by_id or wh_by_id[warehouse_id].deleted_at is not None:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "Warehouse not found."
@@ -1147,7 +1152,7 @@ class InventoryService:
             or wh_by_id[dst_warehouse_id].deleted_at is not None
         ):
             raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Destination warehouse not found."
+                status.HTTP_404_NOT_FOUND, "Warehouse not found."
             )
         warehouse = wh_by_id[warehouse_id]
         dst_warehouse = wh_by_id[dst_warehouse_id]
@@ -1251,23 +1256,38 @@ class InventoryService:
                     },
                 )
 
-        # Sprint 5.4.11 test hook — locks are now held. Race tests
-        # wait on this signal to know that a competing UPDATE is
-        # about to block on our FOR UPDATE lock (row-locked columns)
-        # OR to sequence non-locked table updates
-        # (``role_assignments``, memberships) so the transfer's
-        # subsequent authorization query reads the mutated state.
+        # (6) Sprint 5.4.12 — AUTHORIZATION ADVISORY LOCK.
+        # Acquire the transaction-scoped per-organization
+        # authorization advisory lock BEFORE any read against
+        # ``organization_memberships`` / ``farm_memberships`` /
+        # ``role_assignments`` / ``roles`` / ``role_permissions``.
+        # Every mutation of those tables acquires the SAME lock
+        # first (see :mod:`app.services._authorization_lock` and
+        # its callers in :mod:`app.services.invitation_service`,
+        # :mod:`app.services.organization_service`). Two orgs are
+        # independent — a transfer within org A does not block
+        # authorization work on org B.
+        await acquire_org_authorization_locks(
+            self.session,
+            {warehouse.organization_id, dst_warehouse.organization_id},
+        )
+
+        # Sprint 5.4.11 test hook — locks + advisory lock are now
+        # held. Race tests wait on this signal to know that a
+        # competing authorization mutation which also participates
+        # in the advisory-lock protocol MUST block until this
+        # transaction commits or rolls back.
         locks_signal = type(self)._transfer_after_locks_signal
         if locks_signal is not None:
             lset = getattr(locks_signal, "set", None)
             if lset is not None:
                 lset()
 
-        # Sprint 5.4.11 test hook — hold transfer AFTER locks are
-        # acquired and BEFORE authorization decision runs. Race
-        # tests use this to keep the transfer transaction paused
-        # (still holding every FOR UPDATE lock) while asserting the
-        # competing mutation is genuinely blocked.
+        # Sprint 5.4.11 / 5.4.12 test hook — hold transfer AFTER
+        # every row lock AND the authorization advisory lock are
+        # acquired, BEFORE the authorization decision runs. Race
+        # tests use this gate to prove concurrent revocations
+        # genuinely block against the advisory-lock protocol.
         hold = type(self)._transfer_hold_before_authorize_gate
         if hold is not None:
             hold_wait = getattr(hold, "wait", None)
@@ -1276,20 +1296,19 @@ class InventoryService:
                 if hasattr(res, "__await__"):
                     await res
 
-        # (6) LOCKED AUTHORIZATION. Every authorization decision from
+        # (7) LOCKED AUTHORIZATION. Every authorization decision from
         # here on is derived exclusively from the LOCKED warehouse /
         # farm / organization rows above. Membership + permission
-        # queries hit their own tables — those tables are not row-
-        # locked, but our pre-lock barrier guarantees the mutator
-        # committed BEFORE we reach this point, so the fresh query
-        # observes the authoritative post-mutation state.
+        # queries run UNDER the per-org authorization advisory lock
+        # acquired in step (6) — no concurrent revocation can
+        # commit until the outer transaction ends.
         await self._authorize_transfer_from_locked(
             actor=actor,
             source_warehouse=warehouse,
             dst_warehouse=dst_warehouse,
         )
 
-        # (7) Existing status assertions — MAINTENANCE / CLOSED
+        # (8) Existing status assertions — MAINTENANCE / CLOSED
         # policy on either side aborts early with the pre-existing
         # diagnostic codes.
         self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.TRANSFER_OUT)

@@ -17,6 +17,7 @@ from app.repositories.org_repo import (
     OrganizationRepository,
 )
 from app.repositories.role_repo import RoleAssignmentRepository, RoleRepository
+from app.services._authorization_lock import acquire_org_authorization_lock
 
 
 class OrganizationService:
@@ -40,6 +41,13 @@ class OrganizationService:
         if existing is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "That slug is already in use.")
         org = await self.org_repo.create(**data)
+
+        # Sprint 5.4.12 — acquire the per-organization authorization
+        # advisory lock BEFORE writing the initial owner role
+        # assignment + membership. Even for a fresh org this is
+        # required so the same protocol applies uniformly to every
+        # authorization mutation path (no exceptions).
+        await acquire_org_authorization_lock(self.org_repo.session, org.id)
 
         # Creator becomes an organization_owner + org-member automatically.
         owner_role = await self.role_repo.get_by_name("organization_owner")
@@ -97,6 +105,9 @@ class FarmService:
         self, *, actor: User, organization_id: uuid.UUID, data: dict, request_ctx: dict
     ) -> Farm:
         farm = await self.farm_repo.create(organization_id=organization_id, **data)
+        # Sprint 5.4.12 — acquire the per-organization authorization
+        # advisory lock BEFORE writing the creator's farm membership.
+        await acquire_org_authorization_lock(self.farm_repo.session, organization_id)
         # Creator gets explicit farm membership.
         await self.farm_mem_repo.upsert_active(user_id=actor.id, farm_id=farm.id)
         # Auto-create the default ProductionSite per Sprint 2 spec —
