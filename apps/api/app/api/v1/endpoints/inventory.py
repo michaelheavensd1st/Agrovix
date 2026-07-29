@@ -642,31 +642,22 @@ async def transfer_stock(
     service: Annotated[InventoryService, Depends(get_inventory_service)],
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> InventoryTransactionPublic:
-    wh, _ = await _load_warehouse(warehouse_id, user, session)
-    dst_wh, _ = await _load_warehouse(payload.destination_warehouse_id, user, session)
-    # Sprint 4 CRG03 fix: dual write authorization.
-    # Both source and destination warehouses must permit the caller
-    # to POST an inventory transaction — otherwise a farm operator
-    # with write on farm A could pump stock into farm B without
-    # having been invited there.
-    await _enforce_prod_permission(
-        user=user,
-        session=session,
-        code="inventory_transaction.create",
-        organization_id=wh.organization_id,
-        farm_id=wh.farm_id,
-    )
-    await _enforce_prod_permission(
-        user=user,
-        session=session,
-        code="inventory_transaction.create",
-        organization_id=dst_wh.organization_id,
-        farm_id=dst_wh.farm_id,
-    )
-    del dst_wh  # further validation happens inside the service
+    # Sprint 5.4.11 — Locked Authorization. The endpoint performs
+    # only lightweight request parsing / identity resolution. Every
+    # authorization decision (tenancy 404, membership 404, permission
+    # 403, cross-org 409, warehouse status, farm/organization
+    # validity) happens INSIDE the service, AFTER canonical row
+    # locks on source + destination warehouses, their referenced
+    # farms, and the owning organization are held FOR UPDATE. The
+    # service reloads authoritative rows via those locks and derives
+    # scopes exclusively from the locked state — a permission,
+    # membership, role, warehouse-assignment, farm-assignment, or
+    # organization-status change that races with the transfer is
+    # authoritatively resolved against the locked state.
+    del session  # authorization no longer runs at endpoint layer
     out_tx, _in, is_replay = await service.transfer(
         actor=user,
-        warehouse=wh,
+        warehouse_id=warehouse_id,
         payload=payload.model_dump(),
         request_ctx=request_ctx,
         idempotency_key=idempotency_key,

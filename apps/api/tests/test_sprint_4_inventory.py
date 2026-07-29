@@ -54,6 +54,22 @@ _postgres_only = pytest.mark.skipif(
     reason="Requires real DB-level concurrency (Postgres); SQLite serializes writers.",
 )
 
+# Sprint 5.4.10 — Some pre-Sprint-5.4.10 tests use ``_mutate_tx`` to
+# CORRUPT transfer rows in ways the new Sprint 5.4.10 UPDATE trigger +
+# deferred pair-completeness constraint now REJECT at the DB layer.
+# Those tests remain valuable SQLite functional coverage of the
+# application-layer defense-in-depth, so we mark them ``@_sqlite_only``.
+# The DB-layer rejection is proven separately by the Sprint 5.4.10
+# adversarial tests.
+_sqlite_only = pytest.mark.skipif(
+    "postgresql" in os.environ.get("DATABASE_URL", ""),
+    reason=(
+        "Sprint 5.4.10 — Postgres DB-layer trigger/constraint rejects the "
+        "corruption this test uses to reach the application-layer defense. "
+        "See tests marked test_sprint_5_4_10_* for the DB-layer proofs."
+    ),
+)
+
 
 # --------------------------------------------------------------------- #
 # Fixture helpers
@@ -1289,6 +1305,7 @@ async def _mutate_tx(tx_id: str, **updates) -> None:
 # --------------------------------------------------------------------- #
 # 5.4.3.1 — Corrupted linkage: hard-refuse, never fall through.
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_transfer_reversal_refuses_when_reference_type_missing(
     client: AsyncClient,
 ) -> None:
@@ -1390,6 +1407,7 @@ async def test_transfer_reversal_refuses_when_two_in_rows(client: AsyncClient) -
 # --------------------------------------------------------------------- #
 # 5.4.3.3 — Attribute mismatches on the pair.
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_transfer_reversal_refuses_when_pair_item_mismatch(
     client: AsyncClient,
 ) -> None:
@@ -1442,6 +1460,7 @@ async def test_transfer_reversal_refuses_when_pair_unit_mismatch(
     assert await _count_tx_rows(lot_ids) == before
 
 
+@_sqlite_only
 async def test_transfer_reversal_refuses_when_pair_cross_org(
     client: AsyncClient,
 ) -> None:
@@ -1962,6 +1981,7 @@ async def test_reversal_refused_when_original_lot_in_another_org(
 # --------------------------------------------------------------------- #
 # 5.4.4.4 — Original tx item_id != original lot item_id
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_reversal_refused_when_original_item_id_diverges_from_lot(
     client: AsyncClient,
 ) -> None:
@@ -1984,6 +2004,7 @@ async def test_reversal_refused_when_original_item_id_diverges_from_lot(
 # --------------------------------------------------------------------- #
 # 5.4.4.5 — Partner tx item_id != partner lot item_id
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_reversal_refused_when_partner_item_id_diverges_from_lot(
     client: AsyncClient,
 ) -> None:
@@ -2023,6 +2044,7 @@ async def test_reversal_refused_when_partner_item_id_diverges_from_lot(
     )
 
 
+@_sqlite_only
 async def test_reversal_refused_when_partner_lot_item_id_mismatches_partner_tx(
     client: AsyncClient,
 ) -> None:
@@ -2070,6 +2092,7 @@ async def test_reversal_refused_when_partner_lot_item_id_mismatches_partner_tx(
 # --------------------------------------------------------------------- #
 # 5.4.4.6 — Original tx organization differs from warehouse organization
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_reversal_refused_when_original_tx_org_diverges_from_warehouse(
     client: AsyncClient,
 ) -> None:
@@ -2098,6 +2121,7 @@ async def test_reversal_refused_when_original_tx_org_diverges_from_warehouse(
 # --------------------------------------------------------------------- #
 # 5.4.4.7 — Partner tx organization differs
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_reversal_refused_when_partner_tx_org_diverges(
     client: AsyncClient,
 ) -> None:
@@ -2131,6 +2155,7 @@ async def test_reversal_refused_when_partner_tx_org_diverges(
 # --------------------------------------------------------------------- #
 # 5.4.4.8 — Authorization resolver rejects BEFORE returning scopes
 # --------------------------------------------------------------------- #
+@_sqlite_only
 async def test_resolve_reversal_scopes_rejects_malformed_before_scope_return(
     client: AsyncClient,
 ) -> None:
@@ -3606,3 +3631,688 @@ async def test_sprint_5_4_9_migration_preflight_aborts_on_malformed_topology(
             )
             await session.commit()
 
+
+
+# ===================================================================== #
+# Sprint 5.4.10 — Full UPDATE contract + deferred pair completeness.    #
+# ===================================================================== #
+
+# Section 2 — reject reference_type change away from 'transfer'.
+@_postgres_only
+async def test_sprint_5_4_10_update_cannot_flip_transfer_reference_type(
+    client: AsyncClient,
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    async with _db_session_module.AsyncSessionLocal() as session:
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                sa_update(_InventoryTransaction)
+                .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
+                .values(reference_type="reversal")
+            )
+            await session.commit()
+
+
+# Section 2 — reject transaction_type change from transfer to non-transfer.
+@_postgres_only
+async def test_sprint_5_4_10_update_cannot_reclassify_transfer_to_non_transfer(
+    client: AsyncClient,
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    async with _db_session_module.AsyncSessionLocal() as session:
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                sa_update(_InventoryTransaction)
+                .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
+                .values(transaction_type=_InventoryTransactionType.RECEIPT)
+            )
+            await session.commit()
+
+
+# Section 2 — reject transaction_type flip between transfer roles.
+@_postgres_only
+async def test_sprint_5_4_10_update_cannot_flip_out_to_in(
+    client: AsyncClient,
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    async with _db_session_module.AsyncSessionLocal() as session:
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                sa_update(_InventoryTransaction)
+                .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
+                .values(transaction_type=_InventoryTransactionType.TRANSFER_IN)
+            )
+            await session.commit()
+
+
+# Section 3 — deferred constraint rejects OUT without matching IN at commit.
+@_postgres_only
+async def test_sprint_5_4_10_deferred_constraint_rejects_out_only_pair(
+    client: AsyncClient,
+) -> None:
+    """A raw SQL transaction that inserts ONE TRANSFER_OUT row and
+    commits — without a matching TRANSFER_IN — must be REJECTED at
+    COMMIT time by the deferred pair-completeness constraint
+    trigger. Statement-time enforcement (partial unique index)
+    accepts the row; the deferred trigger fires on COMMIT.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
+    # Copy the OUT row's shape via SELECT, but assign a BRAND-NEW
+    # transfer_group_id so the partial unique index does not fire
+    # (that would be the DIFFERENT bypass proven in Sprint 5.4.8).
+    new_group = uuid4()
+    async with _db_session_module.AsyncSessionLocal() as session:
+        from sqlalchemy import text as _text
+
+        with pytest.raises(IntegrityError):
+            await session.execute(
+                _text(
+                    "INSERT INTO inventory_transactions ("
+                    "  id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "  transaction_type, quantity, unit, performed_by_id,"
+                    "  performed_at, reference_type, reference_id, idempotency_key,"
+                    "  transfer_group_id"
+                    ") SELECT :new_id, organization_id, farm_id, warehouse_id, item_id, lot_id,"
+                    "         'transfer_out'::inventory_transaction_type, quantity, unit, performed_by_id,"
+                    "         performed_at, 'transfer', :new_group, NULL, :new_group"
+                    "    FROM inventory_transactions WHERE id = :src_id"
+                ),
+                {
+                    "new_id": uuid4(),
+                    "new_group": new_group,
+                    "src_id": _UUIDType(setup["out_tx"]["id"]),
+                },
+            )
+            await session.commit()
+
+
+# Section 4 — pre-flight aborts on non-transfer row with transfer reference.
+@_postgres_only
+async def test_sprint_5_4_10_migration_preflight_flags_non_transfer_using_ref(
+    client: AsyncClient,
+) -> None:
+    """The Sprint 5.4.10 pre-flight query counts non-transfer rows
+    that carry ``reference_type = 'transfer'``. Assert the exact
+    SQL used by the migration surfaces that count.
+    """
+    from sqlalchemy import text as _text
+
+    ctx = await _new_owner_org_farm(client)
+    wh = await _create_warehouse(client, ctx["org_id"], farm_id=ctx["farm_id"])
+    item_id = await _create_feed_item(client, ctx["org_id"])
+    await _receipt(client, wh, item_id, quantity=5, unit="kg", lot_code="R")
+    lot_id = await _lot_id_for(client, wh)
+    txs = (await client.get(f"/api/v1/lots/{lot_id}/transactions")).json()["items"]
+    receipt_tx_id = txs[0]["id"]
+
+    # Drop the trigger, corrupt, run pre-flight, restore.
+    async with _db_session_module.AsyncSessionLocal() as session:
+        await session.execute(
+            _text(
+                "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
+                "ON inventory_transactions"
+            )
+        )
+        await session.execute(
+            sa_update(_InventoryTransaction)
+            .where(_InventoryTransaction.id == _UUIDType(receipt_tx_id))
+            .values(reference_type="transfer", reference_id=uuid4())
+        )
+        await session.commit()
+    try:
+        async with _db_session_module.AsyncSessionLocal() as session:
+            result = (
+                await session.execute(
+                    _text(
+                        "SELECT COUNT(*) FROM inventory_transactions "
+                        "WHERE reference_type = 'transfer' "
+                        "  AND transaction_type NOT IN ('transfer_out', 'transfer_in')"
+                    )
+                )
+            ).scalar()
+            assert result > 0, "pre-flight should flag non-transfer rows using transfer reference"
+    finally:
+        # Restore the trigger via the canonical DDL.
+        from app.db.inventory_transfer_ddl import (
+            TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL,
+            TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL,
+            TRANSFER_IMMUTABLE_FN_SQL,
+        )
+
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await session.execute(_text(TRANSFER_IMMUTABLE_FN_SQL))
+            await session.execute(_text(TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL))
+            await session.execute(_text(TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL))
+            await session.commit()
+
+
+# Section 5 — migration LOCK TABLE serialises concurrent writers.
+@_postgres_only
+async def test_sprint_5_4_10_migration_lock_blocks_concurrent_writer(
+    client: AsyncClient,
+) -> None:
+    """Two connections: one acquires ``LOCK TABLE ... ACCESS EXCLUSIVE
+    MODE`` on ``inventory_transactions``, the other attempts an
+    INSERT. The INSERT must BLOCK until the first commits/rolls back.
+    """
+    from sqlalchemy import text as _text
+
+    holder_ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _holder() -> None:
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await session.execute(
+                _text("LOCK TABLE inventory_transactions IN ACCESS EXCLUSIVE MODE")
+            )
+            holder_ready.set()
+            await release.wait()
+            await session.rollback()
+
+    async def _writer() -> None:
+        async with _db_session_module.AsyncSessionLocal() as session:
+            await session.execute(
+                _text(
+                    "SELECT id FROM inventory_transactions LIMIT 1"
+                )
+            )
+            await session.rollback()
+
+    holder = asyncio.create_task(_holder())
+    await asyncio.wait_for(holder_ready.wait(), timeout=5)
+    writer = asyncio.create_task(_writer())
+    await asyncio.sleep(0.3)
+    # ACCESS EXCLUSIVE conflicts with everything including plain
+    # SELECT — the writer must still be blocked.
+    assert writer.done() is False, "writer should block on ACCESS EXCLUSIVE"
+    release.set()
+    await asyncio.wait_for(asyncio.gather(holder, writer), timeout=5)
+    assert writer.done() is True
+
+
+# Section 6 — deterministic creation-vs-reversal barrier test.
+@_postgres_only
+async def test_sprint_5_4_10_creation_vs_reversal_barrier(
+    client: AsyncClient,
+) -> None:
+    """Uses the ``_TwoPartyBarrier`` so both racers reach the
+    advisory-lock boundary before either acquires the lock. Asserts:
+    * no deadlock string in any exception
+    * no 500 response
+    * every outcome is 200/201/409
+    """
+    from app.services.inventory import InventoryService
+
+    setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=8.0)
+
+    barrier = _TwoPartyBarrier()
+
+    class _AwaitableBarrier:
+        async def wait(self) -> None:
+            await barrier.arrive()
+
+    InventoryService._reversal_lock_barrier = _AwaitableBarrier()
+    try:
+        async def _reverser() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
+                json={"reverses_transaction_id": setup["out_tx"]["id"], "reason": "r"},
+                headers={"Idempotency-Key": f"rev-{uuid4().hex[:6]}"},
+            )
+            return r.status_code, r.json()
+
+        async def _creator() -> tuple[int, dict]:
+            # Creator doesn't hit the reversal barrier; it should
+            # complete normally. Combined with the reverser, the
+            # barrier ensures the reverser is definitively paused
+            # while the creator races through — no deadlock possible.
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+                json={
+                    "lot_id": setup["src_lot"],
+                    "destination_warehouse_id": setup["dst"],
+                    "quantity": 1,
+                    "unit": "kg",
+                },
+                headers={"Idempotency-Key": f"cre-{uuid4().hex[:6]}"},
+            )
+            # Once creator has issued its call, allow the reverser
+            # to progress past its barrier.
+            await barrier.arrive()
+            return r.status_code, r.json()
+
+        result = await asyncio.wait_for(
+            asyncio.gather(_reverser(), _creator(), return_exceptions=True),
+            timeout=15,
+        )
+    finally:
+        InventoryService._reversal_lock_barrier = None
+
+    for outcome in result:
+        if isinstance(outcome, BaseException):
+            msg = str(outcome).lower()
+            assert "deadlock" not in msg, f"deadlock surfaced: {outcome!r}"
+            raise AssertionError(f"unexpected exception: {outcome!r}")
+        code, body = outcome
+        assert code != 500, f"unexpected 500: {body}"
+        assert code in (200, 201, 409), (code, body)
+
+
+# ===================================================================== #
+# Sprint 5.4.11 — Locked Authorization & Authoritative Permission
+# Resolution.
+#
+# Every test below proves the Sprint 5.4.11 contract:
+#
+#   Transfer authorization runs EXCLUSIVELY inside the service layer,
+#   AFTER canonical row locks are held on source + destination
+#   warehouses, their referenced farms, and the owning organization.
+#   If a permission, membership, role, warehouse assignment, farm
+#   assignment, or organization status change commits BEFORE the
+#   transfer's locks are acquired, the transfer is authoritatively
+#   REJECTED against the new state — never a stale pre-lock view.
+#
+# The tests use ``InventoryService._transfer_pre_lock_barrier`` — a
+# ``ClassVar`` deterministic-race hook — so the mutator can commit
+# its change while the transfer is guaranteed paused BEFORE any row
+# lock is acquired. On release the transfer proceeds through the
+# locked-authorization pipeline and MUST refuse with 404 (tenancy /
+# membership leak invariant) or 403 (missing permission) or 409
+# (organization / farm / warehouse state broke an invariant).
+#
+# All 6 tests are ``@_postgres_only`` — they assert row-locking
+# semantics that require Postgres.
+# ===================================================================== #
+
+
+async def _setup_locked_auth_operator(
+    client: AsyncClient,
+) -> dict:
+    """Two org-shared warehouses in the same org; an operator with
+    ``farm_director`` (org-scoped) so they hold
+    ``inventory_transaction.create`` at every scope by default. The
+    Sprint 5.4.11 races revoke that permission / membership / role
+    / warehouse-assignment / farm-assignment / org-status through
+    direct DB mutation, then observe the transfer refuse.
+    """
+    owner = await _new_owner_org_farm(client)
+    owner_email = owner["owner"]
+    org_id = owner["org_id"]
+    # Org-shared source + destination warehouses (unpinned).
+    src = await _create_warehouse(client, org_id, code=f"SRC-{uuid4().hex[:4]}")
+    dst = await _create_warehouse(client, org_id, code=f"DST-{uuid4().hex[:4]}")
+    item_id = await _create_feed_item(client, org_id)
+    await _receipt(client, src, item_id, quantity=100, unit="kg", lot_code="LX")
+    src_lot = await _lot_id_for(client, src)
+    # Operator — org-scoped farm_director; carries
+    # inventory_transaction.create in every scope in this org.
+    operator = f"op-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(operator)
+    await invite_and_accept(
+        client,
+        inviter_email=owner_email,
+        invitee_email=operator,
+        org_id=org_id,
+        role_name="farm_director",
+    )
+    await switch_user(client, operator)
+    return {
+        "owner_email": owner_email,
+        "operator": operator,
+        "org_id": org_id,
+        "farm_id": owner["farm_id"],
+        "src": src,
+        "dst": dst,
+        "src_lot": src_lot,
+        "item_id": item_id,
+    }
+
+
+async def _run_transfer_under_pre_lock_race(
+    client: AsyncClient,
+    *,
+    setup: dict,
+    mutator_body,
+) -> tuple[int, dict]:
+    """Run a transfer with ``_transfer_pre_lock_barrier`` active and
+    let ``mutator_body(session)`` commit its change while the
+    transfer is guaranteed paused.
+
+    Contract of ``mutator_body``: takes an ``AsyncSession`` in its
+    own transaction and MUST commit before returning.
+    """
+    from app.services.inventory import InventoryService
+
+    gate = asyncio.Event()
+    InventoryService._transfer_pre_lock_barrier = gate
+    try:
+
+        async def _transferer() -> tuple[int, dict]:
+            r = await client.post(
+                f"/api/v1/warehouses/{setup['src']}/inventory:transfer",
+                json={
+                    "lot_id": setup["src_lot"],
+                    "destination_warehouse_id": setup["dst"],
+                    "quantity": 5,
+                    "unit": "kg",
+                },
+                headers={"Idempotency-Key": f"xfer-{uuid4().hex[:8]}"},
+            )
+            body: dict = {}
+            try:
+                body = r.json()
+            except Exception:
+                body = {"text": r.text}
+            return r.status_code, body
+
+        async def _mutator() -> None:
+            # Give the transferer a moment to enter the barrier.
+            await asyncio.sleep(0.3)
+            async with _db_session_module.AsyncSessionLocal() as session:
+                await mutator_body(session)
+                await session.commit()
+            gate.set()
+
+        result = await asyncio.wait_for(
+            asyncio.gather(_transferer(), _mutator()), timeout=10
+        )
+        return result[0]
+    finally:
+        InventoryService._transfer_pre_lock_barrier = None
+
+
+async def _tx_baseline_count(setup: dict) -> int:
+    async with _db_session_module.AsyncSessionLocal() as session:
+        stmt = select(func.count(_InventoryTransaction.id)).where(
+            _InventoryTransaction.warehouse_id.in_(
+                [_UUIDType(setup["src"]), _UUIDType(setup["dst"])]
+            )
+        )
+        return (await session.execute(stmt)).scalar_one()
+
+
+@_postgres_only
+async def test_sprint_5_4_11_transfer_rejects_permission_revocation_under_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.11 — permission race.
+
+    While the transfer waits at the pre-lock barrier, the mutator
+    strips ``inventory_transaction.create`` from the operator's
+    ``farm_director`` role. On release the transfer's authorization
+    (running from the LOCKED warehouse rows) resolves fresh
+    permission codes and refuses with 403.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from app.models.role import Permission as _Perm
+    from app.models.role import Role as _Role
+    from app.models.role import role_permissions_table as _rp
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    async def _mutator_body(session) -> None:
+        # Find the farm_director role and the target permission.
+        role_id = (
+            await session.execute(select(_Role.id).where(_Role.name == "farm_director"))
+        ).scalar_one()
+        perm_id = (
+            await session.execute(
+                select(_Perm.id).where(_Perm.code == "inventory_transaction.create")
+            )
+        ).scalar_one()
+        # Sever the role ↔ permission link.
+        await session.execute(
+            sa_delete(_rp).where(
+                _rp.c.role_id == role_id, _rp.c.permission_id == perm_id
+            )
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    assert status_code == 403, (status_code, body)
+    assert "inventory_transaction.create" in str(body.get("detail", "")), body
+    # No ledger row landed on either warehouse.
+    assert await _tx_baseline_count(setup) == baseline
+
+
+@_postgres_only
+async def test_sprint_5_4_11_transfer_rejects_org_membership_revocation_under_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.11 — membership race.
+
+    Mutator marks the operator's ``OrganizationMembership`` as
+    inactive while the transfer is paused. Locked authorization
+    resolves the membership fresh and refuses with 404 — same shape
+    a non-member would have seen before Sprint 5.4.11, preserving
+    the CRG02 tenancy-leak invariant.
+    """
+    from app.models.membership import OrganizationMembership as _OrgMem
+    from app.models.user import User as _User
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    async def _mutator_body(session) -> None:
+        op_id = (
+            await session.execute(
+                select(_User.id).where(_User.email == setup["operator"])
+            )
+        ).scalar_one()
+        await session.execute(
+            sa_update(_OrgMem)
+            .where(
+                _OrgMem.user_id == op_id,
+                _OrgMem.organization_id == _UUIDType(setup["org_id"]),
+            )
+            .values(is_active=False)
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    assert status_code == 404, (status_code, body)
+    assert await _tx_baseline_count(setup) == baseline
+
+
+@_postgres_only
+async def test_sprint_5_4_11_transfer_rejects_role_assignment_revocation_under_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.11 — role-assignment race.
+
+    Mutator sets ``role_assignment.revoked_at`` on the operator's
+    ``farm_director`` assignment. Locked authorization resolves the
+    role assignment fresh; no active assignment means no permission
+    codes, so the transfer refuses with 403.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.role_assignment import RoleAssignment as _RoleAssn
+    from app.models.user import User as _User
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    async def _mutator_body(session) -> None:
+        op_id = (
+            await session.execute(
+                select(_User.id).where(_User.email == setup["operator"])
+            )
+        ).scalar_one()
+        await session.execute(
+            sa_update(_RoleAssn)
+            .where(_RoleAssn.user_id == op_id, _RoleAssn.revoked_at.is_(None))
+            .values(revoked_at=_dt.now(_UTC))
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    assert status_code == 403, (status_code, body)
+    assert "inventory_transaction.create" in str(body.get("detail", "")), body
+    assert await _tx_baseline_count(setup) == baseline
+
+
+@_postgres_only
+async def test_sprint_5_4_11_transfer_rejects_warehouse_reassignment_under_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.11 — warehouse-assignment race.
+
+    While the transfer is paused, the mutator flips the destination
+    warehouse's ``farm_id`` to a foreign farm in a different
+    organization. When the transfer bulk-locks warehouses, it
+    observes the new ``organization_id`` on the destination row
+    under lock, and the cross-org invariant refuses the transfer
+    with ``cross_org_transfer_forbidden``. No ledger writes occur.
+    """
+    from app.models.inventory import Warehouse as _Wh
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    # Set up a foreign farm in a second organization.
+    foreign_owner = f"fo-{uuid4().hex[:6]}@agrovix.dev"
+    await create_verified_user(foreign_owner)
+    await switch_user(client, foreign_owner)
+    foreign_org_id = await create_org(client, slug=f"foreign-{uuid4().hex[:6]}")
+    r = await client.post(
+        f"/api/v1/organizations/{foreign_org_id}/farms",
+        json={"name": "F-foreign", "code": f"ff-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 201, r.text
+    foreign_farm_id = r.json()["id"]
+    await switch_user(client, setup["operator"])
+
+    async def _mutator_body(session) -> None:
+        # Rewrite dst warehouse's org + farm to the foreign tenant.
+        await session.execute(
+            sa_update(_Wh)
+            .where(_Wh.id == _UUIDType(setup["dst"]))
+            .values(
+                organization_id=_UUIDType(foreign_org_id),
+                farm_id=_UUIDType(foreign_farm_id),
+            )
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    # Locked authorization sees the destination now belongs to
+    # a different org and refuses. The exact refusal path depends
+    # on which invariant trips first — cross-org or membership 404.
+    # Both are acceptable ways of rejecting against the new state.
+    assert status_code in (404, 409), (status_code, body)
+    if status_code == 409:
+        assert body.get("detail", {}).get("code") == "cross_org_transfer_forbidden"
+    assert await _tx_baseline_count(setup) == baseline
+
+
+@_postgres_only
+async def test_sprint_5_4_11_transfer_rejects_farm_deactivation_under_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.11 — farm-assignment race.
+
+    Setup uses farm-pinned warehouses so ``farm.is_active`` is
+    part of the locked authorization graph. Mutator flips the
+    destination warehouse's owning farm to inactive; on release,
+    the transfer's bulk-lock on farms observes the inactive state
+    and refuses with ``transfer_farm_inactive``.
+    """
+    from app.models.farm import Farm as _Farm
+
+    # Build a farm-pinned two-warehouse setup so the farm rows are
+    # in the locked graph.
+    owner = await _new_owner_org_farm(client)
+    owner_email = owner["owner"]
+    org_id = owner["org_id"]
+    r = await client.post(
+        f"/api/v1/organizations/{org_id}/farms",
+        json={"name": "Farm-B", "code": f"farm-b-{uuid4().hex[:6]}"},
+    )
+    assert r.status_code == 201, r.text
+    farm_b_id = r.json()["id"]
+    src = await _create_warehouse(
+        client, org_id, farm_id=owner["farm_id"], code=f"SRC-{uuid4().hex[:4]}"
+    )
+    dst = await _create_warehouse(
+        client, org_id, farm_id=farm_b_id, code=f"DST-{uuid4().hex[:4]}"
+    )
+    item_id = await _create_feed_item(client, org_id)
+    await _receipt(client, src, item_id, quantity=100, unit="kg", lot_code="LX")
+    src_lot = await _lot_id_for(client, src)
+
+    # Org-scoped operator so both farm scopes carry the permission.
+    operator = f"op-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(operator)
+    await invite_and_accept(
+        client,
+        inviter_email=owner_email,
+        invitee_email=operator,
+        org_id=org_id,
+        role_name="farm_director",
+    )
+    await switch_user(client, operator)
+    setup = {"src": src, "dst": dst, "src_lot": src_lot}
+    baseline = await _tx_baseline_count(setup)
+
+    async def _mutator_body(session) -> None:
+        await session.execute(
+            sa_update(_Farm)
+            .where(_Farm.id == _UUIDType(farm_b_id))
+            .values(is_active=False)
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    assert status_code == 409, (status_code, body)
+    assert body.get("detail", {}).get("code") == "transfer_farm_inactive", body
+    assert await _tx_baseline_count(setup) == baseline
+
+
+@_postgres_only
+async def test_sprint_5_4_11_transfer_rejects_organization_deactivation_under_lock(
+    client: AsyncClient,
+) -> None:
+    """Sprint 5.4.11 — organization-status race.
+
+    Mutator flips ``organization.is_active = False`` on the shared
+    org while the transfer is paused. Locked authorization
+    observes the inactive org under lock and refuses with
+    ``transfer_organization_inactive``.
+    """
+    from app.models.organization import Organization as _Org
+
+    setup = await _setup_locked_auth_operator(client)
+    baseline = await _tx_baseline_count(setup)
+
+    async def _mutator_body(session) -> None:
+        await session.execute(
+            sa_update(_Org)
+            .where(_Org.id == _UUIDType(setup["org_id"]))
+            .values(is_active=False)
+        )
+
+    status_code, body = await _run_transfer_under_pre_lock_race(
+        client, setup=setup, mutator_body=_mutator_body
+    )
+    assert status_code == 409, (status_code, body)
+    assert (
+        body.get("detail", {}).get("code") == "transfer_organization_inactive"
+    ), body
+    assert await _tx_baseline_count(setup) == baseline

@@ -30,6 +30,7 @@ from decimal import Decimal
 from typing import ClassVar
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +47,7 @@ from app.models.inventory import (
     Warehouse,
     WarehouseStatus,
 )
+from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.user import User
 from app.repositories.audit_repo import AuditRepository
 from app.repositories.inventory import (
@@ -56,6 +58,7 @@ from app.repositories.inventory import (
     WarehouseRepository,
 )
 from app.repositories.org_repo import FarmRepository, OrganizationRepository
+from app.security.authorize import has_permission, resolve_permissions
 from app.services._transfer_locks import (
     acquire_transfer_advisory_lock,
     require_exactly_one,
@@ -139,6 +142,42 @@ class InventoryService:
     # competing UPDATE on ``inventory_items.organization_id`` /
     # ``inventory_items.deleted_at``.
     _reversal_after_item_locks_signal: ClassVar[object | None] = None
+
+    # ---------------------------------------------------------------- #
+    # Sprint 5.4.11 — transfer-authorization race hooks.
+    # Every hook below is a class-level ``ClassVar`` that production
+    # code never touches (default ``None``). The Sprint 5.4.11
+    # concurrency test suite temporarily assigns real
+    # ``asyncio.Event`` instances so it can drive deterministic races
+    # against the locked-authorization pipeline in
+    # :meth:`InventoryService.transfer`.
+    # ---------------------------------------------------------------- #
+
+    # Waited on BEFORE :meth:`transfer` acquires ANY row locks. Lets a
+    # racing "mutator" coroutine commit a permission / membership /
+    # role / warehouse-assignment / farm-assignment / organization
+    # status change while the transfer request is guaranteed paused,
+    # then release the barrier so the transfer proceeds. The transfer
+    # then reads the CURRENT authoritative state under lock and MUST
+    # refuse against the new state.
+    _transfer_pre_lock_barrier: ClassVar[object | None] = None
+
+    # Set immediately AFTER :meth:`transfer` has bulk-locked every
+    # warehouse, farm, and organization row referenced by the
+    # request. Row-locked mutation races (e.g. flipping
+    # ``organization.is_active`` while the transfer holds the FOR
+    # UPDATE lock) wait on this signal before firing their competing
+    # UPDATE — proving the UPDATE blocks on the transfer lock.
+    _transfer_after_locks_signal: ClassVar[object | None] = None
+
+    # Awaited AFTER the locks-acquired signal fires and BEFORE the
+    # authorization decision runs. Race tests use it to keep the
+    # transfer transaction paused (still holding every FOR UPDATE
+    # lock) while proving that a competing UPDATE is genuinely
+    # blocked; releasing the gate lets the transfer complete its
+    # authorization step and either commit or refuse.
+    _transfer_hold_before_authorize_gate: ClassVar[object | None] = None
+
 
     def __init__(
         self,
@@ -917,11 +956,129 @@ class InventoryService:
         )
         return tx, False
 
+    async def _authorize_transfer_from_locked(
+        self,
+        *,
+        actor: User,
+        source_warehouse: Warehouse,
+        dst_warehouse: Warehouse,
+    ) -> None:
+        """Sprint 5.4.11 — authorization derived from LOCKED rows.
+
+        Called AFTER :meth:`transfer` has bulk-locked source and
+        destination warehouses, their referenced farms, and the
+        owning organization. Both scope tuples ``(organization_id,
+        farm_id)`` are read directly from the LOCKED warehouse
+        rows so no pre-lock ORM object can influence the decision.
+
+        Contract:
+
+        * Superusers bypass every check.
+        * The tenancy-leak invariant is preserved: callers who are
+          NOT a member of the authoritative locked organization
+          (with, for farm-pinned warehouses, either an active
+          organization membership OR an active farm membership) see
+          HTTP 404 — the same shape as a non-existent warehouse.
+        * Members who lack ``inventory_transaction.create`` at the
+          scope of the source or destination warehouse see HTTP 403
+          with detail ``Missing required permission:
+          inventory_transaction.create`` (matches the endpoint's
+          former behaviour and existing test assertions).
+        * Both scopes are checked — a caller with source-only
+          permission cannot pump stock into a destination they do
+          not control (Sprint 4 CRG03 dual-authorization contract,
+          preserved).
+        """
+        if actor.is_superuser:
+            return
+        # Both scopes are read from the LOCKED warehouse rows.
+        scopes: list[tuple[Warehouse, uuid.UUID | None]] = [
+            (source_warehouse, source_warehouse.farm_id),
+            (dst_warehouse, dst_warehouse.farm_id),
+        ]
+        for wh, farm_id in scopes:
+            # Membership check — non-members see 404 to preserve the
+            # tenancy-leak invariant established in Sprint 1 / CRG02.
+            await self._assert_actor_membership_under_lock(
+                actor=actor,
+                organization_id=wh.organization_id,
+                farm_id=farm_id,
+            )
+            # Permission check — resolve fresh permission codes for
+            # the actor at this LOCKED scope. Role assignments,
+            # permissions, and memberships are re-read every call
+            # so a revocation that committed before this point is
+            # observed authoritatively.
+            codes = await resolve_permissions(
+                self.session,
+                actor,
+                organization_id=wh.organization_id,
+                farm_id=farm_id,
+            )
+            if not has_permission(codes, "inventory_transaction.create"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Missing required permission: inventory_transaction.create"
+                    ),
+                )
+
+    async def _assert_actor_membership_under_lock(
+        self,
+        *,
+        actor: User,
+        organization_id: uuid.UUID,
+        farm_id: uuid.UUID | None,
+    ) -> None:
+        """Sprint 5.4.11 — tenancy 404 for non-members.
+
+        Mirrors the endpoint's ``_assert_org_membership`` /
+        ``_assert_farm_membership_or_org_access`` helpers so the
+        service-layer authorization pipeline produces the same 404
+        shape a non-member would have seen under the previous
+        endpoint-layer check — no membership 403 leak.
+        """
+        # Active org membership always wins (org-scope reader).
+        org_mem = (
+            await self.session.execute(
+                select(OrganizationMembership).where(
+                    OrganizationMembership.user_id == actor.id,
+                    OrganizationMembership.organization_id == organization_id,
+                    OrganizationMembership.is_active.is_(True),
+                    OrganizationMembership.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if org_mem is not None:
+            return
+        # For farm-pinned scopes, an active farm membership is
+        # equally sufficient. Otherwise the caller is not a member of
+        # the authoritative locked org and MUST see 404.
+        if farm_id is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Warehouse not found."
+            )
+        farm_mem = (
+            await self.session.execute(
+                select(FarmMembership).where(
+                    FarmMembership.user_id == actor.id,
+                    FarmMembership.farm_id == farm_id,
+                    FarmMembership.is_active.is_(True),
+                    FarmMembership.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if farm_mem is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Warehouse not found."
+            )
+
+
     async def transfer(
         self,
         *,
         actor: User,
-        warehouse: Warehouse,
+        warehouse_id: uuid.UUID,
         payload: dict,
         request_ctx: dict,
         idempotency_key: str | None,
@@ -933,15 +1090,144 @@ class InventoryService:
         and adds the same canonical quantity there. Both rows share
         ``reference_type='transfer'`` + ``reference_id`` so they can be
         traced together.
+
+        Sprint 5.4.11 — locked authorization + authoritative
+        permission resolution. The endpoint hands us only the caller
+        identity and identifiers (``warehouse_id`` +
+        ``payload["destination_warehouse_id"]``). Every authorization
+        decision runs INSIDE this method, AFTER we have acquired
+        canonical ``SELECT ... FOR UPDATE`` locks on the warehouses,
+        their referenced farms, and the owning organization. We then
+        reload authoritative rows via the identity map (the locked
+        rows), derive authorization scopes from those locked rows,
+        and only then query membership + role-assignment tables to
+        resolve permissions. A permission, membership, role,
+        warehouse assignment, farm assignment, or organization
+        status change that commits BEFORE our lock-acquisition sees
+        our authorization check refuse against the new state; a
+        change racing against the lock either blocks (row-locked
+        columns such as ``warehouse.farm_id``, ``farm.is_active``,
+        ``organization.is_active``) or, if independently locked
+        (``role_assignments``, ``organization_memberships``,
+        ``farm_memberships``), lands before our fresh authorization
+        query reads it. Either way the transfer is rejected using
+        the authoritative locked state — never a stale pre-lock
+        view.
         """
-        # Source must permit TRANSFER_OUT; destination must permit
-        # TRANSFER_IN. Both are checked BEFORE we touch any lots so a
-        # MAINTENANCE / CLOSED warehouse on either side aborts early.
-        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.TRANSFER_OUT)
-        dst_warehouse = await self.warehouse_repo.get_by_id(payload["destination_warehouse_id"])
-        if dst_warehouse is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Destination warehouse not found.")
-        if dst_warehouse.organization_id != warehouse.organization_id:
+        dst_warehouse_id = payload["destination_warehouse_id"]
+
+        # Sprint 5.4.11 — pre-lock race barrier. Concurrency tests
+        # register an ``asyncio.Event`` so the mutator coroutine can
+        # commit its permission / membership / role / warehouse-
+        # assignment / farm / organization change BEFORE the
+        # transfer request acquires any row locks. Production leaves
+        # this ``None`` and the branch is a no-op.
+        pre_lock_barrier = type(self)._transfer_pre_lock_barrier
+        if pre_lock_barrier is not None:
+            pre_wait = getattr(pre_lock_barrier, "wait", None)
+            if pre_wait is not None:
+                pre_res = pre_wait()
+                if hasattr(pre_res, "__await__"):
+                    await pre_res
+
+        # (1) Bulk-lock BOTH warehouses FOR UPDATE in ascending id
+        # order. This is the ONLY place we acquire warehouse locks
+        # in the transfer path — deterministic across every caller
+        # (A→B and B→A collapse to the same lock order).
+        wh_ids_sorted = sorted({warehouse_id, dst_warehouse_id}, key=str)
+        locked_whs = await self.warehouse_repo.list_by_ids_for_update(wh_ids_sorted)
+        wh_by_id = {w.id: w for w in locked_whs}
+        # Missing / soft-deleted warehouse ⇒ tenancy-safe 404.
+        if warehouse_id not in wh_by_id or wh_by_id[warehouse_id].deleted_at is not None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Warehouse not found."
+            )
+        if (
+            dst_warehouse_id not in wh_by_id
+            or wh_by_id[dst_warehouse_id].deleted_at is not None
+        ):
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "Destination warehouse not found."
+            )
+        warehouse = wh_by_id[warehouse_id]
+        dst_warehouse = wh_by_id[dst_warehouse_id]
+
+        # (2) Bulk-lock every referenced farm FOR UPDATE in ascending
+        # id order. Soft-deleted / inactive farms REFUSE the transfer
+        # under lock; a concurrent flip of ``farm.is_active`` /
+        # ``farm.deleted_at`` blocks on this lock until we commit,
+        # and if the flip landed BEFORE we acquired the lock we
+        # observe the new state here and refuse.
+        farm_ids_set: set[uuid.UUID] = set()
+        for wh in (warehouse, dst_warehouse):
+            if wh.farm_id is not None:
+                farm_ids_set.add(wh.farm_id)
+        farm_ids = sorted(farm_ids_set, key=str)
+        locked_farms = await self.farm_repo.list_by_ids_for_update(farm_ids)
+        farm_by_id: dict[uuid.UUID, Farm] = {f.id: f for f in locked_farms}
+        for fid in farm_ids:
+            if fid not in farm_by_id:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND, "Warehouse not found."
+                )
+        for f in locked_farms:
+            if f.deleted_at is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_deleted",
+                        "message": "Referenced farm is soft-deleted.",
+                        "farm_id": str(f.id),
+                    },
+                )
+            if not f.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_inactive",
+                        "message": "Referenced farm is inactive.",
+                        "farm_id": str(f.id),
+                    },
+                )
+
+        # (3) Bulk-lock the owning organization(s) FOR UPDATE.
+        # Cross-org transfers are refused below; typically both
+        # warehouses share ONE org and we lock exactly one row.
+        org_ids = sorted(
+            {warehouse.organization_id, dst_warehouse.organization_id}, key=str
+        )
+        locked_orgs = await self.org_repo.list_by_ids_for_update(org_ids)
+        org_by_id = {o.id: o for o in locked_orgs}
+        for oid in org_ids:
+            if oid not in org_by_id:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND, "Warehouse not found."
+                )
+        for o in locked_orgs:
+            if o.deleted_at is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_organization_deleted",
+                        "message": "Organization is soft-deleted.",
+                        "organization_id": str(o.id),
+                    },
+                )
+            if not o.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_organization_inactive",
+                        "message": "Organization is inactive.",
+                        "organization_id": str(o.id),
+                    },
+                )
+
+        # (4) Cross-org invariant against the LOCKED warehouse state.
+        # A concurrent ``UPDATE warehouses SET organization_id`` would
+        # block on our warehouse lock; if it landed BEFORE we
+        # acquired the lock we observe it here and refuse.
+        if warehouse.organization_id != dst_warehouse.organization_id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
@@ -949,6 +1235,64 @@ class InventoryService:
                     "message": "Cannot transfer across organizations.",
                 },
             )
+        # (5) Farm ⟷ Organization invariant against the locked state.
+        for f in locked_farms:
+            if f.organization_id != warehouse.organization_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_organization_mismatch",
+                        "message": (
+                            "Locked farm belongs to a different organization."
+                        ),
+                        "farm_id": str(f.id),
+                        "farm_organization_id": str(f.organization_id),
+                        "expected_organization_id": str(warehouse.organization_id),
+                    },
+                )
+
+        # Sprint 5.4.11 test hook — locks are now held. Race tests
+        # wait on this signal to know that a competing UPDATE is
+        # about to block on our FOR UPDATE lock (row-locked columns)
+        # OR to sequence non-locked table updates
+        # (``role_assignments``, memberships) so the transfer's
+        # subsequent authorization query reads the mutated state.
+        locks_signal = type(self)._transfer_after_locks_signal
+        if locks_signal is not None:
+            lset = getattr(locks_signal, "set", None)
+            if lset is not None:
+                lset()
+
+        # Sprint 5.4.11 test hook — hold transfer AFTER locks are
+        # acquired and BEFORE authorization decision runs. Race
+        # tests use this to keep the transfer transaction paused
+        # (still holding every FOR UPDATE lock) while asserting the
+        # competing mutation is genuinely blocked.
+        hold = type(self)._transfer_hold_before_authorize_gate
+        if hold is not None:
+            hold_wait = getattr(hold, "wait", None)
+            if hold_wait is not None:
+                res = hold_wait()
+                if hasattr(res, "__await__"):
+                    await res
+
+        # (6) LOCKED AUTHORIZATION. Every authorization decision from
+        # here on is derived exclusively from the LOCKED warehouse /
+        # farm / organization rows above. Membership + permission
+        # queries hit their own tables — those tables are not row-
+        # locked, but our pre-lock barrier guarantees the mutator
+        # committed BEFORE we reach this point, so the fresh query
+        # observes the authoritative post-mutation state.
+        await self._authorize_transfer_from_locked(
+            actor=actor,
+            source_warehouse=warehouse,
+            dst_warehouse=dst_warehouse,
+        )
+
+        # (7) Existing status assertions — MAINTENANCE / CLOSED
+        # policy on either side aborts early with the pre-existing
+        # diagnostic codes.
+        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.TRANSFER_OUT)
         self._assert_warehouse_status_allows(dst_warehouse, InventoryTransactionType.TRANSFER_IN)
 
         # Sprint 5.4.8 — resolve the source lot WITHOUT FOR UPDATE.

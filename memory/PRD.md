@@ -1869,3 +1869,335 @@ intact.
 - Commit: `fix(inventory): mandatory transfer identity + database bypass closure (Sprint 5.4.9)`
 - Local validation only — no push, no PR per sprint brief.
 
+
+## Sprint 5.4.10 — Full UPDATE Contract + Deferred Pair Completeness + Migration Hardening (2026-02, delivered)
+
+### Problem
+Sprint 5.4.9 closed the INSERT-time transfer-identity contract but
+five review findings remained:
+
+1. **Weak UPDATE contract.** The trigger blocked `transfer_group_id`
+   changes but permitted `reference_type`, `reference_id`, and
+   `transaction_type` mutations that could turn a transfer row
+   into a non-transfer classification (or flip OUT↔IN).
+2. **Incomplete pair bypass.** The partial unique index enforces
+   "at most one OUT and one IN per group" but not "exactly one
+   of each". A raw SQL transaction could commit ONE transfer row
+   permanently.
+3. **Backfill scope too broad.** Migration 0009 back-filled every
+   row with `reference_type = 'transfer'` — including any
+   non-transfer row that happened to carry a stale transfer
+   reference.
+4. **Preflight without protection.** The preflight ran BEFORE any
+   table lock; malformed inserts could still land between
+   validation and constraint creation.
+5. **Weak concurrency tests.** The Sprint 5.4.9 creation-vs-
+   reversal test lacked a barrier, lacked bounded synchronization,
+   and accepted arbitrary exceptions as "success".
+
+### Design
+
+#### Canonical DDL module — one source of truth
+`apps/api/app/db/inventory_transfer_ddl.py` exposes the complete
+DDL suite as constants + an ``install_all_sql()`` helper. Consumed
+by BOTH ``Base.metadata.create_all`` (hermetic test path, via
+SQLAlchemy DDL events) AND Alembic migration 0009. No divergence.
+
+#### Enhanced BEFORE INSERT OR UPDATE trigger
+`trg_inventory_tx_group_immutable` now enforces the full contract:
+
+* **INSERT** — unchanged from Sprint 5.4.9.
+* **UPDATE** — expanded to reject:
+  * transition transfer row → non-transfer classification
+  * transition non-transfer row → transfer classification
+    (transfer identity is INSERT-only)
+  * flip between `TRANSFER_OUT` and `TRANSFER_IN`
+  * `reference_type` change away from `'transfer'` on transfer rows
+  * `reference_id` mutation on transfer rows
+  * `reference_id` / `transfer_group_id` divergence
+  * `transfer_group_id` mutation
+
+#### New DEFERRED constraint trigger — pair completeness
+`trg_inventory_tx_pair_complete` is a `CREATE CONSTRAINT TRIGGER
+... AFTER INSERT OR UPDATE OR DELETE ... DEFERRABLE INITIALLY
+DEFERRED FOR EACH ROW`. At COMMIT time, for every
+`transfer_group_id` touched in the transaction, it re-counts:
+
+* rows where `transaction_type = 'transfer_out'` (must be 1)
+* rows where `transaction_type = 'transfer_in'` (must be 1)
+* distinct `organization_id` (must be 1)
+* distinct `item_id` (must be 1)
+
+Any deviation raises `integrity_constraint_violation` at COMMIT.
+Because it is `INITIALLY DEFERRED`, a legitimate `transfer()`
+service call inserts both OUT and IN rows in one transaction and
+the trigger evaluates the fully assembled pair.
+
+Prevents raw-SQL bypasses:
+* OUT only / IN only (incomplete pair)
+* mismatched item between OUT and IN
+* mismatched organization between OUT and IN
+* orphan children referencing a group with no other row
+
+#### Migration 0009 — Sprint 5.4.10 revision
+Sequence rewritten:
+
+1. `LOCK TABLE inventory_transactions IN ACCESS EXCLUSIVE MODE`
+   (Sprint 5.4.10 §5). Ensures preflight and backfill see a
+   stable view; concurrent writers block.
+2. **Expanded preflight** counts every malformed shape:
+   `transfer_rows_with_null_reference`,
+   `transfer_rows_with_wrong_reference_type`,
+   `non_transfer_rows_using_transfer_reference`,
+   `duplicate_roles`, `incomplete_pairs`, `mixed_organizations`,
+   `mixed_items`. Any non-zero count → `RuntimeError` with all
+   counts. Never partially migrates.
+3. Column + index.
+4. **Scope-limited backfill** — `UPDATE ... WHERE
+   transaction_type IN ('transfer_out', 'transfer_in') AND
+   reference_type = 'transfer' AND reference_id IS NOT NULL`.
+   Non-transfer rows are never assigned a `transfer_group_id`.
+5. Partial unique index.
+6. Canonical DDL suite from
+   `app.db.inventory_transfer_ddl.install_all_sql()`.
+
+### PostgreSQL-only tests marked `@_sqlite_only` (defense-in-depth)
+Nine pre-existing tests corrupted transfer rows via `_mutate_tx`
+to reach the application-layer 409 refusal path (`transfer_pair_
+item_mismatch`, `transfer_scope_mismatch`, etc.). Under Sprint
+5.4.10 the DB layer rejects the corrupting UPDATE FIRST. The
+application-layer defense-in-depth is still valuable coverage
+for SQLite (which has no plpgsql triggers), so those tests are
+now decorated `@_sqlite_only` — they skip on Postgres with a
+clear reason string pointing at the Sprint 5.4.10 DB-layer
+proofs. New `_sqlite_only` marker mirrors `_postgres_only`.
+
+### New Sprint 5.4.10 adversarial tests (all Postgres-only, all pass)
+| Test | Proves |
+| --- | --- |
+| `test_sprint_5_4_10_update_cannot_flip_transfer_reference_type` | UPDATE `reference_type='reversal'` on a transfer row → `IntegrityError`. |
+| `test_sprint_5_4_10_update_cannot_reclassify_transfer_to_non_transfer` | UPDATE `transaction_type=RECEIPT` on a transfer row → `IntegrityError`. |
+| `test_sprint_5_4_10_update_cannot_flip_out_to_in` | UPDATE `transaction_type=TRANSFER_IN` on the OUT row → `IntegrityError`. |
+| `test_sprint_5_4_10_deferred_constraint_rejects_out_only_pair` | Raw-SQL INSERT of a lone OUT with a fresh `transfer_group_id` commits the statement but the deferred constraint rejects at COMMIT. |
+| `test_sprint_5_4_10_migration_preflight_flags_non_transfer_using_ref` | Exact preflight SQL surfaces non-transfer rows that carry `reference_type='transfer'`. |
+| `test_sprint_5_4_10_migration_lock_blocks_concurrent_writer` | `ACCESS EXCLUSIVE MODE` blocks a concurrent `SELECT` until the lock holder releases. |
+| `test_sprint_5_4_10_creation_vs_reversal_barrier` | Two-party barrier + bounded `wait_for` + strict allowed-outcome set + no "deadlock" string leak. |
+
+### Files modified
+- `apps/api/app/db/inventory_transfer_ddl.py` (new — canonical DDL)
+- `apps/api/app/models/inventory.py` (imports canonical DDL,
+  installs identity + pair-completeness triggers on `create_all`)
+- `apps/api/alembic/versions/0009_transfer_group_id.py` (LOCK
+  TABLE, expanded preflight, scope-limited backfill, install
+  full DDL suite)
+- `apps/api/tests/test_sprint_4_inventory.py` (`_sqlite_only`
+  marker; 9 legacy tests annotated; new Sprint 5.4.10 adversarial
+  suite)
+- `memory/PRD.md`
+
+### Validation
+- `ruff check` — clean.
+- **SQLite** (non-locking functional coverage — application-layer
+  defense-in-depth): `test_sprint_4_inventory.py` → **65 passed,
+  35 skipped**.
+- **PostgreSQL 15** (locking + DB-layer enforcement):
+  `test_sprint_4_inventory.py` → **91 passed, 9 SQLite-only
+  skipped**. Full backend suite → **276 passed, 32 skipped**.
+
+### Concurrency proof matrix
+| Scenario | Resources contended | Barrier | Expected | Result |
+| --- | --- | --- | --- | --- |
+| Creation vs reversal | Same transfer topology | Two-party barrier + reversal barrier | No deadlock; every outcome 200/201/409 | Verified |
+| Opposite-direction transfers | Same lot set | asyncio.gather + return_exceptions | No deadlock; controlled 409 on loser | Verified (Sprint 5.4.8) |
+| Warehouse mutation | Warehouse row | Reversal-after-warehouse signal | UPDATE blocks | Verified (Sprint 5.4.6/5.4.7) |
+| Farm mutation | Farm row | Reversal-after-farm-org signal + hold gate | UPDATE blocks | Verified (Sprint 5.4.7) |
+| Organization mutation | Org row | Same as above | UPDATE blocks | Verified (Sprint 5.4.7) |
+| Item mutation | Item row | Reversal-after-item signal | UPDATE blocks | Verified (Sprint 5.4.7) |
+| Incomplete raw-SQL transfer | Deferred constraint | — | Reject at COMMIT | Verified (Sprint 5.4.10) |
+| Trigger UPDATE bypass | Trigger contract | — | Reject at statement | Verified (Sprint 5.4.10) |
+| Migration concurrent write | `ACCESS EXCLUSIVE` | — | Writer blocks | Verified (Sprint 5.4.10) |
+| Phantom third row | Partial unique index | — | Reject at INSERT | Verified (Sprint 5.4.8) |
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): full UPDATE contract + deferred pair completeness + migration hardening (Sprint 5.4.10)`
+- Local validation only — no push, no PR per sprint brief.
+
+
+
+## Sprint 5.4.11 — Locked Authorization & Authoritative Permission Resolution (2026-02, delivered)
+
+### Problem
+Transfer creation remained the last inventory write path where
+authorization ran BEFORE canonical row locks were acquired. The
+endpoint (`apps/api/app/api/v1/endpoints/inventory.py`) loaded
+source + destination warehouses via `_load_warehouse`, then called
+`_enforce_prod_permission` for each scope, and only afterwards
+invoked `InventoryService.transfer()` which acquired the FOR
+UPDATE locks. Between those two steps a concurrent transaction
+could have:
+- Revoked the caller's `inventory_transaction.create` permission
+  (delete a row from `role_permissions`)
+- Deactivated the caller's `OrganizationMembership` /
+  `FarmMembership`
+- Revoked the caller's `RoleAssignment` (`revoked_at = now`)
+- Flipped `warehouse.farm_id` / `warehouse.organization_id` to a
+  scope the caller does not control
+- Deactivated / soft-deleted the referenced farm or organization
+
+The transfer would then commit against a stale pre-lock authorization
+view, breaching the same TOCTOU invariant the reversal path already
+closes in Sprint 5.4.5 / 5.4.6 / 5.4.7.
+
+### Solution — endpoint stripped, authorization moved into locked context
+**Endpoint (`inventory.py::transfer_stock`)** — reduced to
+lightweight identifier passing. No `_load_warehouse`, no
+`_enforce_prod_permission`. Only extracts `warehouse_id` from the
+path and forwards `payload`, `user`, `idempotency_key`, `request_ctx`
+to the service.
+
+**Service (`InventoryService.transfer`)** — signature changed from
+`warehouse: Warehouse` to `warehouse_id: uuid.UUID`. Authoritative
+locked pipeline (executes strictly in this order):
+
+1. Wait on `_transfer_pre_lock_barrier` (test hook only; no-op in
+   production).
+2. **Warehouses** — bulk `SELECT ... FOR UPDATE` on the source +
+   destination warehouse rows in ascending id order (single query,
+   deterministic across every caller regardless of transfer
+   direction). Missing / soft-deleted ⇒ HTTP 404.
+3. **Farms** — bulk `SELECT ... FOR UPDATE` on every referenced
+   `warehouse.farm_id` in ascending id order. Missing ⇒ 404;
+   `deleted_at IS NOT NULL` ⇒ 409 `transfer_farm_deleted`;
+   `is_active = false` ⇒ 409 `transfer_farm_inactive`.
+4. **Organizations** — bulk `SELECT ... FOR UPDATE` on the owning
+   org(s) in ascending id order. `deleted_at IS NOT NULL` ⇒ 409
+   `transfer_organization_deleted`; `is_active = false` ⇒ 409
+   `transfer_organization_inactive`.
+5. **Cross-org invariant** on LOCKED warehouse rows ⇒ 409
+   `cross_org_transfer_forbidden`.
+6. **Farm ⟷ Organization consistency** on LOCKED rows ⇒ 409
+   `transfer_farm_organization_mismatch`.
+7. Set `_transfer_after_locks_signal` (test hook).
+8. Await `_transfer_hold_before_authorize_gate` (test hook).
+9. **Locked authorization** (`_authorize_transfer_from_locked`) —
+   for BOTH source and destination scopes derived from the LOCKED
+   warehouse rows:
+   - Query `OrganizationMembership` / `FarmMembership` for an
+     active membership. Non-member ⇒ HTTP 404 (preserves
+     Sprint 1 / CRG02 tenancy-leak invariant — same shape a
+     non-existent warehouse would produce).
+   - Call `resolve_permissions(session, actor, organization_id,
+     farm_id)` to re-read role assignments + role-permission links
+     from the DB. Missing `inventory_transaction.create` ⇒ HTTP
+     403 with detail `Missing required permission:
+     inventory_transaction.create` (matches the endpoint's former
+     detail so existing test assertions still hold).
+10. Existing `_assert_warehouse_status_allows` (MAINTENANCE / CLOSED
+    guardrails on each side).
+11. Remainder of the ledger path unchanged — deterministic lot
+    resolution, bulk `FOR UPDATE` on lots, advisory lock on the
+    transfer topology, paired `TRANSFER_OUT` + `TRANSFER_IN` insert.
+
+Reversal path (`reversal()` / `resolve_reversal_scopes()` /
+`_acquire_reversal_context`) is UNCHANGED — already hardened in
+5.4.5 / 5.4.6 / 5.4.7 and no concrete defect was surfaced while
+implementing this sprint.
+
+### New service-level test hooks (production no-op)
+- `InventoryService._transfer_pre_lock_barrier: ClassVar[object | None]`
+- `InventoryService._transfer_after_locks_signal: ClassVar[object | None]`
+- `InventoryService._transfer_hold_before_authorize_gate: ClassVar[object | None]`
+
+Same pattern as the Sprint 5.4.6 / 5.4.7 reversal hooks — assigned
+to `asyncio.Event()` by concurrency tests, `None` at runtime.
+
+### PostgreSQL concurrency proofs
+Six new `@_postgres_only` tests in
+`apps/api/tests/test_sprint_4_inventory.py` (all use bounded
+`asyncio.wait_for(..., timeout=10)` — no naked `sleep()` loops):
+
+1. `test_sprint_5_4_11_transfer_rejects_permission_revocation_under_lock`
+   — mutator deletes the `role_permissions` link for
+   `inventory_transaction.create ↔ farm_director` while transfer
+   holds at the pre-lock barrier. On release, locked
+   authorization resolves fresh permission codes and refuses with
+   403. Zero ledger writes.
+2. `test_sprint_5_4_11_transfer_rejects_org_membership_revocation_under_lock`
+   — mutator sets `organization_memberships.is_active = false`.
+   Locked authorization observes non-membership ⇒ 404 (tenancy
+   invariant). Zero ledger writes.
+3. `test_sprint_5_4_11_transfer_rejects_role_assignment_revocation_under_lock`
+   — mutator sets `role_assignments.revoked_at = now`. Locked
+   authorization resolves fresh assignments (zero codes) ⇒ 403.
+   Zero ledger writes.
+4. `test_sprint_5_4_11_transfer_rejects_warehouse_reassignment_under_lock`
+   — mutator flips `warehouse.organization_id` +
+   `warehouse.farm_id` on the destination to a foreign tenant.
+   Locked authorization observes the new org under lock and
+   refuses with 404 or 409 `cross_org_transfer_forbidden`.
+   Zero ledger writes.
+5. `test_sprint_5_4_11_transfer_rejects_farm_deactivation_under_lock`
+   — mutator sets `farm.is_active = false` on the destination
+   warehouse's farm. Farm bulk-lock observes the inactive state ⇒
+   409 `transfer_farm_inactive`. Zero ledger writes.
+6. `test_sprint_5_4_11_transfer_rejects_organization_deactivation_under_lock`
+   — mutator sets `organization.is_active = false`. Org lock
+   observes the inactive state ⇒ 409
+   `transfer_organization_inactive`. Zero ledger writes.
+
+Every test asserts (a) the expected HTTP status, (b) the specific
+error code in the response body, and (c)
+`SELECT COUNT(*) FROM inventory_transactions WHERE warehouse_id IN
+(src, dst) == baseline` — proving no partial writes leaked.
+
+### Validation
+- `ruff check apps/api/tests/test_sprint_4_inventory.py
+  apps/api/app/services/inventory.py
+  apps/api/app/api/v1/endpoints/inventory.py` — 0 issues.
+- **SQLite** (application-layer defense-in-depth) — full backend
+  suite → **244 passed, 70 skipped**.
+- **PostgreSQL 15** (row-locking / authoritative concurrency) —
+  full backend suite → **282 passed, 32 skipped** (was 276 →
+  +6 Sprint 5.4.11 concurrency proofs).
+
+### Concurrency proof matrix (Sprint 5.4.11 additions)
+| Scenario | Resources contended | Barrier | Expected | Result |
+| --- | --- | --- | --- | --- |
+| Permission revocation | `role_permissions` row | `_transfer_pre_lock_barrier` | 403 | Verified |
+| Membership revocation | `organization_memberships` row | `_transfer_pre_lock_barrier` | 404 | Verified |
+| Role assignment revocation | `role_assignments.revoked_at` | `_transfer_pre_lock_barrier` | 403 | Verified |
+| Warehouse reassignment | `warehouses.organization_id/farm_id` | `_transfer_pre_lock_barrier` | 404 / 409 cross_org | Verified |
+| Farm deactivation | `farms.is_active` | `_transfer_pre_lock_barrier` | 409 transfer_farm_inactive | Verified |
+| Organization deactivation | `organizations.is_active` | `_transfer_pre_lock_barrier` | 409 transfer_organization_inactive | Verified |
+
+### Invariants introduced
+- No transfer authorization decision is EVER derived from a
+  pre-lock ORM object. The endpoint holds no `Warehouse`
+  reference; the service holds only the caller's identity plus
+  identifiers until the FOR UPDATE locks return authoritative rows.
+- Every scope enumerated for authorization comes from a locked
+  warehouse row.
+- Non-member callers see 404 (never a permission 403 that would
+  reveal the org exists); missing permission on either scope for a
+  valid member sees 403.
+- A refused transfer is a perfect no-op — zero ledger rows on
+  either warehouse.
+
+### Files modified
+- `apps/api/app/api/v1/endpoints/inventory.py` (stripped `transfer_stock`
+  of pre-service authorization).
+- `apps/api/app/services/inventory.py` (added test-hook
+  ClassVars; rewrote `transfer()` top with the locked pipeline;
+  new `_authorize_transfer_from_locked` +
+  `_assert_actor_membership_under_lock` helpers; new imports for
+  `resolve_permissions` / `has_permission` /
+  `OrganizationMembership` / `FarmMembership` / `select`).
+- `apps/api/tests/test_sprint_4_inventory.py` (Sprint 5.4.11
+  concurrency block, +6 tests).
+- `memory/PRD.md`.
+
+### Branch / commit
+- Branch: `feature/sprint-5-4-stock-operations-review`
+- Commit: `fix(inventory): locked authorization and authoritative permission resolution (Sprint 5.4.11)`
+- Local validation only — no push, no PR per sprint brief.
