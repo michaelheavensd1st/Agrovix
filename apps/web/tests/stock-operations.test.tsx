@@ -152,6 +152,32 @@ async function primeDetailPage(opts?: {
   await waitFor(() => expect(screen.getByTestId('item-detail-stock-actions')).toBeInTheDocument());
 }
 
+function rejectNextPostWithValidation(detail: Array<{ loc: string[]; msg: string }>) {
+  mockedApiFetch.mockImplementation((_path: string, init?: RequestInit) => {
+    if (init?.method === 'POST') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return Promise.reject(new ApiError(422, { detail } as any));
+    }
+    return Promise.resolve([]);
+  });
+}
+
+async function submitReceiveForValidation() {
+  fireEvent.click(screen.getByTestId('item-detail-stock-receive'));
+  fireEvent.change(screen.getByTestId('stock-op-receive-warehouse'), {
+    target: { value: WH_1.id },
+  });
+  fireEvent.change(screen.getByTestId('stock-op-receive-lot-code'), {
+    target: { value: 'LOT-XYZ' },
+  });
+  fireEvent.change(screen.getByTestId('stock-op-receive-quantity'), {
+    target: { value: '5' },
+  });
+  fireEvent.click(screen.getByTestId('stock-op-receive-submit'));
+  await waitFor(() => expect(screen.getByTestId('stock-op-receive-confirm')).toBeInTheDocument());
+  fireEvent.click(screen.getByTestId('stock-op-receive-confirm'));
+}
+
 // ------------------------------------------------------------------ //
 // RECEIVE                                                            //
 // ------------------------------------------------------------------ //
@@ -334,6 +360,129 @@ describe('StockOperationDialog — issue', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+  });
+});
+
+// ------------------------------------------------------------------ //
+// API VALIDATION FIELD MAPPING                                       //
+// ------------------------------------------------------------------ //
+describe('StockOperationDialog — API validation field mapping', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    routerReplace.mockClear();
+    toastSpy.mockReset();
+    useParamsMock.mockReset();
+    window.history.replaceState({}, '', '/');
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it('maps lot_code to the visible Lot code field', async () => {
+    await primeDetailPage();
+    rejectNextPostWithValidation([{ loc: ['body', 'lot_code'], msg: 'Lot code is invalid.' }]);
+    await submitReceiveForValidation();
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-receive-lot-code-error')).toHaveTextContent(
+        'Lot code is invalid.',
+      ),
+    );
+  });
+
+  it('maps destination_warehouse_id to the visible Destination warehouse field', async () => {
+    await primeDetailPage();
+    fireEvent.click(screen.getByTestId('item-detail-stock-transfer'));
+    fireEvent.change(screen.getByTestId('stock-op-transfer-warehouse'), {
+      target: { value: WH_1.id },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-transfer-lot'), {
+      target: { value: LOT_1.id },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-transfer-destination'), {
+      target: { value: WH_2.id },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-transfer-quantity'), {
+      target: { value: '3' },
+    });
+    fireEvent.click(screen.getByTestId('stock-op-transfer-submit'));
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-transfer-confirm')).toBeInTheDocument(),
+    );
+    rejectNextPostWithValidation([
+      { loc: ['body', 'destination_warehouse_id'], msg: 'Destination is unavailable.' },
+    ]);
+    fireEvent.click(screen.getByTestId('stock-op-transfer-confirm'));
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-transfer-destination-error')).toHaveTextContent(
+        'Destination is unavailable.',
+      ),
+    );
+  });
+
+  it('maps lot_id to the visible Lot field', async () => {
+    await primeDetailPage();
+    fireEvent.click(screen.getByTestId('item-detail-stock-issue'));
+    fireEvent.change(screen.getByTestId('stock-op-issue-warehouse'), {
+      target: { value: WH_1.id },
+    });
+    fireEvent.change(screen.getByTestId('stock-op-issue-lot'), { target: { value: LOT_1.id } });
+    fireEvent.change(screen.getByTestId('stock-op-issue-quantity'), { target: { value: '2' } });
+    fireEvent.click(screen.getByTestId('stock-op-issue-submit'));
+    await waitFor(() => expect(screen.getByTestId('stock-op-issue-confirm')).toBeInTheDocument());
+    rejectNextPostWithValidation([{ loc: ['body', 'lot_id'], msg: 'Lot is unavailable.' }]);
+    fireEvent.click(screen.getByTestId('stock-op-issue-confirm'));
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-issue-lot-error')).toHaveTextContent(
+        'Lot is unavailable.',
+      ),
+    );
+  });
+
+  it('shows a generic error for an unknown snake_case field', async () => {
+    await primeDetailPage();
+    rejectNextPostWithValidation([
+      { loc: ['body', 'storage_location_id'], msg: 'Storage location is invalid.' },
+    ]);
+    await submitReceiveForValidation();
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-receive-error')).toHaveTextContent(
+        'Some validation errors could not be matched to a form field.',
+      ),
+    );
+  });
+
+  it('shows both mapped and generic errors for a mixed response', async () => {
+    await primeDetailPage();
+    rejectNextPostWithValidation([
+      { loc: ['body', 'lot_code'], msg: 'Lot code is invalid.' },
+      { loc: ['body', 'storage_location_id'], msg: 'Storage location is invalid.' },
+    ]);
+    await submitReceiveForValidation();
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-receive-lot-code-error')).toHaveTextContent(
+        'Lot code is invalid.',
+      ),
+    );
+    expect(screen.getByTestId('stock-op-receive-error')).toHaveTextContent(
+      'Some validation errors could not be matched to a form field.',
+    );
+  });
+
+  it('does not duplicate the generic error for a fully mapped response', async () => {
+    await primeDetailPage();
+    rejectNextPostWithValidation([
+      { loc: ['body', 'lot_code'], msg: 'Lot code is invalid.' },
+      { loc: ['body', 'quantity'], msg: 'Quantity is invalid.' },
+    ]);
+    await submitReceiveForValidation();
+    await waitFor(() =>
+      expect(screen.getByTestId('stock-op-receive-lot-code-error')).toHaveTextContent(
+        'Lot code is invalid.',
+      ),
+    );
+    expect(screen.getByTestId('stock-op-receive-quantity-error')).toHaveTextContent(
+      'Quantity is invalid.',
+    );
+    expect(screen.queryByTestId('stock-op-receive-error')).not.toBeInTheDocument();
   });
 });
 

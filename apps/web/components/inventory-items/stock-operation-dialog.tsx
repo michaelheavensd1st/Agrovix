@@ -84,6 +84,47 @@ export interface StockOperationDialogProps {
   onUnauthenticated(): void;
 }
 
+type StockOperationField =
+  | 'warehouseId'
+  | 'destinationWarehouseId'
+  | 'lotId'
+  | 'lotCode'
+  | 'expiryDate'
+  | 'quantity'
+  | 'reason'
+  | 'direction';
+
+type ApiValidationField =
+  | 'warehouse_id'
+  | 'destination_warehouse_id'
+  | 'lot_id'
+  | 'lot_code'
+  | 'expiry_date'
+  | 'quantity'
+  | 'reason'
+  | 'direction';
+
+const API_VALIDATION_FIELD_MAP: Record<ApiValidationField, StockOperationField> = {
+  warehouse_id: 'warehouseId',
+  destination_warehouse_id: 'destinationWarehouseId',
+  lot_id: 'lotId',
+  lot_code: 'lotCode',
+  expiry_date: 'expiryDate',
+  quantity: 'quantity',
+  reason: 'reason',
+  direction: 'direction',
+};
+
+const VISIBLE_FIELDS: Record<StockOperationType, ReadonlySet<StockOperationField>> = {
+  receive: new Set(['warehouseId', 'lotCode', 'expiryDate', 'quantity', 'reason']),
+  issue: new Set(['warehouseId', 'lotId', 'quantity', 'reason']),
+  transfer: new Set(['warehouseId', 'destinationWarehouseId', 'lotId', 'quantity', 'reason']),
+  adjust: new Set(['warehouseId', 'lotId', 'direction', 'quantity', 'reason']),
+  reverse: new Set(['reason']),
+};
+
+const GENERIC_VALIDATION_ERROR = 'Some validation errors could not be matched to a form field.';
+
 function operationLabel(type: StockOperationType, reversalTx?: ItemLedgerTx): string {
   if (
     type === 'reverse' &&
@@ -113,7 +154,7 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
   } = props;
 
   const [form, setForm] = useState<StockOperationForm>(() => initialForm(type));
-  const [fieldErrors, setFieldErrors] = useState<Partial<Record<string, string>>>({});
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<StockOperationField, string>>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -328,17 +369,33 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
       if (err instanceof ApiError && err.status === 422) {
         // Field-level 422 payload: `{detail: [{loc:[...], msg}]}`
         const payload = err.payload as { detail?: unknown };
-        const fieldMap: Partial<Record<string, string>> = {};
+        const fieldMap: Partial<Record<StockOperationField, string>> = {};
+        let hasUnmappedError = false;
         if (Array.isArray(payload.detail)) {
           for (const entry of payload.detail as Array<{ loc?: unknown; msg?: string }>) {
             const loc = Array.isArray(entry.loc) ? entry.loc[entry.loc.length - 1] : null;
-            if (typeof loc === 'string' && entry.msg) fieldMap[loc] = entry.msg;
+            const mappedField =
+              typeof loc === 'string'
+                ? API_VALIDATION_FIELD_MAP[loc as ApiValidationField]
+                : undefined;
+            if (mappedField && VISIBLE_FIELDS[form.type].has(mappedField) && entry.msg) {
+              fieldMap[mappedField] = entry.msg;
+            } else {
+              hasUnmappedError = true;
+            }
           }
         }
         if (Object.keys(fieldMap).length > 0) {
           setFieldErrors(fieldMap);
+          setError(hasUnmappedError ? GENERIC_VALIDATION_ERROR : null);
           // Return to the form view so the user can correct the
           // offending fields — the confirmation summary hides them.
+          setConfirming(false);
+          setBusy(false);
+          return;
+        }
+        if (hasUnmappedError) {
+          setError(GENERIC_VALIDATION_ERROR);
           setConfirming(false);
           setBusy(false);
           return;
@@ -605,8 +662,11 @@ function ReceiveFields({
           value={form.expiryDate}
           onChange={(e) => onChange({ type: 'receive', expiryDate: e.target.value })}
           className="mt-1 block w-full rounded-md border border-border bg-background px-2 py-1"
+          aria-invalid={!!errors.expiryDate}
+          aria-describedby={errors.expiryDate ? `${testIdRoot}-expiry-error` : undefined}
         />
       </label>
+      <FieldError id={`${testIdRoot}-expiry-error`} msg={errors.expiryDate} />
       <ReasonField
         value={form.reason}
         error={errors.reason}
@@ -772,7 +832,11 @@ function AdjustFields({
         onChange={(lotId) => onChange({ type: 'adjust', lotId })}
         testId={`${testIdRoot}-lot`}
       />
-      <fieldset className="text-sm">
+      <fieldset
+        className="text-sm"
+        aria-invalid={!!errors.direction}
+        aria-describedby={errors.direction ? `${testIdRoot}-direction-error` : undefined}
+      >
         <legend className="mb-1">Direction</legend>
         <label className="mr-3 inline-flex items-center gap-1">
           <input
@@ -795,6 +859,7 @@ function AdjustFields({
           Decrease
         </label>
       </fieldset>
+      <FieldError id={`${testIdRoot}-direction-error`} msg={errors.direction} />
       <QuantityField
         value={form.quantity}
         error={errors.quantity}
