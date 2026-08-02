@@ -42,7 +42,7 @@ import hashlib
 import uuid
 from collections.abc import Iterable
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -100,7 +100,27 @@ async def acquire_org_authorization_locks(
     return keys
 
 
+async def acquire_all_org_authorization_locks(session: AsyncSession) -> list[int]:
+    """Lock the stable set of org authorization epochs for global catalog writes.
+
+    The role/permission seeder changes system-wide authorization data. On
+    PostgreSQL, a SHARE table lock prevents organization inserts while the
+    existing ids are enumerated, closing the otherwise-unlocked-new-org race.
+    """
+    from app.models.organization import Organization
+
+    bind = session.bind
+    dialect = bind.dialect.name if bind is not None else ""
+    if dialect == "postgresql":
+        await session.execute(text("LOCK TABLE organizations IN SHARE MODE"))
+    organization_ids = (
+        await session.execute(select(Organization.id).order_by(Organization.id.asc()))
+    ).scalars().all()
+    return await acquire_org_authorization_locks(session, organization_ids)
+
+
 __all__ = [
+    "acquire_all_org_authorization_locks",
     "acquire_org_authorization_lock",
     "acquire_org_authorization_locks",
     "advisory_lock_key_for_org_authorization",

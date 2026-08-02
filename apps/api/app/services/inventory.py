@@ -963,6 +963,7 @@ class InventoryService:
         actor: User,
         source_warehouse: Warehouse,
         dst_warehouse: Warehouse,
+        locked_farms: list[Farm] | None = None,
     ) -> None:
         """Sprint 5.4.11 — authorization derived from LOCKED rows.
 
@@ -993,16 +994,21 @@ class InventoryService:
         if actor.is_superuser:
             return
         # Both scopes are read from the LOCKED warehouse rows.
-        scopes: list[tuple[Warehouse, uuid.UUID | None]] = [
-            (source_warehouse, source_warehouse.farm_id),
-            (dst_warehouse, dst_warehouse.farm_id),
-        ]
-        for wh, farm_id in scopes:
+        scopes = {
+            (source_warehouse.organization_id, source_warehouse.farm_id),
+            (dst_warehouse.organization_id, dst_warehouse.farm_id),
+        }
+        # A corrupt/racing warehouse→farm edge must not reveal the foreign
+        # farm tenant. Authorize its authoritative locked organization too
+        # before returning any topology or lifecycle diagnostic.
+        for farm in locked_farms or []:
+            scopes.add((farm.organization_id, farm.id))
+        for organization_id, farm_id in sorted(scopes, key=lambda scope: tuple(map(str, scope))):
             # Membership check — non-members see 404 to preserve the
             # tenancy-leak invariant established in Sprint 1 / CRG02.
             await self._assert_actor_membership_under_lock(
                 actor=actor,
-                organization_id=wh.organization_id,
+                organization_id=organization_id,
                 farm_id=farm_id,
             )
             # Permission check — resolve fresh permission codes for
@@ -1013,7 +1019,7 @@ class InventoryService:
             codes = await resolve_permissions(
                 self.session,
                 actor,
-                organization_id=wh.organization_id,
+                organization_id=organization_id,
                 farm_id=farm_id,
             )
             if not has_permission(codes, "inventory_transaction.create"):
@@ -1175,25 +1181,6 @@ class InventoryService:
                 raise HTTPException(
                     status.HTTP_404_NOT_FOUND, "Warehouse not found."
                 )
-        for f in locked_farms:
-            if f.deleted_at is not None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_farm_deleted",
-                        "message": "Referenced farm is soft-deleted.",
-                        "farm_id": str(f.id),
-                    },
-                )
-            if not f.is_active:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_farm_inactive",
-                        "message": "Referenced farm is inactive.",
-                        "farm_id": str(f.id),
-                    },
-                )
 
         # (3) Bulk-lock the owning organization(s) FOR UPDATE.
         # Cross-org transfers are refused below; typically both
@@ -1208,55 +1195,7 @@ class InventoryService:
                 raise HTTPException(
                     status.HTTP_404_NOT_FOUND, "Warehouse not found."
                 )
-        for o in locked_orgs:
-            if o.deleted_at is not None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_organization_deleted",
-                        "message": "Organization is soft-deleted.",
-                        "organization_id": str(o.id),
-                    },
-                )
-            if not o.is_active:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_organization_inactive",
-                        "message": "Organization is inactive.",
-                        "organization_id": str(o.id),
-                    },
-                )
-
-        # (4) Cross-org invariant against the LOCKED warehouse state.
-        # A concurrent ``UPDATE warehouses SET organization_id`` would
-        # block on our warehouse lock; if it landed BEFORE we
-        # acquired the lock we observe it here and refuse.
-        if warehouse.organization_id != dst_warehouse.organization_id:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {
-                    "code": "cross_org_transfer_forbidden",
-                    "message": "Cannot transfer across organizations.",
-                },
-            )
-        # (5) Farm ⟷ Organization invariant against the locked state.
-        for f in locked_farms:
-            if f.organization_id != warehouse.organization_id:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_farm_organization_mismatch",
-                        "message": (
-                            "Locked farm belongs to a different organization."
-                        ),
-                        "farm_id": str(f.id),
-                        "farm_organization_id": str(f.organization_id),
-                        "expected_organization_id": str(warehouse.organization_id),
-                    },
-                )
-
-        # (6) Sprint 5.4.12 — AUTHORIZATION ADVISORY LOCK.
+        # (4) Sprint 5.4.12 — AUTHORIZATION ADVISORY LOCK.
         # Acquire the transaction-scoped per-organization
         # authorization advisory lock BEFORE any read against
         # ``organization_memberships`` / ``farm_memberships`` /
@@ -1296,7 +1235,7 @@ class InventoryService:
                 if hasattr(res, "__await__"):
                     await res
 
-        # (7) LOCKED AUTHORIZATION. Every authorization decision from
+        # (5) LOCKED AUTHORIZATION. Every authorization decision from
         # here on is derived exclusively from the LOCKED warehouse /
         # farm / organization rows above. Membership + permission
         # queries run UNDER the per-org authorization advisory lock
@@ -1306,9 +1245,72 @@ class InventoryService:
             actor=actor,
             source_warehouse=warehouse,
             dst_warehouse=dst_warehouse,
+            locked_farms=locked_farms,
         )
 
-        # (8) Existing status assertions — MAINTENANCE / CLOSED
+        # Only an actor authorized for BOTH locked scopes may learn
+        # cross-tenant topology or organization/farm lifecycle state.
+        # Unauthorized destination access above always collapses to the
+        # tenancy-safe Warehouse-not-found response.
+        if warehouse.organization_id != dst_warehouse.organization_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "cross_org_transfer_forbidden",
+                    "message": "Cannot transfer across organizations.",
+                },
+            )
+        for f in locked_farms:
+            if f.organization_id != warehouse.organization_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_organization_mismatch",
+                        "message": "Locked farm belongs to a different organization.",
+                        "farm_id": str(f.id),
+                        "farm_organization_id": str(f.organization_id),
+                        "expected_organization_id": str(warehouse.organization_id),
+                    },
+                )
+            if f.deleted_at is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_deleted",
+                        "message": "Referenced farm is soft-deleted.",
+                        "farm_id": str(f.id),
+                    },
+                )
+            if not f.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_farm_inactive",
+                        "message": "Referenced farm is inactive.",
+                        "farm_id": str(f.id),
+                    },
+                )
+        for o in locked_orgs:
+            if o.deleted_at is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_organization_deleted",
+                        "message": "Organization is soft-deleted.",
+                        "organization_id": str(o.id),
+                    },
+                )
+            if not o.is_active:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    {
+                        "code": "transfer_organization_inactive",
+                        "message": "Organization is inactive.",
+                        "organization_id": str(o.id),
+                    },
+                )
+
+        # (6) Existing status assertions — MAINTENANCE / CLOSED
         # policy on either side aborts early with the pre-existing
         # diagnostic codes.
         self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.TRANSFER_OUT)

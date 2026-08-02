@@ -4242,13 +4242,10 @@ async def test_sprint_5_4_11_transfer_rejects_warehouse_reassignment_under_lock(
     status_code, body = await _run_transfer_under_pre_lock_race(
         client, setup=setup, mutator_body=_mutator_body
     )
-    # Locked authorization sees the destination now belongs to
-    # a different org and refuses. The exact refusal path depends
-    # on which invariant trips first — cross-org or membership 404.
-    # Both are acceptable ways of rejecting against the new state.
-    assert status_code in (404, 409), (status_code, body)
-    if status_code == 409:
-        assert body.get("detail", {}).get("code") == "cross_org_transfer_forbidden"
+    # The actor has no access to the destination's new tenant. Do not
+    # disclose that a cross-org topology exists before authorization.
+    assert status_code == 404, (status_code, body)
+    assert body.get("detail") == "Warehouse not found."
     assert await _tx_baseline_count(setup) == baseline
 
 
@@ -4806,11 +4803,12 @@ async def test_sprint_5_4_12_role_assignment_service_participates_in_advisory_lo
     from app.services.inventory import InventoryService
 
     setup = await _setup_locked_auth_operator(client)
-    op_id = (
-        await (
-            await _db_session_module.AsyncSessionLocal().__aenter__()
-        ).execute(select(_User.id).where(_User.email == setup["operator"]))
-    ).scalar_one()
+    async with _db_session_module.AsyncSessionLocal() as session:
+        op_id = (
+            await session.execute(
+                select(_User.id).where(_User.email == setup["operator"])
+            )
+        ).scalar_one()
     async with _db_session_module.AsyncSessionLocal() as s:
         assignment_id = (
             await s.execute(
