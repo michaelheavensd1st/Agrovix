@@ -1128,7 +1128,7 @@ describe('InventoryItemActivity — atomic transfer reversal (Sprint 5.4.2)', ()
   });
   afterEach(() => vi.clearAllMocks());
 
-  it('exposes the reversal action on transfer_out only — never on transfer_in', async () => {
+  it('exposes exactly one logical Reverse transfer action on the canonical OUT row', async () => {
     // Bespoke mock: return the OUT row when the source lot is queried
     // and the IN row when the destination lot is queried, so the
     // merged activity list contains exactly one of each.
@@ -1199,9 +1199,18 @@ describe('InventoryItemActivity — atomic transfer reversal (Sprint 5.4.2)', ()
     expect(screen.getByTestId('item-activity-reverse-tx-out')).toHaveTextContent(
       /reverse transfer/i,
     );
+    expect(screen.getAllByRole('button', { name: /reverse transfer/i })).toHaveLength(1);
     // IN row does NOT expose the button — inventory integrity depends
     // on the single-entry-point rule.
     expect(screen.queryByTestId('item-activity-reverse-tx-in')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('item-activity-reverse-tx-out'));
+    expect(screen.getByRole('dialog', { name: /reverse transfer/i })).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('stock-op-reverse-reason'), {
+      target: { value: 'wrong destination' },
+    });
+    fireEvent.click(screen.getByTestId('stock-op-reverse-submit'));
+    expect(screen.getByText(/atomically reverses both sides of the transfer/i)).toBeInTheDocument();
   });
 
   it('reversing a transfer_out submits exactly ONE backend request', async () => {

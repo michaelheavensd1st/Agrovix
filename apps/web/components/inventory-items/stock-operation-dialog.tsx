@@ -84,6 +84,17 @@ export interface StockOperationDialogProps {
   onUnauthenticated(): void;
 }
 
+function operationLabel(type: StockOperationType, reversalTx?: ItemLedgerTx): string {
+  if (
+    type === 'reverse' &&
+    (reversalTx?.transaction_type === 'transfer_out' ||
+      reversalTx?.transaction_type === 'transfer_in')
+  ) {
+    return 'Reverse transfer';
+  }
+  return STOCK_OPERATION_LABELS[type];
+}
+
 // ------------------------------------------------------------------ //
 // Component                                                          //
 // ------------------------------------------------------------------ //
@@ -269,7 +280,7 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
         body: JSON.stringify(body),
       });
       if (!isCurrent()) return;
-      toast(`${STOCK_OPERATION_LABELS[form.type]} succeeded.`, 'success');
+      toast(`${operationLabel(form.type, reversalTx)} succeeded.`, 'success');
       // Confirmed success → clear the stored idempotency key so a
       // subsequent submission mints a fresh one.
       idemKeyRef.current = null;
@@ -419,7 +430,7 @@ export function StockOperationDialog(props: StockOperationDialogProps) {
   if (!open) return null;
 
   const testIdRoot = `stock-op-${type}`;
-  const label = STOCK_OPERATION_LABELS[type];
+  const label = operationLabel(type, reversalTx);
 
   return (
     <div
@@ -1054,7 +1065,10 @@ function ConfirmationSummary({
       </p>
       <p className="mt-1 text-xs text-muted-foreground">
         {type === 'reverse'
-          ? 'This posts an inverse transaction. The original ledger entry stays intact.'
+          ? reversalTx?.transaction_type === 'transfer_out' ||
+            reversalTx?.transaction_type === 'transfer_in'
+            ? 'This atomically reverses both sides of the transfer. The original ledger entries stay intact.'
+            : 'This posts an inverse transaction. The original ledger entry stays intact.'
           : 'This will be recorded in the ledger and cannot be edited afterward — only reversed.'}
       </p>
       <dl
