@@ -404,6 +404,16 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
     reason: Mapped[str | None] = mapped_column(String(500))
     reference_type: Mapped[str | None] = mapped_column(String(64), index=True)
     reference_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    # Sprint 5.4.8 — immutable transfer-group identity. Assigned once
+    # at transfer creation, never mutated (enforced by a Postgres
+    # trigger; SQLite tests rely on the application invariant). Used
+    # as the advisory-lock key for every transfer topology mutation
+    # so callers can never derive a DIFFERENT key for the same pair
+    # by moving mutable fields (``organization_id`` / ``reference_id``
+    # / ``reference_type``). ``NULL`` for non-transfer rows.
+    transfer_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), index=True, nullable=True
+    )
     reverses_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("inventory_transactions.id", ondelete="RESTRICT"),
@@ -432,4 +442,60 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
         ),
         Index("ix_inventory_tx_ledger", "lot_id", "performed_at"),
         Index("ix_inventory_tx_reference", "reference_type", "reference_id"),
+        # Sprint 5.4.8 — topology enforcement. At most one
+        # TRANSFER_OUT and one TRANSFER_IN row may belong to a
+        # single transfer_group_id. Partial index on Postgres;
+        # SQLite emits the equivalent as a partial index too.
+        Index(
+            "uq_inventory_tx_transfer_role",
+            "transfer_group_id",
+            "transaction_type",
+            unique=True,
+            postgresql_where=text(
+                "transfer_group_id IS NOT NULL AND "
+                "transaction_type IN ('transfer_out', 'transfer_in')"
+            ),
+            sqlite_where=text(
+                "transfer_group_id IS NOT NULL AND "
+                "transaction_type IN ('transfer_out', 'transfer_in')"
+            ),
+        ),
+    )
+
+
+# Sprint 5.4.10 — install the complete transfer-topology DDL suite
+# automatically on ``create_all`` against PostgreSQL. Alembic migrations
+# install the same objects for production/CI databases; this DDL event
+# mirrors them for the hermetic test suite so
+# ``pytest --database-url=postgres://…`` observes the same behaviour
+# without running the migration chain. ``install_all_sql`` remains the
+# authoritative source for both the statements and their execution order.
+from sqlalchemy import DDL  # noqa: E402
+from sqlalchemy import event as _sa_event  # noqa: E402
+
+from app.db.inventory_transfer_ddl import (  # noqa: E402
+    TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL,
+    TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL,
+    TRANSFER_IMMUTABLE_FN_SQL,
+    TRANSFER_PAIR_COMPLETE_CREATE_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_DROP_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_FN_SQL,
+    install_all_sql,
+)
+
+_canonical_transfer_ddl_statements = (
+    TRANSFER_IMMUTABLE_FN_SQL,
+    TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL,
+    TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_FN_SQL,
+    TRANSFER_PAIR_COMPLETE_DROP_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_CREATE_TRIGGER_SQL,
+)
+assert install_all_sql() == list(_canonical_transfer_ddl_statements)
+
+for _statement in install_all_sql():
+    _sa_event.listen(
+        InventoryTransaction.__table__,
+        "after_create",
+        DDL(_statement.replace("%", "%%")).execute_if(dialect="postgresql"),
     )

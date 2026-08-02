@@ -13,6 +13,7 @@ from sqlalchemy import select
 from app.models.production import ProductionUnitType
 from app.models.role import Permission, Role
 from app.security.permissions import ALL_PERMISSIONS, ROLE_DEFINITIONS
+from app.services._authorization_lock import acquire_all_org_authorization_locks
 
 # System-owned production unit types.
 #
@@ -127,6 +128,10 @@ async def seed_permissions_and_roles() -> None:
     from app.db import session as _db
 
     async with _db.AsyncSessionLocal() as session:
+        # Roles and permissions are global authorization inputs. Coordinate
+        # their mutation with every per-organization authorization reader.
+        await acquire_all_org_authorization_locks(session)
+
         # Permissions
         perms_by_code: dict[str, Permission] = {}
         for perm_def in ALL_PERMISSIONS:

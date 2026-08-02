@@ -39,6 +39,31 @@ class OrganizationRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def list_by_ids_for_update(
+        self, ids: list[uuid.UUID] | tuple[uuid.UUID, ...]
+    ) -> list[Organization]:
+        """Sprint 5.4.7 — row-lock a set of organizations deterministically.
+
+        Emits ``SELECT ... WHERE id IN (:ids) ORDER BY id ASC
+        FOR UPDATE`` with ``populate_existing`` so the identity map
+        adopts the LOCKED authoritative row. Callers pass the ids in
+        already-sorted order; the ``ORDER BY`` clause is redundant
+        for a single id but guards multi-org acquisition against
+        deadlocks. Soft-deleted rows are INCLUDED — reversal callers
+        need to observe ``deleted_at`` explicitly to refuse the
+        operation.
+        """
+        if not ids:
+            return []
+        stmt = (
+            select(Organization)
+            .where(Organization.id.in_(list(ids)))
+            .order_by(Organization.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def list_for_user(self, user_id: uuid.UUID) -> list[Organization]:
         stmt = (
             select(Organization)
@@ -162,6 +187,30 @@ class FarmRepository:
         stmt = select(Farm).where(Farm.id == farm_id).options(selectinload(Farm.organization))
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def list_by_ids_for_update(
+        self, ids: list[uuid.UUID] | tuple[uuid.UUID, ...]
+    ) -> list[Farm]:
+        """Sprint 5.4.7 — row-lock a set of farms deterministically.
+
+        Emits ``SELECT ... WHERE id IN (:ids) ORDER BY id ASC
+        FOR UPDATE`` with ``populate_existing`` so the identity map
+        adopts the LOCKED authoritative row. Soft-deleted rows are
+        INCLUDED — reversal callers must inspect ``deleted_at`` /
+        ``is_active`` under the lock to refuse the operation with
+        the appropriate ``transfer_farm_deleted`` /
+        ``transfer_farm_inactive`` diagnostic.
+        """
+        if not ids:
+            return []
+        stmt = (
+            select(Farm)
+            .where(Farm.id.in_(list(ids)))
+            .order_by(Farm.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
 
     async def list_for_org(self, org_id: uuid.UUID) -> list[Farm]:
         stmt = (

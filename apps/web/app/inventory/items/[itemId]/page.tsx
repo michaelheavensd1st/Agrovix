@@ -64,6 +64,8 @@ import {
   InventoryItemForm,
   type ItemFormPayload,
 } from '@/components/inventory-items/inventory-item-form';
+import { StockOperationDialog } from '@/components/inventory-items/stock-operation-dialog';
+import type { StockOperationType } from '@/lib/stock-operations';
 
 type ForbiddenScope = 'org' | 'item' | 'availability' | 'activity';
 
@@ -114,6 +116,10 @@ function InventoryItemDetailInner() {
   const [editError, setEditError] = useState<string | null>(null);
   const [pendingActive, setPendingActive] = useState<boolean | null>(null);
   const [statusBusy, setStatusBusy] = useState(false);
+  // Sprint 5.4: which stock-operation dialog is open (if any) and,
+  // for reversals, the transaction the caller wants to reverse.
+  const [activeStockOp, setActiveStockOp] = useState<StockOperationType | null>(null);
+  const [reversalTx, setReversalTx] = useState<ItemLedgerTx | null>(null);
 
   const itemRef = useRef(0);
   const availabilityRef = useRef(0);
@@ -395,6 +401,9 @@ function InventoryItemDetailInner() {
     setStatusBusy(false);
     setLoading(true);
     setLoadingActivity(false);
+    // Sprint 5.4: close any open stock-op dialog on identity change.
+    setActiveStockOp(null);
+    setReversalTx(null);
   }, [orgId, itemId]);
 
   useEffect(() => {
@@ -549,6 +558,26 @@ function InventoryItemDetailInner() {
             onToggleActive={(next) => setPendingActive(next)}
             editDisabled={editBusy}
           />
+          {/* Sprint 5.4: primary stock operation entry points. Disabled
+              when the item is inactive — backend authorization is still
+              authoritative but this avoids the obvious deadend. */}
+          <div className="mb-4 flex flex-wrap gap-2" data-testid="item-detail-stock-actions">
+            {(['receive', 'issue', 'transfer', 'adjust'] as const).map((op) => (
+              <button
+                key={op}
+                type="button"
+                data-testid={`item-detail-stock-${op}`}
+                onClick={() => {
+                  setReversalTx(null);
+                  setActiveStockOp(op);
+                }}
+                disabled={!item.is_active}
+                className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-secondary disabled:opacity-60"
+              >
+                {op.charAt(0).toUpperCase() + op.slice(1)}
+              </button>
+            ))}
+          </div>
           {error && (
             <div className="mb-4">
               <ErrorBanner message={error} />
@@ -605,7 +634,14 @@ function InventoryItemDetailInner() {
                   <SkeletonRows rows={4} />
                 </div>
               ) : (
-                <InventoryItemActivity transactions={activity} partial={activityPartial} />
+                <InventoryItemActivity
+                  transactions={activity}
+                  partial={activityPartial}
+                  onReverse={(tx) => {
+                    setReversalTx(tx);
+                    setActiveStockOp('reverse');
+                  }}
+                />
               )}
             </div>
             <div className="space-y-6">
@@ -627,6 +663,50 @@ function InventoryItemDetailInner() {
             onConfirm={confirmStatusChange}
             onCancel={() => setPendingActive(null)}
           />
+          {/* Sprint 5.4: unified stock operation dialog. Uses the
+              same route-identity/generation guards as the parent
+              page — the dialog's own guard fires on close, and
+              `onSuccess` triggers a bounded refresh of every
+              affected slice (item, availability, activity). */}
+          {activeStockOp && orgId && (
+            <StockOperationDialog
+              open
+              type={activeStockOp}
+              organizationId={orgId}
+              item={item}
+              warehouses={warehouses}
+              lots={lots}
+              reversalTx={
+                activeStockOp === 'reverse' && reversalTx
+                  ? {
+                      ...reversalTx,
+                      // The activity API returns the owning warehouse
+                      // on each row; we defensively fall back to the
+                      // owning lot if not present.
+                      warehouse_id:
+                        (reversalTx as ItemLedgerTx & { warehouse_id?: string }).warehouse_id ??
+                        lots.find((l) => l.id === (reversalTx as { lot_id?: string }).lot_id)
+                          ?.warehouse_id,
+                    }
+                  : undefined
+              }
+              onClose={() => {
+                setActiveStockOp(null);
+                setReversalTx(null);
+              }}
+              onSuccess={async () => {
+                // Refresh the two slices that a ledger operation can
+                // change: warehouse availability (lots) and activity.
+                // The item itself is not mutated by any ledger op,
+                // so we don't touch loadDetail — reloading it in
+                // parallel with loadAvailability would cross the
+                // shared availability generation ref and produce
+                // spurious loading flickers.
+                await Promise.all([loadAvailability(), loadActivity()]);
+              }}
+              onUnauthenticated={() => router.push('/login')}
+            />
+          )}
         </>
       ) : (
         <div data-testid="item-detail-not-found">

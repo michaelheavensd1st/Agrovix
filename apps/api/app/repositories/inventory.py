@@ -90,6 +90,26 @@ class WarehouseRepository:
         stmt = select(Warehouse).where(Warehouse.id == wh_id, Warehouse.deleted_at.is_(None))
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def list_by_ids_for_update(self, ids: Sequence[uuid.UUID]) -> list[Warehouse]:
+        """Row-lock a set of warehouses in a single deterministic query.
+
+        Sprint 5.4.6 — the transfer-reversal locking sequence must
+        acquire warehouse locks in ascending id order to avoid
+        cross-caller deadlocks. Using one query with
+        ``ORDER BY id ASC FOR UPDATE`` guarantees the DB acquires
+        the row locks in that order.
+        """
+        if not ids:
+            return []
+        stmt = (
+            select(Warehouse)
+            .where(Warehouse.id.in_(list(ids)))
+            .order_by(Warehouse.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def list_for_org(self, org_id: uuid.UUID) -> Sequence[Warehouse]:
         stmt = (
             select(Warehouse)
@@ -128,6 +148,25 @@ class InventoryItemRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def list_by_ids_for_update(self, ids: Sequence[uuid.UUID]) -> list[InventoryItem]:
+        """Row-lock a set of items in a single deterministic query.
+
+        Sprint 5.4.6 — items are referenced by both sides of a
+        transfer pair; the reversal locking sequence acquires them
+        in ascending id order so concurrent reversals cannot
+        deadlock over item locks.
+        """
+        if not ids:
+            return []
+        stmt = (
+            select(InventoryItem)
+            .where(InventoryItem.id.in_(list(ids)))
+            .order_by(InventoryItem.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def list_for_org(self, org_id: uuid.UUID) -> Sequence[InventoryItem]:
         stmt = (
             select(InventoryItem)
@@ -165,6 +204,27 @@ class InventoryLotRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def list_by_ids_for_update(self, ids: Sequence[uuid.UUID]) -> list[InventoryLot]:
+        """Row-lock a set of lots in a single deterministic query.
+
+        Sprint 5.4.6 — the reversal write phase must acquire both
+        transfer lots in ascending id order to avoid AB / BA
+        deadlocks between concurrent reversal attempts.
+        """
+        if not ids:
+            return []
+        stmt = (
+            select(InventoryLot)
+            .where(
+                InventoryLot.id.in_(list(ids)),
+                InventoryLot.deleted_at.is_(None),
+            )
+            .order_by(InventoryLot.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def find_or_none(
         self, *, warehouse_id: uuid.UUID, item_id: uuid.UUID, lot_code: str
     ) -> InventoryLot | None:
@@ -195,6 +255,53 @@ class InventoryTransactionRepository:
     async def get_by_id(self, tx_id: uuid.UUID) -> InventoryTransaction | None:
         stmt = select(InventoryTransaction).where(InventoryTransaction.id == tx_id)
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def get_by_id_for_update(self, tx_id: uuid.UUID) -> InventoryTransaction | None:
+        """Row-lock a ledger row inside the current transaction.
+
+        Sprint 5.4.5 — paired-transfer reversal MUST hold locks on
+        BOTH participating transaction rows before trusting their
+        relationship fields, otherwise a concurrent update to
+        ``farm_id`` / ``item_id`` / ``reference_id`` between our
+        unlocked validation and the write phase would leak a
+        partial reversal past the invariants.
+
+        Postgres emits ``SELECT ... FOR UPDATE``; SQLite silently
+        no-ops (StaticPool serialises writers). ``populate_existing``
+        forces the identity map to refresh from the DB even if the
+        row was previously loaded — so callers always see the
+        authoritative locked state.
+        """
+        stmt = (
+            select(InventoryTransaction)
+            .where(InventoryTransaction.id == tx_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def list_by_ids_for_update(self, ids: Sequence[uuid.UUID]) -> list[InventoryTransaction]:
+        """Row-lock a set of ledger rows in a single deterministic query.
+
+        Sprint 5.4.6 — the ONLY safe way to lock the two participating
+        transactions of a transfer pair. The caller sorts the ids
+        ascending; the DB acquires the locks in that order, so two
+        concurrent reversal attempts on the same pair — targeting
+        opposite sides — never deadlock. Postgres executes
+        ``SELECT ... WHERE id IN (:sorted_ids) ORDER BY id ASC
+        FOR UPDATE``; SQLite silently no-ops (StaticPool already
+        serialises writers).
+        """
+        if not ids:
+            return []
+        stmt = (
+            select(InventoryTransaction)
+            .where(InventoryTransaction.id.in_(list(ids)))
+            .order_by(InventoryTransaction.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
 
     async def get_by_lot_and_key(
         self, lot_id: uuid.UUID, idempotency_key: str

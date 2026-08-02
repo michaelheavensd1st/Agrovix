@@ -24,6 +24,7 @@ from app.repositories.org_repo import (
 )
 from app.repositories.role_repo import RoleAssignmentRepository, RoleRepository
 from app.repositories.user_repo import UserRepository
+from app.services._authorization_lock import acquire_org_authorization_lock
 
 
 def _hash_token(raw: str) -> str:
@@ -191,6 +192,16 @@ class InvitationService:
                 status.HTTP_403_FORBIDDEN, "This invitation is for a different email address."
             )
 
+        # Sprint 5.4.12 — acquire the per-organization authorization
+        # advisory lock BEFORE writing the membership + role
+        # assignment. Ensures a concurrent transfer authorization
+        # (which acquires the same lock) either commits before we
+        # begin OR blocks until we finish, so no reader sees the
+        # partial "membership set but role not yet linked" state.
+        await acquire_org_authorization_lock(
+            self.invitation_repo.session, invitation.organization_id
+        )
+
         # Wire memberships + role assignment
         await self.org_mem_repo.upsert_active(
             user_id=actor.id,
@@ -298,6 +309,14 @@ class RoleAssignmentService:
                 status.HTTP_400_BAD_REQUEST, "farm_id must be null for organization-scoped roles."
             )
 
+        # Sprint 5.4.12 — acquire the per-organization authorization
+        # advisory lock BEFORE mutating role assignments / membership
+        # rows. Every authorization reader (e.g. InventoryService.transfer)
+        # acquires the SAME lock before reading permissions, so
+        # concurrent assign / revoke / transfer paths serialise per
+        # organization. Two organizations do not block one another.
+        await acquire_org_authorization_lock(self.role_assign_repo.session, organization_id)
+
         assignment = await self.role_assign_repo.create(
             user_id=target_user.id,
             role_id=role.id,
@@ -338,6 +357,15 @@ class RoleAssignmentService:
         """
         role = await self.role_repo.get_by_id(assignment.role_id)
         is_owner_role = role is not None and role.name == "organization_owner"
+
+        # Sprint 5.4.12 — acquire the per-organization authorization
+        # advisory lock BEFORE mutating role assignments. Serialises
+        # every authorization reader (transfer) + writer (assign /
+        # revoke / accept-invitation / membership upsert) inside
+        # this org.
+        await acquire_org_authorization_lock(
+            self.role_assign_repo.session, assignment.organization_id
+        )
 
         # Serialise concurrent owner mutations on this org so the
         # post-check below sees a consistent view of committed revokes.
