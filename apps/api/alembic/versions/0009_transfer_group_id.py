@@ -1,18 +1,24 @@
-"""Sprint 5.4.8 — Immutable transfer_group_id + topology constraint.
+"""Sprint 5.4.8/5.4.9/5.4.10 — Immutable transfer identity + full
+topology enforcement (canonical DDL, pre-flight, table lock,
+deferred pair-completeness constraint).
 
-Adds:
-  * ``inventory_transactions.transfer_group_id`` column
-    (nullable, indexed);
-  * partial unique index ``uq_inventory_tx_transfer_role`` enforcing
-    at most one ``TRANSFER_OUT`` and one ``TRANSFER_IN`` per group;
-  * PostgreSQL trigger blocking mutation of a non-null
-    ``transfer_group_id`` (immutable-after-set);
-  * backfill: for every existing pair sharing
-    ``reference_type = 'transfer'``, copy ``reference_id`` into the
-    new column so legacy transfers can still be reversed under the
-    new advisory-lock protocol.
-
-Downgrade removes the trigger, the index, and the column.
+Upgrade sequence
+----------------
+1. Acquire ``ACCESS EXCLUSIVE`` lock on ``inventory_transactions`` so
+   pre-flight validation and back-fill see a stable, malformed-write-
+   free view (Sprint 5.4.10 §5).
+2. Run pre-flight malformed-topology detection over transfer-role
+   rows AND non-transfer rows carrying transfer references. On any
+   finding, abort with counts (§4/§5).
+3. Add the ``transfer_group_id`` column + index.
+4. Back-fill ``transfer_group_id`` STRICTLY on rows whose
+   ``transaction_type`` is a transfer role (§4). Non-transfer rows
+   are left untouched.
+5. Create the partial unique index that enforces "at most one OUT
+   and one IN per group" (§3).
+6. Install the canonical enforcement DDL from
+   ``app.db.inventory_transfer_ddl`` — a single source of truth
+   shared with ``Base.metadata.create_all`` (§2).
 """
 
 from __future__ import annotations
@@ -21,6 +27,8 @@ from collections.abc import Sequence
 
 from alembic import op
 from sqlalchemy import text as _sa_text
+
+from app.db.inventory_transfer_ddl import install_all_sql
 
 revision: str = "0009_transfer_group_id"
 down_revision: str | None = "0008_wh_maintenance"
@@ -32,22 +40,36 @@ def upgrade() -> None:
     bind = op.get_bind()
     dialect = bind.dialect.name
 
-    # Sprint 5.4.9 — pre-flight malformed-topology detection. If
-    # pre-existing rows would violate the constraints we are about
-    # to create, abort with an explicit diagnostic. Never leave a
-    # partially migrated topology behind.
     if dialect == "postgresql":
-        malformed = bind.execute(
+        # Sprint 5.4.10 §5 — pre-flight and back-fill run under an
+        # ACCESS EXCLUSIVE lock so no concurrent writer can insert
+        # malformed rows between pre-flight and constraint creation.
+        bind.execute(
+            _sa_text(
+                "LOCK TABLE inventory_transactions "
+                "IN ACCESS EXCLUSIVE MODE"
+            )
+        )
+
+        # Sprint 5.4.10 §4 pre-flight — count every malformed shape.
+        pre = bind.execute(
             _sa_text(
                 "WITH transfer_rows AS ("
-                "  SELECT id, transaction_type, reference_id, reference_type "
+                "  SELECT id, transaction_type, reference_id, reference_type, "
+                "         organization_id, item_id "
                 "  FROM inventory_transactions "
                 "  WHERE transaction_type IN ('transfer_out', 'transfer_in')"
                 ") "
                 "SELECT "
                 "  (SELECT COUNT(*) FROM transfer_rows "
-                "    WHERE reference_id IS NULL "
-                "       OR reference_type IS DISTINCT FROM 'transfer') AS orphans, "
+                "    WHERE reference_id IS NULL) AS transfer_null_ref, "
+                "  (SELECT COUNT(*) FROM transfer_rows "
+                "    WHERE reference_type IS DISTINCT FROM 'transfer') "
+                "    AS transfer_wrong_ref_type, "
+                "  (SELECT COUNT(*) FROM inventory_transactions "
+                "    WHERE reference_type = 'transfer' "
+                "      AND transaction_type NOT IN ('transfer_out', 'transfer_in')) "
+                "    AS non_transfer_using_ref, "
                 "  (SELECT COUNT(*) FROM ("
                 "    SELECT reference_id, transaction_type, COUNT(*) c "
                 "      FROM transfer_rows WHERE reference_id IS NOT NULL "
@@ -56,25 +78,61 @@ def upgrade() -> None:
                 "  (SELECT COUNT(*) FROM ("
                 "    SELECT reference_id FROM transfer_rows "
                 "     WHERE reference_id IS NOT NULL "
-                "     GROUP BY reference_id HAVING COUNT(*) <> 2) x) AS incomplete_pairs"
+                "     GROUP BY reference_id HAVING COUNT(*) <> 2) x) "
+                "    AS incomplete_pairs, "
+                "  (SELECT COUNT(*) FROM ("
+                "    SELECT reference_id FROM transfer_rows "
+                "     WHERE reference_id IS NOT NULL "
+                "     GROUP BY reference_id "
+                "    HAVING COUNT(DISTINCT organization_id) <> 1) x) "
+                "    AS mixed_organizations, "
+                "  (SELECT COUNT(*) FROM ("
+                "    SELECT reference_id FROM transfer_rows "
+                "     WHERE reference_id IS NOT NULL "
+                "     GROUP BY reference_id "
+                "    HAVING COUNT(DISTINCT item_id) <> 1) x) "
+                "    AS mixed_items"
             )
         ).one()
-        orphans, dup_roles, incomplete = malformed
-        if orphans or dup_roles or incomplete:
+        (
+            null_ref,
+            wrong_ref_type,
+            non_transfer_using_ref,
+            dup_roles,
+            incomplete,
+            mixed_orgs,
+            mixed_items,
+        ) = pre
+        if any((
+            null_ref, wrong_ref_type, non_transfer_using_ref,
+            dup_roles, incomplete, mixed_orgs, mixed_items,
+        )):
             raise RuntimeError(
-                "Sprint 5.4.9 migration 0009 aborted: malformed transfer "
-                f"topology present — orphan_transfer_rows={orphans}, "
-                f"duplicate_roles={dup_roles}, incomplete_pairs={incomplete}. "
-                "Repair the offending rows before re-running the migration."
+                "Sprint 5.4.10 migration 0009 aborted: malformed "
+                "transfer topology present — "
+                f"transfer_rows_with_null_reference={null_ref}, "
+                f"transfer_rows_with_wrong_reference_type={wrong_ref_type}, "
+                f"non_transfer_rows_using_transfer_reference="
+                f"{non_transfer_using_ref}, "
+                f"duplicate_roles={dup_roles}, "
+                f"incomplete_pairs={incomplete}, "
+                f"mixed_organizations={mixed_orgs}, "
+                f"mixed_items={mixed_items}. "
+                "Repair the offending rows before re-running the "
+                "migration. This is intentional: partial migrations "
+                "would produce an invalid post-migration topology."
             )
 
-    # 1. Column.
-    op.execute(
-        "ALTER TABLE inventory_transactions "
-        "ADD COLUMN IF NOT EXISTS transfer_group_id UUID"
-        if dialect == "postgresql"
-        else "ALTER TABLE inventory_transactions ADD COLUMN transfer_group_id UUID"
-    )
+        # 1. Column.
+        op.execute(
+            "ALTER TABLE inventory_transactions "
+            "ADD COLUMN IF NOT EXISTS transfer_group_id UUID"
+        )
+    else:
+        op.execute(
+            "ALTER TABLE inventory_transactions ADD COLUMN transfer_group_id UUID"
+        )
+
     op.create_index(
         "ix_inventory_transactions_transfer_group_id",
         "inventory_transactions",
@@ -82,78 +140,37 @@ def upgrade() -> None:
         unique=False,
     )
 
-    # 2. Backfill from reference_id for existing transfer pairs.
+    # 2. Back-fill. Sprint 5.4.10 §4 — ONLY transfer-role rows may
+    #    receive a transfer_group_id. Non-transfer rows that happen
+    #    to share reference_type='transfer' would have been caught
+    #    by the pre-flight and forced the migration to abort.
     op.execute(
         "UPDATE inventory_transactions "
         "SET transfer_group_id = reference_id "
-        "WHERE reference_type = 'transfer' "
+        "WHERE transaction_type IN ('transfer_out', 'transfer_in') "
+        "  AND reference_type = 'transfer' "
         "  AND reference_id IS NOT NULL "
         "  AND transfer_group_id IS NULL"
     )
 
-    # 3. Topology-enforcing partial unique index.
     if dialect == "postgresql":
+        # 3. Topology-enforcing partial unique index.
         op.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_tx_transfer_role "
             "ON inventory_transactions (transfer_group_id, transaction_type) "
             "WHERE transfer_group_id IS NOT NULL "
             "  AND transaction_type IN ('transfer_out', 'transfer_in')"
         )
-        # 4. Sprint 5.4.9 comprehensive trigger — enforces:
-        #    - transfer rows are BORN with a non-null group_id;
-        #    - non-transfer rows must NOT carry a group_id;
-        #    - reference_id must equal transfer_group_id on transfer
-        #      rows (coupling; prevents divergence);
-        #    - reference_type must be 'transfer' on transfer rows;
-        #    - transfer_group_id is immutable after INSERT.
-        op.execute(
-            "CREATE OR REPLACE FUNCTION inventory_transactions_group_immutable() "
-            "RETURNS TRIGGER AS $$ "
-            "BEGIN "
-            "  IF TG_OP = 'INSERT' THEN "
-            "    IF NEW.transaction_type IN ('transfer_out', 'transfer_in') THEN "
-            "      IF NEW.transfer_group_id IS NULL THEN "
-            "        RAISE EXCEPTION 'transfer_group_id is required for transfer rows' "
-            "          USING ERRCODE = 'not_null_violation'; "
-            "      END IF; "
-            "      IF NEW.reference_type IS DISTINCT FROM 'transfer' THEN "
-            "        RAISE EXCEPTION 'transfer rows must have reference_type=transfer' "
-            "          USING ERRCODE = 'integrity_constraint_violation'; "
-            "      END IF; "
-            "      IF NEW.reference_id IS NULL OR NEW.reference_id != NEW.transfer_group_id THEN "
-            "        RAISE EXCEPTION 'transfer_group_id must equal reference_id' "
-            "          USING ERRCODE = 'integrity_constraint_violation'; "
-            "      END IF; "
-            "    ELSIF NEW.transfer_group_id IS NOT NULL THEN "
-            "      RAISE EXCEPTION 'transfer_group_id may only be set on transfer rows' "
-            "        USING ERRCODE = 'integrity_constraint_violation'; "
-            "    END IF; "
-            "    RETURN NEW; "
-            "  END IF; "
-            "  IF OLD.transfer_group_id IS DISTINCT FROM NEW.transfer_group_id THEN "
-            "    RAISE EXCEPTION 'transfer_group_id is immutable once set' "
-            "      USING ERRCODE = 'integrity_constraint_violation'; "
-            "  END IF; "
-            "  IF NEW.transaction_type IN ('transfer_out', 'transfer_in') "
-            "     AND NEW.reference_id IS DISTINCT FROM NEW.transfer_group_id THEN "
-            "    RAISE EXCEPTION 'transfer reference_id and transfer_group_id must match' "
-            "      USING ERRCODE = 'integrity_constraint_violation'; "
-            "  END IF; "
-            "  RETURN NEW; "
-            "END; "
-            "$$ LANGUAGE plpgsql"
-        )
-        op.execute(
-            "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
-            "ON inventory_transactions"
-        )
-        op.execute(
-            "CREATE TRIGGER trg_inventory_tx_group_immutable "
-            "BEFORE INSERT OR UPDATE ON inventory_transactions "
-            "FOR EACH ROW EXECUTE FUNCTION inventory_transactions_group_immutable()"
-        )
+        # 4. Canonical DDL — installs BOTH the identity-contract
+        #    trigger (BEFORE INSERT OR UPDATE) and the deferred
+        #    pair-completeness constraint trigger (AFTER, DEFERRABLE
+        #    INITIALLY DEFERRED). Shared with
+        #    ``Base.metadata.create_all`` via
+        #    ``app.db.inventory_transfer_ddl`` — one canonical
+        #    definition, no divergence.
+        for stmt in install_all_sql():
+            op.execute(stmt)
     else:
-        # SQLite — partial unique index works too.
         op.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_tx_transfer_role "
             "ON inventory_transactions (transfer_group_id, transaction_type) "
@@ -166,7 +183,15 @@ def downgrade() -> None:
     bind = op.get_bind()
     dialect = bind.dialect.name
     if dialect == "postgresql":
-        op.execute("DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable ON inventory_transactions")
+        op.execute(
+            "DROP TRIGGER IF EXISTS trg_inventory_tx_pair_complete "
+            "ON inventory_transactions"
+        )
+        op.execute("DROP FUNCTION IF EXISTS inventory_transactions_pair_complete()")
+        op.execute(
+            "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
+            "ON inventory_transactions"
+        )
         op.execute("DROP FUNCTION IF EXISTS inventory_transactions_group_immutable()")
     op.execute("DROP INDEX IF EXISTS uq_inventory_tx_transfer_role")
     op.drop_index(

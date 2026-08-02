@@ -462,45 +462,39 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
         ),
     )
 
-
-
-# Sprint 5.4.8 — install the transfer_group_id immutability trigger
-# automatically on ``create_all`` against PostgreSQL. Alembic migration
-# 0009 installs the same trigger for production/CI databases; this DDL
-# event mirrors it for the hermetic test suite so
+# Sprint 5.4.10 — install the complete transfer-topology DDL suite
+# automatically on ``create_all`` against PostgreSQL. Alembic migrations
+# install the same objects for production/CI databases; this DDL event
+# mirrors them for the hermetic test suite so
 # ``pytest --database-url=postgres://…`` observes the same behaviour
-# without running the migration chain.
+# without running the migration chain. ``install_all_sql`` remains the
+# authoritative source for both the statements and their execution order.
 from sqlalchemy import DDL  # noqa: E402
 from sqlalchemy import event as _sa_event  # noqa: E402
 
 from app.db.inventory_transfer_ddl import (  # noqa: E402
-    CREATE_TRANSFER_GROUP_IMMUTABLE_TRIGGER_SQL,
-    DROP_TRANSFER_GROUP_IMMUTABLE_TRIGGER_SQL,
-    TRANSFER_GROUP_IMMUTABLE_FUNCTION_SQL,
+    TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL,
+    TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL,
+    TRANSFER_IMMUTABLE_FN_SQL,
+    TRANSFER_PAIR_COMPLETE_CREATE_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_DROP_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_FN_SQL,
+    install_all_sql,
 )
 
-_transfer_group_immutable_fn_ddl = DDL(TRANSFER_GROUP_IMMUTABLE_FUNCTION_SQL)
+_canonical_transfer_ddl_statements = (
+    TRANSFER_IMMUTABLE_FN_SQL,
+    TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL,
+    TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_FN_SQL,
+    TRANSFER_PAIR_COMPLETE_DROP_TRIGGER_SQL,
+    TRANSFER_PAIR_COMPLETE_CREATE_TRIGGER_SQL,
+)
+assert install_all_sql() == list(_canonical_transfer_ddl_statements)
 
-_transfer_group_immutable_drop_trigger_ddl = DDL(
-    DROP_TRANSFER_GROUP_IMMUTABLE_TRIGGER_SQL
-)
-
-_transfer_group_immutable_create_trigger_ddl = DDL(
-    CREATE_TRANSFER_GROUP_IMMUTABLE_TRIGGER_SQL
-)
-
-_sa_event.listen(
-    InventoryTransaction.__table__,
-    "after_create",
-    _transfer_group_immutable_fn_ddl.execute_if(dialect="postgresql"),
-)
-_sa_event.listen(
-    InventoryTransaction.__table__,
-    "after_create",
-    _transfer_group_immutable_drop_trigger_ddl.execute_if(dialect="postgresql"),
-)
-_sa_event.listen(
-    InventoryTransaction.__table__,
-    "after_create",
-    _transfer_group_immutable_create_trigger_ddl.execute_if(dialect="postgresql"),
-)
+for _statement in install_all_sql():
+    _sa_event.listen(
+        InventoryTransaction.__table__,
+        "after_create",
+        DDL(_statement).execute_if(dialect="postgresql"),
+    )

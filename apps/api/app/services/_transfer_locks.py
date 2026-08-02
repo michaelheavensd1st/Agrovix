@@ -105,7 +105,7 @@ async def acquire_transfer_advisory_lock(
 T = TypeVar("T")
 
 
-def require_exactly_one(  # noqa: UP047
+def require_exactly_one(
     rows: Sequence[T],
     *,
     resource: str,
