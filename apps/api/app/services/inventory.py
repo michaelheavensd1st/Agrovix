@@ -179,7 +179,6 @@ class InventoryService:
     # authorization step and either commit or refuse.
     _transfer_hold_before_authorize_gate: ClassVar[object | None] = None
 
-
     def __init__(
         self,
         session: AsyncSession,
@@ -1025,9 +1024,7 @@ class InventoryService:
             if not has_permission(codes, "inventory_transaction.create"):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        "Missing required permission: inventory_transaction.create"
-                    ),
+                    detail=("Missing required permission: inventory_transaction.create"),
                 )
 
     async def _assert_actor_membership_under_lock(
@@ -1062,9 +1059,7 @@ class InventoryService:
         # equally sufficient. Otherwise the caller is not a member of
         # the authoritative locked org and MUST see 404.
         if farm_id is None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Warehouse not found."
-            )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
         farm_mem = (
             await self.session.execute(
                 select(FarmMembership).where(
@@ -1076,10 +1071,7 @@ class InventoryService:
             )
         ).scalar_one_or_none()
         if farm_mem is None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Warehouse not found."
-            )
-
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
 
     async def transfer(
         self,
@@ -1150,16 +1142,9 @@ class InventoryService:
         # I named exists but I lack access to it" from "no such
         # warehouse" from the destination-side response alone.
         if warehouse_id not in wh_by_id or wh_by_id[warehouse_id].deleted_at is not None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Warehouse not found."
-            )
-        if (
-            dst_warehouse_id not in wh_by_id
-            or wh_by_id[dst_warehouse_id].deleted_at is not None
-        ):
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "Warehouse not found."
-            )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
+        if dst_warehouse_id not in wh_by_id or wh_by_id[dst_warehouse_id].deleted_at is not None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
         warehouse = wh_by_id[warehouse_id]
         dst_warehouse = wh_by_id[dst_warehouse_id]
 
@@ -1178,23 +1163,17 @@ class InventoryService:
         farm_by_id: dict[uuid.UUID, Farm] = {f.id: f for f in locked_farms}
         for fid in farm_ids:
             if fid not in farm_by_id:
-                raise HTTPException(
-                    status.HTTP_404_NOT_FOUND, "Warehouse not found."
-                )
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
 
         # (3) Bulk-lock the owning organization(s) FOR UPDATE.
         # Cross-org transfers are refused below; typically both
         # warehouses share ONE org and we lock exactly one row.
-        org_ids = sorted(
-            {warehouse.organization_id, dst_warehouse.organization_id}, key=str
-        )
+        org_ids = sorted({warehouse.organization_id, dst_warehouse.organization_id}, key=str)
         locked_orgs = await self.org_repo.list_by_ids_for_update(org_ids)
         org_by_id = {o.id: o for o in locked_orgs}
         for oid in org_ids:
             if oid not in org_by_id:
-                raise HTTPException(
-                    status.HTTP_404_NOT_FOUND, "Warehouse not found."
-                )
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
         # (4) Sprint 5.4.12 — AUTHORIZATION ADVISORY LOCK.
         # Acquire the transaction-scoped per-organization
         # authorization advisory lock BEFORE any read against
@@ -1362,9 +1341,7 @@ class InventoryService:
         # is a no-op set.
         lot_ids_sorted = sorted({src_lot.id, dst_lot.id}, key=str)
         locked_lots = await self.lot_repo.list_by_ids_for_update(lot_ids_sorted)
-        require_set_equality(
-            locked_lots, resource="lot", requested_ids=set(lot_ids_sorted)
-        )
+        require_set_equality(locked_lots, resource="lot", requested_ids=set(lot_ids_sorted))
         lots_by_id = {lot.id: lot for lot in locked_lots}
         src_lot = lots_by_id[src_lot.id]
         dst_lot = lots_by_id[dst_lot.id]
@@ -1408,9 +1385,7 @@ class InventoryService:
         # lock BEFORE writing either side of the pair. Keyed on the
         # IMMUTABLE ``transfer_group_id`` (Sprint 5.4.8), which
         # cannot drift under concurrent tenant mutation.
-        await acquire_transfer_advisory_lock(
-            self.session, transfer_group_id=transfer_group
-        )
+        await acquire_transfer_advisory_lock(self.session, transfer_group_id=transfer_group)
 
         p_hash = _payload_hash(
             {
@@ -2003,12 +1978,8 @@ class InventoryService:
                 identifier=original_locked.warehouse_id,
             )
             # Sprint 5.4.8 — lock the farm (if any) and the owning org.
-            farm_ids_single = (
-                [locked_wh.farm_id] if locked_wh.farm_id is not None else []
-            )
-            locked_farms_single = await self.farm_repo.list_by_ids_for_update(
-                farm_ids_single
-            )
+            farm_ids_single = [locked_wh.farm_id] if locked_wh.farm_id is not None else []
+            locked_farms_single = await self.farm_repo.list_by_ids_for_update(farm_ids_single)
             if farm_ids_single:
                 locked_farm = require_exactly_one(
                     locked_farms_single,
@@ -2134,9 +2105,7 @@ class InventoryService:
             if original_probe.transfer_group_id is not None
             else original_probe.reference_id
         )
-        await acquire_transfer_advisory_lock(
-            self.session, transfer_group_id=group_key
-        )
+        await acquire_transfer_advisory_lock(self.session, transfer_group_id=group_key)
 
         # (2b) Re-read the target transaction after acquiring the
         # advisory lock — an earlier concurrent reversal may have
@@ -2165,9 +2134,7 @@ class InventoryService:
             )
         original_probe = refreshed_target
 
-        candidates = await self.tx_repo.list_by_reference(
-            "transfer", original_probe.reference_id
-        )
+        candidates = await self.tx_repo.list_by_reference("transfer", original_probe.reference_id)
         transfer_rows = [
             t
             for t in candidates
@@ -2196,12 +2163,10 @@ class InventoryService:
             )
         # Exactly one OUT and one IN.
         out_rows = [
-            t for t in transfer_rows
-            if t.transaction_type == InventoryTransactionType.TRANSFER_OUT
+            t for t in transfer_rows if t.transaction_type == InventoryTransactionType.TRANSFER_OUT
         ]
         in_rows = [
-            t for t in transfer_rows
-            if t.transaction_type == InventoryTransactionType.TRANSFER_IN
+            t for t in transfer_rows if t.transaction_type == InventoryTransactionType.TRANSFER_IN
         ]
         if len(out_rows) != 1 or len(in_rows) != 1:
             raise HTTPException(
@@ -2278,9 +2243,7 @@ class InventoryService:
         # a third row, but this re-check catches any pre-existing
         # malformed state (e.g. a third row that was inserted before
         # any advisory locking was in place). Any deviation → 409.
-        recheck = await self.tx_repo.list_by_reference(
-            "transfer", original_locked.reference_id
-        )
+        recheck = await self.tx_repo.list_by_reference("transfer", original_locked.reference_id)
         recheck_transfers = [
             t
             for t in recheck
@@ -2299,8 +2262,7 @@ class InventoryService:
                 {
                     "code": "transfer_topology_malformed",
                     "message": (
-                        "Transfer identity topology changed under lock; "
-                        "refusing to reverse."
+                        "Transfer identity topology changed under lock; " "refusing to reverse."
                     ),
                     "reference_id": str(original_locked.reference_id),
                     "row_count": len(recheck_transfers),
@@ -2313,9 +2275,7 @@ class InventoryService:
         # ``warehouse`` object is used solely for path identity
         # matching (and its .id must match ``original_locked.warehouse_id``,
         # already asserted above).
-        wh_ids = sorted(
-            {original_locked.warehouse_id, partner_locked.warehouse_id}, key=str
-        )
+        wh_ids = sorted({original_locked.warehouse_id, partner_locked.warehouse_id}, key=str)
         locked_whs = await self.warehouse_repo.list_by_ids_for_update(wh_ids)
         wh_by_id = {w.id: w for w in locked_whs}
         if (
@@ -2376,10 +2336,7 @@ class InventoryService:
                     status.HTTP_409_CONFLICT,
                     {
                         "code": "transfer_farm_deleted",
-                        "message": (
-                            "Referenced farm is soft-deleted; refusing to "
-                            "reverse."
-                        ),
+                        "message": ("Referenced farm is soft-deleted; refusing to " "reverse."),
                         "farm_id": str(f.id),
                     },
                 )
@@ -2388,10 +2345,7 @@ class InventoryService:
                     status.HTTP_409_CONFLICT,
                     {
                         "code": "transfer_farm_inactive",
-                        "message": (
-                            "Referenced farm is inactive; refusing to "
-                            "reverse."
-                        ),
+                        "message": ("Referenced farm is inactive; refusing to " "reverse."),
                         "farm_id": str(f.id),
                     },
                 )
@@ -2415,10 +2369,7 @@ class InventoryService:
                 },
             )
         # Under the locked view, both warehouses must share ONE org.
-        if (
-            original_warehouse.organization_id
-            != partner_warehouse_locked.organization_id
-        ):
+        if original_warehouse.organization_id != partner_warehouse_locked.organization_id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
@@ -2435,9 +2386,7 @@ class InventoryService:
                 status.HTTP_409_CONFLICT,
                 {
                     "code": "transfer_organization_deleted",
-                    "message": (
-                        "Organization is soft-deleted; refusing to reverse."
-                    ),
+                    "message": ("Organization is soft-deleted; refusing to reverse."),
                     "organization_id": str(locked_org.id),
                 },
             )
@@ -2446,9 +2395,7 @@ class InventoryService:
                 status.HTTP_409_CONFLICT,
                 {
                     "code": "transfer_organization_inactive",
-                    "message": (
-                        "Organization is inactive; refusing to reverse."
-                    ),
+                    "message": ("Organization is inactive; refusing to reverse."),
                     "organization_id": str(locked_org.id),
                 },
             )
@@ -2483,9 +2430,7 @@ class InventoryService:
                     status.HTTP_409_CONFLICT,
                     {
                         "code": "transfer_farm_organization_mismatch",
-                        "message": (
-                            "Locked farm belongs to a different organization."
-                        ),
+                        "message": ("Locked farm belongs to a different organization."),
                         "farm_id": str(f.id),
                         "farm_organization_id": str(f.organization_id),
                         "expected_organization_id": str(locked_org.id),
@@ -2512,10 +2457,7 @@ class InventoryService:
         item_ids = sorted({original_locked.item_id, partner_locked.item_id}, key=str)
         locked_items = await self.item_repo.list_by_ids_for_update(item_ids)
         item_by_id = {it.id: it for it in locked_items}
-        if (
-            original_locked.item_id not in item_by_id
-            or partner_locked.item_id not in item_by_id
-        ):
+        if original_locked.item_id not in item_by_id or partner_locked.item_id not in item_by_id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
@@ -2558,10 +2500,7 @@ class InventoryService:
         lot_ids = sorted({original_locked.lot_id, partner_locked.lot_id}, key=str)
         locked_lots = await self.lot_repo.list_by_ids_for_update(lot_ids)
         lot_by_id = {lot.id: lot for lot in locked_lots}
-        if (
-            original_locked.lot_id not in lot_by_id
-            or partner_locked.lot_id not in lot_by_id
-        ):
+        if original_locked.lot_id not in lot_by_id or partner_locked.lot_id not in lot_by_id:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {

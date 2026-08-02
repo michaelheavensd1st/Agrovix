@@ -315,9 +315,7 @@ class RoleAssignmentService:
         # acquires the SAME lock before reading permissions, so
         # concurrent assign / revoke / transfer paths serialise per
         # organization. Two organizations do not block one another.
-        await acquire_org_authorization_lock(
-            self.role_assign_repo.session, organization_id
-        )
+        await acquire_org_authorization_lock(self.role_assign_repo.session, organization_id)
 
         assignment = await self.role_assign_repo.create(
             user_id=target_user.id,

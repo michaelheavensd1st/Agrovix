@@ -68,9 +68,7 @@ def advisory_lock_key_for_transfer(
     that pins the exact algorithm. Callers writing new code should
     use :func:`advisory_lock_key_for_transfer_group` instead.
     """
-    canonical = (
-        f"inventory-transfer:{organization_id}:{reference_type}:{reference_id}"
-    )
+    canonical = f"inventory-transfer:{organization_id}:{reference_type}:{reference_id}"
     digest = hashlib.sha256(canonical.encode("utf-8")).digest()
     as_unsigned = int.from_bytes(digest[:8], byteorder="big", signed=False)
     if as_unsigned >= (1 << 63):

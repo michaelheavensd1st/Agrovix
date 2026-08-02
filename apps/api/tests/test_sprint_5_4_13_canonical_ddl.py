@@ -166,6 +166,22 @@ def test_pair_complete_function_contains(phrase: str) -> None:
     )
 
 
+def test_pair_complete_raise_placeholders_are_executable_postgresql_sql() -> None:
+    """PL/pgSQL ``RAISE`` uses one ``%`` per supplied argument.
+
+    Doubling these placeholders is not SQLAlchemy escaping: it reaches
+    PostgreSQL as literal double-percent text and makes function creation
+    fail with ``too many parameters specified for RAISE``.
+    """
+    raise_lines = [
+        fragment
+        for fragment in TRANSFER_PAIR_COMPLETE_FN_SQL.split("; ")
+        if "RAISE EXCEPTION" in fragment
+    ]
+    assert [line.count("%") for line in raise_lines] == [3, 1, 1]
+    assert all("%%" not in line for line in raise_lines)
+
+
 def test_pair_complete_trigger_is_deferrable_constraint_trigger() -> None:
     """DEFERRABLE INITIALLY DEFERRED constraint trigger is
     load-bearing: Sprint 5.4.10 depends on the pair-completeness
@@ -215,6 +231,7 @@ def test_metadata_event_uses_canonical_ddl() -> None:
         assert constant in src, f"regression: models/inventory.py no longer imports {constant}"
     # Guard against anyone silently disabling the DDL event.
     assert 'execute_if(dialect="postgresql")' in src
+    assert 'DDL(_statement.replace("%", "%%"))' in src
 
 
 def test_alembic_0009_reconciles_against_canonical_ddl() -> None:
@@ -230,6 +247,7 @@ def test_alembic_0009_reconciles_against_canonical_ddl() -> None:
     src = path.read_text()
     assert "from app.db.inventory_transfer_ddl import install_all_sql" in src
     assert "for stmt in install_all_sql():" in src
+    assert "op.execute(stmt)" in src
 
 
 def test_alembic_0010_reconciles_against_canonical_ddl() -> None:

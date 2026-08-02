@@ -462,6 +462,7 @@ class InventoryTransaction(Base, UUIDPrimaryKeyMixin):
         ),
     )
 
+
 # Sprint 5.4.10 — install the complete transfer-topology DDL suite
 # automatically on ``create_all`` against PostgreSQL. Alembic migrations
 # install the same objects for production/CI databases; this DDL event
@@ -496,5 +497,5 @@ for _statement in install_all_sql():
     _sa_event.listen(
         InventoryTransaction.__table__,
         "after_create",
-        DDL(_statement).execute_if(dialect="postgresql"),
+        DDL(_statement.replace("%", "%%")).execute_if(dialect="postgresql"),
     )

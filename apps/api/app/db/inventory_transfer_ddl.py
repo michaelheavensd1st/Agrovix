@@ -114,8 +114,7 @@ TRANSFER_IMMUTABLE_FN_SQL = (
 )
 
 TRANSFER_IMMUTABLE_DROP_TRIGGER_SQL = (
-    "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
-    "ON inventory_transactions"
+    "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable " "ON inventory_transactions"
 )
 
 TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL = (
@@ -158,15 +157,15 @@ TRANSFER_PAIR_COMPLETE_FN_SQL = (
     "    RETURN NULL; "
     "  END IF; "
     "  IF out_count <> 1 OR in_count <> 1 THEN "
-    "    RAISE EXCEPTION 'transfer group %% must have exactly one OUT and one IN at commit (found out=%%, in=%%)', target, out_count, in_count "
+    "    RAISE EXCEPTION 'transfer group % must have exactly one OUT and one IN at commit (found out=%, in=%)', target, out_count, in_count "
     "      USING ERRCODE = 'integrity_constraint_violation'; "
     "  END IF; "
     "  IF distinct_orgs <> 1 THEN "
-    "    RAISE EXCEPTION 'transfer group %% spans multiple organizations at commit', target "
+    "    RAISE EXCEPTION 'transfer group % spans multiple organizations at commit', target "
     "      USING ERRCODE = 'integrity_constraint_violation'; "
     "  END IF; "
     "  IF distinct_items <> 1 THEN "
-    "    RAISE EXCEPTION 'transfer group %% spans multiple items at commit', target "
+    "    RAISE EXCEPTION 'transfer group % spans multiple items at commit', target "
     "      USING ERRCODE = 'integrity_constraint_violation'; "
     "  END IF; "
     "  RETURN NULL; "
@@ -175,8 +174,7 @@ TRANSFER_PAIR_COMPLETE_FN_SQL = (
 )
 
 TRANSFER_PAIR_COMPLETE_DROP_TRIGGER_SQL = (
-    "DROP TRIGGER IF EXISTS trg_inventory_tx_pair_complete "
-    "ON inventory_transactions"
+    "DROP TRIGGER IF EXISTS trg_inventory_tx_pair_complete " "ON inventory_transactions"
 )
 
 TRANSFER_PAIR_COMPLETE_CREATE_TRIGGER_SQL = (

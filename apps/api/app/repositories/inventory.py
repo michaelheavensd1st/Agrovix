@@ -280,9 +280,7 @@ class InventoryTransactionRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def list_by_ids_for_update(
-        self, ids: Sequence[uuid.UUID]
-    ) -> list[InventoryTransaction]:
+    async def list_by_ids_for_update(self, ids: Sequence[uuid.UUID]) -> list[InventoryTransaction]:
         """Row-lock a set of ledger rows in a single deterministic query.
 
         Sprint 5.4.6 — the ONLY safe way to lock the two participating

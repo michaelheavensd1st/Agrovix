@@ -171,9 +171,7 @@ export function InventoryItemActivity({
                           onClick={() => onReverse(tx)}
                           className="rounded-md border border-border px-2 py-0.5 text-xs hover:bg-secondary"
                         >
-                          {tx.transaction_type === 'transfer_out'
-                            ? 'Reverse transfer'
-                            : 'Reverse'}
+                          {tx.transaction_type === 'transfer_out' ? 'Reverse transfer' : 'Reverse'}
                         </button>
                       ) : alreadyReversedIds.has(tx.id) ? (
                         <span

@@ -114,8 +114,10 @@ async def acquire_all_org_authorization_locks(session: AsyncSession) -> list[int
     if dialect == "postgresql":
         await session.execute(text("LOCK TABLE organizations IN SHARE MODE"))
     organization_ids = (
-        await session.execute(select(Organization.id).order_by(Organization.id.asc()))
-    ).scalars().all()
+        (await session.execute(select(Organization.id).order_by(Organization.id.asc())))
+        .scalars()
+        .all()
+    )
     return await acquire_org_authorization_locks(session, organization_ids)
 
 

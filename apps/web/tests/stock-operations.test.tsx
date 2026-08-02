@@ -1114,7 +1114,6 @@ describe('InventoryItemActivity — filter accessibility (Sprint 5.4.1)', () => 
   });
 });
 
-
 // ------------------------------------------------------------------ //
 // Sprint 5.4.2 — atomic warehouse-transfer reversal (UI contract)     //
 // ------------------------------------------------------------------ //
@@ -1145,10 +1144,8 @@ describe('InventoryItemActivity — atomic transfer reversal (Sprint 5.4.2)', ()
     } as ItemLot;
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
-        return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
-        return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
       if (path === '/v1/warehouses/wh-1/lots') return Promise.resolve([LOT_1]);
       if (path === '/v1/warehouses/wh-2/lots') return Promise.resolve([LOT_2]);
       if (path.startsWith(`/v1/lots/${LOT_1.id}/transactions`)) {

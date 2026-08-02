@@ -41,7 +41,7 @@ def upgrade() -> None:
         "LOCK TABLE inventory_transactions IN ACCESS EXCLUSIVE MODE"
     )
     for stmt in install_all_sql():
-        bind.exec_driver_sql(stmt)
+        op.execute(stmt)
 
 
 def downgrade() -> None:
@@ -60,4 +60,4 @@ def downgrade() -> None:
         "LOCK TABLE inventory_transactions IN ACCESS EXCLUSIVE MODE"
     )
     for stmt in install_all_sql():
-        bind.exec_driver_sql(stmt)
+        op.execute(stmt)

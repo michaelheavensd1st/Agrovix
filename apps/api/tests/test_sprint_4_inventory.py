@@ -1805,6 +1805,7 @@ async def _count_audit_rows_for_wrong_scope(
     misleading audit rows were emitted for a refused reversal.
     """
     from app.models.audit import AuditEvent  # local import — the model
+
     # is not otherwise needed at module scope
 
     async with _db_session_module.AsyncSessionLocal() as session:
@@ -1850,9 +1851,9 @@ async def _assert_no_writes_after(
     assert await _count_reversal_markers(lot_ids) == baseline["marker"]
     assert await _sum_org_inventory(client, org_id) == baseline["total"]
     balances_now = await _snapshot_lot_state(client, lot_ids)
-    assert balances_now == baseline["balances"], (
-        f"lot balances changed under a refused reversal: {balances_now} != {baseline['balances']}"
-    )
+    assert (
+        balances_now == baseline["balances"]
+    ), f"lot balances changed under a refused reversal: {balances_now} != {baseline['balances']}"
 
 
 async def _baseline(client: AsyncClient, *, lot_ids: list[str], org_id: str) -> dict:
@@ -2599,9 +2600,7 @@ async def test_reversal_blocks_concurrent_item_org_mutation(
     baseline_tx = await _count_tx_rows(lot_ids)
     org_id = setup["ctx"]["org_id"]
     # Item id.
-    items = (
-        await client.get(f"/api/v1/organizations/{org_id}/inventory-items")
-    ).json()
+    items = (await client.get(f"/api/v1/organizations/{org_id}/inventory-items")).json()
     item_id = items[0]["id"]
     # A second org we'd try to move the item to.
     other_owner_email = f"other-{uuid4().hex[:8]}@agrovix.dev"
@@ -2734,9 +2733,9 @@ async def test_reversal_locks_transactions_in_ascending_id_order(
         assert r.status_code == 201, r.text
         # Every recorded call must have received an ascending-id list.
         for name, ids in captured:
-            assert ids == sorted(ids), (
-                f"{name}.list_by_ids_for_update received non-ascending ids: {ids}"
-            )
+            assert ids == sorted(
+                ids
+            ), f"{name}.list_by_ids_for_update received non-ascending ids: {ids}"
         # And the transaction lock was acquired.
         assert any(name == "InventoryTransactionRepository" for name, _ in captured)
 
@@ -2745,6 +2744,7 @@ async def test_reversal_locks_transactions_in_ascending_id_order(
 # Sprint 5.4.7 — Serialized Transfer Topology + Full Authorization      #
 # Locking (advisory-lock proofs, farm/org locking, bounded barriers).    #
 # ===================================================================== #
+
 
 class _TwoPartyBarrier:
     """Two-party synchronization barrier for concurrency tests.
@@ -2771,9 +2771,7 @@ def _advisory_key(org_id: str, ref_id: str) -> int:
     """Recompute the Sprint 5.4.7 advisory-lock key (SHA-256 truncated)."""
     from app.services._transfer_locks import advisory_lock_key_for_transfer
 
-    return advisory_lock_key_for_transfer(
-        _UUIDType(org_id), "transfer", _UUIDType(ref_id)
-    )
+    return advisory_lock_key_for_transfer(_UUIDType(org_id), "transfer", _UUIDType(ref_id))
 
 
 # --------------------------------------------------------------------- #
@@ -2884,9 +2882,7 @@ async def test_reference_mutation_blocks_on_advisory_lock(
         from sqlalchemy import text as _text
 
         async with _db_session_module.AsyncSessionLocal() as session:
-            await session.execute(
-                _text("SELECT pg_advisory_xact_lock(:k)"), {"k": key}
-            )
+            await session.execute(_text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
             holder_ready.set()
             await release.wait()
             await session.commit()
@@ -2897,9 +2893,7 @@ async def test_reference_mutation_blocks_on_advisory_lock(
         async def _do() -> None:
             async with _db_session_module.AsyncSessionLocal() as session:
                 # Must acquire the SAME key before mutating.
-                await session.execute(
-                    _text("SELECT pg_advisory_xact_lock(:k)"), {"k": key}
-                )
+                await session.execute(_text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
                 await session.execute(
                     sa_update(_InventoryTransaction)
                     .where(_InventoryTransaction.id == _UUIDType(setup["out_tx"]["id"]))
@@ -2914,9 +2908,9 @@ async def test_reference_mutation_blocks_on_advisory_lock(
     mut_task = await _mutator()
     # Give the mutator a moment to reach the pg_advisory_xact_lock call.
     await asyncio.sleep(0.4)
-    assert mut_task.done() is False, (
-        "Mutator must block on the advisory lock while the reverser holds it"
-    )
+    assert (
+        mut_task.done() is False
+    ), "Mutator must block on the advisory lock while the reverser holds it"
     release.set()
     await asyncio.wait_for(holder, timeout=5)
     await asyncio.wait_for(mut_task, timeout=5)
@@ -2949,6 +2943,7 @@ async def test_reversal_blocks_concurrent_organization_deactivation(
     InventoryService._reversal_after_farm_org_locks_signal = farm_org_locked
     InventoryService._reversal_hold_after_farm_org_locks_gate = hold
     try:
+
         async def _reverser() -> tuple[int, dict]:
             r = await client.post(
                 f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
@@ -2961,9 +2956,7 @@ async def test_reversal_blocks_concurrent_organization_deactivation(
             await farm_org_locked.wait()
             async with _db_session_module.AsyncSessionLocal() as session:
                 await session.execute(
-                    sa_update(_Org)
-                    .where(_Org.id == _UUIDType(org_id))
-                    .values(is_active=False)
+                    sa_update(_Org).where(_Org.id == _UUIDType(org_id)).values(is_active=False)
                 )
                 await session.commit()
 
@@ -2973,14 +2966,10 @@ async def test_reversal_blocks_concurrent_organization_deactivation(
         await asyncio.wait_for(farm_org_locked.wait(), timeout=5)
         # A tiny delay to let the mutator actually enter its UPDATE.
         await asyncio.sleep(0.5)
-        assert mut_task.done() is False, (
-            "Org deactivation must block on the reverser's FOR UPDATE"
-        )
+        assert mut_task.done() is False, "Org deactivation must block on the reverser's FOR UPDATE"
         # Release the reverser so it can complete and release locks.
         hold.set()
-        r_rev, _ = await asyncio.wait_for(
-            asyncio.gather(rev_task, mut_task), timeout=10
-        )
+        r_rev, _ = await asyncio.wait_for(asyncio.gather(rev_task, mut_task), timeout=10)
     finally:
         InventoryService._reversal_lock_barrier = None
         InventoryService._reversal_after_farm_org_locks_signal = None
@@ -3053,6 +3042,7 @@ async def test_reversal_blocks_concurrent_farm_deactivation(
     InventoryService._reversal_after_farm_org_locks_signal = farm_org_locked
     InventoryService._reversal_hold_after_farm_org_locks_gate = hold
     try:
+
         async def _reverser() -> tuple[int, dict]:
             r = await client.post(
                 f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
@@ -3075,13 +3065,9 @@ async def test_reversal_blocks_concurrent_farm_deactivation(
         mut_task = asyncio.create_task(_mutator())
         await asyncio.wait_for(farm_org_locked.wait(), timeout=5)
         await asyncio.sleep(0.5)
-        assert mut_task.done() is False, (
-            "Farm deactivation must block on reverser's FOR UPDATE"
-        )
+        assert mut_task.done() is False, "Farm deactivation must block on reverser's FOR UPDATE"
         hold.set()
-        r_rev, _ = await asyncio.wait_for(
-            asyncio.gather(rev_task, mut_task), timeout=10
-        )
+        r_rev, _ = await asyncio.wait_for(asyncio.gather(rev_task, mut_task), timeout=10)
     finally:
         InventoryService._reversal_lock_barrier = None
         InventoryService._reversal_after_farm_org_locks_signal = None
@@ -3158,6 +3144,7 @@ async def test_reversal_opposite_sides_two_party_barrier(
 
     InventoryService._reversal_lock_barrier = _AwaitableBarrier()
     try:
+
         async def _fire(warehouse: str, tx_id: str, key: str) -> tuple[int, dict]:
             r = await client.post(
                 f"/api/v1/warehouses/{warehouse}/inventory:reverse",
@@ -3189,6 +3176,7 @@ async def test_reversal_opposite_sides_two_party_barrier(
 # Sprint 5.4.8 — Adversarial concurrency proofs (PostgreSQL only).      #
 # ===================================================================== #
 
+
 # ---- SQLite domain proofs (NOT locking / concurrency) ---------------- #
 async def test_sprint_5_4_8_require_exactly_one_helper() -> None:
     """SQLite domain-safe: cardinality helper never destructures."""
@@ -3216,8 +3204,10 @@ async def test_sprint_5_4_8_require_exactly_one_helper() -> None:
     # Duplicate rows → 409 integrity.
     with pytest.raises(HTTPException) as ei:
         require_exactly_one(
-            [_Row("11111111-1111-1111-1111-111111111111"),
-             _Row("11111111-1111-1111-1111-111111111111")],
+            [
+                _Row("11111111-1111-1111-1111-111111111111"),
+                _Row("11111111-1111-1111-1111-111111111111"),
+            ],
             resource="lot",
             identifier=uuid4(),
         )
@@ -3228,9 +3218,7 @@ async def test_sprint_5_4_8_require_exactly_one_helper() -> None:
     a = _UUIDType("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     b = _UUIDType("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
     with pytest.raises(HTTPException) as ei:
-        require_set_equality(
-            [_Row(str(a))], resource="lot", requested_ids={a, b}
-        )
+        require_set_equality([_Row(str(a))], resource="lot", requested_ids={a, b})
     assert ei.value.status_code == 409
     assert str(b) in ei.value.detail["missing_ids"]
 
@@ -3245,17 +3233,21 @@ async def test_sprint_5_4_8_transfer_uses_immutable_group_id(
     setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=5.0)
     async with _db_session_module.AsyncSessionLocal() as session:
         rows = (
-            await session.execute(
-                select(_InventoryTransaction).where(
-                    _InventoryTransaction.id.in_(
-                        [
-                            _UUIDType(setup["out_tx"]["id"]),
-                            _UUIDType(setup["in_tx"]["id"]),
-                        ]
+            (
+                await session.execute(
+                    select(_InventoryTransaction).where(
+                        _InventoryTransaction.id.in_(
+                            [
+                                _UUIDType(setup["out_tx"]["id"]),
+                                _UUIDType(setup["in_tx"]["id"]),
+                            ]
+                        )
                     )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
     assert len(rows) == 2
     group_ids = {r.transfer_group_id for r in rows}
     assert None not in group_ids, "transfer_group_id must be set on both rows"
@@ -3263,6 +3255,7 @@ async def test_sprint_5_4_8_transfer_uses_immutable_group_id(
 
 
 # ---- Adversarial PostgreSQL proofs ---------------------------------- #
+
 
 # Test A — opposite-direction transfer deadlock (no AB/BA deadlock).
 @_postgres_only
@@ -3398,9 +3391,7 @@ async def test_sprint_5_4_8_non_transfer_reversal_missing_lot(
     item_id = await _create_feed_item(client, ctx["org_id"])
     await _receipt(client, wh, item_id, quantity=5, unit="kg", lot_code="LM")
     lot_id = await _lot_id_for(client, wh)
-    txs = (
-        await client.get(f"/api/v1/lots/{lot_id}/transactions")
-    ).json()["items"]
+    txs = (await client.get(f"/api/v1/lots/{lot_id}/transactions")).json()["items"]
     receipt_tx = txs[0]
     before_tx = await _count_tx_rows([lot_id])
     # Soft-delete the lot BEFORE the reversal attempt.
@@ -3409,9 +3400,7 @@ async def test_sprint_5_4_8_non_transfer_reversal_missing_lot(
         from datetime import datetime as _dt
 
         await session.execute(
-            sa_update(_Lot)
-            .where(_Lot.id == _UUIDType(lot_id))
-            .values(deleted_at=_dt.now(_UTC))
+            sa_update(_Lot).where(_Lot.id == _UUIDType(lot_id)).values(deleted_at=_dt.now(_UTC))
         )
         await session.commit()
 
@@ -3432,10 +3421,10 @@ async def test_sprint_5_4_8_non_transfer_reversal_missing_lot(
     assert await _count_tx_rows([lot_id]) == before_tx
 
 
-
 # ===================================================================== #
 # Sprint 5.4.9 — Mandatory transfer identity + database bypass proofs.  #
 # ===================================================================== #
+
 
 # Test — DB rejects INSERT of a transfer row with NULL transfer_group_id.
 @_postgres_only
@@ -3519,6 +3508,7 @@ async def test_sprint_5_4_9_creation_vs_reversal_no_deadlock(
     """
     # Existing transfer to reverse.
     setup = await _setup_transfer_pair(client, transfer_qty=1.0, initial_qty=8.0)
+
     # Fresh transfer to create in parallel — same warehouses / lots so
     # both racers contend for the SAME row locks. This is the
     # canonical creation-vs-reversal contention scenario.
@@ -3606,36 +3596,30 @@ async def test_sprint_5_4_9_migration_preflight_aborts_on_malformed_topology(
                     )
                 )
             ).scalar()
-            assert result > 0, (
-                "pre-flight query should surface incomplete pairs after corruption"
-            )
+            assert result > 0, "pre-flight query should surface incomplete pairs after corruption"
     finally:
-        # Restore the trigger via the DDL from the model.
-        from app.models.inventory import (
-            _transfer_group_immutable_create_trigger_ddl,
-            _transfer_group_immutable_fn_ddl,
+        # Restore the trigger via the canonical DDL implementation.
+        from app.db.inventory_transfer_ddl import (
+            TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL,
+            TRANSFER_IMMUTABLE_FN_SQL,
         )
 
         async with _db_session_module.AsyncSessionLocal() as session:
-            await session.execute(
-                _text(_transfer_group_immutable_fn_ddl.statement)
-            )
+            await session.execute(_text(TRANSFER_IMMUTABLE_FN_SQL))
             await session.execute(
                 _text(
                     "DROP TRIGGER IF EXISTS trg_inventory_tx_group_immutable "
                     "ON inventory_transactions"
                 )
             )
-            await session.execute(
-                _text(_transfer_group_immutable_create_trigger_ddl.statement)
-            )
+            await session.execute(_text(TRANSFER_IMMUTABLE_CREATE_TRIGGER_SQL))
             await session.commit()
-
 
 
 # ===================================================================== #
 # Sprint 5.4.10 — Full UPDATE contract + deferred pair completeness.    #
 # ===================================================================== #
+
 
 # Section 2 — reject reference_type change away from 'transfer'.
 @_postgres_only
@@ -3819,11 +3803,7 @@ async def test_sprint_5_4_10_migration_lock_blocks_concurrent_writer(
 
     async def _writer() -> None:
         async with _db_session_module.AsyncSessionLocal() as session:
-            await session.execute(
-                _text(
-                    "SELECT id FROM inventory_transactions LIMIT 1"
-                )
-            )
+            await session.execute(_text("SELECT id FROM inventory_transactions LIMIT 1"))
             await session.rollback()
 
     holder = asyncio.create_task(_holder())
@@ -3861,6 +3841,7 @@ async def test_sprint_5_4_10_creation_vs_reversal_barrier(
 
     InventoryService._reversal_lock_barrier = _AwaitableBarrier()
     try:
+
         async def _reverser() -> tuple[int, dict]:
             r = await client.post(
                 f"/api/v1/warehouses/{setup['src']}/inventory:reverse",
@@ -4021,9 +4002,7 @@ async def _run_transfer_under_pre_lock_race(
                 await session.commit()
             gate.set()
 
-        result = await asyncio.wait_for(
-            asyncio.gather(_transferer(), _mutator()), timeout=10
-        )
+        result = await asyncio.wait_for(asyncio.gather(_transferer(), _mutator()), timeout=10)
         return result[0]
     finally:
         InventoryService._transfer_pre_lock_barrier = None
@@ -4072,9 +4051,7 @@ async def test_sprint_5_4_11_transfer_rejects_permission_revocation_under_lock(
         ).scalar_one()
         # Sever the role ↔ permission link.
         await session.execute(
-            sa_delete(_rp).where(
-                _rp.c.role_id == role_id, _rp.c.permission_id == perm_id
-            )
+            sa_delete(_rp).where(_rp.c.role_id == role_id, _rp.c.permission_id == perm_id)
         )
 
     try:
@@ -4091,15 +4068,11 @@ async def test_sprint_5_4_11_transfer_rejects_permission_revocation_under_lock(
         # do not inherit a globally-broken authorization graph.
         async with _db_session_module.AsyncSessionLocal() as session:
             role_id = (
-                await session.execute(
-                    select(_Role.id).where(_Role.name == "farm_director")
-                )
+                await session.execute(select(_Role.id).where(_Role.name == "farm_director"))
             ).scalar_one()
             perm_id = (
                 await session.execute(
-                    select(_Perm.id).where(
-                        _Perm.code == "inventory_transaction.create"
-                    )
+                    select(_Perm.id).where(_Perm.code == "inventory_transaction.create")
                 )
             ).scalar_one()
             existing = (
@@ -4111,9 +4084,7 @@ async def test_sprint_5_4_11_transfer_rejects_permission_revocation_under_lock(
                 )
             ).first()
             if existing is None:
-                await session.execute(
-                    _rp.insert().values(role_id=role_id, permission_id=perm_id)
-                )
+                await session.execute(_rp.insert().values(role_id=role_id, permission_id=perm_id))
                 await session.commit()
 
 
@@ -4137,9 +4108,7 @@ async def test_sprint_5_4_11_transfer_rejects_org_membership_revocation_under_lo
 
     async def _mutator_body(session) -> None:
         op_id = (
-            await session.execute(
-                select(_User.id).where(_User.email == setup["operator"])
-            )
+            await session.execute(select(_User.id).where(_User.email == setup["operator"]))
         ).scalar_one()
         await session.execute(
             sa_update(_OrgMem)
@@ -4179,9 +4148,7 @@ async def test_sprint_5_4_11_transfer_rejects_role_assignment_revocation_under_l
 
     async def _mutator_body(session) -> None:
         op_id = (
-            await session.execute(
-                select(_User.id).where(_User.email == setup["operator"])
-            )
+            await session.execute(select(_User.id).where(_User.email == setup["operator"]))
         ).scalar_one()
         await session.execute(
             sa_update(_RoleAssn)
@@ -4277,9 +4244,7 @@ async def test_sprint_5_4_11_transfer_rejects_farm_deactivation_under_lock(
     src = await _create_warehouse(
         client, org_id, farm_id=owner["farm_id"], code=f"SRC-{uuid4().hex[:4]}"
     )
-    dst = await _create_warehouse(
-        client, org_id, farm_id=farm_b_id, code=f"DST-{uuid4().hex[:4]}"
-    )
+    dst = await _create_warehouse(client, org_id, farm_id=farm_b_id, code=f"DST-{uuid4().hex[:4]}")
     item_id = await _create_feed_item(client, org_id)
     await _receipt(client, src, item_id, quantity=100, unit="kg", lot_code="LX")
     src_lot = await _lot_id_for(client, src)
@@ -4300,9 +4265,7 @@ async def test_sprint_5_4_11_transfer_rejects_farm_deactivation_under_lock(
 
     async def _mutator_body(session) -> None:
         await session.execute(
-            sa_update(_Farm)
-            .where(_Farm.id == _UUIDType(farm_b_id))
-            .values(is_active=False)
+            sa_update(_Farm).where(_Farm.id == _UUIDType(farm_b_id)).values(is_active=False)
         )
 
     status_code, body = await _run_transfer_under_pre_lock_race(
@@ -4331,18 +4294,14 @@ async def test_sprint_5_4_11_transfer_rejects_organization_deactivation_under_lo
 
     async def _mutator_body(session) -> None:
         await session.execute(
-            sa_update(_Org)
-            .where(_Org.id == _UUIDType(setup["org_id"]))
-            .values(is_active=False)
+            sa_update(_Org).where(_Org.id == _UUIDType(setup["org_id"])).values(is_active=False)
         )
 
     status_code, body = await _run_transfer_under_pre_lock_race(
         client, setup=setup, mutator_body=_mutator_body
     )
     assert status_code == 409, (status_code, body)
-    assert (
-        body.get("detail", {}).get("code") == "transfer_organization_inactive"
-    ), body
+    assert body.get("detail", {}).get("code") == "transfer_organization_inactive", body
     assert await _tx_baseline_count(setup) == baseline
 
 
@@ -4456,9 +4415,7 @@ async def test_sprint_5_4_12_transfer_blocks_authorization_mutation_while_holdin
                 # Once we get the lock, revoke THIS operator's role
                 # assignment (per-user; does not pollute shared roles).
                 op_id = (
-                    await session.execute(
-                        select(_User.id).where(_User.email == setup["operator"])
-                    )
+                    await session.execute(select(_User.id).where(_User.email == setup["operator"]))
                 ).scalar_one()
                 await session.execute(
                     sa_update(_RoleAssn)
@@ -4481,8 +4438,7 @@ async def test_sprint_5_4_12_transfer_blocks_authorization_mutation_while_holdin
         # the mutator is genuinely blocked.
         await asyncio.sleep(0.5)
         assert mut_task.done() is False, (
-            "authorization mutator must block on the advisory lock while "
-            "the transfer holds it"
+            "authorization mutator must block on the advisory lock while " "the transfer holds it"
         )
         assert mut_committed.is_set() is False
 
@@ -4491,9 +4447,7 @@ async def test_sprint_5_4_12_transfer_blocks_authorization_mutation_while_holdin
         # mutation until the transfer commits, the transfer sees
         # the ORIGINAL (still-authorized) state and commits (201).
         hold.set()
-        transfer_result, _ = await asyncio.wait_for(
-            asyncio.gather(rev_task, mut_task), timeout=15
-        )
+        transfer_result, _ = await asyncio.wait_for(asyncio.gather(rev_task, mut_task), timeout=15)
     finally:
         InventoryService._transfer_after_locks_signal = None
         InventoryService._transfer_hold_before_authorize_gate = None
@@ -4533,9 +4487,7 @@ async def test_sprint_5_4_12_revocation_wins_first_transfer_refused(
         # RoleAssignmentService.revoke).
         await _acquire_org_auth_lock_via_sql(session, setup["org_id"])
         op_id = (
-            await session.execute(
-                select(_User.id).where(_User.email == setup["operator"])
-            )
+            await session.execute(select(_User.id).where(_User.email == setup["operator"]))
         ).scalar_one()
         await session.execute(
             sa_update(_RoleAssn)
@@ -4602,9 +4554,7 @@ async def test_sprint_5_4_12_rollback_releases_authorization_lock(
             async with _db_session_module.AsyncSessionLocal() as session:
                 await _acquire_org_auth_lock_via_sql(session, setup["org_id"])
                 op_id = (
-                    await session.execute(
-                        select(_User.id).where(_User.email == setup["operator"])
-                    )
+                    await session.execute(select(_User.id).where(_User.email == setup["operator"]))
                 ).scalar_one()
                 await session.execute(
                     sa_update(_RoleAssn)
@@ -4623,9 +4573,7 @@ async def test_sprint_5_4_12_rollback_releases_authorization_lock(
         # Release the hold — transfer will fail on insufficient_stock
         # and roll back, releasing the advisory lock.
         hold.set()
-        transfer_result, _ = await asyncio.wait_for(
-            asyncio.gather(rev_task, mut_task), timeout=15
-        )
+        transfer_result, _ = await asyncio.wait_for(asyncio.gather(rev_task, mut_task), timeout=15)
     finally:
         InventoryService._transfer_after_locks_signal = None
         InventoryService._transfer_hold_before_authorize_gate = None
@@ -4695,9 +4643,7 @@ async def test_sprint_5_4_12_unrelated_organizations_do_not_block(
         await asyncio.wait_for(mut_acquired.wait(), timeout=5)
         # Release the transfer and let it finish.
         hold.set()
-        transfer_result, _ = await asyncio.wait_for(
-            asyncio.gather(rev_task, mut_task), timeout=15
-        )
+        transfer_result, _ = await asyncio.wait_for(asyncio.gather(rev_task, mut_task), timeout=15)
     finally:
         InventoryService._transfer_after_locks_signal = None
         InventoryService._transfer_hold_before_authorize_gate = None
@@ -4805,9 +4751,7 @@ async def test_sprint_5_4_12_role_assignment_service_participates_in_advisory_lo
     setup = await _setup_locked_auth_operator(client)
     async with _db_session_module.AsyncSessionLocal() as session:
         op_id = (
-            await session.execute(
-                select(_User.id).where(_User.email == setup["operator"])
-            )
+            await session.execute(select(_User.id).where(_User.email == setup["operator"]))
         ).scalar_one()
     async with _db_session_module.AsyncSessionLocal() as s:
         assignment_id = (
@@ -4864,9 +4808,7 @@ async def test_sprint_5_4_12_role_assignment_service_participates_in_advisory_lo
                     audit_repo=AuditRepository(session),
                 )
                 assignment = (
-                    await session.execute(
-                        select(_RoleAssn).where(_RoleAssn.id == assignment_id)
-                    )
+                    await session.execute(select(_RoleAssn).where(_RoleAssn.id == assignment_id))
                 ).scalar_one()
                 # Faux actor (superuser) — audit will use the actor.id.
                 from app.models.user import User
@@ -4902,9 +4844,7 @@ async def test_sprint_5_4_12_role_assignment_service_participates_in_advisory_lo
         assert mut_completed.is_set() is False
 
         hold.set()
-        transfer_result, _ = await asyncio.wait_for(
-            asyncio.gather(rev_task, mut_task), timeout=15
-        )
+        transfer_result, _ = await asyncio.wait_for(asyncio.gather(rev_task, mut_task), timeout=15)
     finally:
         InventoryService._transfer_after_locks_signal = None
         InventoryService._transfer_hold_before_authorize_gate = None
