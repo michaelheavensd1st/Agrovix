@@ -58,13 +58,20 @@ describe('CatalogEventForm structured validation', () => {
       } as never);
     });
     render(
-      <CatalogEventForm batchId="batch-1" entry={SAMPLING} onCreated={() => {}} onCancel={() => {}} />,
+      <CatalogEventForm
+        batchId="batch-1"
+        entry={SAMPLING}
+        onCreated={() => {}}
+        onCancel={() => {}}
+      />,
     );
     const minimum = screen.getByTestId('catalog-field-minimum_weight');
     fireEvent.change(minimum, { target: { value: '9.2' } });
     fireEvent.click(screen.getByTestId('catalog-submit-SAMPLING'));
 
-    expect(await screen.findByText('minimum_weight cannot exceed average_weight.')).toBeInTheDocument();
+    expect(
+      await screen.findByText('minimum_weight cannot exceed average_weight.'),
+    ).toBeInTheDocument();
     expect(minimum).toHaveValue(9.2);
     expect(minimum).toHaveAttribute(
       'aria-describedby',
@@ -79,7 +86,12 @@ describe('CatalogEventForm structured validation', () => {
       } as never);
     });
     render(
-      <CatalogEventForm batchId="batch-1" entry={SAMPLING} onCreated={() => {}} onCancel={() => {}} />,
+      <CatalogEventForm
+        batchId="batch-1"
+        entry={SAMPLING}
+        onCreated={() => {}}
+        onCancel={() => {}}
+      />,
     );
     fireEvent.click(screen.getByTestId('catalog-submit-SAMPLING'));
     expect(await screen.findByText('Batch rule failed.')).toBeInTheDocument();

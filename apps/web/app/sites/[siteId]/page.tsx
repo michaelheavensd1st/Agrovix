@@ -11,12 +11,7 @@ import type {
   ProductionUnit,
   ProductionUnitType,
 } from '@/lib/types';
-import {
-  Breadcrumbs,
-  ErrorBanner,
-  ForbiddenBanner,
-  Loading,
-} from '@/components/ape-ui';
+import { Breadcrumbs, ErrorBanner, ForbiddenBanner, Loading } from '@/components/ape-ui';
 import { EmptyStateCard, friendlyError, toast } from '@/components/ui-polish';
 import {
   ProductionUnitCreateDialog,

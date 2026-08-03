@@ -15,7 +15,9 @@ export class ApiError extends Error {
     public readonly status: number,
     public readonly payload: ApiErrorPayload,
   ) {
-    super(typeof payload.detail === 'string' ? payload.detail : `Request failed with status ${status}`);
+    super(
+      typeof payload.detail === 'string' ? payload.detail : `Request failed with status ${status}`,
+    );
     this.name = 'ApiError';
   }
 }

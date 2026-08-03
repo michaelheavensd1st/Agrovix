@@ -105,8 +105,7 @@ export default function UnitBatchesPage() {
         if (!isCurrent()) return;
         if (err instanceof ApiError && err.status === 401) router.push('/login');
         else if (err instanceof ApiError && err.status === 403) setForbidden(true);
-        else
-          setError(friendlyError(err));
+        else setError(friendlyError(err));
       }
     })();
     return () => {
@@ -160,9 +159,7 @@ export default function UnitBatchesPage() {
       setCreating(false);
       toast(`Production batch "${created.code}" created.`, 'success');
       try {
-        const refreshed = await apiFetch<ProductionBatch[]>(
-          `/v1/units/${capturedUnitId}/batches`,
-        );
+        const refreshed = await apiFetch<ProductionBatch[]>(`/v1/units/${capturedUnitId}/batches`);
         if (isCurrent()) setBatches(refreshed);
       } catch {
         if (isCurrent()) {

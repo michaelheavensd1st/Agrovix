@@ -358,9 +358,7 @@ describe('Production Unit creation', () => {
     fireEvent.click(submit);
     await waitFor(() => expect(submit).toBeDisabled());
     expect(submit).toHaveTextContent('Creating…');
-    expect(
-      mockedApiFetch.mock.calls.filter(([, init]) => init?.method === 'POST'),
-    ).toHaveLength(1);
+    expect(mockedApiFetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
     resolveCreate(CREATED);
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });

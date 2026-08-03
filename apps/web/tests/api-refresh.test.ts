@@ -106,9 +106,9 @@ describe('apiFetch session refresh', () => {
     vi.stubGlobal('fetch', fetchMock);
     const { apiFetch } = await import('@/lib/api');
 
-    await expect(apiFetch('/v1/auth/refresh', { method: 'POST', body: '{}' })).rejects.toMatchObject(
-      { status: 401 },
-    );
+    await expect(
+      apiFetch('/v1/auth/refresh', { method: 'POST', body: '{}' }),
+    ).rejects.toMatchObject({ status: 401 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

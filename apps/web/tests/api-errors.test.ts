@@ -54,7 +54,8 @@ describe('parseApiErrors', () => {
       'Duplicate.',
     ]);
     expect(
-      parseApiErrors(new ApiError(409, { detail: { message: 'Lifecycle blocked.' } } as never)).generalErrors,
+      parseApiErrors(new ApiError(409, { detail: { message: 'Lifecycle blocked.' } } as never))
+        .generalErrors,
     ).toEqual(['Lifecycle blocked.']);
     expect(
       parseApiErrors(

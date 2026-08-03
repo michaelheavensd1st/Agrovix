@@ -98,7 +98,8 @@ export function ProductionBatchCreateDialog({
     let plannedAt: string | null = null;
     if (values.plannedAt) {
       const parsed = new Date(values.plannedAt);
-      if (Number.isNaN(parsed.getTime())) errors.planned_at = 'Enter a valid planned date and time.';
+      if (Number.isNaN(parsed.getTime()))
+        errors.planned_at = 'Enter a valid planned date and time.';
       else plannedAt = parsed.toISOString();
     }
 
@@ -209,9 +210,7 @@ export function ProductionBatchCreateDialog({
               min="0"
               step="1"
               value={values.expectedQuantity}
-              onChange={(event) =>
-                setValues({ ...values, expectedQuantity: event.target.value })
-              }
+              onChange={(event) => setValues({ ...values, expectedQuantity: event.target.value })}
               aria-invalid={Boolean(errors.expected_quantity)}
               aria-describedby={
                 errors.expected_quantity ? 'create-batch-expected-quantity-error' : undefined

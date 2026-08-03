@@ -107,7 +107,9 @@ function baseMock({
 async function openDialog(testId = 'unit-create-batch-empty') {
   await waitFor(() => expect(screen.getByText('No batches yet')).toBeInTheDocument());
   fireEvent.click(screen.getByTestId(testId));
-  expect(await screen.findByRole('dialog', { name: 'Create Production Batch' })).toBeInTheDocument();
+  expect(
+    await screen.findByRole('dialog', { name: 'Create Production Batch' }),
+  ).toBeInTheDocument();
 }
 
 function fillValidForm() {
@@ -251,7 +253,9 @@ describe('Production Batch creation', () => {
 
   it('surfaces lifecycle conflicts without mislabeling them as duplicate codes', async () => {
     mockCreateError(
-      new ApiError(409, { detail: { code: 'unit_under_maintenance', message: 'blocked' } } as never),
+      new ApiError(409, {
+        detail: { code: 'unit_under_maintenance', message: 'blocked' },
+      } as never),
     );
     render(<UnitBatchesPage />);
     await openDialog();
@@ -276,7 +280,9 @@ describe('Production Batch creation', () => {
     await openDialog();
     fillValidForm();
     fireEvent.click(screen.getByTestId('production-batch-create-submit'));
-    expect(await screen.findByText(/don't have permission to create production batches/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/don't have permission to create production batches/i),
+    ).toBeInTheDocument();
     expect(screen.getByRole('dialog')).toBeInTheDocument();
   });
 
