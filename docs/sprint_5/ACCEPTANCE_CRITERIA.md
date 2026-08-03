@@ -156,3 +156,15 @@ into `develop`.**
   `vitest --run`, and `next build` all pass on the branch. Backend
   regression `pytest` remains green (no backend files were touched
   during this slice).
+# Sprint 5.5 — Production Unit creation (UAT-PROD-001)
+
+- Authorized users see **Create Unit** in the site header and the no-units empty state; users
+  without `production_unit.create` see neither action.
+- The dialog loads system and organization-visible unit types and exposes required type, name,
+  and code fields, optional non-negative integer capacity, and an active default status.
+- Submission uses `POST /api/v1/sites/{siteId}/units`, is single-flight, maps `422` errors inline,
+  and follows established handling for `401`, `403`, `404`, `409`, and network failures.
+- Success closes the dialog, restores focus, displays success feedback, renders the unit
+  immediately, and refreshes the site-scoped list without losing route context.
+- Frontend coverage includes both CTAs, permission hiding, type loading/empty states, success and
+  refresh, pending submission, `401`, `403`, `409`, `422`, network failure, and focus restoration.

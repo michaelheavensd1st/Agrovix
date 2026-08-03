@@ -188,6 +188,26 @@ GET    /api/v1/batches/{batch_id}/events   # cursor pagination
 GET    /api/v1/events/{event_id}
 ```
 
+## Web workflow: creating a production unit
+
+The Site detail page (`/sites/{site_id}`) provides **Create Unit** actions in both the page header
+and the empty state for callers whose current-user permissions include `production_unit.create`
+(platform administrators are always eligible). The accessible dialog uses the existing API surface
+and supports:
+
+- system-seeded and organization-specific unit types;
+- name, code, optional non-negative integer capacity, and initial status (metadata is omitted until
+  the product has a safe structured object-input pattern);
+- inline client validation plus field-level FastAPI `422` validation messages;
+- explicit handling for expired authentication, forbidden access, missing sites, duplicate codes,
+  and network failures; and
+- disabled controls while saving, Escape-to-close, trapped keyboard focus, and focus restoration.
+
+On success, the dialog closes, the created unit is rendered immediately, and the site unit list is
+refetched from the server. Authorization, site lifecycle rules, type visibility, uniqueness, and
+audit recording remain enforced by `POST /api/v1/sites/{site_id}/units`; the frontend does not
+duplicate or bypass those backend policies.
+
 ## Permissions
 
 New codes (see `app/security/permissions.py`):
