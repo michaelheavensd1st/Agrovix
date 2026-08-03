@@ -208,6 +208,24 @@ refetched from the server. Authorization, site lifecycle rules, type visibility,
 audit recording remain enforced by `POST /api/v1/sites/{site_id}/units`; the frontend does not
 duplicate or bypass those backend policies.
 
+## Web workflow: creating a production batch
+
+Manual UAT after UAT-PROD-001 exposed a blocker: the Production Unit detail page could list
+batches but offered no way to create the first one. Sprint 5.6 completes that workflow with
+permission-aware **Create Batch** actions in the page header and the no-batches empty state.
+
+The accessible dialog exposes only fields supported by `ProductionBatchCreate`: required code,
+optional species, planned date/time, non-negative integer expected quantity, and notes. Metadata is
+omitted until the product has a safe structured object-input pattern. The backend assigns the
+initial `planned` state.
+
+The frontend uses `POST /api/v1/units/{unit_id}/batches`, prevents duplicate submission, maps
+field-level `422` responses, distinguishes duplicate-code conflicts from site/unit lifecycle
+conflicts, and follows the established `401`, `403`, `404`, and network-error conventions. Both the
+parent site and unit must be active. On success, the dialog closes, focus returns to its trigger, a
+success toast is shown, the new batch appears immediately with a link to its detail page, and the
+unit-scoped batch list is refreshed.
+
 ## Permissions
 
 New codes (see `app/security/permissions.py`):

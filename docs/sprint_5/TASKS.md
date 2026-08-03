@@ -1,5 +1,20 @@
 # Sprint 5 Tasks
 
+## Sprint 5.6 — Production Batch frontend completion
+
+Status: **implemented; pending final validation and manual UAT.**
+Branch: `feature/sprint-5-5-production-unit-frontend` (continued because Sprint 5.5 remains
+uncommitted and must be preserved).
+
+| # | Task | State |
+| --- | --- | --- |
+| UAT blocker | Record missing Production Batch creation UI discovered after UAT-PROD-001 | ✅ |
+| 5.6.1 | Permission-aware unit header and empty-state Create Batch actions | ✅ |
+| 5.6.2 | Backend-schema-aligned accessible creation dialog | ✅ |
+| 5.6.3 | Lifecycle gating, API errors, single-flight submit, immediate render, and refresh | ✅ |
+| 5.6.4 | Frontend integration coverage for behavior and accessibility | ✅ |
+| 5.6.5 | Production Engine and Sprint 5 documentation | ✅ |
+
 ## Sprint 5.5 — Production Unit creation
 
 Status: **implemented; ready for validation and manual UAT.**

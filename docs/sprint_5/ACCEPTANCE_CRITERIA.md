@@ -168,3 +168,21 @@ into `develop`.**
   immediately, and refreshes the site-scoped list without losing route context.
 - Frontend coverage includes both CTAs, permission hiding, type loading/empty states, success and
   refresh, pending submission, `401`, `403`, `409`, `422`, network failure, and focus restoration.
+
+# Sprint 5.6 — Production Batch creation (UAT blocker completion)
+
+- The Manual UAT blocker—no frontend path to create the first batch from a Production Unit—is
+  recorded and resolved on the unit detail page.
+- Authorized users see **Create Batch** in the unit header and no-batches empty state; callers
+  without `production_batch.create` see neither action.
+- Actions are disabled when the parent site or unit is not active, matching backend lifecycle
+  policy without bypassing server enforcement.
+- The dialog supports required code and optional species, planned date/time, expected quantity,
+  and notes. The server-owned initial state is `planned`; unsupported metadata input is omitted.
+- Submission is single-flight and handles `401`, `403`, tenant-safe `404`, duplicate-code and
+  lifecycle `409`, field-level `422`, and network failure.
+- Success closes the dialog, restores focus, shows feedback, renders a linked batch immediately,
+  and refreshes the unit-scoped list.
+- Integration coverage verifies actions and permissions, lifecycle disabling, initial state,
+  validation, every required API error, pending/double submission, immediate render and refresh,
+  batch navigation, and focus restoration.
