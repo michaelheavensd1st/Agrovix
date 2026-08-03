@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import { ApiError, apiFetch } from '@/lib/api';
 import type {
   BatchProjections,
@@ -72,6 +72,7 @@ function payloadSummary(evt: ProductionEvent): string {
 }
 
 export default function BatchDetailPage() {
+  const router = useRouter();
   const params = useParams<{ batchId: string }>();
   const batchId = params.batchId;
   const [batch, setBatch] = useState<ProductionBatch | null>(null);
@@ -296,6 +297,7 @@ export default function BatchDetailPage() {
                 batchId={batchId}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
             {picker.kind === 'deliberate' && picker.type === 'FEEDING' && (
@@ -303,6 +305,7 @@ export default function BatchDetailPage() {
                 batchId={batchId}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
             {picker.kind === 'deliberate' && picker.type === 'MORTALITY' && (
@@ -310,6 +313,7 @@ export default function BatchDetailPage() {
                 batchId={batchId}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
             {picker.kind === 'catalog' && (
@@ -318,6 +322,7 @@ export default function BatchDetailPage() {
                 entry={picker.entry}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
           </div>
