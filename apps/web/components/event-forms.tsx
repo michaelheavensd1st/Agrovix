@@ -298,9 +298,7 @@ export function FeedingForm({
       try {
         const [warehouses, items] = await Promise.all([
           apiFetch<DashboardWarehouse[]>(`/v1/organizations/${organizationId}/warehouses`),
-          apiFetch<DashboardInventoryItem[]>(
-            `/v1/organizations/${organizationId}/inventory-items`,
-          ),
+          apiFetch<DashboardInventoryItem[]>(`/v1/organizations/${organizationId}/inventory-items`),
         ]);
         const itemById = new Map(
           items
@@ -419,8 +417,8 @@ export function FeedingForm({
           className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground"
           data-testid="feeding-lots-empty"
         >
-          No eligible feed lots are available for this farm. You can record an ad-hoc feeding with
-          a description, or receive feed stock in Inventory first.
+          No eligible feed lots are available for this farm. You can record an ad-hoc feeding with a
+          description, or receive feed stock in Inventory first.
         </p>
       )}
       {lotsError && (
