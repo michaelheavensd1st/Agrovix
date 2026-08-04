@@ -14,6 +14,11 @@ import { FormEvent, useEffect, useState } from 'react';
 import { ApiError, apiFetch, apiFetchResult } from '@/lib/api';
 import { parseApiErrors } from '@/lib/api-errors';
 import type { EventCatalogEntry, ProductionEvent } from '@/lib/types';
+import type {
+  DashboardInventoryItem,
+  DashboardLot,
+  DashboardWarehouse,
+} from '@/lib/inventory-dashboard';
 
 interface EventFormProps {
   batchId: string;
@@ -34,6 +39,16 @@ interface CatalogFormProps {
 interface CreateResponse {
   event: ProductionEvent;
   replay: boolean;
+}
+
+interface FeedingFormProps extends Omit<EventFormProps, 'eventType'> {
+  organizationId: string;
+  farmId: string;
+}
+
+interface EligibleFeedLot {
+  id: string;
+  label: string;
 }
 
 async function postEvent(
@@ -256,10 +271,12 @@ export function StockingForm({
 
 export function FeedingForm({
   batchId,
+  organizationId,
+  farmId,
   onCreated,
   onCancel,
   onUnauthenticated,
-}: Omit<EventFormProps, 'eventType'>) {
+}: FeedingFormProps) {
   const [description, setDescription] = useState('Grower crumble 35%');
   const [quantity, setQuantity] = useState('2.5');
   const [unit, setUnit] = useState<'g' | 'kg'>('kg');
@@ -267,19 +284,85 @@ export function FeedingForm({
   const [round, setRound] = useState('1');
   const [notes, setNotes] = useState('');
   const [lotId, setLotId] = useState('');
+  const [eligibleLots, setEligibleLots] = useState<EligibleFeedLot[]>([]);
+  const [lotsLoading, setLotsLoading] = useState(true);
+  const [lotsError, setLotsError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadEligibleLots() {
+      setLotsLoading(true);
+      setLotsError(null);
+      try {
+        const [warehouses, items] = await Promise.all([
+          apiFetch<DashboardWarehouse[]>(`/v1/organizations/${organizationId}/warehouses`),
+          apiFetch<DashboardInventoryItem[]>(
+            `/v1/organizations/${organizationId}/inventory-items`,
+          ),
+        ]);
+        const itemById = new Map(
+          items
+            .filter(
+              (item) =>
+                item.is_active &&
+                item.category === 'feed' &&
+                (item.canonical_unit === 'kg' || item.canonical_unit === 'g'),
+            )
+            .map((item) => [item.id, item]),
+        );
+        const visibleWarehouses = warehouses.filter(
+          (warehouse) =>
+            warehouse.status === 'active' &&
+            (warehouse.farm_id === null || warehouse.farm_id === farmId),
+        );
+        const lotsByWarehouse = await Promise.all(
+          visibleWarehouses.map(async (warehouse) => ({
+            warehouse,
+            lots: await apiFetch<DashboardLot[]>(`/v1/warehouses/${warehouse.id}/lots`),
+          })),
+        );
+        const options = lotsByWarehouse.flatMap(({ warehouse, lots }) =>
+          lots.flatMap((lot) => {
+            const item = itemById.get(lot.item_id);
+            const balance = Number(lot.balance);
+            if (!item || !Number.isFinite(balance) || balance <= 0) return [];
+            return [
+              {
+                id: lot.id,
+                label: `${item.name} · lot ${lot.lot_code} · ${balance} ${lot.balance_unit} · ${warehouse.name}`,
+              },
+            ];
+          }),
+        );
+        if (!cancelled) setEligibleLots(options);
+      } catch (err) {
+        if (!cancelled) {
+          if (err instanceof ApiError && err.status === 401) onUnauthenticated?.();
+          setLotsError(extractServerMessage(err));
+          setEligibleLots([]);
+        }
+      } finally {
+        if (!cancelled) setLotsLoading(false);
+      }
+    }
+    void loadEligibleLots();
+    return () => {
+      cancelled = true;
+    };
+  }, [farmId, onUnauthenticated, organizationId]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      const trimmedLot = lotId.trim();
+      const selectedLotId = eligibleLots.some((lot) => lot.id === lotId) ? lotId : '';
       const trimmedDesc = description.trim();
-      // Server requires at least one of feed_description / inventory_lot_id.
-      const feedRef: Record<string, unknown> = trimmedLot
-        ? { inventory_lot_id: trimmedLot }
+      // A lot id can only originate from the scoped server-backed selection.
+      const feedRef: Record<string, unknown> = selectedLotId
+        ? { inventory_lot_id: selectedLotId }
         : { feed_description: trimmedDesc };
       const { event } = await postEvent(
         batchId,
@@ -310,14 +393,41 @@ export function FeedingForm({
 
       <label className="block text-sm">
         Feed lot (optional — deducts inventory)
-        <input
+        <select
           data-testid="feeding-lot-id"
-          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono"
-          placeholder="Paste a lot UUID from /inventory, or leave blank for ad-hoc"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
           value={lotId}
           onChange={(e) => setLotId(e.target.value)}
-        />
+          disabled={lotsLoading || Boolean(lotsError)}
+        >
+          <option value="">No inventory lot — record ad-hoc feeding</option>
+          {eligibleLots.map((lot) => (
+            <option key={lot.id} value={lot.id}>
+              {lot.label}
+            </option>
+          ))}
+        </select>
       </label>
+
+      {lotsLoading && (
+        <p className="text-xs text-muted-foreground" data-testid="feeding-lots-loading">
+          Loading eligible feed lots…
+        </p>
+      )}
+      {!lotsLoading && !lotsError && eligibleLots.length === 0 && (
+        <p
+          className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground"
+          data-testid="feeding-lots-empty"
+        >
+          No eligible feed lots are available for this farm. You can record an ad-hoc feeding with
+          a description, or receive feed stock in Inventory first.
+        </p>
+      )}
+      {lotsError && (
+        <p className="text-xs text-destructive" data-testid="feeding-lots-error">
+          Feed lots could not be loaded: {lotsError}. Ad-hoc feeding remains available.
+        </p>
+      )}
 
       <label className="block text-sm">
         Feed description {lotId.trim() ? '(ignored when a lot is provided)' : ''}

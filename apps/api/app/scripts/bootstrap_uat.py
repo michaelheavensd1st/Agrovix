@@ -15,6 +15,7 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +24,13 @@ from app.core.config import Settings, get_settings
 from app.core.security import hash_password
 from app.db.session import AsyncSessionLocal
 from app.models.farm import Farm
+from app.models.inventory import (
+    InventoryItem,
+    InventoryItemCategory,
+    StockUnit,
+    Warehouse,
+    WarehouseStatus,
+)
 from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.organization import Organization
 from app.models.production import (
@@ -36,6 +44,13 @@ from app.models.production import (
 )
 from app.models.user import User
 from app.repositories.audit_repo import AuditRepository
+from app.repositories.inventory import (
+    InventoryItemRepository,
+    InventoryLotRepository,
+    InventoryTransactionRepository,
+    StorageLocationRepository,
+    WarehouseRepository,
+)
 from app.repositories.org_repo import (
     FarmMembershipRepository,
     FarmRepository,
@@ -52,6 +67,7 @@ from app.repositories.production import (
 from app.repositories.role_repo import RoleAssignmentRepository, RoleRepository
 from app.repositories.user_repo import UserRepository
 from app.seed import seed_permissions_and_roles
+from app.services.inventory import InventoryService
 from app.services.organization_service import FarmService, OrganizationService
 from app.services.production import (
     ProductionBatchService,
@@ -68,6 +84,10 @@ SITE_CODE = "MAIN"
 UNIT_CODE = "UAT-UNIT"
 BATCH_CODE = "UAT-BATCH"
 UNIT_TYPE_CODE = "GROW_OUT_POND"
+WAREHOUSE_CODE = "UAT-FEED"
+FEED_ITEM_CODE = "UAT-GROWER-FEED"
+FEED_LOT_CODE = "UAT-FEED-LOT-01"
+FEED_RECEIPT_IDEMPOTENCY_KEY = "bootstrap-uat-feed-receipt-v1"
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _REQUEST_CTX = {
@@ -173,6 +193,11 @@ async def bootstrap_uat(
     unit_repo = ProductionUnitRepository(session)
     batch_repo = ProductionBatchRepository(session)
     transition_repo = ProductionBatchTransitionRepository(session)
+    warehouse_repo = WarehouseRepository(session)
+    item_repo = InventoryItemRepository(session)
+    lot_repo = InventoryLotRepository(session)
+    tx_repo = InventoryTransactionRepository(session)
+    location_repo = StorageLocationRepository(session)
 
     user = (
         await session.execute(select(User).where(User.email == config.email.lower()))
@@ -459,6 +484,112 @@ async def bootstrap_uat(
                 "Existing UAT production batch is not suitable for event UAT; refusing to alter it."
             )
         summary.mark("production batch", f"existing ({batch.state.value})")
+
+    inventory_service = InventoryService(
+        session=session,
+        warehouse_repo=warehouse_repo,
+        item_repo=item_repo,
+        lot_repo=lot_repo,
+        tx_repo=tx_repo,
+        location_repo=location_repo,
+        audit_repo=audit_repo,
+        farm_repo=farm_repo,
+        org_repo=org_repo,
+    )
+    warehouse = (
+        await session.execute(
+            select(Warehouse).where(
+                Warehouse.organization_id == organization.id,
+                Warehouse.code == WAREHOUSE_CODE,
+            )
+        )
+    ).scalar_one_or_none()
+    if warehouse is None:
+        warehouse = await inventory_service.create_warehouse(
+            actor=user,
+            organization_id=organization.id,
+            data={
+                "farm_id": farm.id,
+                "site_id": site.id,
+                "name": "UAT Feed Store",
+                "code": WAREHOUSE_CODE,
+                "description": "Non-production feed stock for Feeding event UAT.",
+                "address": None,
+                "metadata_json": {"uat_bootstrap": True},
+            },
+            request_ctx=_REQUEST_CTX,
+        )
+        summary.mark("feed warehouse", "created")
+    else:
+        if (
+            warehouse.deleted_at is not None
+            or warehouse.status != WarehouseStatus.ACTIVE
+            or warehouse.farm_id != farm.id
+            or warehouse.site_id != site.id
+        ):
+            raise BootstrapRefusedError(
+                "Existing UAT feed warehouse is inactive or has different farm/site scope; "
+                "refusing to alter it."
+            )
+        summary.mark("feed warehouse", "existing")
+
+    item = (
+        await session.execute(
+            select(InventoryItem).where(
+                InventoryItem.organization_id == organization.id,
+                InventoryItem.code == FEED_ITEM_CODE,
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        item = await inventory_service.create_item(
+            actor=user,
+            organization_id=organization.id,
+            data={
+                "code": FEED_ITEM_CODE,
+                "name": "UAT Grower Feed",
+                "description": "Mass-based feed item for Feeding event UAT.",
+                "category": InventoryItemCategory.FEED,
+                "canonical_unit": StockUnit.KG,
+                "sku": None,
+                "metadata_json": {"uat_bootstrap": True},
+            },
+            request_ctx=_REQUEST_CTX,
+        )
+        summary.mark("feed inventory item", "created")
+    else:
+        if (
+            item.deleted_at is not None
+            or not item.is_active
+            or item.category != InventoryItemCategory.FEED
+            or item.canonical_unit != StockUnit.KG
+        ):
+            raise BootstrapRefusedError(
+                "Existing UAT feed item is inactive, not feed, or not kg-based; refusing to alter it."
+            )
+        summary.mark("feed inventory item", "existing")
+
+    _tx, lot, receipt_replayed = await inventory_service.receipt(
+        actor=user,
+        warehouse=warehouse,
+        payload={
+            "item_id": item.id,
+            "lot_code": FEED_LOT_CODE,
+            "quantity": Decimal("100"),
+            "unit": StockUnit.KG,
+            "storage_location_id": None,
+            "expiry_date": None,
+            "unit_cost_amount": None,
+            "unit_cost_currency": None,
+            "reason": "Initial non-production Feeding event UAT stock.",
+            "metadata_json": {"uat_bootstrap": True},
+        },
+        request_ctx=_REQUEST_CTX,
+        idempotency_key=FEED_RECEIPT_IDEMPOTENCY_KEY,
+    )
+    if lot.deleted_at is not None:
+        raise BootstrapRefusedError("Existing UAT feed lot is deleted; refusing to alter it.")
+    summary.mark("feed inventory lot", "existing" if receipt_replayed else "created (100 kg)")
 
     return summary
 

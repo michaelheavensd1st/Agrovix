@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.models.farm import Farm
+from app.models.inventory import InventoryItem, InventoryLot, InventoryTransaction, Warehouse
 from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.organization import Organization
 from app.models.production import ProductionBatch, ProductionSite, ProductionUnit
@@ -49,6 +50,9 @@ async def test_first_run_creates_required_records(db_session) -> None:
     assert summary.records["farm"] == "created"
     assert summary.records["production unit"] == "created"
     assert summary.records["production batch"] == "created (planned)"
+    assert summary.records["feed warehouse"] == "created"
+    assert summary.records["feed inventory item"] == "created"
+    assert summary.records["feed inventory lot"] == "created (100 kg)"
 
     user = (await db_session.execute(select(User).where(User.email == CONFIG.email))).scalar_one()
     assert user.is_active is True
@@ -89,7 +93,18 @@ async def test_second_run_creates_no_duplicates(db_session) -> None:
     await db_session.commit()
     before = {
         model: await _count(db_session, model)
-        for model in (User, Organization, Farm, ProductionSite, ProductionUnit, ProductionBatch)
+        for model in (
+            User,
+            Organization,
+            Farm,
+            ProductionSite,
+            ProductionUnit,
+            ProductionBatch,
+            Warehouse,
+            InventoryItem,
+            InventoryLot,
+            InventoryTransaction,
+        )
     }
 
     summary = await bootstrap_uat(db_session, CONFIG, settings=Settings(app_env="development"))
