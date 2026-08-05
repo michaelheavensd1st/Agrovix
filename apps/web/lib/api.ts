@@ -1,12 +1,12 @@
 /**
  * Cookie-first API client for the Next.js web app.
  *
- * All auth cookies are httpOnly + Secure — the browser attaches them
- * automatically once ``credentials: 'include'`` is set. We never touch
- * localStorage/sessionStorage for tokens.
+ * Auth cookies are always httpOnly; the Secure attribute depends on the
+ * environment. The browser attaches them when ``credentials: 'include'`` is
+ * set. We never touch localStorage/sessionStorage for tokens.
  */
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000/api';
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? '/api-proxy';
 
 export type ApiErrorPayload = { detail?: string; [key: string]: unknown };
 
@@ -39,13 +39,14 @@ const NO_REFRESH_PATHS = new Set([
 ]);
 
 function requestInit(init: RequestInit): RequestInit {
+  const headers = new Headers(init.headers);
+  if (!headers.has('Content-Type') && typeof init.body === 'string') {
+    headers.set('Content-Type', 'application/json');
+  }
   return {
     ...init,
     credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init.headers ?? {}),
-    },
+    headers,
   };
 }
 
