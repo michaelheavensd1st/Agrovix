@@ -1,5 +1,33 @@
 # Sprint 5 Tasks
 
+## Sprint 5.6 — Production Batch frontend completion
+
+Status: **implemented; pending final validation and manual UAT.**
+Branch: `feature/sprint-5-5-production-unit-frontend` (continued because Sprint 5.5 remains
+uncommitted and must be preserved).
+
+| #           | Task                                                                              | State |
+| ----------- | --------------------------------------------------------------------------------- | ----- |
+| UAT blocker | Record missing Production Batch creation UI discovered after UAT-PROD-001         | ✅    |
+| 5.6.1       | Permission-aware unit header and empty-state Create Batch actions                 | ✅    |
+| 5.6.2       | Backend-schema-aligned accessible creation dialog                                 | ✅    |
+| 5.6.3       | Lifecycle gating, API errors, single-flight submit, immediate render, and refresh | ✅    |
+| 5.6.4       | Frontend integration coverage for behavior and accessibility                      | ✅    |
+| 5.6.5       | Production Engine and Sprint 5 documentation                                      | ✅    |
+
+## Sprint 5.5 — Production Unit creation
+
+Status: **implemented; ready for validation and manual UAT.**
+Branch: `feature/sprint-5-5-production-unit-frontend`.
+
+| #            | Task                                                                        | State |
+| ------------ | --------------------------------------------------------------------------- | ----- |
+| UAT-PROD-001 | Permission-aware site header and empty-state creation actions               | ✅    |
+| UAT-PROD-001 | Accessible validated creation dialog and visible unit-type states           | ✅    |
+| UAT-PROD-001 | API error handling, single-flight submission, immediate render, and refresh | ✅    |
+| UAT-PROD-001 | Frontend integration coverage for acceptance and accessibility behavior     | ✅    |
+| UAT-PROD-001 | Production Engine and Sprint 5 documentation                                | ✅    |
+
 This document tracks task-level progress per Sprint 5 slice. Only
 completed and in-flight tasks are recorded here — the rest of the
 Sprint 5 backlog remains in `SPRINT_PLAN.md` under "Deliverables".

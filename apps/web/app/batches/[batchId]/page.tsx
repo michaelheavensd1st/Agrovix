@@ -1,14 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import { ApiError, apiFetch } from '@/lib/api';
 import type {
   BatchProjections,
   EventCatalogEntry,
+  Farm,
   ProductionBatch,
   ProductionEvent,
   ProductionEventPage,
+  ProductionSite,
   ProductionUnit,
   ProductionUnitType,
 } from '@/lib/types';
@@ -72,10 +74,13 @@ function payloadSummary(evt: ProductionEvent): string {
 }
 
 export default function BatchDetailPage() {
+  const router = useRouter();
   const params = useParams<{ batchId: string }>();
   const batchId = params.batchId;
   const [batch, setBatch] = useState<ProductionBatch | null>(null);
   const [unit, setUnit] = useState<ProductionUnit | null>(null);
+  const [site, setSite] = useState<ProductionSite | null>(null);
+  const [farm, setFarm] = useState<Farm | null>(null);
   const [unitType, setUnitType] = useState<ProductionUnitType | null>(null);
   const [events, setEvents] = useState<ProductionEvent[] | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -101,6 +106,10 @@ export default function BatchDetailPage() {
     setBatch(b);
     const u = await apiFetch<ProductionUnit>(`/v1/units/${b.unit_id}`);
     setUnit(u);
+    const s = await apiFetch<ProductionSite>(`/v1/sites/${u.site_id}`);
+    setSite(s);
+    const f = await apiFetch<Farm>(`/v1/farms/${s.farm_id}`);
+    setFarm(f);
     const allTypes = await apiFetch<ProductionUnitType[]>('/v1/production-unit-types');
     setUnitType(allTypes.find((t) => t.id === u.unit_type_id) ?? null);
   }, [batchId]);
@@ -296,13 +305,17 @@ export default function BatchDetailPage() {
                 batchId={batchId}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
-            {picker.kind === 'deliberate' && picker.type === 'FEEDING' && (
+            {picker.kind === 'deliberate' && picker.type === 'FEEDING' && farm && site && (
               <FeedingForm
                 batchId={batchId}
+                organizationId={farm.organization_id}
+                farmId={site.farm_id}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
             {picker.kind === 'deliberate' && picker.type === 'MORTALITY' && (
@@ -310,6 +323,7 @@ export default function BatchDetailPage() {
                 batchId={batchId}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
             {picker.kind === 'catalog' && (
@@ -318,6 +332,7 @@ export default function BatchDetailPage() {
                 entry={picker.entry}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
               />
             )}
           </div>

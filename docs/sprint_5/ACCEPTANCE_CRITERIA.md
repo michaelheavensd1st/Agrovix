@@ -156,3 +156,34 @@ into `develop`.**
   `vitest --run`, and `next build` all pass on the branch. Backend
   regression `pytest` remains green (no backend files were touched
   during this slice).
+
+# Sprint 5.5 — Production Unit creation (UAT-PROD-001)
+
+- Authorized users see **Create Unit** in the site header and the no-units empty state; users
+  without `production_unit.create` see neither action.
+- The dialog loads system and organization-visible unit types and exposes required type, name,
+  and code fields, optional non-negative integer capacity, and an active default status.
+- Submission uses `POST /api/v1/sites/{siteId}/units`, is single-flight, maps `422` errors inline,
+  and follows established handling for `401`, `403`, `404`, `409`, and network failures.
+- Success closes the dialog, restores focus, displays success feedback, renders the unit
+  immediately, and refreshes the site-scoped list without losing route context.
+- Frontend coverage includes both CTAs, permission hiding, type loading/empty states, success and
+  refresh, pending submission, `401`, `403`, `409`, `422`, network failure, and focus restoration.
+
+# Sprint 5.6 — Production Batch creation (UAT blocker completion)
+
+- The Manual UAT blocker—no frontend path to create the first batch from a Production Unit—is
+  recorded and resolved on the unit detail page.
+- Authorized users see **Create Batch** in the unit header and no-batches empty state; callers
+  without `production_batch.create` see neither action.
+- Actions are disabled when the parent site or unit is not active, matching backend lifecycle
+  policy without bypassing server enforcement.
+- The dialog supports required code and optional species, planned date/time, expected quantity,
+  and notes. The server-owned initial state is `planned`; unsupported metadata input is omitted.
+- Submission is single-flight and handles `401`, `403`, tenant-safe `404`, duplicate-code and
+  lifecycle `409`, field-level `422`, and network failure.
+- Success closes the dialog, restores focus, shows feedback, renders a linked batch immediately,
+  and refreshes the unit-scoped list.
+- Integration coverage verifies actions and permissions, lifecycle disabling, initial state,
+  validation, every required API error, pending/double submission, immediate render and refresh,
+  batch navigation, and focus restoration.

@@ -1,50 +1,224 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter } from 'next/navigation';
 import { ApiError, apiFetch } from '@/lib/api';
-import type { ProductionBatch, ProductionUnit, ProductionUnitType } from '@/lib/types';
+import { hasScopedPermission } from '@/lib/permissions';
+import type {
+  CurrentUser,
+  Farm,
+  ProductionBatch,
+  ProductionSite,
+  ProductionUnit,
+  ProductionUnitType,
+} from '@/lib/types';
 import {
   Breadcrumbs,
-  EmptyState,
   ErrorBanner,
   ForbiddenBanner,
   Loading,
   StateBadge,
 } from '@/components/ape-ui';
+import { EmptyStateCard, friendlyError, toast } from '@/components/ui-polish';
+import {
+  ProductionBatchCreateDialog,
+  type ProductionBatchCreateValues,
+  type ProductionBatchFieldErrors,
+} from '@/components/production-batch-create-dialog';
+
+const VALIDATION_FIELDS = new Set<keyof ProductionBatchFieldErrors>([
+  'code',
+  'species',
+  'planned_at',
+  'expected_quantity',
+  'notes',
+]);
+
+function validationErrors(error: ApiError): ProductionBatchFieldErrors {
+  const result: ProductionBatchFieldErrors = {};
+  const detail = error.payload.detail;
+  if (!Array.isArray(detail)) return result;
+  for (const item of detail) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as { loc?: unknown; msg?: unknown };
+    if (!Array.isArray(record.loc)) continue;
+    const field = record.loc.at(-1);
+    if (
+      typeof field === 'string' &&
+      VALIDATION_FIELDS.has(field as keyof ProductionBatchFieldErrors)
+    ) {
+      result[field as keyof ProductionBatchFieldErrors] =
+        typeof record.msg === 'string' ? record.msg : 'Invalid value.';
+    }
+  }
+  return result;
+}
+
+const LIFECYCLE_CONFLICTS: Record<string, string> = {
+  unit_under_maintenance: 'This unit is under maintenance and cannot accept a new batch.',
+  unit_closed_no_writes: 'This unit is closed and cannot accept a new batch.',
+  site_under_maintenance: 'This site is under maintenance and cannot accept a new batch.',
+  site_closed_no_writes: 'This site is closed and cannot accept a new batch.',
+};
 
 export default function UnitBatchesPage() {
+  const router = useRouter();
   const params = useParams<{ unitId: string }>();
   const unitId = params.unitId;
   const [unit, setUnit] = useState<ProductionUnit | null>(null);
+  const [site, setSite] = useState<ProductionSite | null>(null);
   const [type, setType] = useState<ProductionUnitType | null>(null);
   const [batches, setBatches] = useState<ProductionBatch[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
+  const [user, setUser] = useState<CurrentUser | null>(null);
+  const [farm, setFarm] = useState<Farm | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [createFieldErrors, setCreateFieldErrors] = useState<ProductionBatchFieldErrors>({});
+  const loadGenerationRef = useRef(0);
+  const mutationGenerationRef = useRef(0);
+  const submittingRef = useRef(false);
+  const unitIdRef = useRef(unitId);
+  unitIdRef.current = unitId;
 
   useEffect(() => {
+    const generation = ++loadGenerationRef.current;
+    let cancelled = false;
+    const isCurrent = () =>
+      !cancelled && loadGenerationRef.current === generation && unitIdRef.current === unitId;
     (async () => {
       try {
-        const [u, b, types] = await Promise.all([
+        const [u, b, types, me] = await Promise.all([
           apiFetch<ProductionUnit>(`/v1/units/${unitId}`),
           apiFetch<ProductionBatch[]>(`/v1/units/${unitId}/batches`),
           apiFetch<ProductionUnitType[]>('/v1/production-unit-types'),
+          apiFetch<CurrentUser>('/v1/auth/me'),
         ]);
+        const parentSite = await apiFetch<ProductionSite>(`/v1/sites/${u.site_id}`);
+        const parentFarm = await apiFetch<Farm>(`/v1/farms/${parentSite.farm_id}`);
+        if (!isCurrent()) return;
         setUnit(u);
+        setSite(parentSite);
         setBatches(b);
+        setUser(me);
+        setFarm(parentFarm);
         setType(types.find((t) => t.id === u.unit_type_id) ?? null);
       } catch (err) {
-        if (err instanceof ApiError && err.status === 403) setForbidden(true);
-        else
-          setError(
-            err instanceof ApiError
-              ? ((err.payload.detail as string) ?? 'Failed to load.')
-              : String(err),
-          );
+        if (!isCurrent()) return;
+        if (err instanceof ApiError && err.status === 401) router.push('/login');
+        else if (err instanceof ApiError && err.status === 403) setForbidden(true);
+        else setError(friendlyError(err));
       }
     })();
-  }, [unitId]);
+    return () => {
+      cancelled = true;
+      loadGenerationRef.current += 1;
+      mutationGenerationRef.current += 1;
+      submittingRef.current = false;
+    };
+  }, [router, unitId]);
+
+  const canCreate = hasScopedPermission(
+    user,
+    'production_batch.create',
+    farm ? { organizationId: farm.organization_id, farmId: farm.id } : null,
+  );
+  const creationDisabled = unit?.status !== 'active' || site?.status !== 'active';
+  const creationDisabledReason =
+    unit?.status !== 'active'
+      ? 'Batches can only be created in an active unit.'
+      : site?.status !== 'active'
+        ? 'Batches can only be created at an active site.'
+        : undefined;
+
+  const openCreate = useCallback(() => {
+    setCreateError(null);
+    setCreateFieldErrors({});
+    setCreating(true);
+  }, []);
+
+  const closeCreate = useCallback(() => {
+    setCreating(false);
+    setCreateError(null);
+    setCreateFieldErrors({});
+  }, []);
+
+  async function submitCreate(values: ProductionBatchCreateValues) {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    const generation = ++mutationGenerationRef.current;
+    const capturedUnitId = unitId;
+    const isCurrent = () =>
+      mutationGenerationRef.current === generation && unitIdRef.current === capturedUnitId;
+    setCreateBusy(true);
+    setCreateError(null);
+    setCreateFieldErrors({});
+    try {
+      const created = await apiFetch<ProductionBatch>(`/v1/units/${capturedUnitId}/batches`, {
+        method: 'POST',
+        body: JSON.stringify(values),
+      });
+      if (!isCurrent()) return;
+      setBatches((current) => [...(current ?? []), created]);
+      setCreating(false);
+      toast(`Production batch "${created.code}" created.`, 'success');
+      try {
+        const refreshed = await apiFetch<ProductionBatch[]>(`/v1/units/${capturedUnitId}/batches`);
+        if (isCurrent()) setBatches(refreshed);
+      } catch {
+        if (isCurrent()) {
+          toast('The batch was created, but the list could not be refreshed.', 'error');
+        }
+      }
+    } catch (err) {
+      if (!isCurrent()) return;
+      if (err instanceof ApiError && err.status === 401) {
+        router.push('/login');
+        return;
+      }
+      if (err instanceof ApiError && err.status === 403) {
+        setCreateError("You don't have permission to create production batches in this unit.");
+        return;
+      }
+      if (err instanceof ApiError && err.status === 404) {
+        setCreateError('This production unit is not available.');
+        return;
+      }
+      if (err instanceof ApiError && err.status === 409) {
+        const detail = err.payload.detail;
+        const code =
+          detail && typeof detail === 'object' && 'code' in detail
+            ? String((detail as { code: unknown }).code)
+            : '';
+        if (LIFECYCLE_CONFLICTS[code]) {
+          setCreateError(LIFECYCLE_CONFLICTS[code]);
+        } else {
+          setCreateFieldErrors({ code: 'A batch with this code already exists in the unit.' });
+          setCreateError('Choose a different batch code and try again.');
+        }
+        return;
+      }
+      if (err instanceof ApiError && err.status === 422) {
+        const fields = validationErrors(err);
+        setCreateFieldErrors(fields);
+        setCreateError(
+          Object.keys(fields).length > 0
+            ? 'Correct the highlighted fields and try again.'
+            : 'The server rejected one or more values. Review the form and try again.',
+        );
+        return;
+      }
+      setCreateError(friendlyError(err));
+    } finally {
+      if (isCurrent()) {
+        submittingRef.current = false;
+        setCreateBusy(false);
+      }
+    }
+  }
 
   const displayLabel = type?.display_name ?? 'Unit';
 
@@ -69,14 +243,28 @@ export default function UnitBatchesPage() {
           { label: unit ? unit.name : 'Unit' },
         ]}
       />
-      <div className="mt-4">
-        <p className="text-xs uppercase tracking-widest text-muted-foreground">{displayLabel}</p>
-        <h1 className="font-display text-3xl">{unit?.name ?? '…'}</h1>
-        {unit && (
-          <p className="mt-0.5 text-sm text-muted-foreground">
-            {displayLabel} · Code {unit.code} · Status {unit.status} · Capacity{' '}
-            {unit.capacity ?? '—'}
-          </p>
+      <div className="mt-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-widest text-muted-foreground">{displayLabel}</p>
+          <h1 className="font-display text-3xl">{unit?.name ?? '…'}</h1>
+          {unit && (
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              {displayLabel} · Code {unit.code} · Status {unit.status} · Capacity{' '}
+              {unit.capacity ?? '—'}
+            </p>
+          )}
+        </div>
+        {canCreate && (
+          <button
+            type="button"
+            data-testid="unit-create-batch-header"
+            onClick={openCreate}
+            disabled={creationDisabled}
+            title={creationDisabledReason}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            + Create Batch
+          </button>
         )}
       </div>
 
@@ -92,9 +280,23 @@ export default function UnitBatchesPage() {
         </div>
       ) : sortedBatches.length === 0 ? (
         <div className="mt-4">
-          <EmptyState
+          <EmptyStateCard
             title="No batches yet"
             description="A batch is a stocking / planting cycle recorded against this unit."
+            action={
+              canCreate ? (
+                <button
+                  type="button"
+                  data-testid="unit-create-batch-empty"
+                  onClick={openCreate}
+                  disabled={creationDisabled}
+                  title={creationDisabledReason}
+                  className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Create Batch
+                </button>
+              ) : undefined
+            }
           />
         </div>
       ) : (
@@ -119,6 +321,15 @@ export default function UnitBatchesPage() {
           ))}
         </ul>
       )}
+
+      <ProductionBatchCreateDialog
+        open={creating}
+        busy={createBusy}
+        errorMessage={createError}
+        fieldErrors={createFieldErrors}
+        onSubmit={(values) => void submitCreate(values)}
+        onClose={closeCreate}
+      />
     </main>
   );
 }

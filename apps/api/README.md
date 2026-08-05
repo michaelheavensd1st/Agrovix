@@ -22,6 +22,25 @@ uvicorn app.main:app --reload --port 8000
 
 Open http://localhost:8000/docs for the interactive OpenAPI browser.
 
+## Developer/UAT bootstrap
+
+After migrations, a non-production database can be populated with the minimum persistent
+tenant hierarchy needed for browser UAT. The command is idempotent, creates only missing
+records, and refuses to run when `APP_ENV` is `production` or `prod`.
+
+```bash
+export AGROVIX_UAT_EMAIL="uat-admin@example.com"
+export AGROVIX_UAT_PASSWORD="<provide at runtime>"
+export AGROVIX_UAT_ORG_NAME="Agrovix UAT"
+export AGROVIX_UAT_FARM_NAME="Agrovix UAT Farm"
+python -m app.scripts.bootstrap_uat
+```
+
+`AGROVIX_UAT_PASSWORD` may be omitted only in an interactive terminal, where the command
+uses a hidden password prompt. No password, hash, token, or secret is printed. Existing
+matching records are preserved; inactive, deleted, or structurally conflicting records cause
+the command to refuse rather than repair or overwrite them.
+
 ## Layout
 
 ```

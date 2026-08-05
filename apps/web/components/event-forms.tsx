@@ -11,13 +11,20 @@
  */
 
 import { FormEvent, useEffect, useState } from 'react';
-import { ApiError, apiFetch } from '@/lib/api';
+import { ApiError, apiFetch, apiFetchResult } from '@/lib/api';
+import { parseApiErrors } from '@/lib/api-errors';
 import type { EventCatalogEntry, ProductionEvent } from '@/lib/types';
+import type {
+  DashboardInventoryItem,
+  DashboardLot,
+  DashboardWarehouse,
+} from '@/lib/inventory-dashboard';
 
 interface EventFormProps {
   batchId: string;
   onCreated(evt: ProductionEvent): void;
   onCancel(): void;
+  onUnauthenticated?(): void;
   eventType: 'STOCKING' | 'FEEDING' | 'MORTALITY';
 }
 
@@ -25,6 +32,7 @@ interface CatalogFormProps {
   batchId: string;
   onCreated(evt: ProductionEvent): void;
   onCancel(): void;
+  onUnauthenticated?(): void;
   entry: EventCatalogEntry;
 }
 
@@ -33,29 +41,34 @@ interface CreateResponse {
   replay: boolean;
 }
 
+interface FeedingFormProps extends Omit<EventFormProps, 'eventType'> {
+  organizationId: string;
+  farmId: string;
+}
+
+interface EligibleFeedLot {
+  id: string;
+  label: string;
+}
+
 async function postEvent(
   batchId: string,
   body: { event_type: string; data: Record<string, unknown> },
   idempotencyKey: string,
 ): Promise<CreateResponse> {
-  const res = await fetch(
-    `${process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000/api'}/v1/batches/${batchId}/events`,
+  const { data, response } = await apiFetchResult<ProductionEvent>(
+    `/v1/batches/${batchId}/events`,
     {
       method: 'POST',
-      credentials: 'include',
       headers: {
-        'Content-Type': 'application/json',
         'Idempotency-Key': idempotencyKey,
       },
       body: JSON.stringify(body),
     },
   );
-  const isJson = res.headers.get('content-type')?.includes('application/json');
-  const payload = isJson ? await res.json() : {};
-  if (!res.ok) throw new ApiError(res.status, payload);
   return {
-    event: payload as ProductionEvent,
-    replay: res.headers.get('X-Idempotent-Replay') === 'true',
+    event: data,
+    replay: response.headers.get('X-Idempotent-Replay') === 'true',
   };
 }
 
@@ -66,23 +79,24 @@ function nowLocalIso(): string {
 }
 
 function extractServerMessage(err: unknown): string {
-  if (err instanceof ApiError) {
-    const detail = err.payload.detail as unknown;
-    if (typeof detail === 'string') return detail;
-    if (detail && typeof detail === 'object') {
-      const d = detail as { message?: string; code?: string };
-      return d.message ?? d.code ?? 'Request failed.';
-    }
-    return `Request failed (${err.status}).`;
-  }
-  return err instanceof Error ? err.message : String(err);
+  return parseApiErrors(err).generalErrors[0] ?? 'Request failed.';
+}
+
+function eventErrorMessage(err: unknown, onUnauthenticated?: () => void): string {
+  if (err instanceof ApiError && err.status === 401) onUnauthenticated?.();
+  return extractServerMessage(err);
 }
 
 /* ================================================================= */
 /* STOCKING — deliberate                                              */
 /* ================================================================= */
 
-export function StockingForm({ batchId, onCreated, onCancel }: Omit<EventFormProps, 'eventType'>) {
+export function StockingForm({
+  batchId,
+  onCreated,
+  onCancel,
+  onUnauthenticated,
+}: Omit<EventFormProps, 'eventType'>) {
   const [species, setSpecies] = useState('WHITE_SHRIMP');
   const [quantity, setQuantity] = useState('25000');
   const [avgWeight, setAvgWeight] = useState('0.02');
@@ -121,7 +135,7 @@ export function StockingForm({ batchId, onCreated, onCancel }: Omit<EventFormPro
       );
       onCreated(event);
     } catch (err) {
-      setError(extractServerMessage(err));
+      setError(eventErrorMessage(err, onUnauthenticated));
     } finally {
       setBusy(false);
     }
@@ -255,7 +269,14 @@ export function StockingForm({ batchId, onCreated, onCancel }: Omit<EventFormPro
 /* FEEDING — deliberate                                               */
 /* ================================================================= */
 
-export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProps, 'eventType'>) {
+export function FeedingForm({
+  batchId,
+  organizationId,
+  farmId,
+  onCreated,
+  onCancel,
+  onUnauthenticated,
+}: FeedingFormProps) {
   const [description, setDescription] = useState('Grower crumble 35%');
   const [quantity, setQuantity] = useState('2.5');
   const [unit, setUnit] = useState<'g' | 'kg'>('kg');
@@ -263,19 +284,83 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
   const [round, setRound] = useState('1');
   const [notes, setNotes] = useState('');
   const [lotId, setLotId] = useState('');
+  const [eligibleLots, setEligibleLots] = useState<EligibleFeedLot[]>([]);
+  const [lotsLoading, setLotsLoading] = useState(true);
+  const [lotsError, setLotsError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadEligibleLots() {
+      setLotsLoading(true);
+      setLotsError(null);
+      try {
+        const [warehouses, items] = await Promise.all([
+          apiFetch<DashboardWarehouse[]>(`/v1/organizations/${organizationId}/warehouses`),
+          apiFetch<DashboardInventoryItem[]>(`/v1/organizations/${organizationId}/inventory-items`),
+        ]);
+        const itemById = new Map(
+          items
+            .filter(
+              (item) =>
+                item.is_active &&
+                item.category === 'feed' &&
+                (item.canonical_unit === 'kg' || item.canonical_unit === 'g'),
+            )
+            .map((item) => [item.id, item]),
+        );
+        const visibleWarehouses = warehouses.filter(
+          (warehouse) =>
+            warehouse.status === 'active' &&
+            (warehouse.farm_id === null || warehouse.farm_id === farmId),
+        );
+        const lotsByWarehouse = await Promise.all(
+          visibleWarehouses.map(async (warehouse) => ({
+            warehouse,
+            lots: await apiFetch<DashboardLot[]>(`/v1/warehouses/${warehouse.id}/lots`),
+          })),
+        );
+        const options = lotsByWarehouse.flatMap(({ warehouse, lots }) =>
+          lots.flatMap((lot) => {
+            const item = itemById.get(lot.item_id);
+            const balance = Number(lot.balance);
+            if (!item || !Number.isFinite(balance) || balance <= 0) return [];
+            return [
+              {
+                id: lot.id,
+                label: `${item.name} · lot ${lot.lot_code} · ${balance} ${lot.balance_unit} · ${warehouse.name}`,
+              },
+            ];
+          }),
+        );
+        if (!cancelled) setEligibleLots(options);
+      } catch (err) {
+        if (!cancelled) {
+          if (err instanceof ApiError && err.status === 401) onUnauthenticated?.();
+          setLotsError(extractServerMessage(err));
+          setEligibleLots([]);
+        }
+      } finally {
+        if (!cancelled) setLotsLoading(false);
+      }
+    }
+    void loadEligibleLots();
+    return () => {
+      cancelled = true;
+    };
+  }, [farmId, onUnauthenticated, organizationId]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      const trimmedLot = lotId.trim();
+      const selectedLotId = eligibleLots.some((lot) => lot.id === lotId) ? lotId : '';
       const trimmedDesc = description.trim();
-      // Server requires at least one of feed_description / inventory_lot_id.
-      const feedRef: Record<string, unknown> = trimmedLot
-        ? { inventory_lot_id: trimmedLot }
+      // A lot id can only originate from the scoped server-backed selection.
+      const feedRef: Record<string, unknown> = selectedLotId
+        ? { inventory_lot_id: selectedLotId }
         : { feed_description: trimmedDesc };
       const { event } = await postEvent(
         batchId,
@@ -294,7 +379,7 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
       );
       onCreated(event);
     } catch (err) {
-      setError(extractServerMessage(err));
+      setError(eventErrorMessage(err, onUnauthenticated));
     } finally {
       setBusy(false);
     }
@@ -306,14 +391,41 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
 
       <label className="block text-sm">
         Feed lot (optional — deducts inventory)
-        <input
+        <select
           data-testid="feeding-lot-id"
-          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono"
-          placeholder="Paste a lot UUID from /inventory, or leave blank for ad-hoc"
+          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
           value={lotId}
           onChange={(e) => setLotId(e.target.value)}
-        />
+          disabled={lotsLoading || Boolean(lotsError)}
+        >
+          <option value="">No inventory lot — record ad-hoc feeding</option>
+          {eligibleLots.map((lot) => (
+            <option key={lot.id} value={lot.id}>
+              {lot.label}
+            </option>
+          ))}
+        </select>
       </label>
+
+      {lotsLoading && (
+        <p className="text-xs text-muted-foreground" data-testid="feeding-lots-loading">
+          Loading eligible feed lots…
+        </p>
+      )}
+      {!lotsLoading && !lotsError && eligibleLots.length === 0 && (
+        <p
+          className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground"
+          data-testid="feeding-lots-empty"
+        >
+          No eligible feed lots are available for this farm. You can record an ad-hoc feeding with a
+          description, or receive feed stock in Inventory first.
+        </p>
+      )}
+      {lotsError && (
+        <p className="text-xs text-destructive" data-testid="feeding-lots-error">
+          Feed lots could not be loaded: {lotsError}. Ad-hoc feeding remains available.
+        </p>
+      )}
 
       <label className="block text-sm">
         Feed description {lotId.trim() ? '(ignored when a lot is provided)' : ''}
@@ -420,7 +532,12 @@ export function FeedingForm({ batchId, onCreated, onCancel }: Omit<EventFormProp
 /* MORTALITY — deliberate                                             */
 /* ================================================================= */
 
-export function MortalityForm({ batchId, onCreated, onCancel }: Omit<EventFormProps, 'eventType'>) {
+export function MortalityForm({
+  batchId,
+  onCreated,
+  onCancel,
+  onUnauthenticated,
+}: Omit<EventFormProps, 'eventType'>) {
   const [count, setCount] = useState('10');
   const [cause, setCause] = useState('');
   const [disposal, setDisposal] = useState('burial');
@@ -453,7 +570,7 @@ export function MortalityForm({ batchId, onCreated, onCancel }: Omit<EventFormPr
       );
       onCreated(event);
     } catch (err) {
-      setError(extractServerMessage(err));
+      setError(eventErrorMessage(err, onUnauthenticated));
     } finally {
       setBusy(false);
     }
@@ -578,7 +695,13 @@ function inputTypeFor(prop: JsonSchema): 'text' | 'number' | 'datetime-local' | 
   return 'text';
 }
 
-export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: CatalogFormProps) {
+export function CatalogEventForm({
+  batchId,
+  onCreated,
+  onCancel,
+  onUnauthenticated,
+  entry,
+}: CatalogFormProps) {
   const schema = entry.schema as JsonSchema;
   const properties = schema.properties ?? {};
   const required = new Set(schema.required ?? []);
@@ -595,15 +718,18 @@ export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: Catalo
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   function set(key: string, val: string) {
     setValues((prev) => ({ ...prev, [key]: val }));
+    setFieldErrors((prev) => ({ ...prev, [key]: '' }));
   }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
+    setFieldErrors({});
     try {
       const data: Record<string, unknown> = {};
       for (const [key, prop] of Object.entries(properties)) {
@@ -629,7 +755,15 @@ export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: Catalo
       );
       onCreated(event);
     } catch (err) {
-      setError(extractServerMessage(err));
+      if (err instanceof ApiError && err.status === 401) onUnauthenticated?.();
+      const visibleFields = new Set(
+        Object.entries(properties)
+          .filter(([, prop]) => prop.type !== 'object' && !prop.$ref)
+          .map(([key]) => key),
+      );
+      const parsed = parseApiErrors(err, visibleFields);
+      setFieldErrors(parsed.fieldErrors);
+      setError(parsed.generalErrors[0] ?? null);
     } finally {
       setBusy(false);
     }
@@ -647,6 +781,8 @@ export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: Catalo
         if (prop.type === 'object' || prop.$ref) return null;
         const type = inputTypeFor(prop);
         const isEnum = Array.isArray(prop.enum);
+        const fieldError = fieldErrors[key];
+        const errorId = `catalog-field-${entry.code}-${key}-error`;
         return (
           <label key={key} className="block text-sm">
             {key}
@@ -658,6 +794,8 @@ export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: Catalo
                 value={values[key] ?? ''}
                 onChange={(e) => set(key, e.target.value)}
                 required={required.has(key)}
+                aria-invalid={Boolean(fieldError)}
+                aria-describedby={fieldError ? errorId : undefined}
               >
                 <option value="" />
                 {(prop.enum ?? []).map((opt) => (
@@ -677,7 +815,14 @@ export function CatalogEventForm({ batchId, onCreated, onCancel, entry }: Catalo
                 step={prop.type === 'number' ? '0.001' : undefined}
                 min={prop.minimum}
                 max={prop.maximum}
+                aria-invalid={Boolean(fieldError)}
+                aria-describedby={fieldError ? errorId : undefined}
               />
+            )}
+            {fieldError && (
+              <span id={errorId} role="alert" className="mt-1 block text-xs text-destructive">
+                {fieldError}
+              </span>
             )}
             {prop.description && (
               <span className="mt-0.5 block text-xs text-muted-foreground">{prop.description}</span>

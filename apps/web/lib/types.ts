@@ -59,6 +59,21 @@ export interface ProductionUnit {
   deleted_at?: string | null;
 }
 
+export interface CurrentUser {
+  id: UUID;
+  email: string;
+  full_name: string | null;
+  is_active: boolean;
+  is_verified: boolean;
+  is_superuser: boolean;
+  permissions: string[];
+  permission_scopes?: Array<{
+    organization_id: UUID | null;
+    farm_id: UUID | null;
+    permissions: string[];
+  }>;
+}
+
 export type BatchState =
   'planned' | 'stocked' | 'active' | 'harvested' | 'closed' | 'suspended' | 'cancelled' | 'failed';
 
