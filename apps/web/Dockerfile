@@ -5,6 +5,21 @@
 FROM node:20-alpine AS base
 RUN corepack enable
 
+# ---- development ----
+# Compose supervises this target. Source directories are bind-mounted,
+# dependencies remain image-owned, and a named volume isolates .next state.
+FROM base AS development
+WORKDIR /repo
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json ./
+COPY apps/web/package.json ./apps/web/package.json
+COPY packages ./packages
+RUN corepack prepare pnpm@9.12.0 --activate && \
+    pnpm install --frozen-lockfile --filter @agrovix/web...
+COPY apps/web ./apps/web
+ENV NODE_ENV=development
+EXPOSE 3000
+CMD ["pnpm", "--dir", "apps/web", "exec", "next", "dev", "-H", "0.0.0.0", "-p", "3000"]
+
 # ---- deps ----
 FROM base AS deps
 WORKDIR /repo
