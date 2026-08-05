@@ -125,15 +125,6 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
-      redis:
-        image: redis:7-alpine
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -161,7 +152,6 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://agrovix:agrovix_dev@localhost:5432/agrovix_agos_test
           DATABASE_URL_SYNC: postgresql+psycopg2://agrovix:agrovix_dev@localhost:5432/agrovix_agos_test
-          REDIS_URL: redis://localhost:6379/0
           JWT_SECRET_KEY: test-secret-key-for-ci-do-not-use-in-prod
         run: pytest -v --cov=app --cov-report=xml
 
