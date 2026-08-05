@@ -1,5 +1,3 @@
-version: "3.9"
-
 # =============================================================================
 # Agrovix AgOS — Local Development Stack
 # -----------------------------------------------------------------------------
@@ -13,14 +11,11 @@ version: "3.9"
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: agrovix_postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-agrovix}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agrovix_dev}
       POSTGRES_DB: ${POSTGRES_DB:-agrovix_agos}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -33,11 +28,8 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: agrovix_redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -52,7 +44,6 @@ services:
     build:
       context: ./apps/api
       dockerfile: Dockerfile
-    container_name: agrovix_api
     restart: unless-stopped
     depends_on:
       postgres:
@@ -62,15 +53,29 @@ services:
     environment:
       API_HOST: 0.0.0.0
       API_PORT: 8000
+      APP_ENV: ${APP_ENV:-development}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-agrovix}:${POSTGRES_PASSWORD:-agrovix_dev}@postgres:5432/${POSTGRES_DB:-agrovix_agos}
       DATABASE_URL_SYNC: postgresql+psycopg2://${POSTGRES_USER:-agrovix}:${POSTGRES_PASSWORD:-agrovix_dev}@postgres:5432/${POSTGRES_DB:-agrovix_agos}
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
       API_CORS_ORIGINS: http://localhost:3000
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./apps/api:/app
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=3)); raise SystemExit(0 if d.get('status') == 'ready' and d.get('checks', {}).get('database') is True and d.get('checks', {}).get('redis') is True else 1)",
+        ]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 12
     networks:
       - agrovix
 
@@ -78,15 +83,44 @@ services:
     build:
       context: .
       dockerfile: ./apps/web/Dockerfile
-    container_name: agrovix_web
+      target: development
     restart: unless-stopped
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8000/api
+      NEXT_PUBLIC_API_URL: /api-proxy
+      API_PROXY_TARGET: http://api:8000
       NODE_ENV: development
+      WATCHPACK_POLLING: "true"
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./apps/web/app:/repo/apps/web/app
+      - ./apps/web/components:/repo/apps/web/components
+      - ./apps/web/lib:/repo/apps/web/lib
+      - ./apps/web/public:/repo/apps/web/public
+      - ./apps/web/next.config.js:/repo/apps/web/next.config.js:ro
+      - ./apps/web/postcss.config.js:/repo/apps/web/postcss.config.js:ro
+      - ./apps/web/tailwind.config.ts:/repo/apps/web/tailwind.config.ts:ro
+      - ./apps/web/tsconfig.json:/repo/apps/web/tsconfig.json:ro
+      - ./packages/types/src:/repo/packages/types/src
+      - ./packages/ui/src:/repo/packages/ui/src
+      - ./packages/utils/src:/repo/packages/utils/src
+      - ./packages/validation/src:/repo/packages/validation/src
+      - web_next:/repo/apps/web/.next
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/api-proxy/v1/health/ready').then((r) => r.json()).then((d) => process.exit(d.status === 'ready' && d.checks?.database === true && d.checks?.redis === true ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      start_period: 20s
+      retries: 12
     networks:
       - agrovix
 
@@ -97,3 +131,4 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  web_next:

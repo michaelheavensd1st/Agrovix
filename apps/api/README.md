@@ -2,25 +2,22 @@
 
 FastAPI backend for the Agrovix Agricultural Operating System.
 
-## Local run
+## Compose-managed local run
 
 ```bash
-cd apps/api
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt
-cp .env.example .env
-
-# start supporting infra
-docker compose -f ../../docker-compose.yml up -d postgres redis
-
-# apply migrations
-alembic upgrade head
-
-# start the API
-uvicorn app.main:app --reload --port 8000
+scripts/dev/check.sh
+scripts/dev/start.sh
+scripts/dev/migrate.sh   # explicit; only needed when status reports pending
+scripts/dev/status.sh
 ```
 
-Open http://localhost:8000/docs for the interactive OpenAPI browser.
+Run these commands from the repository root. Docker Compose supervises PostgreSQL, Redis,
+FastAPI, and Next.js. The browser reaches the API through
+`http://localhost:3000/api-proxy`; direct <http://localhost:8000/docs> access is retained on
+host loopback for diagnostics only. PostgreSQL and Redis have no host-published ports.
+
+Migrations never run during API startup. `scripts/dev/migrate.sh` shows current and target
+revisions, requires confirmation, runs Alembic inside the API container, and verifies the result.
 
 ## Developer/UAT bootstrap
 
@@ -28,18 +25,28 @@ After migrations, a non-production database can be populated with the minimum pe
 tenant hierarchy needed for browser UAT. The command is idempotent, creates only missing
 records, and refuses to run when `APP_ENV` is `production` or `prod`.
 
-```bash
-export AGROVIX_UAT_EMAIL="uat-admin@example.com"
-export AGROVIX_UAT_PASSWORD="<provide at runtime>"
-export AGROVIX_UAT_ORG_NAME="Agrovix UAT"
-export AGROVIX_UAT_FARM_NAME="Agrovix UAT Farm"
-python -m app.scripts.bootstrap_uat
-```
+From the repository root, run `scripts/dev/bootstrap-uat.sh`. It forwards an existing
+`AGROVIX_UAT_PASSWORD` without printing it or prompts securely when it is absent. Optional
+`AGROVIX_UAT_EMAIL`, `AGROVIX_UAT_ORG_NAME`, and `AGROVIX_UAT_FARM_NAME` values are forwarded
+when set. The bootstrap is never invoked by startup or migration commands.
 
 `AGROVIX_UAT_PASSWORD` may be omitted only in an interactive terminal, where the command
 uses a hidden password prompt. No password, hash, token, or secret is printed. Existing
 matching records are preserved; inactive, deleted, or structurally conflicting records cause
 the command to refuse rather than repair or overwrite them.
+
+Runtime inspection and recovery:
+
+```bash
+scripts/dev/logs.sh api
+scripts/dev/status.sh
+scripts/dev/stop.sh       # preserves data; safe to repeat
+scripts/dev/start.sh      # recovers the same Compose services
+```
+
+`scripts/dev/reset.sh` is the only destructive runtime command and deletes the named PostgreSQL
+and Redis volumes after explicit confirmation. Compose project and volume names are derived from
+the checkout path, isolating data when multiple checkouts are used concurrently.
 
 ## Layout
 

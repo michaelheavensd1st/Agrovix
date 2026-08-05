@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const API = 'http://localhost:8000/api';
+const API = '/api-proxy';
 
 function jsonResponse(status: number, body: unknown = {}) {
   return new Response(JSON.stringify(body), {
@@ -78,6 +78,62 @@ describe('apiFetch session refresh', () => {
     expect(retry.headers).toEqual(first.headers);
     expect(new Headers(retry.headers).get('Idempotency-Key')).toBe('event-key-1');
     expect(new Headers(retry.headers).get('X-Test')).toBe('preserved');
+  });
+
+  it.each([
+    ['plain object', { Authorization: 'Bearer object', 'Idempotency-Key': 'object-key' }],
+    [
+      'Headers instance',
+      new Headers({ Authorization: 'Bearer headers', 'Idempotency-Key': 'headers-key' }),
+    ],
+    [
+      'tuple array',
+      [
+        ['Authorization', 'Bearer tuples'],
+        ['Idempotency-Key', 'tuple-key'],
+      ] as [string, string][],
+    ],
+  ])('normalizes %s headers and preserves them across refresh retry', async (_label, headers) => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(401))
+      .mockResolvedValueOnce(jsonResponse(200))
+      .mockResolvedValueOnce(jsonResponse(201, { id: 'event-1' }));
+    vi.stubGlobal('fetch', fetchMock);
+    const { apiFetch } = await import('@/lib/api');
+
+    await apiFetch('/v1/batches/b1/events', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ event_type: 'SAMPLING' }),
+    });
+
+    const initial = fetchMock.mock.calls[0][1] as RequestInit;
+    const retry = fetchMock.mock.calls[2][1] as RequestInit;
+    expect(initial.headers).toBeInstanceOf(Headers);
+    expect(retry.headers).toBe(initial.headers);
+    expect(new Headers(retry.headers).get('Authorization')).toMatch(/^Bearer /);
+    expect(new Headers(retry.headers).get('Idempotency-Key')).toMatch(/-key$/);
+    expect(new Headers(retry.headers).get('Content-Type')).toBe('application/json');
+  });
+
+  it('does not add a JSON content type to a bodyless request or replace a caller content type', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200))
+      .mockResolvedValueOnce(jsonResponse(200));
+    vi.stubGlobal('fetch', fetchMock);
+    const { apiFetch } = await import('@/lib/api');
+
+    await apiFetch('/v1/auth/me', { headers: [['X-Test', 'bodyless']] });
+    await apiFetch('/v1/import', {
+      method: 'POST',
+      headers: new Headers({ 'Content-Type': 'text/plain' }),
+      body: 'raw',
+    });
+
+    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).has('Content-Type')).toBe(false);
+    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get('Content-Type')).toBe('text/plain');
   });
 
   it('uses one shared refresh for concurrent 401 responses', async () => {
