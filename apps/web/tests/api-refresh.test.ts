@@ -82,7 +82,10 @@ describe('apiFetch session refresh', () => {
 
   it.each([
     ['plain object', { Authorization: 'Bearer object', 'Idempotency-Key': 'object-key' }],
-    ['Headers instance', new Headers({ Authorization: 'Bearer headers', 'Idempotency-Key': 'headers-key' })],
+    [
+      'Headers instance',
+      new Headers({ Authorization: 'Bearer headers', 'Idempotency-Key': 'headers-key' }),
+    ],
     [
       'tuple array',
       [
