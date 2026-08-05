@@ -110,37 +110,31 @@ Guiding principles:
 ## Quick Start (Local Development)
 
 ```bash
-# 1. Clone & enter
+# Clone and enter the repository
 git clone <your-fork-url> agrovix-agos
 cd agrovix-agos
 
-# 2. Enable pnpm via corepack
+# First-time host setup
 corepack enable && corepack prepare pnpm@9.12.0 --activate
+pnpm install --frozen-lockfile
 
-# 3. Install JS/TS dependencies for all workspaces
-pnpm install
+# Validate, start, and inspect the Compose-managed runtime
+scripts/dev/check.sh
+scripts/dev/start.sh
+scripts/dev/status.sh
+```
 
-# 4. Copy env templates
-cp .env.example .env
-cp apps/api/.env.example apps/api/.env
-cp apps/web/.env.example apps/web/.env.local
-cp apps/mobile/.env.example apps/mobile/.env
+Docker Compose supervises PostgreSQL, Redis, FastAPI, and Next.js. The commands are the same
+inside Codespaces; no custom Codespaces lifecycle hook or foreground terminal must remain open.
+Normal browser traffic uses <http://localhost:3000>. API requests stay on that origin under
+`/api-proxy` and are forwarded by Next.js to FastAPI over the Compose network.
 
-# 5. Start Postgres + Redis (via Docker)
-docker compose up -d postgres redis
+On a new database, `start.sh` reports pending migrations without applying them. Apply them
+explicitly, then inspect readiness again:
 
-# 6. Setup Python API (in another terminal)
-cd apps/api
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt
-alembic upgrade head
-uvicorn app.main:app --reload --port 8000
-
-# 7. Start the web app (from repo root)
-pnpm dev:web             # → http://localhost:3000
-
-# 8. Start the mobile app (optional)
-pnpm dev:mobile          # → Expo dev tools
+```bash
+scripts/dev/migrate.sh       # asks for confirmation
+scripts/dev/status.sh
 ```
 
 ## Environment Variables
@@ -159,36 +153,61 @@ Each surface has its own `.env.example`:
 ## Running with Docker Compose
 
 ```bash
-# spin up the full stack
-docker compose up --build
+# daily start (safe to repeat)
+scripts/dev/start.sh
 
-# just infrastructure (recommended while developing locally)
-docker compose up -d postgres redis
+# rebuild after package.json, pnpm-lock.yaml, or Dockerfile changes
+scripts/dev/start.sh --build
 
-# tear everything down (keeps volumes)
-docker compose down
+# status and logs
+scripts/dev/status.sh
+scripts/dev/logs.sh          # or: scripts/dev/logs.sh api
 
-# tear everything down (drops data volumes)
-docker compose down -v
+# stop only Agrovix services; preserve data
+scripts/dev/stop.sh
+
+# destructive reset; requires typed confirmation
+scripts/dev/reset.sh
 ```
 
-Ports exposed on the host:
+Diagnostic ports exposed on host loopback only:
 
 | Service    | Host port | Container port |
 | ---------- | --------- | -------------- |
-| Postgres   | 5432      | 5432           |
-| Redis      | 6379      | 6379           |
 | API        | 8000      | 8000           |
 | Web        | 3000      | 3000           |
 
-## Common Commands
-
-Run these from the **repo root** (they use Turborepo to fan out):
+PostgreSQL and Redis are not published to the host. Each checkout derives a stable, path-specific
+Compose project name, so its database and Redis volumes cannot collide with another checkout.
+Set `AGROVIX_COMPOSE_PROJECT` to a valid lowercase Compose project name only when an explicit
+override is needed. To inspect the current checkout through Compose, use its derived project:
 
 ```bash
-pnpm dev            # start every app in parallel (web + api + mobile)
-pnpm dev:web        # start only the Next.js web app
-pnpm dev:api        # start only the FastAPI backend
+project="$(bash -c 'source scripts/dev/common.sh; printf %s "$COMPOSE_PROJECT_NAME"')"
+docker compose --project-name "$project" exec postgres psql -U agrovix -d agrovix_agos
+docker compose --project-name "$project" exec redis redis-cli ping
+```
+
+Port 8000 is diagnostic only. Browser login, cookie refresh, and application requests use
+`http://localhost:3000/api-proxy`; normal operation does not require opening port 8000.
+
+## Common Commands
+
+Run these from the **repo root**. The `dev:*` runtime commands use Docker Compose; build and
+workspace-only commands use Turborepo where noted:
+
+```bash
+pnpm dev:start      # Compose-managed PostgreSQL + Redis + API + web
+pnpm dev            # same canonical full-stack Compose start
+pnpm dev:workspace  # legacy frontend/mobile workspace dev tasks via Turborepo
+pnpm dev:check      # non-mutating host and Compose preflight
+pnpm dev:status     # service, readiness, proxy, and migration status
+pnpm dev:logs       # Compose logs (optionally pass a service via the shell script)
+pnpm dev:stop       # stop services and preserve volumes
+pnpm dev:migrate    # explicit, confirmed Alembic upgrade
+pnpm dev:bootstrap-uat # explicit, secret-driven UAT bootstrap
+pnpm dev:reset      # destructive data reset with confirmation
+pnpm dev:web        # optional foreground host-only Next.js development
 pnpm dev:mobile     # start only the Expo mobile app
 pnpm build          # build every app (respecting the dep graph)
 pnpm lint           # ESLint across all TS packages
@@ -209,6 +228,20 @@ pytest              # tests
 alembic upgrade head        # apply migrations
 alembic revision --autogenerate -m "message"   # create a migration
 ```
+
+For the Compose runtime, prefer `scripts/dev/migrate.sh`; it uses the database URL already
+configured inside the API container and verifies the final revision. UAT data is never created
+automatically. Run `scripts/dev/bootstrap-uat.sh` only after migrations, supplying
+`AGROVIX_UAT_PASSWORD` in the environment or through its hidden prompt.
+
+If a service becomes unhealthy, inspect `scripts/dev/status.sh` and the relevant service log,
+then run `scripts/dev/stop.sh` followed by `scripts/dev/start.sh`. This preserves data. Use
+`reset.sh` only when loss of all local PostgreSQL and Redis data is intended.
+
+The web development image contains its installed dependencies. Source directories are mounted
+for hot reload, while `.next` stays in a container-only volume. After changing a package manifest,
+`pnpm-lock.yaml`, or either development Dockerfile, run `scripts/dev/start.sh --build`; dependencies
+are not installed on every container start.
 
 ## Backend (FastAPI) Details
 
@@ -258,8 +291,10 @@ CSS, and shadcn/ui. Sprint 0 ships the following pages:
 | `/dashboard` | `app/dashboard/page.tsx`        | Placeholder authenticated area  |
 | `*`          | `app/not-found.tsx`             | Custom 404                      |
 
-State + API interaction is handled through a thin `lib/api.ts` client (fetch-based) that reads
-`NEXT_PUBLIC_API_URL` at runtime.
+State + API interaction is handled through a thin `lib/api.ts` client. Its default
+`NEXT_PUBLIC_API_URL=/api-proxy` keeps cookies and requests on the web origin. Host-only Next.js
+uses `API_PROXY_TARGET=http://127.0.0.1:8000`; Compose overrides the target to
+`http://api:8000`.
 
 ## Mobile (Expo / React Native) Details
 
