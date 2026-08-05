@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { ApiError, apiFetch } from '@/lib/api';
+import { hasScopedPermission } from '@/lib/permissions';
 import type {
   CurrentUser,
   Farm,
@@ -55,6 +56,7 @@ export default function SiteUnitsPage() {
   const [units, setUnits] = useState<ProductionUnit[] | null>(null);
   const [types, setTypes] = useState<ProductionUnitType[] | null>(null);
   const [user, setUser] = useState<CurrentUser | null>(null);
+  const [farm, setFarm] = useState<Farm | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [typesError, setTypesError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
@@ -87,6 +89,7 @@ export default function SiteUnitsPage() {
 
         try {
           const farm = await apiFetch<Farm>(`/v1/farms/${s.farm_id}`);
+          if (isCurrent()) setFarm(farm);
           const t = await apiFetch<ProductionUnitType[]>(
             `/v1/production-unit-types?organization_id=${encodeURIComponent(farm.organization_id)}`,
           );
@@ -124,8 +127,10 @@ export default function SiteUnitsPage() {
     };
   }, [router, siteId]);
 
-  const canCreate = Boolean(
-    user?.is_superuser || user?.permissions.includes('production_unit.create'),
+  const canCreate = hasScopedPermission(
+    user,
+    'production_unit.create',
+    farm ? { organizationId: farm.organization_id, farmId: farm.id } : null,
   );
   const creationDisabled = site?.status !== 'active';
 

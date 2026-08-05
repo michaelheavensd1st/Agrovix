@@ -25,6 +25,7 @@ import UnitBatchesPage from '@/app/units/[unitId]/page';
 import { ApiError, apiFetch } from '@/lib/api';
 import type {
   CurrentUser,
+  Farm,
   ProductionBatch,
   ProductionSite,
   ProductionUnit,
@@ -49,6 +50,13 @@ const SITE: ProductionSite = {
   code: 'MAIN',
   status: 'active',
 };
+const FARM: Farm = {
+  id: 'farm-1',
+  organization_id: 'org-1',
+  name: 'Test Farm',
+  code: 'FARM',
+  deleted_at: null,
+};
 const TYPE: ProductionUnitType = {
   id: 'type-1',
   organization_id: null,
@@ -67,7 +75,14 @@ const USER: CurrentUser = {
   is_active: true,
   is_verified: true,
   is_superuser: false,
-  permissions: ['production_batch.create'],
+  permissions: [],
+  permission_scopes: [
+    {
+      organization_id: 'org-1',
+      farm_id: 'farm-1',
+      permissions: ['production_batch.create'],
+    },
+  ],
 };
 const CREATED: ProductionBatch = {
   id: 'batch-1',
@@ -100,6 +115,7 @@ function baseMock({
     if (path === '/v1/production-unit-types') return Promise.resolve([TYPE]);
     if (path === '/v1/auth/me') return Promise.resolve(user);
     if (path === '/v1/sites/site-1') return Promise.resolve(site);
+    if (path === '/v1/farms/farm-1') return Promise.resolve(FARM);
     return Promise.reject(new Error(`Unexpected request: ${path}`));
   });
 }
@@ -140,6 +156,7 @@ function mockCreateError(error: unknown) {
     if (path === '/v1/production-unit-types') return Promise.resolve([TYPE]);
     if (path === '/v1/auth/me') return Promise.resolve(USER);
     if (path === '/v1/sites/site-1') return Promise.resolve(SITE);
+    if (path === '/v1/farms/farm-1') return Promise.resolve(FARM);
     return Promise.reject(new Error(`Unexpected request: ${path}`));
   });
 }
@@ -159,7 +176,7 @@ describe('Production Batch creation', () => {
   });
 
   it('hides both creation actions without production_batch.create', async () => {
-    baseMock({ user: { ...USER, permissions: [] } });
+    baseMock({ user: { ...USER, permissions: [], permission_scopes: [] } });
     render(<UnitBatchesPage />);
     await waitFor(() => expect(screen.getByText('No batches yet')).toBeInTheDocument());
     expect(screen.queryByTestId('unit-create-batch-header')).not.toBeInTheDocument();
@@ -188,6 +205,7 @@ describe('Production Batch creation', () => {
       if (path === '/v1/production-unit-types') return Promise.resolve([TYPE]);
       if (path === '/v1/auth/me') return Promise.resolve(USER);
       if (path === '/v1/sites/site-1') return Promise.resolve(SITE);
+      if (path === '/v1/farms/farm-1') return Promise.resolve(FARM);
       return Promise.reject(new Error(`Unexpected request: ${path}`));
     });
     render(<UnitBatchesPage />);
@@ -318,6 +336,7 @@ describe('Production Batch creation', () => {
       if (path === '/v1/production-unit-types') return Promise.resolve([TYPE]);
       if (path === '/v1/auth/me') return Promise.resolve(USER);
       if (path === '/v1/sites/site-1') return Promise.resolve(SITE);
+      if (path === '/v1/farms/farm-1') return Promise.resolve(FARM);
       return Promise.reject(new Error(`Unexpected request: ${path}`));
     });
     render(<UnitBatchesPage />);

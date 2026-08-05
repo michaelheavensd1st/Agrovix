@@ -4,8 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { ApiError, apiFetch } from '@/lib/api';
+import { hasScopedPermission } from '@/lib/permissions';
 import type {
   CurrentUser,
+  Farm,
   ProductionBatch,
   ProductionSite,
   ProductionUnit,
@@ -71,6 +73,7 @@ export default function UnitBatchesPage() {
   const [error, setError] = useState<string | null>(null);
   const [forbidden, setForbidden] = useState(false);
   const [user, setUser] = useState<CurrentUser | null>(null);
+  const [farm, setFarm] = useState<Farm | null>(null);
   const [creating, setCreating] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -95,11 +98,13 @@ export default function UnitBatchesPage() {
           apiFetch<CurrentUser>('/v1/auth/me'),
         ]);
         const parentSite = await apiFetch<ProductionSite>(`/v1/sites/${u.site_id}`);
+        const parentFarm = await apiFetch<Farm>(`/v1/farms/${parentSite.farm_id}`);
         if (!isCurrent()) return;
         setUnit(u);
         setSite(parentSite);
         setBatches(b);
         setUser(me);
+        setFarm(parentFarm);
         setType(types.find((t) => t.id === u.unit_type_id) ?? null);
       } catch (err) {
         if (!isCurrent()) return;
@@ -116,8 +121,10 @@ export default function UnitBatchesPage() {
     };
   }, [router, unitId]);
 
-  const canCreate = Boolean(
-    user?.is_superuser || user?.permissions.includes('production_batch.create'),
+  const canCreate = hasScopedPermission(
+    user,
+    'production_batch.create',
+    farm ? { organizationId: farm.organization_id, farmId: farm.id } : null,
   );
   const creationDisabled = unit?.status !== 'active' || site?.status !== 'active';
   const creationDisabledReason =

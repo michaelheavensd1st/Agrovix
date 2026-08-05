@@ -9,14 +9,122 @@ and check for the required permission code.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.farm import Farm
+from app.models.membership import FarmMembership, OrganizationMembership
+from app.models.organization import Organization
 from app.models.role import Role
 from app.models.role_assignment import RoleAssignment
 from app.models.user import User
+
+
+@dataclass(frozen=True)
+class PermissionScope:
+    organization_id: uuid.UUID | None
+    farm_id: uuid.UUID | None
+    permissions: tuple[str, ...]
+
+
+async def resolve_permission_scopes(
+    session: AsyncSession,
+    user: User,
+) -> list[PermissionScope]:
+    """Return active permission grants grouped by their exact tenant scope."""
+    if not user.is_active:
+        return []
+    if user.is_superuser:
+        return [PermissionScope(None, None, ("*", "platform.admin"))]
+
+    assignments = (
+        (
+            await session.execute(
+                select(RoleAssignment)
+                .where(
+                    RoleAssignment.user_id == user.id,
+                    RoleAssignment.revoked_at.is_(None),
+                )
+                .options(selectinload(RoleAssignment.role).selectinload(Role.permissions))
+            )
+        )
+        .scalars()
+        .unique()
+        .all()
+    )
+
+    organization_ids = {
+        assignment.organization_id
+        for assignment in assignments
+        if assignment.organization_id is not None
+    }
+    farm_ids = {assignment.farm_id for assignment in assignments if assignment.farm_id is not None}
+
+    active_organization_ids: set[uuid.UUID] = set()
+    if organization_ids:
+        active_organization_ids = set(
+            (
+                await session.execute(
+                    select(OrganizationMembership.organization_id)
+                    .join(
+                        Organization,
+                        Organization.id == OrganizationMembership.organization_id,
+                    )
+                    .where(
+                        OrganizationMembership.user_id == user.id,
+                        OrganizationMembership.organization_id.in_(organization_ids),
+                        OrganizationMembership.is_active.is_(True),
+                        OrganizationMembership.deleted_at.is_(None),
+                        Organization.is_active.is_(True),
+                        Organization.deleted_at.is_(None),
+                    )
+                )
+            ).scalars()
+        )
+
+    active_farm_ids: set[uuid.UUID] = set()
+    if farm_ids:
+        active_farm_ids = set(
+            (
+                await session.execute(
+                    select(FarmMembership.farm_id)
+                    .join(Farm, Farm.id == FarmMembership.farm_id)
+                    .where(
+                        FarmMembership.user_id == user.id,
+                        FarmMembership.farm_id.in_(farm_ids),
+                        FarmMembership.is_active.is_(True),
+                        FarmMembership.deleted_at.is_(None),
+                        Farm.is_active.is_(True),
+                        Farm.deleted_at.is_(None),
+                        Farm.organization_id.in_(active_organization_ids),
+                    )
+                )
+            ).scalars()
+        )
+
+    grouped: dict[tuple[uuid.UUID | None, uuid.UUID | None], set[str]] = {}
+    for assignment in assignments:
+        organization_id = assignment.organization_id
+        farm_id = assignment.farm_id
+        if organization_id is not None and organization_id not in active_organization_ids:
+            continue
+        if farm_id is not None and farm_id not in active_farm_ids:
+            continue
+        key = (organization_id, farm_id)
+        grouped.setdefault(key, set()).update(
+            permission.code for permission in assignment.role.permissions
+        )
+
+    return [
+        PermissionScope(organization_id, farm_id, tuple(sorted(codes)))
+        for (organization_id, farm_id), codes in sorted(
+            grouped.items(),
+            key=lambda item: tuple("" if value is None else str(value) for value in item[0]),
+        )
+    ]
 
 
 async def resolve_permissions(

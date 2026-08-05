@@ -16,15 +16,39 @@ describe('apiFetch session refresh', () => {
   });
 
   it('refreshes an expired session and retries the original request once', async () => {
+    const refreshedUser = {
+      id: 'user-1',
+      email: 'manager@example.com',
+      full_name: 'Farm Manager',
+      is_active: true,
+      is_verified: true,
+      is_superuser: false,
+      permissions: [],
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['production_batch.create'],
+        },
+      ],
+    };
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(401, { detail: 'expired' }))
       .mockResolvedValueOnce(jsonResponse(200, { token_type: 'bearer' }))
-      .mockResolvedValueOnce(jsonResponse(200, { id: 'ok' }));
+      .mockResolvedValueOnce(jsonResponse(200, refreshedUser));
     vi.stubGlobal('fetch', fetchMock);
     const { apiFetch } = await import('@/lib/api');
+    const { hasScopedPermission } = await import('@/lib/permissions');
 
-    await expect(apiFetch('/v1/auth/me')).resolves.toEqual({ id: 'ok' });
+    const user = await apiFetch<typeof refreshedUser>('/v1/auth/me');
+    expect(user).toEqual(refreshedUser);
+    expect(
+      hasScopedPermission(user, 'production_batch.create', {
+        organizationId: 'org-1',
+        farmId: 'farm-1',
+      }),
+    ).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls[1][0]).toBe(`${API}/v1/auth/refresh`);
     expect(fetchMock.mock.calls[2][0]).toBe(`${API}/v1/auth/me`);

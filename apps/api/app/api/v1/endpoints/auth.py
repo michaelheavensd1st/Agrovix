@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import get_settings
 from app.core.cookies import clear_auth_cookies, set_auth_cookies
 from app.core.trusted_proxy import get_client_ip
-from app.deps import CurrentUser, get_auth_service
+from app.deps import CurrentUser, DBSession, get_auth_service
 from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
@@ -21,14 +21,19 @@ from app.schemas.auth import (
     VerifyEmailRequest,
 )
 from app.schemas.common import MessageResponse
-from app.schemas.user import UserPublic
+from app.schemas.user import PermissionScopePublic, UserPublic
+from app.security.authorize import resolve_permission_scopes
 from app.services.auth_service import AuthService
 
 router = APIRouter()
 _settings = get_settings()
 
 
-def _to_public(user: User, permissions: list[str] | None = None) -> UserPublic:
+def _to_public(
+    user: User,
+    permissions: list[str] | None = None,
+    permission_scopes: list[PermissionScopePublic] | None = None,
+) -> UserPublic:
     return UserPublic.model_validate(
         {
             "id": user.id,
@@ -40,6 +45,7 @@ def _to_public(user: User, permissions: list[str] | None = None) -> UserPublic:
             "created_at": user.created_at,
             "updated_at": user.updated_at,
             "permissions": permissions or [],
+            "permission_scopes": permission_scopes or [],
         }
     )
 
@@ -141,5 +147,18 @@ async def logout(
 
 
 @router.get("/me", response_model=UserPublic)
-async def me(user: CurrentUser) -> UserPublic:
-    return _to_public(user)
+async def me(user: CurrentUser, session: DBSession) -> UserPublic:
+    scopes = await resolve_permission_scopes(session, user)
+    public_scopes = [
+        PermissionScopePublic(
+            organization_id=scope.organization_id,
+            farm_id=scope.farm_id,
+            permissions=list(scope.permissions),
+        )
+        for scope in scopes
+        if scope.organization_id is not None
+    ]
+    platform_permissions = next(
+        (list(scope.permissions) for scope in scopes if scope.organization_id is None), []
+    )
+    return _to_public(user, platform_permissions, public_scopes)

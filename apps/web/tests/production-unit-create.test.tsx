@@ -56,6 +56,18 @@ const ADMIN: CurrentUser = {
   is_superuser: true,
   permissions: [],
 };
+const FARM_MANAGER: CurrentUser = {
+  ...ADMIN,
+  is_superuser: false,
+  permissions: [],
+  permission_scopes: [
+    {
+      organization_id: 'org-1',
+      farm_id: 'farm-1',
+      permissions: ['production_unit.create'],
+    },
+  ],
+};
 const SYSTEM_TYPE: ProductionUnitType = {
   id: 'type-system',
   organization_id: null,
@@ -135,7 +147,7 @@ describe('Production Unit creation', () => {
   });
 
   it('renders helpful empty-state and header actions only for an authorized user', async () => {
-    baseMock();
+    baseMock({ user: FARM_MANAGER });
     const { unmount } = render(<SiteUnitsPage />);
     await waitFor(() => expect(screen.getByText('No units yet')).toBeInTheDocument());
     expect(screen.getByTestId('site-create-unit-header')).toBeInTheDocument();
