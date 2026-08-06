@@ -8,7 +8,7 @@
  * dedicated sub-resource endpoints reachable from the detail page.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useParams } from 'next/navigation';
 
@@ -42,10 +42,28 @@ export default function BusinessPartnerEditPage() {
   const [taxIdentifier, setTaxIdentifier] = useState('');
   const [notes, setNotes] = useState('');
 
+  // Stale-response guards for detail-load and post-mutation refresh.
+  const genRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    // Route id changed → clear old partner data immediately.
+    setPartner(null);
+    setError(null);
+  }, [partnerId]);
+
   useEffect(() => {
     void (async () => {
+      const gen = ++genRef.current;
+      const capturedId = partnerId;
       try {
-        const p = await getBusinessPartner(partnerId);
+        const p = await getBusinessPartner(capturedId);
+        if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
         setPartner(p);
         setLegalName(p.legal_name);
         setTradingName(p.trading_name ?? '');
@@ -62,11 +80,12 @@ export default function BusinessPartnerEditPage() {
         setTaxIdentifier(p.tax_identifier ?? '');
         setNotes(p.notes ?? '');
       } catch (err) {
+        if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
         if (err instanceof ApiError && err.status === 404) setError('Not found.');
         else if (err instanceof ApiError && err.status === 403) setError('Forbidden.');
         else setError('Failed to load partner.');
       } finally {
-        setLoading(false);
+        if (mountedRef.current && gen === genRef.current) setLoading(false);
       }
     })();
   }, [partnerId]);

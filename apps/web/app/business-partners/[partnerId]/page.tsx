@@ -8,7 +8,7 @@
  * (edit / deactivate / restore / add capability / add contact).
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useParams } from 'next/navigation';
 
@@ -47,13 +47,37 @@ export default function BusinessPartnerDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Stale-response guards — every async load carries a route generation
+  // and a partner-identity capture; a response that returns after the
+  // route id changed or after unmount is discarded.
+  const genRef = useRef(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  // Whenever the route partner id changes, immediately clear old
+  // tenant-specific state so a slower prior response never paints
+  // the wrong partner underneath the header.
+  useEffect(() => {
+    setPartner(null);
+    setError(null);
+  }, [partnerId]);
+
   const refresh = useCallback(async () => {
     if (!partnerId) return;
+    const gen = ++genRef.current;
+    const capturedId = partnerId;
     try {
       setLoading(true);
-      const p = await getBusinessPartner(partnerId);
+      const p = await getBusinessPartner(capturedId);
+      if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
       setPartner(p);
+      setError(null);
     } catch (err) {
+      if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
       if (err instanceof ApiError && err.status === 404) {
         setError('Business Partner not found.');
       } else if (err instanceof ApiError && err.status === 403) {
@@ -62,7 +86,7 @@ export default function BusinessPartnerDetailPage() {
         setError('Failed to load partner.');
       }
     } finally {
-      setLoading(false);
+      if (mountedRef.current && gen === genRef.current) setLoading(false);
     }
   }, [partnerId]);
 
@@ -70,7 +94,7 @@ export default function BusinessPartnerDetailPage() {
     void (async () => {
       try {
         const me = await apiFetch<CurrentUser>('/v1/auth/me');
-        setUser(me);
+        if (mountedRef.current) setUser(me);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           router.push('/login');

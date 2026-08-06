@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
+from app.core.country_codes import ISO_3166_1_ALPHA_2
 from app.models.business_partner import (
     BusinessPartnerCapabilityCode,
     BusinessPartnerContactRole,
@@ -31,11 +32,15 @@ _METADATA_FORBIDDEN_KEYS = frozenset(
 def _normalise_country_code(v: str | None) -> str | None:
     if v is None:
         return None
+    if not isinstance(v, str):
+        raise ValueError("country_code must be a string.")
     v = v.strip().upper()
     if not v:
         return None
     if not _COUNTRY_CODE_RE.match(v):
         raise ValueError("country_code must be ISO 3166-1 alpha-2 (two uppercase letters).")
+    if v not in ISO_3166_1_ALPHA_2:
+        raise ValueError(f"country_code '{v}' is not a valid ISO 3166-1 alpha-2 code.")
     return v
 
 
@@ -310,13 +315,32 @@ class BusinessPartnerCapabilityAddRequest(BaseModel):
 
 
 class BusinessPartnerContactUpdateRequest(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=255)
+    """PATCH contact — omit a field to leave unchanged, send explicit
+    ``null`` to clear a nullable field. Required fields (``name``,
+    ``contact_role``, ``is_primary``) are typed non-nullable so
+    sending ``null`` for them yields 422 at the schema layer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Required fields — non-nullable type → explicit null → 422.
+    name: str = Field(default=None, min_length=1, max_length=255)  # type: ignore[assignment]
+    contact_role: BusinessPartnerContactRole = Field(default=None)  # type: ignore[assignment]
+    is_primary: bool = Field(default=None)  # type: ignore[assignment]
+    # Nullable — omit to leave unchanged, send null to clear.
     job_title: str | None = Field(default=None, max_length=255)
     email: EmailStr | None = None
     phone: str | None = Field(default=None, max_length=80)
-    contact_role: BusinessPartnerContactRole | None = None
-    is_primary: bool | None = None
     notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("job_title", "phone", "notes", mode="before")
+    @classmethod
+    def _strip_nullable(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            stripped = v.strip()
+            # Whitespace-only string collapses to null (clear intent).
+            return stripped or None
+        return v
 
 
 class BusinessPartnerContactDeactivateRequest(BaseModel):

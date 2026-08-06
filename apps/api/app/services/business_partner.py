@@ -48,6 +48,96 @@ from app.repositories.business_partner import (
 _ = SAIntegrityError  # re-exported alias for clarity
 
 
+# Map DB unique-constraint / index names to stable 409 envelope codes.
+# Only KNOWN constraints are translated — anything else surfaces as
+# an unclassified 500 via the normal internal-error path.
+_INTEGRITY_CONSTRAINT_MAP: dict[str, tuple[str, str]] = {
+    # Postgres named constraints.
+    "uq_business_partner_org_code": (
+        "business_partner_code_conflict",
+        "A partner with this code already exists in this organization.",
+    ),
+    "uq_business_partner_capability": (
+        "business_partner_capability_conflict",
+        "Capability already exists on this partner.",
+    ),
+    "uq_business_partner_supplier_profile_partner": (
+        "supplier_profile_conflict",
+        "Supplier profile already exists for this partner.",
+    ),
+    "uq_business_partner_supplier_profile": (
+        "supplier_profile_conflict",
+        "Supplier profile already exists for this partner.",
+    ),
+    "uq_business_partner_contact_primary_per_role": (
+        "business_partner_contact_primary_conflict",
+        "Another primary contact already exists for this role.",
+    ),
+    "uq_business_partner_active_primary_contact": (
+        "business_partner_contact_primary_conflict",
+        "Another primary contact already exists for this role.",
+    ),
+    # SQLite constraint-failed strings (column-list based).
+    "business_partners.organization_id, business_partners.code": (
+        "business_partner_code_conflict",
+        "A partner with this code already exists in this organization.",
+    ),
+    "business_partner_capabilities.business_partner_id, business_partner_capabilities.capability": (
+        "business_partner_capability_conflict",
+        "Capability already exists on this partner.",
+    ),
+    "business_partner_supplier_profiles.business_partner_id": (
+        "supplier_profile_conflict",
+        "Supplier profile already exists for this partner.",
+    ),
+    "ix_business_partner_contact_active_primary_per_role": (
+        "business_partner_contact_primary_conflict",
+        "Another primary contact already exists for this role.",
+    ),
+}
+
+
+def _translate_integrity(exc: SAIntegrityError) -> HTTPException | None:
+    """Translate a narrowly-identified IntegrityError into a 409 envelope.
+
+    Returns ``None`` for unknown constraint hits so they surface as an
+    internal error rather than being misclassified as a client conflict.
+    Does NOT include SQL text, constraint internals, or tenant data
+    in the response.
+    """
+    payload = str(exc.orig) if exc.orig is not None else str(exc)
+    for constraint, (code, message) in _INTEGRITY_CONSTRAINT_MAP.items():
+        if constraint in payload:
+            return HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"code": code, "message": message, "context": {}},
+            )
+    return None
+
+
+def _translate_integrity_errors(fn):
+    """Decorator: translate known IntegrityError races into 409 envelopes.
+
+    Race-safety net that runs AFTER the service's pre-checks. If a
+    concurrent writer wins the race and the DB raises IntegrityError
+    on flush, we surface a stable 409 rather than a 500. Unknown
+    constraints are re-raised so they surface as internal errors.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except SAIntegrityError as exc:
+            translated = _translate_integrity(exc)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    return wrapper
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -117,6 +207,7 @@ class BusinessPartnerService:
     # ------------------------------------------------------------- #
     # Create (atomic — nested capabilities / profile / contacts).
     # ------------------------------------------------------------- #
+    @_translate_integrity_errors
     async def create(
         self,
         *,
@@ -232,6 +323,7 @@ class BusinessPartnerService:
     # ------------------------------------------------------------- #
     # PATCH — partner-header fields only.
     # ------------------------------------------------------------- #
+    @_translate_integrity_errors
     async def update_header(
         self,
         *,
@@ -281,6 +373,7 @@ class BusinessPartnerService:
     # ------------------------------------------------------------- #
     # Deactivate / restore (idempotent on same-state).
     # ------------------------------------------------------------- #
+    @_translate_integrity_errors
     async def deactivate(
         self,
         *,
@@ -305,6 +398,7 @@ class BusinessPartnerService:
         )
         return partner
 
+    @_translate_integrity_errors
     async def restore(
         self,
         *,
@@ -332,6 +426,7 @@ class BusinessPartnerService:
     # ------------------------------------------------------------- #
     # Capabilities.
     # ------------------------------------------------------------- #
+    @_translate_integrity_errors
     async def add_capability(
         self,
         *,
@@ -354,6 +449,7 @@ class BusinessPartnerService:
         )
         return row
 
+    @_translate_integrity_errors
     async def remove_capability(
         self,
         *,
@@ -391,6 +487,7 @@ class BusinessPartnerService:
     # ------------------------------------------------------------- #
     # Supplier profile.
     # ------------------------------------------------------------- #
+    @_translate_integrity_errors
     async def upsert_supplier_profile(
         self,
         *,
@@ -431,7 +528,6 @@ class BusinessPartnerService:
                 ),
             )
         else:
-            old_qual = profile.qualification_status
             old_qual_value = profile.qualification_status.value
             old_pref_value = profile.preference_tier.value
             profile.qualification_status = new_qual
@@ -444,7 +540,6 @@ class BusinessPartnerService:
                 else:
                     profile.qualified_by_id = actor.id
                     profile.qualified_at = _now()
-            _ = old_qual
             self.profile_repo.session.add(profile)
             await self.profile_repo.session.flush()
             await self.profile_repo.session.refresh(profile)
@@ -529,6 +624,7 @@ class BusinessPartnerService:
             )
         return row
 
+    @_translate_integrity_errors
     async def create_contact(
         self,
         *,
@@ -545,6 +641,7 @@ class BusinessPartnerService:
             audit=True,
         )
 
+    @_translate_integrity_errors
     async def update_contact(
         self,
         *,
@@ -578,7 +675,14 @@ class BusinessPartnerService:
             "is_primary",
             "notes",
         ):
-            if field in data and data[field] is not None and getattr(contact, field) != data[field]:
+            # Per §4.1 partial-update convention: `field in data` means
+            # the caller explicitly sent it (because the endpoint uses
+            # ``model_dump(exclude_unset=True)``). We MUST accept an
+            # explicit ``null`` for nullable fields as a "clear" intent
+            # rather than silently ignoring it. The schema rejects null
+            # for the three required fields, so we don't need a runtime
+            # guard here.
+            if field in data and getattr(contact, field) != data[field]:
                 changed[field] = data[field]
                 setattr(contact, field, data[field])
         if not changed:
@@ -598,6 +702,7 @@ class BusinessPartnerService:
         )
         return contact
 
+    @_translate_integrity_errors
     async def deactivate_contact(
         self,
         *,
@@ -629,6 +734,7 @@ class BusinessPartnerService:
         )
         return contact
 
+    @_translate_integrity_errors
     async def restore_contact(
         self,
         *,
