@@ -2419,3 +2419,112 @@ to the canonical Python constants.
 * Commit: `fix(inventory): final authorization serialization + DB hardening (Sprint 5.4.12)`
 * Local validation only — no push, no PR per sprint brief.
 
+
+
+---
+
+# Release 6.0.2 — Business Partners (COMPLETE — Option A extended)
+
+## Scope
+Vertical slice #1 of Release 6.0 (Purchase-to-Stock). Ships the
+Business Partner aggregate — model, capabilities, supplier profile,
+contacts — with the full API surface + Next.js UI, fully conforming
+to §4.1 of `docs/architecture/release-6.0-purchase-to-stock.md`
+(structured `primary_address` JSONB, partner-level `email`, `phone`,
+ISO 3166-1 alpha-2 `country_code`, `tax_identifier`, bounded
+`metadata` JSONB). Purchase Orders, Purchase Receipts, and the
+"active document" enforcement on capability removal remain OUT OF
+SCOPE (Release 6.0.3+).
+
+## Final commit history (6 commits on `feature/6.0.2-business-partners`)
+
+1. **`feat(partners): add Business Partner domain and migration`**
+   Models, frozen enums, repositories, migration `0011_business_partners`
+   with §4.1 columns (`primary_address JSONB`, `email`, `phone`,
+   `country_code CHAR(2)`, `tax_identifier`, `metadata JSONB`),
+   partial unique index for active-primary-contact-per-role,
+   organization-scoped code uniqueness across all lifecycle states.
+2. **`feat(partners): add Business Partner APIs and permissions`**
+   Pydantic schemas (`PartnerAddress` with `extra="forbid"` +
+   ISO-alpha-2 validator; bounded 4 KiB `metadata` with secret-keyword
+   rejection), service layer with server-controlled qualification
+   stamping, 17 REST endpoints, 4 frozen permissions
+   (`business_partner.{read,create,update,deactivate}`) wired into
+   §12 role grants, bounded audit metadata.
+3. **`feat(partners): add Business Partner web workflows`**
+   Typed API client (`apps/web/lib/business-partners.ts`), four
+   Next.js routes (`list / new / detail / edit`) — supplier-oriented
+   default (`capability=supplier` pre-selected), stable `bp-*`
+   `data-testid`s, permission-aware action buttons, generation-ref
+   stale-request guard on tenant switch.
+4. **`fix(partners): harden Business Partner persistence and portability`**
+   `btrim` → `trim` for portable CHECK constraints; eager
+   `selectinload(contacts)` on the list path; `session.refresh` after
+   mutation flush to reload `TimestampMixin.updated_at`; qualification
+   stamping on nested-create.
+5. **`test(partners): harden Business Partner coverage`**
+   **69** backend integration tests (29 baseline + 13 §4.1 conformance
+   + 19 iteration-9 adversarial + 8 iteration-10 adversarial) in
+   `apps/api/tests/test_business_partners.py`; **11** frontend Vitest
+   tests in `apps/web/tests/business-partners.test.tsx` (10 baseline
+   + 1 §4.1 create-payload assertion).
+6. **`docs(partners): document Business Partner workflows`**
+   Full workflow doc `docs/release_6.0/business-partners.md` with the
+   §4.1 field-conformance table, business-rule catalog, API surface,
+   permission matrix, audit taxonomy, UI conventions, out-of-scope
+   items. Independent testing-agent iteration reports checked in at
+   `test_reports/iteration_{9,10}.json`.
+
+## Validation summary (all green)
+
+| Gate | Result |
+| --- | --- |
+| Ruff (BP files) | clean |
+| Black (BP files) | clean |
+| Pytest hermetic (SQLite) — full suite | **340 passed, 77 skipped** |
+| Pytest hermetic — BP suite only | **69 passed** |
+| Pytest against real PostgreSQL 15 — full suite | **406 passed, 32 skipped** |
+| Pytest against real PostgreSQL 15 — BP suite only | **69 passed** |
+| Alembic upgrade to `0011_business_partners` on PG | ✓ |
+| Alembic downgrade `0011 → 0010` on PG (tables + enums removed) | ✓ |
+| Alembic re-upgrade to `0011_business_partners` on PG | ✓ |
+| Alembic single head check | `0011_business_partners` |
+| Permission seeding idempotency on PG | 4 codes after 2 seed runs |
+| Frontend Vitest (all files) | **253 passed** |
+| Frontend Vitest (BP file only) | **11 passed** |
+| Next.js lint | clean |
+| TypeScript `tsc --noEmit` | clean |
+| Next.js production build | successful, 4 BP routes prerender/dynamic |
+| Independent testing-agent verification (iteration 9) | 0 Critical / 0 High |
+| Independent testing-agent verification (iteration 10 — Option A) | 0 Critical / 0 High |
+| Architecture conformance (§4.1, §4.5, §11.1, §11.2, §12) | fully conformant |
+
+## Architecture conformance (§4.1 partner header)
+
+| Field | Impl | Notes |
+| --- | --- | --- |
+| `primary_address` | `JSONB` | Bounded shape `{line1, line2, city, region, postal_code, country_code}`, `extra="forbid"`, ISO α-2 for nested `country_code`. |
+| `email` | `VARCHAR(320)` | Partner-level convenience; does NOT replace multi-contact. |
+| `phone` | `VARCHAR(80)` | Partner-level convenience; whitespace stripped, empty → null. |
+| `country_code` | `CHAR(2)` | Uppercased at API, ISO α-2 regex; DB `CHECK` `length = 2` backstop. |
+| `tax_identifier` | `VARCHAR(80)` | Reference-only, no tax logic. |
+| `metadata` | `JSONB` (ORM attribute `metadata_json` shielding SQLAlchemy Declarative reserved name) | ≤ 4 KiB serialized; keys matching `password/secret/token/api_key/credential/authorization` rejected. |
+| Old flat `address_line_*`, `city`, `region`, `postal_code`, `country` | Removed | No compatibility shim; branch was never shipped. |
+
+## Push / PR status
+
+* **Local head SHA**: `e2b2b9c` (docs commit)
+* **Sandbox environment**: no GitHub credentials — `git push` returns
+  "could not read Username for 'https://github.com'".
+* **Deferred**: `git push -u origin feature/6.0.2-business-partners`,
+  Draft PR creation, CI observation, and ready-for-review flip
+  must be performed from an authenticated environment.
+
+## Pending (out of scope, upcoming releases)
+
+* **Release 6.0.3** — Purchase Orders + wire the "cannot remove
+  `supplier` capability while active non-terminal PO/Receipt exists"
+  enforcement into `BusinessPartnerService.remove_capability`.
+* **Release 6.0.4+** — Purchase Receipts, receipt → inventory
+  transaction bridge.
+
