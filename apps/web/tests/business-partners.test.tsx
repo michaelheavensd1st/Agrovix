@@ -431,4 +431,58 @@ describe('BusinessPartnerDetailPage', () => {
       expect(screen.getByTestId('bp-detail-error')).toHaveTextContent(/not found/i);
     });
   });
+
+  it('discards a stale response when the route partner id changes mid-flight', async () => {
+    // First mount: bp-1 slow, then remount for bp-2 fast → the bp-1
+    // response must be ignored so the header never flashes back.
+    const slow = new Promise<any>(() => {}); // never resolves
+    const fastPartner = makePartner({ id: 'bp-2', legal_name: 'Second Partner' });
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/business-partners/bp-1') return slow;
+      if (path === '/v1/business-partners/bp-2') return Promise.resolve(fastPartner);
+      return Promise.resolve(null);
+    });
+    useParamsMock.mockReturnValue({ partnerId: 'bp-1' });
+    const { rerender } = render(<BusinessPartnerDetailPage />);
+    // Switch route mid-flight.
+    useParamsMock.mockReturnValue({ partnerId: 'bp-2' });
+    rerender(<BusinessPartnerDetailPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Second Partner')).toBeInTheDocument();
+    });
+    // Even if the slow bp-1 response completed later it must not paint
+    // (this test doesn't resolve it, but the guard is what prevents it).
+    expect(screen.queryByText('Acme Feeds Ltd.')).toBeNull();
+  });
+
+  it('does not paint a stale 404 for a previous partner id', async () => {
+    const { ApiError } = await import('@/lib/api');
+    let firstReject: (err: any) => void = () => {};
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/business-partners/bp-1') {
+        return new Promise((_, reject) => {
+          firstReject = reject;
+        });
+      }
+      if (path === '/v1/business-partners/bp-2') {
+        return Promise.resolve(makePartner({ id: 'bp-2', legal_name: 'Second' }));
+      }
+      return Promise.resolve(null);
+    });
+    useParamsMock.mockReturnValue({ partnerId: 'bp-1' });
+    const { rerender } = render(<BusinessPartnerDetailPage />);
+    // Switch to bp-2 (which resolves).
+    useParamsMock.mockReturnValue({ partnerId: 'bp-2' });
+    rerender(<BusinessPartnerDetailPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Second')).toBeInTheDocument();
+    });
+    // Now the bp-1 promise rejects late — must NOT paint an error.
+    firstReject(new ApiError(404, { detail: 'stale' } as any));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByTestId('bp-detail-error')).toBeNull();
+    expect(screen.getByText('Second')).toBeInTheDocument();
+  });
 });

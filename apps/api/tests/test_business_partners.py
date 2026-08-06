@@ -22,6 +22,8 @@ Coverage per Phase 7 of the frozen implementation plan
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -44,6 +46,14 @@ pytestmark = pytest.mark.asyncio
 # --------------------------------------------------------------------- #
 # Fixtures / helpers
 # --------------------------------------------------------------------- #
+
+# Concurrency tests require real DB-level MVCC (Postgres).
+_postgres_only = pytest.mark.skipif(
+    "postgresql" not in os.environ.get("DATABASE_URL", ""),
+    reason="Requires real DB-level concurrency (Postgres); SQLite serializes writers.",
+)
+
+
 async def _new_owner_org(client: AsyncClient) -> dict:
     email = f"owner-{uuid4().hex[:8]}@agrovix.dev"
     await create_verified_user(email)
@@ -1454,13 +1464,15 @@ async def test_all_contact_role_enums_accepted(client: AsyncClient) -> None:
 
 
 # --- Migration architecture conformance -------------------------------- #
+_ALEMBIC_VERSIONS = Path(__file__).resolve().parent.parent / "alembic" / "versions"
+
+
 async def test_migration_revision_conformance() -> None:
     """0011_business_partners must exist with expected down_revision."""
     import re
-    from pathlib import Path
 
-    path = Path("/app/apps/api/alembic/versions/0011_business_partners.py")
-    assert path.exists(), "migration file missing"
+    path = _ALEMBIC_VERSIONS / "0011_business_partners.py"
+    assert path.exists(), f"migration file missing at {path}"
     src = path.read_text()
     m_rev = re.search(r"revision(?:\s*:\s*str)?\s*=\s*['\"]([^'\"]+)['\"]", src)
     m_down = re.search(r"down_revision(?:\s*:\s*[^=]+)?\s*=\s*['\"]([^'\"]+)['\"]", src)
@@ -1667,19 +1679,16 @@ async def test_declarative_base_metadata_intact() -> None:
 
 # --- Migration uses DB column name `metadata`, not `metadata_json` ----- #
 async def test_migration_uses_metadata_column_name() -> None:
-    from pathlib import Path
-
-    src = Path("/app/apps/api/alembic/versions/0011_business_partners.py").read_text()
+    src = (_ALEMBIC_VERSIONS / "0011_business_partners.py").read_text()
     # Positive: DB column literally named "metadata".
     assert 'sa.Column("metadata"' in src or "sa.Column('metadata'" in src
     # Negative: no flat address columns from the old shape.
     for banned in ("address_line_1", "address_line_2"):
         assert banned not in src, f"flat address column {banned} still in migration"
     # There is a single 0011_business_partners head; no 0011a / 0012 BP file.
-    versions_dir = Path("/app/apps/api/alembic/versions")
     bp_migrations = [
         p.name
-        for p in versions_dir.glob("*.py")
+        for p in _ALEMBIC_VERSIONS.glob("*.py")
         if "business_partner" in p.name.lower() or "business-partner" in p.name.lower()
     ]
     assert bp_migrations == ["0011_business_partners.py"], bp_migrations
@@ -1709,3 +1718,474 @@ async def test_metadata_rejects_non_dict(client: AsyncClient) -> None:
             },
         )
         assert r.status_code == 422, (bad, r.text)
+
+
+# ===================================================================== #
+# CODEX REVIEW REMEDIATION (PR #15, second-review prep)
+# ===================================================================== #
+async def _create_farm(client: AsyncClient, org_id: str) -> str:
+    return await create_farm(client, org_id, name="Test Farm")
+
+
+# --- Phase 1: farm-scoped reads must succeed for §12 "Scoped" roles ---- #
+@pytest.mark.parametrize("role_name", ["farm_manager", "supervisor", "storekeeper"])
+async def test_farm_scoped_role_can_read_org_partner(client: AsyncClient, role_name: str) -> None:
+    ctx = await _new_owner_org(client)
+    farm_id = await _create_farm(client, ctx["org_id"])
+    p = await _create_partner(client, ctx["org_id"], code=f"FSR-{role_name[:3].upper()}")
+    scoped = f"{role_name}-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(scoped)
+    await invite_and_accept(
+        client,
+        inviter_email=ctx["owner"],
+        invitee_email=scoped,
+        org_id=ctx["org_id"],
+        role_name=role_name,
+        farm_id=farm_id,
+    )
+    # Now client is switched to the scoped user.
+    r = await client.get(f"/api/v1/business-partners/{p['id']}")
+    assert r.status_code == 200, r.text
+    r = await client.get(f"/api/v1/organizations/{ctx['org_id']}/business-partners")
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.parametrize("role_name", ["farm_manager", "supervisor", "storekeeper"])
+async def test_farm_scoped_role_cannot_mutate_partner(client: AsyncClient, role_name: str) -> None:
+    ctx = await _new_owner_org(client)
+    farm_id = await _create_farm(client, ctx["org_id"])
+    p = await _create_partner(client, ctx["org_id"], code=f"FSM-{role_name[:3].upper()}")
+    scoped = f"{role_name}mut-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(scoped)
+    await invite_and_accept(
+        client,
+        inviter_email=ctx["owner"],
+        invitee_email=scoped,
+        org_id=ctx["org_id"],
+        role_name=role_name,
+        farm_id=farm_id,
+    )
+    # Create — must be 403 (no create grant).
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={"code": "NEW-FSM", "legal_name": "Nope", "capabilities": ["supplier"]},
+    )
+    assert r.status_code == 403
+    # Update — must be 403.
+    r = await client.patch(f"/api/v1/business-partners/{p['id']}", json={"trading_name": "hijack"})
+    assert r.status_code == 403
+    # Deactivate — must be 403.
+    r = await client.post(
+        f"/api/v1/business-partners/{p['id']}/deactivate",
+        json={"reason": "shouldnt work"},
+    )
+    assert r.status_code == 403
+
+
+async def test_scoped_read_stays_tenant_hidden_for_foreign_org(
+    client: AsyncClient,
+) -> None:
+    a = await _new_owner_org(client)
+    p = await _create_partner(client, a["org_id"], code="TSH-A")
+    # New user with a farm-scoped role in a DIFFERENT organization.
+    b = await _new_owner_org(client)
+    b_farm = await _create_farm(client, b["org_id"])
+    outsider = f"outsider-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(outsider)
+    await invite_and_accept(
+        client,
+        inviter_email=b["owner"],
+        invitee_email=outsider,
+        org_id=b["org_id"],
+        role_name="farm_manager",
+        farm_id=b_farm,
+    )
+    r = await client.get(f"/api/v1/business-partners/{p['id']}")
+    assert r.status_code == 404, r.text
+
+
+# --- Phase 2: audit completeness ----------------------------------------- #
+async def test_nested_contact_creation_emits_contact_create_audit(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    partner = await _create_partner(
+        client,
+        ctx["org_id"],
+        code="AUD-NCT",
+        capabilities=["supplier"],
+        contacts=[
+            {"name": "A", "contact_role": "accounts", "is_primary": True},
+            {"name": "B", "contact_role": "warehouse", "is_primary": False},
+            {"name": "C", "contact_role": "sales", "is_primary": True},
+        ],
+    )
+    assert len(partner["contacts"]) == 3
+    actions = await _audit_actions_for(ctx["org_id"])
+    contact_creates = [a for a in actions if a == "business_partner.contact.create"]
+    assert len(contact_creates) == 3, actions
+
+
+async def test_initial_approved_profile_emits_qualification_audit(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    await _create_partner(
+        client,
+        ctx["org_id"],
+        code="AUD-QIA",
+        capabilities=["supplier"],
+        supplier_profile={
+            "qualification_status": "approved",
+            "preference_tier": "preferred",
+        },
+    )
+    actions = await _audit_actions_for(ctx["org_id"])
+    assert "business_partner.qualification.update" in actions
+
+
+async def test_initial_unqualified_profile_does_not_emit_qualification_audit(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    await _create_partner(
+        client,
+        ctx["org_id"],
+        code="AUD-UNQ",
+        capabilities=["supplier"],
+        supplier_profile={
+            "qualification_status": "unqualified",
+            "preference_tier": "standard",
+        },
+    )
+    actions = await _audit_actions_for(ctx["org_id"])
+    assert "business_partner.qualification.update" not in actions
+
+
+async def test_qualification_update_records_bounded_old_and_new(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(
+        client,
+        ctx["org_id"],
+        code="AUD-QBN",
+        capabilities=["supplier"],
+        supplier_profile={
+            "qualification_status": "unqualified",
+            "preference_tier": "standard",
+        },
+    )
+    await client.put(
+        f"/api/v1/business-partners/{p['id']}/supplier-profile",
+        json={"qualification_status": "approved", "preference_tier": "preferred"},
+    )
+    async with _db.AsyncSessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(AuditEvent).where(
+                        AuditEvent.organization_id == uuid_from(ctx["org_id"]),
+                        AuditEvent.action == "business_partner.qualification.update",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows
+    for row in rows:
+        md = row.metadata_json or {}
+        assert md.get("old_qualification_status") is not None
+        assert md.get("new_qualification_status") == "approved"
+        assert "changed_fields" in md
+        # No PII / notes / addresses in audit metadata.
+        blob = str(md).lower()
+        for banned in ("note", "email", "phone", "address"):
+            assert banned not in blob, (banned, md)
+
+
+async def test_same_state_qualification_no_duplicate_audit(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(
+        client,
+        ctx["org_id"],
+        code="AUD-IDEM",
+        capabilities=["supplier"],
+        supplier_profile={
+            "qualification_status": "approved",
+            "preference_tier": "preferred",
+        },
+    )
+    # Same state PUT.
+    await client.put(
+        f"/api/v1/business-partners/{p['id']}/supplier-profile",
+        json={"qualification_status": "approved", "preference_tier": "preferred"},
+    )
+    async with _db.AsyncSessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(AuditEvent).where(
+                        AuditEvent.organization_id == uuid_from(ctx["org_id"]),
+                        AuditEvent.action == "business_partner.qualification.update",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    # Exactly ONE qualification event (from the initial approved create).
+    assert len(rows) == 1
+
+
+# --- Phase 4: ISO 3166-1 alpha-2 real-set validation --------------------- #
+async def test_country_code_ng_is_uppercased(client: AsyncClient) -> None:
+    ctx = await _new_owner_org(client)
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={
+            "code": "CC-NG",
+            "legal_name": "Nigeria",
+            "capabilities": ["supplier"],
+            "country_code": "ng",
+        },
+    )
+    assert r.status_code == 201
+    assert r.json()["country_code"] == "NG"
+
+
+@pytest.mark.parametrize("code", ["NG", "US", "IN", "GB", "ZA"])
+async def test_country_code_valid_iso_accepted(client: AsyncClient, code: str) -> None:
+    ctx = await _new_owner_org(client)
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={
+            "code": f"CC-{code}",
+            "legal_name": f"Country {code}",
+            "capabilities": ["supplier"],
+            "country_code": code,
+        },
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["country_code"] == code
+
+
+@pytest.mark.parametrize("bad", ["ZZ", "QQ", "XX", "ZY"])
+async def test_country_code_reserved_or_nonexistent_rejected(client: AsyncClient, bad: str) -> None:
+    ctx = await _new_owner_org(client)
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={
+            "code": f"CC-{bad}",
+            "legal_name": "Bad ISO",
+            "capabilities": ["supplier"],
+            "country_code": bad,
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+async def test_country_code_non_string_rejected(client: AsyncClient) -> None:
+    ctx = await _new_owner_org(client)
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={
+            "code": "CC-NUM",
+            "legal_name": "Numeric CC",
+            "capabilities": ["supplier"],
+            "country_code": 42,
+        },
+    )
+    assert r.status_code == 422
+
+
+async def test_country_code_null_accepted_optional(client: AsyncClient) -> None:
+    ctx = await _new_owner_org(client)
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={
+            "code": "CC-NULL",
+            "legal_name": "No Country",
+            "capabilities": ["supplier"],
+            "country_code": None,
+        },
+    )
+    assert r.status_code == 201
+    assert r.json()["country_code"] is None
+
+
+# --- Phase 5: nullable contact clearing --------------------------------- #
+async def test_contact_patch_can_clear_nullable_fields(client: AsyncClient) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(client, ctx["org_id"], code="CLR-01")
+    r = await client.post(
+        f"/api/v1/business-partners/{p['id']}/contacts",
+        json={
+            "name": "Alice",
+            "job_title": "Buyer",
+            "email": "alice@ex.example",
+            "phone": "+91 22 5555 0100",
+            "contact_role": "accounts",
+            "is_primary": True,
+            "notes": "some notes",
+        },
+    )
+    contact_id = r.json()["id"]
+    # Explicit null for each nullable → cleared.
+    r = await client.patch(
+        f"/api/v1/business-partner-contacts/{contact_id}",
+        json={"job_title": None, "email": None, "phone": None, "notes": None},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["job_title"] is None
+    assert body["email"] is None
+    assert body["phone"] is None
+    assert body["notes"] is None
+
+
+async def test_contact_patch_omitted_field_unchanged(client: AsyncClient) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(client, ctx["org_id"], code="CLR-OMT")
+    r = await client.post(
+        f"/api/v1/business-partners/{p['id']}/contacts",
+        json={
+            "name": "Bob",
+            "job_title": "Ops",
+            "contact_role": "warehouse",
+            "is_primary": True,
+        },
+    )
+    contact_id = r.json()["id"]
+    # PATCH only email — job_title must remain.
+    r = await client.patch(
+        f"/api/v1/business-partner-contacts/{contact_id}",
+        json={"email": "bob@ex.example"},
+    )
+    assert r.status_code == 200
+    assert r.json()["job_title"] == "Ops"
+    assert r.json()["email"] == "bob@ex.example"
+
+
+@pytest.mark.parametrize("field", ["name", "contact_role", "is_primary"])
+async def test_contact_patch_required_field_null_rejected(client: AsyncClient, field: str) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(client, ctx["org_id"], code=f"REQ-{field[:3]}")
+    r = await client.post(
+        f"/api/v1/business-partners/{p['id']}/contacts",
+        json={"name": "C", "contact_role": "sales", "is_primary": True},
+    )
+    contact_id = r.json()["id"]
+    r = await client.patch(
+        f"/api/v1/business-partner-contacts/{contact_id}",
+        json={field: None},
+    )
+    assert r.status_code == 422, r.text
+
+
+async def test_contact_patch_audit_records_changed_fields_no_pii(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(client, ctx["org_id"], code="AUD-CLR")
+    r = await client.post(
+        f"/api/v1/business-partners/{p['id']}/contacts",
+        json={
+            "name": "D",
+            "email": "d@ex.example",
+            "contact_role": "sales",
+            "is_primary": True,
+        },
+    )
+    contact_id = r.json()["id"]
+    await client.patch(
+        f"/api/v1/business-partner-contacts/{contact_id}",
+        json={"email": None},
+    )
+    async with _db.AsyncSessionLocal() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(AuditEvent).where(
+                        AuditEvent.organization_id == uuid_from(ctx["org_id"]),
+                        AuditEvent.action == "business_partner.contact.update",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert rows
+    blob = str([r.metadata_json for r in rows]).lower()
+    assert "d@ex.example" not in blob
+
+
+# --- Phase 6: concurrent-write IntegrityError → 409 --------------------- #
+@_postgres_only
+async def test_concurrent_duplicate_code_returns_deterministic_409(
+    client: AsyncClient,
+) -> None:
+    """Simulate a race where the pre-check passes but the flush loses.
+
+    The IntegrityError from the unique (organization_id, code) index
+    is translated into a stable 409 envelope rather than a 500.
+    """
+    import asyncio
+
+    ctx = await _new_owner_org(client)
+
+    # Both requests attempt the SAME code — one must win, one must lose.
+    async def _create() -> int:
+        r = await client.post(
+            f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+            json={
+                "code": "RACE-01",
+                "legal_name": "Racy",
+                "capabilities": ["supplier"],
+            },
+        )
+        return r.status_code
+
+    results = await asyncio.gather(_create(), _create(), return_exceptions=False)
+    assert sorted(results) == [201, 409], results
+
+
+@_postgres_only
+async def test_concurrent_duplicate_capability_returns_409(
+    client: AsyncClient,
+) -> None:
+    import asyncio
+
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(client, ctx["org_id"], code="RACE-CAP", capabilities=[])
+
+    async def _add() -> int:
+        r = await client.post(
+            f"/api/v1/business-partners/{p['id']}/capabilities",
+            json={"capability": "customer"},
+        )
+        return r.status_code
+
+    results = await asyncio.gather(_add(), _add(), return_exceptions=False)
+    # Both idempotent OK, or one 201 + one 409 — never a 500. The
+    # service pre-check may see both as "not present" concurrently and
+    # let the DB reject one.
+    assert all(s in (201, 409) for s in results), results
+
+
+# --- Phase 4: nested primary_address uses the real ISO set too --------- #
+async def test_primary_address_nested_iso_real_set(client: AsyncClient) -> None:
+    ctx = await _new_owner_org(client)
+    r = await client.post(
+        f"/api/v1/organizations/{ctx['org_id']}/business-partners",
+        json={
+            "code": "PACC-ZZ",
+            "legal_name": "Nested Bad ISO",
+            "capabilities": ["supplier"],
+            "primary_address": {"country_code": "ZZ"},
+        },
+    )
+    assert r.status_code == 422, r.text
