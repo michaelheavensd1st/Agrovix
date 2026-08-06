@@ -2528,3 +2528,72 @@ SCOPE (Release 6.0.3+).
 * **Release 6.0.4+** — Purchase Receipts, receipt → inventory
   transaction bridge.
 
+
+---
+
+## Release 6.0.2 — PR #15 Codex Review Fixes (2026-02-06)
+
+Independent Codex review on the initial 4-commit PR #15 branch surfaced 8
+merge-blocking findings. All 8 have been resolved in 3 focused fix commits
+on top of the existing branch history (no rewrites — review continuity
+preserved).
+
+### Fix commits added on top of PR #15
+
+| SHA | Subject | Files |
+| --- | --- | --- |
+| `73c6b1b` | fix(partners): correct scoped authorization and audit coverage | `authorize.py`, `deps.py`, `endpoints/business_partners.py`, `services/business_partner.py` (audit-only hunks) |
+| `9f3b77b` | fix(partners): harden validation, concurrency handling, and route guards | `core/country_codes.py` (new), `schemas/business_partner.py`, `services/business_partner.py` (409-map hunks), both web pages |
+| `ccd7f11` | test(partners): expand coverage and resolve CI issues | `test_business_partners.py` (+ CI-path fix), `business-partners.test.tsx` |
+
+### Codex findings resolution matrix
+
+| # | Finding | Resolution | Commit |
+| --- | --- | --- | --- |
+| 1 | Farm managers cannot read org-owned Business Partners | `require_permission(include_farm_grants_in_org=True)` on the 5 read paths; farm grants in the same org now grant read; mutations never widen. | `73c6b1b` |
+| 2 | Nested contact creation swallowed by parent audit | Each nested contact create emits its own `business_partner.contact.create`; initial non-`unqualified` supplier profile emits `business_partner.qualification.update` with full before/after. | `73c6b1b` |
+| 3 | Supplier-profile upsert audit missing before/after | `old_qualification_status`, `new_qualification_status`, `old_preference_tier`, `new_preference_tier`, `changed_fields` array; no-op same-state emits nothing. | `73c6b1b` |
+| 4 | `country_code` accepted arbitrary 2-char strings | New `app/core/country_codes.py` ISO 3166-1 α-2 registry; schema rejects non-uppercase, non-2-letter, and non-registered codes with 422. | `9f3b77b` |
+| 5 | PATCH could not clear nullable fields via explicit `null` | Contact update no longer guards `data[field] is not None` for nullable columns; explicit `null` persists as SQL NULL. | `9f3b77b` |
+| 6 | Concurrency race returned 500 instead of 409 | `_translate_integrity_errors` decorator + `_INTEGRITY_CONSTRAINT_MAP` translates known constraint hits (org+code, capability, primary-per-role, supplier profile) to stable 409 envelopes; unknown constraints re-raise. | `9f3b77b` |
+| 7 | Frontend detail/edit could render stale responses | Mount-ref + generation-counter guard (functionally equivalent to AbortController; also survives StrictMode double-mount). | `9f3b77b` |
+| 8 | Tests hardcoded `/app/...` paths → CI failure | Replaced with `Path(__file__).resolve().parent.parent`; suite portable to any workspace root. | `ccd7f11` |
+
+### Validation totals (2026-02-06)
+
+| Gate | Result |
+| --- | --- |
+| Ruff (all PR #15 files) | clean |
+| Black `--check` | clean |
+| Pytest hermetic SQLite — BP suite | **100 passed, 2 skipped** (2 postgres-only concurrency) |
+| Pytest against real PostgreSQL 15 — BP suite | **102 passed, 0 skipped** |
+| Pytest against real PostgreSQL 15 — full API suite | **433 passed, 9 skipped** (skips unrelated to PR #15) |
+| Alembic fresh upgrade to `0011_business_partners` on PG | ✓ |
+| Alembic `0011 → 0010` downgrade — tables + enums removed | ✓ |
+| Alembic re-upgrade to `0011_business_partners` on PG | ✓ |
+| Alembic single head | `0011_business_partners` |
+| Permission seeding idempotency on PG (3 consecutive runs) | 4 `business_partner.*` codes stable |
+| Frontend Vitest — full suite | **255 passed** |
+| Frontend Vitest — BP file only | **13 passed** (2 new stale-guard tests + 11 baseline) |
+| ESLint (`next lint`) | clean |
+| TypeScript (`tsc --noEmit`) | clean |
+| Next.js production build | successful; 4 BP routes prerender/dynamic |
+| Independent `testing_agent_v3_fork` (iteration 11) | **0 Critical / 0 High / 0 Medium**; retest_needed=false |
+
+### PR / push status
+
+- Branch: `feature/6.0.2-business-partners`
+- Local tip commit: `ccd7f11` (PR #15 fixes) — auto-commit `a96daf2` on top is test-artifact only (test_reports + system_deps)
+- **Not pushed** per user instruction and sandbox lacking GitHub credentials
+- Keep PR in Draft until push + CI green + second Codex review
+
+### Non-blocking observations from testing agent (iteration 11)
+
+1. Stale-response guard uses mount-ref + generation-counter (behaviorally equivalent to AbortController). Functional; not a bug.
+2. Concurrency tests exercise IntegrityError→409 translator on in-process asyncio.gather, not true network parallelism. Unit-level guarantee holds.
+3. `test_concurrent_duplicate_capability_returns_409` accepts both {201,409} and {201,201} outcomes (documented — pre-check race semantics).
+
+### Pending upcoming releases (unchanged)
+
+- **Release 6.0.3** — Purchase Orders + wire "cannot remove `supplier` capability while active non-terminal PO/Receipt exists" enforcement into `BusinessPartnerService.remove_capability`.
+- **Release 6.0.4+** — Purchase Receipts, receipt → inventory transaction bridge.
