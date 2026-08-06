@@ -133,8 +133,18 @@ async def resolve_permissions(
     *,
     organization_id: uuid.UUID | None = None,
     farm_id: uuid.UUID | None = None,
+    include_farm_grants_in_org: bool = False,
 ) -> set[str]:
-    """Return the set of permission codes the user has for the given scope."""
+    """Return the set of permission codes the user has for the given scope.
+
+    When ``include_farm_grants_in_org`` is True and ``organization_id`` is
+    provided (with ``farm_id`` unset), farm-scoped assignments belonging to
+    the same organization also contribute their grants. This models the
+    §12 "Scoped" read entries for organization-owned resources such as
+    Business Partners: a user with a farm-scoped ``business_partner.read``
+    grant may read the org-owned partner aggregate. Mutations remain
+    strictly org-scoped (no widening).
+    """
     if not user.is_active:
         return set()
 
@@ -163,8 +173,18 @@ async def resolve_permissions(
                 codes.update(p.code for p in a.role.permissions)
             continue
         # Farm-scoped assignments apply when the request targets that
-        # exact farm.
+        # exact farm, OR — for narrowly-marked read paths — when the
+        # request is org-scoped and the assignment lives inside that
+        # same organization (see include_farm_grants_in_org).
         if farm_id is not None and a.farm_id == farm_id:
+            codes.update(p.code for p in a.role.permissions)
+            continue
+        if (
+            include_farm_grants_in_org
+            and farm_id is None
+            and organization_id is not None
+            and a.organization_id == organization_id
+        ):
             codes.update(p.code for p in a.role.permissions)
 
     return codes

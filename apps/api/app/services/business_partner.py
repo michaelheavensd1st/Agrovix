@@ -172,11 +172,12 @@ class BusinessPartnerService:
                     "supplier_profile requires the supplier capability.",
                 )
             new_qual = profile_input["qualification_status"]
+            new_pref = profile_input["preference_tier"]
             await self.profile_repo.create(
                 business_partner_id=partner.id,
                 qualification_status=new_qual,
                 qualification_note=profile_input.get("qualification_note"),
-                preference_tier=profile_input["preference_tier"],
+                preference_tier=new_pref,
                 qualified_by_id=(
                     actor.id if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED else None
                 ),
@@ -184,6 +185,26 @@ class BusinessPartnerService:
                     _now() if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED else None
                 ),
             )
+            # Explicit governance event whenever the initial state is
+            # NOT the default "unqualified". Preference tier is always
+            # captured as an initial-state before/after for consistency
+            # with the update path.
+            if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED:
+                await self._audit(
+                    actor=actor,
+                    action="business_partner.qualification.update",
+                    partner=partner,
+                    request_ctx=request_ctx,
+                    metadata={
+                        "old_qualification_status": (
+                            BusinessPartnerQualificationStatus.UNQUALIFIED.value
+                        ),
+                        "new_qualification_status": new_qual.value,
+                        "old_preference_tier": None,
+                        "new_preference_tier": new_pref.value,
+                        "changed_fields": ["qualification_status", "preference_tier"],
+                    },
+                )
 
         for contact_input in data.get("contacts") or []:
             await self._create_contact_inner(
@@ -191,7 +212,7 @@ class BusinessPartnerService:
                 data=contact_input,
                 actor=actor,
                 request_ctx=request_ctx,
-                audit=False,  # rolled into the partner.create audit event
+                audit=True,  # per §4.5 each contact creation is its own event
             )
 
         await self._audit(
@@ -392,7 +413,11 @@ class BusinessPartnerService:
         new_note = data.get("qualification_note")
 
         qualification_changed = profile is None or profile.qualification_status != new_qual
+        old_qual_value: str | None = None
+        old_pref_value: str | None = None
         if profile is None:
+            old_qual_value = BusinessPartnerQualificationStatus.UNQUALIFIED.value
+            old_pref_value = None
             profile = await self.profile_repo.create(
                 business_partner_id=partner.id,
                 qualification_status=new_qual,
@@ -407,6 +432,8 @@ class BusinessPartnerService:
             )
         else:
             old_qual = profile.qualification_status
+            old_qual_value = profile.qualification_status.value
+            old_pref_value = profile.preference_tier.value
             profile.qualification_status = new_qual
             profile.qualification_note = new_note
             profile.preference_tier = new_pref
@@ -423,18 +450,24 @@ class BusinessPartnerService:
             await self.profile_repo.session.refresh(profile)
 
         if qualification_changed:
+            changed = ["qualification_status"]
+            if old_pref_value != new_pref.value:
+                changed.append("preference_tier")
             await self._audit(
                 actor=actor,
                 action="business_partner.qualification.update",
                 partner=partner,
                 request_ctx=request_ctx,
                 metadata={
-                    "qualification_status": new_qual.value,
-                    "preference_tier": new_pref.value,
+                    "old_qualification_status": old_qual_value,
+                    "new_qualification_status": new_qual.value,
+                    "old_preference_tier": old_pref_value,
+                    "new_preference_tier": new_pref.value,
+                    "changed_fields": changed,
                 },
             )
-        else:
-            # Preference / note change only.
+        elif old_pref_value != new_pref.value:
+            # Preference-only change (qualification unchanged).
             await self._audit(
                 actor=actor,
                 action="business_partner.update",
@@ -442,9 +475,12 @@ class BusinessPartnerService:
                 request_ctx=request_ctx,
                 metadata={
                     "supplier_profile": True,
-                    "preference_tier": new_pref.value,
+                    "old_preference_tier": old_pref_value,
+                    "new_preference_tier": new_pref.value,
+                    "changed_fields": ["preference_tier"],
                 },
             )
+        # No-op same-state upsert emits no audit (idempotent).
         return profile
 
     # ------------------------------------------------------------- #

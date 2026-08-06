@@ -73,7 +73,9 @@ ServiceDep = Annotated[BusinessPartnerService, Depends(_get_service)]
 @router.get(
     "/organizations/{organization_id}/business-partners",
     response_model=CursorPage,
-    dependencies=[Depends(require_permission("business_partner.read"))],
+    dependencies=[
+        Depends(require_permission("business_partner.read", include_farm_grants_in_org=True))
+    ],
     tags=["business-partners"],
 )
 async def list_business_partners(
@@ -178,7 +180,7 @@ async def get_business_partner(
 ) -> BusinessPartnerPublic:
     partner, org_id = await _load_partner_for_read(partner_id, user, service)
     # Enforce permission using the loaded org id.
-    await require_permission("business_partner.read")(
+    await require_permission("business_partner.read", include_farm_grants_in_org=True)(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
     partner = await service.load_for_tenant(
@@ -287,7 +289,7 @@ async def list_capabilities(
     service: ServiceDep,
 ) -> list[BusinessPartnerCapabilityPublic]:
     _partner, org_id = await _load_partner_for_read(partner_id, user, service)
-    await require_permission("business_partner.read")(
+    await require_permission("business_partner.read", include_farm_grants_in_org=True)(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
     partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
@@ -366,7 +368,7 @@ async def get_supplier_profile(
     service: ServiceDep,
 ) -> BusinessPartnerSupplierProfilePublic:
     _partner, org_id = await _load_partner_for_read(partner_id, user, service)
-    await require_permission("business_partner.read")(
+    await require_permission("business_partner.read", include_farm_grants_in_org=True)(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
     partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
@@ -428,7 +430,7 @@ async def list_contacts(
     limit: int = Query(default=50, ge=1, le=200),
 ) -> CursorPage:
     _partner, org_id = await _load_partner_for_read(partner_id, user, service)
-    await require_permission("business_partner.read")(
+    await require_permission("business_partner.read", include_farm_grants_in_org=True)(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
     partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
@@ -499,7 +501,7 @@ async def get_contact(
     service: ServiceDep,
 ) -> BusinessPartnerContactPublic:
     contact, partner = await _load_contact_and_partner(contact_id, user, service)
-    await require_permission("business_partner.read")(
+    await require_permission("business_partner.read", include_farm_grants_in_org=True)(
         user=user,
         session=session,
         organization_id=partner.organization_id,

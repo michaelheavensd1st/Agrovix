@@ -323,7 +323,7 @@ CurrentFarm = Annotated[Farm, Depends(get_current_farm)]
 # --------------------------------------------------------------------- #
 # Permission dependencies (permission-driven, never role-name based)
 # --------------------------------------------------------------------- #
-def require_permission(code: str):
+def require_permission(code: str, *, include_farm_grants_in_org: bool = False):
     """Permission-check dependency factory.
 
     Ordering invariant (do NOT reverse this in a refactor):
@@ -332,6 +332,11 @@ def require_permission(code: str):
     than 403 (permission-denied). Distinguishing those responses would
     leak the existence of resources in another tenant to outsiders —
     see ``tests/test_cross_tenant.py`` for the acceptance shape.
+
+    ``include_farm_grants_in_org`` widens the effective permission set
+    for narrowly-marked read paths against org-owned resources (§12
+    Business Partner "Scoped" reads). Farm-scoped assignments in the
+    same organization are included; mutations never widen.
     """
 
     async def _dep(
@@ -345,11 +350,15 @@ def require_permission(code: str):
         # that "org exists but you have no perm" is indistinguishable
         # from "org does not exist" for outsiders.
         if organization_id is not None and not user.is_superuser:
-            from sqlalchemy import select
+            from sqlalchemy import or_, select
 
-            from app.models.membership import OrganizationMembership
+            from app.models.farm import Farm
+            from app.models.membership import (
+                FarmMembership,
+                OrganizationMembership,
+            )
 
-            membership = (
+            org_membership = (
                 await session.execute(
                     select(OrganizationMembership).where(
                         OrganizationMembership.user_id == user.id,
@@ -359,11 +368,39 @@ def require_permission(code: str):
                     )
                 )
             ).scalar_one_or_none()
-            if membership is None:
+            has_any_membership = org_membership is not None
+            if not has_any_membership and include_farm_grants_in_org:
+                # A user without a direct organization membership may
+                # still hold farm-scoped grants inside the same org.
+                # We treat that as "in-tenant" for the tenant-hidden
+                # check ONLY on paths that opted in via
+                # ``include_farm_grants_in_org``. See §12 partner reads.
+                farm_membership = (
+                    await session.execute(
+                        select(FarmMembership.id)
+                        .join(Farm, Farm.id == FarmMembership.farm_id)
+                        .where(
+                            FarmMembership.user_id == user.id,
+                            FarmMembership.is_active.is_(True),
+                            FarmMembership.deleted_at.is_(None),
+                            Farm.organization_id == organization_id,
+                            Farm.deleted_at.is_(None),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                has_any_membership = farm_membership is not None
+                # Suppress unused-variable warning on or_ import.
+                _ = or_
+            if not has_any_membership:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Organization not found.")
 
         codes = await resolve_permissions(
-            session, user, organization_id=organization_id, farm_id=farm_id
+            session,
+            user,
+            organization_id=organization_id,
+            farm_id=farm_id,
+            include_farm_grants_in_org=include_farm_grants_in_org,
         )
         if not has_permission(codes, code):
             raise HTTPException(
