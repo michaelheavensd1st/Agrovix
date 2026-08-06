@@ -197,9 +197,7 @@ class BusinessPartnerSupplierProfileWriteRequest(BaseModel):
         BusinessPartnerQualificationStatus.UNQUALIFIED
     )
     qualification_note: str | None = Field(default=None, max_length=2000)
-    preference_tier: BusinessPartnerPreferenceTier = (
-        BusinessPartnerPreferenceTier.STANDARD
-    )
+    preference_tier: BusinessPartnerPreferenceTier = BusinessPartnerPreferenceTier.STANDARD
 
 
 class BusinessPartnerCreateRequest(BaseModel):
@@ -226,9 +224,7 @@ class BusinessPartnerCreateRequest(BaseModel):
     def _normalise_code(cls, v: str) -> str:
         v = v.strip().upper()
         if not _CODE_RE.match(v):
-            raise ValueError(
-                "code must match ^[A-Z0-9][A-Z0-9._-]{0,63}$."
-            )
+            raise ValueError("code must match ^[A-Z0-9][A-Z0-9._-]{0,63}$.")
         return v
 
     @field_validator("legal_name")

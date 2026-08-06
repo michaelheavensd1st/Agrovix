@@ -137,9 +137,7 @@ class BusinessPartner(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    deactivated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deactivation_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     organization: Mapped[Organization] = relationship("Organization")
@@ -164,14 +162,10 @@ class BusinessPartner(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         # §4.2 — code is unique within an organization ACROSS all
         # lifecycle states. Codes are NEVER recycled for another
         # legal entity.
-        UniqueConstraint(
-            "organization_id", "code", name="uq_business_partner_org_code"
-        ),
+        UniqueConstraint("organization_id", "code", name="uq_business_partner_org_code"),
+        CheckConstraint("length(trim(code)) > 0", name="ck_business_partner_code_non_empty"),
         CheckConstraint(
-            "length(btrim(code)) > 0", name="ck_business_partner_code_non_empty"
-        ),
-        CheckConstraint(
-            "length(btrim(legal_name)) > 0",
+            "length(trim(legal_name)) > 0",
             name="ck_business_partner_legal_name_non_empty",
         ),
         # ISO 3166-1 alpha-2 length enforced at the DB layer; the
@@ -255,9 +249,7 @@ class BusinessPartnerSupplierProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
-    qualified_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    qualified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     preference_tier: Mapped[BusinessPartnerPreferenceTier] = mapped_column(
         SQLEnum(
             BusinessPartnerPreferenceTier,
@@ -274,9 +266,7 @@ class BusinessPartnerSupplierProfile(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     qualified_by: Mapped[User | None] = relationship("User")
 
     __table_args__ = (
-        UniqueConstraint(
-            "business_partner_id", name="uq_business_partner_supplier_profile"
-        ),
+        UniqueConstraint("business_partner_id", name="uq_business_partner_supplier_profile"),
     )
 
 
@@ -315,16 +305,14 @@ class BusinessPartnerContact(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
-    deactivated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deactivation_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     business_partner: Mapped[BusinessPartner] = relationship(back_populates="contacts")
 
     __table_args__ = (
         CheckConstraint(
-            "length(btrim(name)) > 0", name="ck_business_partner_contact_name_non_empty"
+            "length(trim(name)) > 0", name="ck_business_partner_contact_name_non_empty"
         ),
         Index(
             "ix_business_partner_contact_partner_active_name_id",

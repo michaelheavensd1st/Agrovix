@@ -241,10 +241,10 @@ def upgrade() -> None:
             "organization_id", "code", name="uq_business_partner_org_code"
         ),
         sa.CheckConstraint(
-            "length(btrim(code)) > 0", name="ck_business_partner_code_non_empty"
+            "length(trim(code)) > 0", name="ck_business_partner_code_non_empty"
         ),
         sa.CheckConstraint(
-            "length(btrim(legal_name)) > 0",
+            "length(trim(legal_name)) > 0",
             name="ck_business_partner_legal_name_non_empty",
         ),
         sa.CheckConstraint(
@@ -394,7 +394,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.CheckConstraint(
-            "length(btrim(name)) > 0",
+            "length(trim(name)) > 0",
             name="ck_business_partner_contact_name_non_empty",
         ),
     )

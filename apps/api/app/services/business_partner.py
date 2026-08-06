@@ -52,9 +52,7 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _error(
-    code: str, message: str, *, context: dict | None = None
-) -> HTTPException:
+def _error(code: str, message: str, *, context: dict | None = None) -> HTTPException:
     """Frozen error envelope — §11.1."""
     return HTTPException(
         status.HTTP_409_CONFLICT,
@@ -106,9 +104,7 @@ class BusinessPartnerService:
         expected_org_id: uuid.UUID,
         with_relations: bool = False,
     ) -> BusinessPartner:
-        partner = await self.partner_repo.get_by_id(
-            partner_id, with_relations=with_relations
-        )
+        partner = await self.partner_repo.get_by_id(partner_id, with_relations=with_relations)
         if partner is None or partner.organization_id != expected_org_id:
             raise _tenant_hidden()
         if partner.deleted_at is not None and not actor.is_superuser:
@@ -134,9 +130,7 @@ class BusinessPartnerService:
         # Per-org code uniqueness — deterministic pre-check produces
         # the frozen error envelope; the UNIQUE constraint at the DB
         # is the ultimate authority against a race.
-        existing = await self.partner_repo.get_by_org_and_code(
-            organization_id, code
-        )
+        existing = await self.partner_repo.get_by_org_and_code(organization_id, code)
         if existing is not None:
             raise _error(
                 "business_partner_code_conflict",
@@ -164,9 +158,7 @@ class BusinessPartnerService:
             header_fields["metadata_json"] = data.get("metadata")
         partner = await self.partner_repo.create(organization_id=organization_id, **header_fields)
 
-        capabilities: list[BusinessPartnerCapabilityCode] = list(
-            data.get("capabilities") or []
-        )
+        capabilities: list[BusinessPartnerCapabilityCode] = list(data.get("capabilities") or [])
         # Deduplicate; deterministic ordering.
         capabilities = sorted(set(capabilities), key=lambda c: c.value)
         for cap in capabilities:
@@ -179,13 +171,18 @@ class BusinessPartnerService:
                     "supplier_profile_requires_supplier_capability",
                     "supplier_profile requires the supplier capability.",
                 )
+            new_qual = profile_input["qualification_status"]
             await self.profile_repo.create(
                 business_partner_id=partner.id,
-                qualification_status=profile_input[
-                    "qualification_status"
-                ],
+                qualification_status=new_qual,
                 qualification_note=profile_input.get("qualification_note"),
                 preference_tier=profile_input["preference_tier"],
+                qualified_by_id=(
+                    actor.id if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED else None
+                ),
+                qualified_at=(
+                    _now() if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED else None
+                ),
             )
 
         for contact_input in data.get("contacts") or []:
@@ -244,9 +241,7 @@ class BusinessPartnerService:
             return partner
         # Non-empty invariant on legal_name — schema already stripped
         # blanks, but PATCH may pass an all-whitespace value.
-        if "legal_name" in changed_fields and not (
-            (data["legal_name"] or "").strip()
-        ):
+        if "legal_name" in changed_fields and not ((data["legal_name"] or "").strip()):
             raise _error(
                 "business_partner_legal_name_blank",
                 "legal_name must not be blank.",
@@ -392,12 +387,8 @@ class BusinessPartnerService:
                 "supplier_profile requires the supplier capability.",
             )
         profile = await self.profile_repo.get_for_partner(partner.id)
-        new_qual = data.get(
-            "qualification_status", BusinessPartnerQualificationStatus.UNQUALIFIED
-        )
-        new_pref = data.get(
-            "preference_tier", BusinessPartnerPreferenceTier.STANDARD
-        )
+        new_qual = data.get("qualification_status", BusinessPartnerQualificationStatus.UNQUALIFIED)
+        new_pref = data.get("preference_tier", BusinessPartnerPreferenceTier.STANDARD)
         new_note = data.get("qualification_note")
 
         qualification_changed = profile is None or profile.qualification_status != new_qual
@@ -407,12 +398,12 @@ class BusinessPartnerService:
                 qualification_status=new_qual,
                 qualification_note=new_note,
                 preference_tier=new_pref,
-                qualified_by_id=actor.id
-                if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED
-                else None,
-                qualified_at=_now()
-                if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED
-                else None,
+                qualified_by_id=(
+                    actor.id if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED else None
+                ),
+                qualified_at=(
+                    _now() if new_qual != BusinessPartnerQualificationStatus.UNQUALIFIED else None
+                ),
             )
         else:
             old_qual = profile.qualification_status
@@ -429,6 +420,7 @@ class BusinessPartnerService:
             _ = old_qual
             self.profile_repo.session.add(profile)
             await self.profile_repo.session.flush()
+            await self.profile_repo.session.refresh(profile)
 
         if qualification_changed:
             await self._audit(
@@ -532,12 +524,8 @@ class BusinessPartnerService:
         # If is_primary is being turned on, check the invariant.
         target_role = data.get("contact_role", contact.contact_role)
         target_primary = data.get("is_primary", contact.is_primary)
-        if target_primary and (
-            not contact.is_primary or target_role != contact.contact_role
-        ):
-            existing = await self.contact_repo.list_active_primary_for_role(
-                partner.id, target_role
-            )
+        if target_primary and (not contact.is_primary or target_role != contact.contact_role):
+            existing = await self.contact_repo.list_active_primary_for_role(partner.id, target_role)
             existing = [e for e in existing if e.id != contact.id]
             if existing:
                 raise _error(
@@ -554,17 +542,14 @@ class BusinessPartnerService:
             "is_primary",
             "notes",
         ):
-            if (
-                field in data
-                and data[field] is not None
-                and getattr(contact, field) != data[field]
-            ):
+            if field in data and data[field] is not None and getattr(contact, field) != data[field]:
                 changed[field] = data[field]
                 setattr(contact, field, data[field])
         if not changed:
             return contact
         self.contact_repo.session.add(contact)
         await self.contact_repo.session.flush()
+        await self.contact_repo.session.refresh(contact)
         await self._audit(
             actor=actor,
             action="business_partner.contact.update",
@@ -595,6 +580,7 @@ class BusinessPartnerService:
         contact.deactivation_reason = reason
         self.contact_repo.session.add(contact)
         await self.contact_repo.session.flush()
+        await self.contact_repo.session.refresh(contact)
         await self._audit(
             actor=actor,
             action="business_partner.contact.deactivate",
@@ -638,6 +624,7 @@ class BusinessPartnerService:
         contact.deactivation_reason = None
         self.contact_repo.session.add(contact)
         await self.contact_repo.session.flush()
+        await self.contact_repo.session.refresh(contact)
         await self._audit(
             actor=actor,
             action="business_partner.contact.restore",

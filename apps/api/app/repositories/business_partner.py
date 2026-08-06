@@ -137,42 +137,33 @@ class BusinessPartnerRepository:
         Returns ``(rows, next_cursor)`` where ``next_cursor`` is
         ``None`` when the caller has reached the last page.
         """
-        base = select(BusinessPartner).where(
-            BusinessPartner.organization_id == organization_id
-        )
+        base = select(BusinessPartner).where(BusinessPartner.organization_id == organization_id)
         if not include_deleted:
             base = base.where(BusinessPartner.deleted_at.is_(None))
         if active is not None:
             base = base.where(BusinessPartner.is_active.is_(active))
         if capability is not None:
             base = base.where(
-                BusinessPartner.capabilities.any(
-                    BusinessPartnerCapability.capability == capability
-                )
+                BusinessPartner.capabilities.any(BusinessPartnerCapability.capability == capability)
             )
         if qualification is not None or preference is not None:
             base = base.join(
                 BusinessPartnerSupplierProfile,
-                BusinessPartnerSupplierProfile.business_partner_id
-                == BusinessPartner.id,
+                BusinessPartnerSupplierProfile.business_partner_id == BusinessPartner.id,
             )
             if qualification is not None:
                 base = base.where(
                     BusinessPartnerSupplierProfile.qualification_status == qualification
                 )
             if preference is not None:
-                base = base.where(
-                    BusinessPartnerSupplierProfile.preference_tier == preference
-                )
+                base = base.where(BusinessPartnerSupplierProfile.preference_tier == preference)
         if search:
             like = f"%{search.lower()}%"
             base = base.where(
                 or_(
                     func.lower(BusinessPartner.code).like(like),
                     func.lower(BusinessPartner.legal_name).like(like),
-                    func.lower(func.coalesce(BusinessPartner.trading_name, "")).like(
-                        like
-                    ),
+                    func.lower(func.coalesce(BusinessPartner.trading_name, "")).like(like),
                 )
             )
         if cursor:
@@ -192,6 +183,7 @@ class BusinessPartnerRepository:
             .options(
                 selectinload(BusinessPartner.capabilities),
                 selectinload(BusinessPartner.supplier_profile),
+                selectinload(BusinessPartner.contacts),
             )
         )
         rows = list((await self.session.execute(stmt)).scalars().unique())
@@ -210,9 +202,7 @@ class BusinessPartnerCapabilityRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def list_for_partner(
-        self, partner_id: uuid.UUID
-    ) -> list[BusinessPartnerCapability]:
+    async def list_for_partner(self, partner_id: uuid.UUID) -> list[BusinessPartnerCapability]:
         stmt = (
             select(BusinessPartnerCapability)
             .where(BusinessPartnerCapability.business_partner_id == partner_id)
@@ -232,9 +222,7 @@ class BusinessPartnerCapabilityRepository:
     async def add(
         self, partner_id: uuid.UUID, capability: BusinessPartnerCapabilityCode
     ) -> BusinessPartnerCapability:
-        row = BusinessPartnerCapability(
-            business_partner_id=partner_id, capability=capability
-        )
+        row = BusinessPartnerCapability(business_partner_id=partner_id, capability=capability)
         self.session.add(row)
         await self.session.flush()
         return row
@@ -248,17 +236,13 @@ class BusinessPartnerSupplierProfileRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def get_for_partner(
-        self, partner_id: uuid.UUID
-    ) -> BusinessPartnerSupplierProfile | None:
+    async def get_for_partner(self, partner_id: uuid.UUID) -> BusinessPartnerSupplierProfile | None:
         stmt = select(BusinessPartnerSupplierProfile).where(
             BusinessPartnerSupplierProfile.business_partner_id == partner_id
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
-    async def create(
-        self, **kwargs
-    ) -> BusinessPartnerSupplierProfile:
+    async def create(self, **kwargs) -> BusinessPartnerSupplierProfile:
         row = BusinessPartnerSupplierProfile(**kwargs)
         self.session.add(row)
         await self.session.flush()
@@ -269,12 +253,8 @@ class BusinessPartnerContactRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def get_by_id(
-        self, contact_id: uuid.UUID
-    ) -> BusinessPartnerContact | None:
-        stmt = select(BusinessPartnerContact).where(
-            BusinessPartnerContact.id == contact_id
-        )
+    async def get_by_id(self, contact_id: uuid.UUID) -> BusinessPartnerContact | None:
+        stmt = select(BusinessPartnerContact).where(BusinessPartnerContact.id == contact_id)
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def create(self, **kwargs) -> BusinessPartnerContact:

@@ -155,9 +155,7 @@ async def _load_partner_for_read(
     ``require_permission`` factory is invoked via the router
     dependency below for the FastAPI-native path.
     """
-    partner = await service.partner_repo.get_by_id(
-        partner_id, with_relations=False
-    )
+    partner = await service.partner_repo.get_by_id(partner_id, with_relations=False)
     if partner is None:
         # Tenant-hidden — do not tell the caller anything.
         raise HTTPException(
@@ -206,9 +204,7 @@ async def update_business_partner(
     await require_permission("business_partner.update")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     await service.update_header(
         actor=user,
         partner=partner,
@@ -236,9 +232,7 @@ async def deactivate_business_partner(
     await require_permission("business_partner.deactivate")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     await service.deactivate(
         actor=user, partner=partner, reason=payload.reason, request_ctx=request_ctx
     )
@@ -296,9 +290,7 @@ async def list_capabilities(
     await require_permission("business_partner.read")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     rows = await service.capability_repo.list_for_partner(partner.id)
     return [BusinessPartnerCapabilityPublic.model_validate(r) for r in rows]
 
@@ -321,9 +313,7 @@ async def add_capability(
     await require_permission("business_partner.update")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     row = await service.add_capability(
         actor=user,
         partner=partner,
@@ -351,9 +341,7 @@ async def remove_capability(
     await require_permission("business_partner.update")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     await service.remove_capability(
         actor=user,
         partner=partner,
@@ -381,9 +369,7 @@ async def get_supplier_profile(
     await require_permission("business_partner.read")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     profile = await service.profile_repo.get_for_partner(partner.id)
     if profile is None:
         raise HTTPException(
@@ -414,9 +400,7 @@ async def put_supplier_profile(
     await require_permission("business_partner.update")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     profile = await service.upsert_supplier_profile(
         actor=user,
         partner=partner,
@@ -447,9 +431,7 @@ async def list_contacts(
     await require_permission("business_partner.read")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     rows, next_cursor = await service.contact_repo.list_page(
         partner.id,
         include_inactive=include_inactive,
@@ -480,9 +462,7 @@ async def create_contact(
     await require_permission("business_partner.update")(
         user=user, session=session, organization_id=org_id, farm_id=None
     )
-    partner = await service.load_for_tenant(
-        partner_id, actor=user, expected_org_id=org_id
-    )
+    partner = await service.load_for_tenant(partner_id, actor=user, expected_org_id=org_id)
     row = await service.create_contact(
         actor=user, partner=partner, data=payload.model_dump(), request_ctx=request_ctx
     )
