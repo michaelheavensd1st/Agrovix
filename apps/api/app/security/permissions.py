@@ -86,6 +86,14 @@ ALL_PERMISSIONS: tuple[PermissionDef, ...] = (
         "inventory_transaction.create",
         "Post ledger transactions (receipt/issue/transfer/adjustment/reversal)",
     ),
+    # --- Release 6.0.2 — Business Partners ------------------------- #
+    PermissionDef("business_partner.read", "Read Business Partners"),
+    PermissionDef("business_partner.create", "Create Business Partners"),
+    PermissionDef("business_partner.update", "Update Business Partners"),
+    PermissionDef(
+        "business_partner.deactivate",
+        "Deactivate or restore Business Partners",
+    ),
 )
 
 
@@ -154,6 +162,11 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_lot.update",
             "inventory_transaction.read",
             "inventory_transaction.create",
+            # Release 6.0.2 — full partner authority.
+            "business_partner.read",
+            "business_partner.create",
+            "business_partner.update",
+            "business_partner.deactivate",
         ),
     ),
     RoleDef(
@@ -193,6 +206,11 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_lot.update",
             "inventory_transaction.read",
             "inventory_transaction.create",
+            # Release 6.0.2 — directors can create + update partners
+            # but NOT deactivate (owner-only per §12).
+            "business_partner.read",
+            "business_partner.create",
+            "business_partner.update",
         ),
     ),
     RoleDef(
@@ -224,6 +242,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_lot.create",
             "inventory_transaction.read",
             "inventory_transaction.create",
+            # Release 6.0.2 — read-only on partners.
+            "business_partner.read",
         ),
     ),
     RoleDef(
@@ -243,6 +263,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_item.read",
             "inventory_lot.read",
             "inventory_transaction.read",
+            # Release 6.0.2 — read-only on partners.
+            "business_partner.read",
         ),
     ),
     RoleDef(
@@ -265,6 +287,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_lot.update",
             "inventory_transaction.read",
             "inventory_transaction.create",
+            # Release 6.0.2 — read-only on partners.
+            "business_partner.read",
         ),
     ),
     RoleDef(
@@ -300,6 +324,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_item.read",
             "inventory_lot.read",
             "inventory_transaction.read",
+            # Release 6.0.2 — accountants can read partners.
+            "business_partner.read",
         ),
     ),
     RoleDef(
@@ -332,6 +358,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_item.read",
             "inventory_lot.read",
             "inventory_transaction.read",
+            # Release 6.0.2 — viewers can read partners.
+            "business_partner.read",
         ),
     ),
 )

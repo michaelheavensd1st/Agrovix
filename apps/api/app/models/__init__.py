@@ -2,6 +2,16 @@
 
 from app.db.base import Base
 from app.models.audit import AuditEvent
+from app.models.business_partner import (
+    BusinessPartner,
+    BusinessPartnerCapability,
+    BusinessPartnerCapabilityCode,
+    BusinessPartnerContact,
+    BusinessPartnerContactRole,
+    BusinessPartnerPreferenceTier,
+    BusinessPartnerQualificationStatus,
+    BusinessPartnerSupplierProfile,
+)
 from app.models.farm import Farm
 from app.models.inventory import (
     InventoryItem,
@@ -37,6 +47,14 @@ from app.models.verification import EmailVerificationToken
 __all__ = [
     "AuditEvent",
     "Base",
+    "BusinessPartner",
+    "BusinessPartnerCapability",
+    "BusinessPartnerCapabilityCode",
+    "BusinessPartnerContact",
+    "BusinessPartnerContactRole",
+    "BusinessPartnerPreferenceTier",
+    "BusinessPartnerQualificationStatus",
+    "BusinessPartnerSupplierProfile",
     "EmailVerificationToken",
     "Farm",
     "FarmMembership",
