@@ -263,7 +263,6 @@ ISO_3166_1_ALPHA_2: frozenset[str] = frozenset(
         "VU",
         "WF",
         "WS",
-        "XK",
         "YE",
         "YT",
         "ZA",
