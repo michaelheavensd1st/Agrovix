@@ -1,7 +1,18 @@
 # Release 6.0.3 — Purchase Orders — Phase 1 Draft PR Report
 
-**Status:** Ready for review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
+**Status:** Sprint 1.1 remediation applied — ready for a 2nd independent review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
 **Contract:** `docs/release_6.0/purchase-orders.md` (frozen 6.0.3) · **Base:** `0011_business_partners`
+
+> **Sprint 1.1 addendum (domain hardening / review remediation).** The independent
+> Milestone-1 review returned BLOCK (4 High / 6 Medium / 3 Low). All findings are now
+> remediated — transactional governance locking, in-transaction authorization revalidation,
+> full submission rebuild, stable line identity (UUID-preserving add/update/reorder/remove),
+> exact 6-dp decimals, delivery-address + ISO-3166 + bounded-string validation, dual
+> received-accumulator cancel guard, richer repository filters + transition pagination, and an
+> expanded PostgreSQL concurrency matrix. Gate: ruff/black clean, **SQLite 441 passed**,
+> **PostgreSQL 502 passed**, alembic round-trip clean (head `0012`), seed OK. Details:
+> `docs/release_6.0/purchase-orders-sprint-1.1-remediation-report.md`. Migration `0012` is
+> unchanged. **Milestone 2 not started.**
 
 ---
 
