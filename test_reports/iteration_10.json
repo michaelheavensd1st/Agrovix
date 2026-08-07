@@ -1,0 +1,42 @@
+{
+  "summary": "Second independent verification pass on Release 6.0.2 Business Partners — Option A schema extension (primary_address JSONB, partner-level email/phone/country_code/tax_identifier, bounded metadata JSONB, flat address columns fully removed). Ran the full BP test suite (61 baseline tests, includes the 13 new §4.1 tests + the 19 adversarial tests from iteration 9) — all 61 GREEN on SQLite. Added 8 new adversarial tests targeting the specific §4.1 review checkpoints not yet covered: PATCH extra_field rejection, phone whitespace/empty normalization, audit-metadata PII leak on the four new PATCH fields, DB-level contact-row independence from header email, Declarative Base.metadata reserved-name shielding, migration DB column name = 'metadata' (not 'metadata_json'), null primary_address rendering, metadata non-dict rejection. All 8 new tests pass. Ran the full backend suite: 361 passed, 77 postgres-only skipped, 0 failures. Frontend Vitest suite (business-partners.test.tsx): 11/11 pass. No regressions; every §4.1 conformance point in the review checklist is now verified in code.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/apps/api/tests/test_business_partners.py",
+    "/app/test_reports/pytest/bp_iter10.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "PartnerAddress uses ConfigDict(extra='forbid') AND per-field ISO validator — frozen key set + ISO alpha-2 both enforced. Verified.",
+    "BusinessPartnerUpdateRequest has extra='forbid'; BusinessPartnerCreateRequest does NOT (documented behavior; PATCH is the strict surface).",
+    "_METADATA_FORBIDDEN_KEYS is a SUPERSET of the review's list (adds 'secret', 'token', 'credential') — stricter than required, all four review-mandated keys still rejected (verified case-insensitive substring match).",
+    "ORM attribute BusinessPartner.metadata_json is correctly mapped to DB column 'metadata' via mapped_column('metadata', ...). Base.metadata still resolves to the SQLAlchemy MetaData registry — reserved-name collision successfully shielded (new test asserts this explicitly).",
+    "CHECK constraint 'ck_business_partner_country_code_len2' enforces length=2 at DB layer; the Python regex additionally enforces uppercase alpha at API layer. Two-layer defense verified.",
+    "Migration 0011_business_partners is a single BP migration file with column 'metadata' (JSONB); no 0011a / 0012 BP file exists; no residual address_line_1 / address_line_2 columns anywhere in the DDL.",
+    "BusinessPartnerPublic uses validation_alias='metadata_json' + serialization_alias='metadata' — the ORM/API boundary correctly translates the shielded attribute name back to the wire name 'metadata'.",
+    "Phone whitespace stripping AND empty→null coercion are wired via mode='before' on both Create and Update schemas.",
+    "PATCH audit-metadata records only field names (not values) for email/phone/tax_identifier/metadata — no PII leak on the four new §4.1 fields. Verified by decoding the audit row's metadata_json blob.",
+    "Contact rows persist independently from header email: verified at DB level via direct BusinessPartnerContact SELECT (3 rows in DB, header email present only on the partner row)."
+  ],
+  "updated_files": [
+    "/app/apps/api/tests/test_business_partners.py (added 8 §4.1-specific adversarial tests at bottom under the iteration-10 banner; total 69 BP tests, all passing)"
+  ],
+  "success_rate": {
+    "backend": "100% (69/69 BP tests, 361/361 full-suite non-skipped)",
+    "frontend": "100% (11/11 Vitest tests in business-partners.test.tsx)"
+  },
+  "test_credentials": "N/A — pytest fixtures create verified users via tests._helpers with DEFAULT_PW 'Sprint0ne!2026'.",
+  "seed_data_creation": "None — each test spins up its own owner+org+partners in the hermetic SQLite session.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "69 BP tests live in /app/apps/api/tests/test_business_partners.py: 29 original + 13 §4.1 conformance + 19 iteration-9 adversarial + 8 iteration-10 adversarial. Suite is fast (~40s on SQLite). Frontend Vitest is untouched — 11 baseline tests. When Purchase Orders (6.0.3) lands, the frozen-permissions test WILL fail — that's intentional; extend the allowed permission set at that time. Nothing to fix; Option A schema extension is fully conformant to §4.1 as verified.",
+  "rca of the issue": "No bug found. All 6 §4.1 requirements pass: (a) no residual flat-address columns anywhere (model, migration, API response); (b) metadata→metadata_json shielding leaves Base.metadata intact and audit rows still write; (c) no invalid country_code bypass — API rejects 3-letter/numeric/punctuation at both partner and address levels, DB CHECK enforces length=2 as backstop; (d) metadata bounds enforced (>4 KiB → 422, forbidden secret substrings → 422, non-dict → 422); (e) frontend routes render new fields with matching bp-* testids and 11 Vitest tests green."
+}

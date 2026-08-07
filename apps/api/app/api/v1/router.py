@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints import (
     audit,
     auth,
+    business_partners,
     farms,
     health,
     inventory,
@@ -29,3 +30,4 @@ api_v1_router.include_router(role_assignments.router, tags=["role-assignments"])
 api_v1_router.include_router(audit.router, tags=["audit"])
 api_v1_router.include_router(production.router, tags=["production"])
 api_v1_router.include_router(inventory.router, tags=["inventory"])
+api_v1_router.include_router(business_partners.router, tags=["business-partners"])

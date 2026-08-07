@@ -85,12 +85,12 @@ async def resolve_permission_scopes(
             ).scalars()
         )
 
-    active_farm_ids: set[uuid.UUID] = set()
+    active_farm_organizations: dict[uuid.UUID, uuid.UUID] = {}
     if farm_ids:
-        active_farm_ids = set(
+        active_farm_organizations = dict(
             (
                 await session.execute(
-                    select(FarmMembership.farm_id)
+                    select(FarmMembership.farm_id, Farm.organization_id)
                     .join(Farm, Farm.id == FarmMembership.farm_id)
                     .where(
                         FarmMembership.user_id == user.id,
@@ -102,7 +102,7 @@ async def resolve_permission_scopes(
                         Farm.organization_id.in_(active_organization_ids),
                     )
                 )
-            ).scalars()
+            ).all()
         )
 
     grouped: dict[tuple[uuid.UUID | None, uuid.UUID | None], set[str]] = {}
@@ -111,8 +111,10 @@ async def resolve_permission_scopes(
         farm_id = assignment.farm_id
         if organization_id is not None and organization_id not in active_organization_ids:
             continue
-        if farm_id is not None and farm_id not in active_farm_ids:
-            continue
+        if farm_id is not None:
+            farm_organization_id = active_farm_organizations.get(farm_id)
+            if farm_organization_id is None or farm_organization_id != organization_id:
+                continue
         key = (organization_id, farm_id)
         grouped.setdefault(key, set()).update(
             permission.code for permission in assignment.role.permissions
@@ -133,8 +135,18 @@ async def resolve_permissions(
     *,
     organization_id: uuid.UUID | None = None,
     farm_id: uuid.UUID | None = None,
+    include_farm_grants_in_org: bool = False,
 ) -> set[str]:
-    """Return the set of permission codes the user has for the given scope."""
+    """Return the set of permission codes the user has for the given scope.
+
+    When ``include_farm_grants_in_org`` is True and ``organization_id`` is
+    provided (with ``farm_id`` unset), farm-scoped assignments belonging to
+    the same organization also contribute their grants. This models the
+    §12 "Scoped" read entries for organization-owned resources such as
+    Business Partners: a user with a farm-scoped ``business_partner.read``
+    grant may read the org-owned partner aggregate. Mutations remain
+    strictly org-scoped (no widening).
+    """
     if not user.is_active:
         return set()
 
@@ -142,30 +154,42 @@ async def resolve_permissions(
         # Convention: superusers implicitly hold every permission.
         return {"platform.admin", "*"}
 
+    codes: set[str] = set()
+    if include_farm_grants_in_org:
+        # The Business Partner read-widening path must use canonical active
+        # scopes so a stale farm assignment cannot become an org-wide grant.
+        # Other permission paths retain their established lifecycle behavior;
+        # their resource services perform the relevant locked status checks.
+        scopes = await resolve_permission_scopes(session, user)
+        for scope in scopes:
+            applies = (
+                (scope.organization_id is None and scope.farm_id is None)
+                or (scope.farm_id is None and scope.organization_id == organization_id)
+                or (farm_id is not None and scope.farm_id == farm_id)
+                or (
+                    farm_id is None
+                    and organization_id is not None
+                    and scope.organization_id == organization_id
+                )
+            )
+            if applies:
+                codes.update(scope.permissions)
+        return codes
+
     stmt = (
         select(RoleAssignment)
         .where(RoleAssignment.user_id == user.id, RoleAssignment.revoked_at.is_(None))
         .options(selectinload(RoleAssignment.role).selectinload(Role.permissions))
     )
-    result = await session.execute(stmt)
-    assignments = result.scalars().all()
-
-    codes: set[str] = set()
-    for a in assignments:
-        # Platform-scoped assignments always apply.
-        if a.organization_id is None and a.farm_id is None:
-            codes.update(p.code for p in a.role.permissions)
-            continue
-        # Organization-scoped assignments apply when the request is
-        # within (or scoped to) that organization.
-        if a.farm_id is None:
-            if organization_id is None or a.organization_id == organization_id:
-                codes.update(p.code for p in a.role.permissions)
-            continue
-        # Farm-scoped assignments apply when the request targets that
-        # exact farm.
-        if farm_id is not None and a.farm_id == farm_id:
-            codes.update(p.code for p in a.role.permissions)
+    assignments = (await session.execute(stmt)).scalars().all()
+    for assignment in assignments:
+        if assignment.organization_id is None and assignment.farm_id is None:
+            codes.update(permission.code for permission in assignment.role.permissions)
+        elif assignment.farm_id is None:
+            if organization_id is None or assignment.organization_id == organization_id:
+                codes.update(permission.code for permission in assignment.role.permissions)
+        elif farm_id is not None and assignment.farm_id == farm_id:
+            codes.update(permission.code for permission in assignment.role.permissions)
 
     return codes
 
