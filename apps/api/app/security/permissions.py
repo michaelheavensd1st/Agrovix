@@ -94,6 +94,14 @@ ALL_PERMISSIONS: tuple[PermissionDef, ...] = (
         "business_partner.deactivate",
         "Deactivate or restore Business Partners",
     ),
+    # --- Release 6.0.3 — Purchase Orders --------------------------- #
+    PermissionDef("purchase_order.read", "Read Purchase Orders"),
+    PermissionDef("purchase_order.create", "Create Purchase Orders"),
+    PermissionDef("purchase_order.update", "Update draft Purchase Orders"),
+    PermissionDef("purchase_order.submit", "Submit Purchase Orders for approval"),
+    PermissionDef("purchase_order.approve", "Approve submitted Purchase Orders"),
+    PermissionDef("purchase_order.reject", "Reject submitted Purchase Orders"),
+    PermissionDef("purchase_order.cancel", "Cancel Purchase Orders"),
 )
 
 
@@ -167,6 +175,14 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "business_partner.create",
             "business_partner.update",
             "business_partner.deactivate",
+            # Release 6.0.3 — full Purchase Order authority.
+            "purchase_order.read",
+            "purchase_order.create",
+            "purchase_order.update",
+            "purchase_order.submit",
+            "purchase_order.approve",
+            "purchase_order.reject",
+            "purchase_order.cancel",
         ),
     ),
     RoleDef(
@@ -211,6 +227,14 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "business_partner.read",
             "business_partner.create",
             "business_partner.update",
+            # Release 6.0.3 — directors have full PO authority (§6).
+            "purchase_order.read",
+            "purchase_order.create",
+            "purchase_order.update",
+            "purchase_order.submit",
+            "purchase_order.approve",
+            "purchase_order.reject",
+            "purchase_order.cancel",
         ),
     ),
     RoleDef(
@@ -244,6 +268,11 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_transaction.create",
             # Release 6.0.2 — read-only on partners.
             "business_partner.read",
+            # Release 6.0.3 — farm managers create/submit within scope (§6).
+            "purchase_order.read",
+            "purchase_order.create",
+            "purchase_order.update",
+            "purchase_order.submit",
         ),
     ),
     RoleDef(
@@ -265,6 +294,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_transaction.read",
             # Release 6.0.2 — read-only on partners.
             "business_partner.read",
+            "purchase_order.read",
         ),
     ),
     RoleDef(
@@ -289,6 +319,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_transaction.create",
             # Release 6.0.2 — read-only on partners.
             "business_partner.read",
+            "purchase_order.read",
         ),
     ),
     RoleDef(
@@ -326,6 +357,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_transaction.read",
             # Release 6.0.2 — accountants can read partners.
             "business_partner.read",
+            "purchase_order.read",
         ),
     ),
     RoleDef(
@@ -360,6 +392,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "inventory_transaction.read",
             # Release 6.0.2 — viewers can read partners.
             "business_partner.read",
+            "purchase_order.read",
         ),
     ),
 )

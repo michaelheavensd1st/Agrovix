@@ -38,6 +38,15 @@ from app.models.production import (
     ProductionUnitStatus,
     ProductionUnitType,
 )
+from app.models.purchase_order import (
+    NON_TERMINAL_STATUSES,
+    REACHABLE_STATUSES,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    PurchaseOrderSequence,
+    PurchaseOrderStatus,
+    PurchaseOrderTransition,
+)
 from app.models.refresh_token import RefreshToken
 from app.models.role import Permission, Role, RoleScope, role_permissions_table
 from app.models.role_assignment import RoleAssignment
@@ -45,6 +54,8 @@ from app.models.user import User
 from app.models.verification import EmailVerificationToken
 
 __all__ = [
+    "NON_TERMINAL_STATUSES",
+    "REACHABLE_STATUSES",
     "AuditEvent",
     "Base",
     "BusinessPartner",
@@ -77,6 +88,11 @@ __all__ = [
     "ProductionUnit",
     "ProductionUnitStatus",
     "ProductionUnitType",
+    "PurchaseOrder",
+    "PurchaseOrderLine",
+    "PurchaseOrderSequence",
+    "PurchaseOrderStatus",
+    "PurchaseOrderTransition",
     "RefreshToken",
     "Role",
     "RoleAssignment",
