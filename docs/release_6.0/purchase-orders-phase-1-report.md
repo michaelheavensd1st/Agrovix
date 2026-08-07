@@ -1,6 +1,6 @@
 # Release 6.0.3 — Purchase Orders — Phase 1 Draft PR Report
 
-**Status:** Sprint 1.1 remediation applied — ready for a 2nd independent review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
+**Status:** Sprint 1.2 remediation applied — ready for a 3rd independent review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
 **Contract:** `docs/release_6.0/purchase-orders.md` (frozen 6.0.3) · **Base:** `0011_business_partners`
 
 > **Sprint 1.1 addendum (domain hardening / review remediation).** The independent
@@ -13,6 +13,17 @@
 > **PostgreSQL 502 passed**, alembic round-trip clean (head `0012`), seed OK. Details:
 > `docs/release_6.0/purchase-orders-sprint-1.1-remediation-report.md`. Migration `0012` is
 > unchanged. **Milestone 2 not started.**
+
+> **Sprint 1.2 addendum (transactional governance / concurrency hardening).** The second
+> independent review returned BLOCK (2 High / 4 Medium / 2 Low). Sprint 1.2 places supplier
+> qualification and active authorization rows inside the PO lock domain, unions current and
+> requested draft dependencies before locking, uses wide-context Decimal result arithmetic,
+> translates only the PO-number unique constraint, and adds direct repository/audit plus expanded
+> PostgreSQL race coverage. Migration `0012` remains byte-identical. Local Ruff, Black, collection,
+> Alembic-head/round-trip, seed, decimal-boundary, scope, whitespace, full SQLite (**447 passed / 105
+> skipped**), full PostgreSQL (**520 passed / 32 skipped**), and repeated PO concurrency checks all
+> pass. Details:
+> `docs/release_6.0/purchase-orders-sprint-1.2-remediation-report.md`. **Milestone 2 not started.**
 
 ---
 
