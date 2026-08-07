@@ -2528,3 +2528,33 @@ SCOPE (Release 6.0.3+).
 * **Release 6.0.4+** — Purchase Receipts, receipt → inventory
   transaction bridge.
 
+
+---
+
+## Release 6.0.3 — Purchase Orders — Phase 1 (Backend domain) — 2026-06
+
+**Scope built (domain only; NO endpoints/frontend):** Alembic migration `0012_purchase_orders`
+(status enum + 4 tables + permission/grant seeding, reversible downgrade); domain models
+(`PurchaseOrder`, `PurchaseOrderLine`, `PurchaseOrderSequence`, `PurchaseOrderTransition`);
+repositories (org/year number allocation, `SELECT … FOR UPDATE`, scoped cursor paging);
+service (full state machine, optimistic `version`, snapshot freeze, supplier governance,
+independent-approval invariant, append-only transitions + replay idempotency, bounded audit,
+exact decimals + canonical unit conversion); 7 PO permissions + role grants; ISO 4217 validator;
+Business-Partner supplier-capability-removal guard.
+
+**Files:** `app/models/purchase_order.py`, `app/repositories/purchase_order.py`,
+`app/services/purchase_order.py`, `app/core/currency_codes.py`,
+`alembic/versions/0012_purchase_orders.py`, edits to `app/security/permissions.py`,
+`app/services/business_partner.py`, `app/models/__init__.py`;
+tests `tests/test_purchase_orders.py` (26) + `tests/test_purchase_orders_concurrency.py` (6).
+
+**Gate:** ruff + black clean; SQLite suite 424 passed; PostgreSQL suite 478 passed / 32 skipped;
+alembic upgrade→downgrade→upgrade round-trip clean (head `0012`); seed OK.
+
+**Out of scope (deferred to later 6.0.3 phases / 6.0.4):** REST endpoints, request/response
+schemas, frontend routes, Purchase Receipts, inventory mutations, warehouse receiving, AP,
+payments. See `docs/release_6.0/purchase-orders-phase-1-report.md`.
+
+**Next:** Phase 2 — API layer (permission deps + tenant scope, Pydantic schemas, idempotency
+header, cursor pagination wiring). Awaiting review before starting.
+
