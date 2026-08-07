@@ -44,6 +44,7 @@ from app.repositories.purchase_order import (
     PurchaseOrderRepository,
     PurchaseOrderSequenceRepository,
     PurchaseOrderTransitionRepository,
+    _clamp_limit,
 )
 from app.services.business_partner import BusinessPartnerService
 from app.services.purchase_order import PurchaseOrderService
@@ -429,6 +430,89 @@ async def test_update_noop_keeps_version(db_session):
         data={"notes": None},
     )
     assert result.version == 1
+
+
+@pytest.mark.parametrize("mutation_kind", ["header", "line"])
+async def test_update_revalidates_inactive_current_farm(db_session, mutation_kind):
+    env = await _seed_env(db_session)
+    po = await _create_draft(db_session, env, farm_id=env["farm"].id)
+    po_id = po.id
+    env["farm"].is_active = False
+    await db_session.commit()
+    data = {"notes": "must not persist"}
+    if mutation_kind == "line":
+        line = po.lines[0]
+        data = {"lines": [_line(env["feed"].id, qty="2", id=line.id)]}
+
+    with pytest.raises(Exception) as exc:
+        await _po_service(db_session).update_draft(
+            actor=env["creator"],
+            organization_id=env["org"].id,
+            po_id=po_id,
+            expected_version=1,
+            data=data,
+        )
+    assert exc.value.status_code == 404
+    assert exc.value.detail["code"] == "not_found"
+    await db_session.rollback()
+    current = await PurchaseOrderRepository(db_session).get_by_id(po_id)
+    assert current.status == PurchaseOrderStatus.DRAFT
+    assert current.version == 1
+    assert current.notes is None
+    assert Decimal(str(current.lines[0].ordered_quantity)) == Decimal("10.000000")
+    assert await PurchaseOrderTransitionRepository(db_session).count_for_po(po_id) == 1
+
+
+async def test_update_active_current_farm_and_change_to_valid_farm(db_session):
+    env = await _seed_env(db_session)
+    po = await _create_draft(db_session, env, farm_id=env["farm"].id)
+    farm_b = Farm(
+        organization_id=env["org"].id,
+        name="Farm B",
+        code=f"FB-{uuid4().hex[:6]}",
+        is_active=True,
+    )
+    db_session.add(farm_b)
+    await db_session.flush()
+
+    updated = await _po_service(db_session).update_draft(
+        actor=env["creator"],
+        organization_id=env["org"].id,
+        po_id=po.id,
+        expected_version=1,
+        data={"notes": "active farm update", "farm_id": farm_b.id},
+    )
+    await db_session.commit()
+    assert updated.version == 2
+    assert updated.notes == "active farm update"
+    assert updated.farm_id == farm_b.id
+
+
+async def test_update_to_foreign_farm_is_tenant_hidden(db_session):
+    env = await _seed_env(db_session)
+    po = await _create_draft(db_session, env, farm_id=env["farm"].id)
+    foreign_org = Organization(name="Foreign", slug=f"foreign-{uuid4().hex[:10]}")
+    db_session.add(foreign_org)
+    await db_session.flush()
+    foreign_farm = Farm(
+        organization_id=foreign_org.id,
+        name="Foreign Farm",
+        code=f"FF-{uuid4().hex[:6]}",
+        is_active=True,
+    )
+    db_session.add(foreign_farm)
+    await db_session.flush()
+
+    with pytest.raises(Exception) as exc:
+        await _po_service(db_session).update_draft(
+            actor=env["creator"],
+            organization_id=env["org"].id,
+            po_id=po.id,
+            expected_version=1,
+            data={"farm_id": foreign_farm.id},
+        )
+    assert exc.value.status_code == 404
+    assert exc.value.detail["code"] == "not_found"
 
 
 async def test_line_edit_preserves_uuid(db_session):
@@ -1005,6 +1089,18 @@ async def test_repository_filters_cursor_limit_and_transition_pagination(db_sess
     page2, final_cursor = await transitions.page_for_po(po2.id, limit=1, cursor=transition_cursor)
     assert len(page1) == len(page2) == 1
     assert page1[0].id != page2[0].id and final_cursor is None
+
+
+async def test_repository_limit_normalization_and_hard_ceiling():
+    assert _clamp_limit(None) == 50
+    assert _clamp_limit(0) == 1
+    assert _clamp_limit(-100) == 1
+    assert _clamp_limit(1) == 1
+    assert _clamp_limit("25") == 25
+    assert _clamp_limit(MAX_PAGE_LIMIT) == MAX_PAGE_LIMIT
+    assert _clamp_limit(MAX_PAGE_LIMIT + 1) == MAX_PAGE_LIMIT
+    with pytest.raises((TypeError, ValueError)):
+        _clamp_limit("not-a-limit")
 
 
 # ===================================================================== #
