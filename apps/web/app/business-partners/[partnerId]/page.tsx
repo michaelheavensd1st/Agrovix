@@ -51,6 +51,13 @@ export default function BusinessPartnerDetailPage() {
   // and a partner-identity capture; a response that returns after the
   // route id changed or after unmount is discarded.
   const genRef = useRef(0);
+  const mutationRef = useRef(0);
+  const currentPartnerIdRef = useRef(partnerId);
+  if (currentPartnerIdRef.current !== partnerId) {
+    currentPartnerIdRef.current = partnerId;
+    genRef.current += 1;
+    mutationRef.current += 1;
+  }
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -64,6 +71,7 @@ export default function BusinessPartnerDetailPage() {
   useEffect(() => {
     setPartner(null);
     setError(null);
+    setBusy(false);
   }, [partnerId]);
 
   const refresh = useCallback(async () => {
@@ -73,11 +81,21 @@ export default function BusinessPartnerDetailPage() {
     try {
       setLoading(true);
       const p = await getBusinessPartner(capturedId);
-      if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
+      if (
+        !mountedRef.current ||
+        gen !== genRef.current ||
+        capturedId !== currentPartnerIdRef.current
+      )
+        return;
       setPartner(p);
       setError(null);
     } catch (err) {
-      if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
+      if (
+        !mountedRef.current ||
+        gen !== genRef.current ||
+        capturedId !== currentPartnerIdRef.current
+      )
+        return;
       if (err instanceof ApiError && err.status === 404) {
         setError('Business Partner not found.');
       } else if (err instanceof ApiError && err.status === 403) {
@@ -89,6 +107,18 @@ export default function BusinessPartnerDetailPage() {
       if (mountedRef.current && gen === genRef.current) setLoading(false);
     }
   }, [partnerId]);
+
+  function beginMutation(targetPartnerId: string) {
+    return { token: ++mutationRef.current, partnerId: targetPartnerId };
+  }
+
+  function mutationIsCurrent(mutation: { token: number; partnerId: string }) {
+    return (
+      mountedRef.current &&
+      mutation.token === mutationRef.current &&
+      mutation.partnerId === currentPartnerIdRef.current
+    );
+  }
 
   useEffect(() => {
     void (async () => {
@@ -116,14 +146,18 @@ export default function BusinessPartnerDetailPage() {
     if (!partner) return;
     const reason = window.prompt('Reason for deactivation:');
     if (!reason || !reason.trim()) return;
+    const mutation = beginMutation(partner.id);
     setBusy(true);
     try {
       await deactivateBusinessPartner(partner.id, reason.trim());
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to deactivate.');
+      if (mutationIsCurrent(mutation)) {
+        alert(err instanceof Error ? err.message : 'Failed to deactivate.');
+      }
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
@@ -131,41 +165,52 @@ export default function BusinessPartnerDetailPage() {
     if (!partner) return;
     const reason = window.prompt('Reason for restore:');
     if (!reason || !reason.trim()) return;
+    const mutation = beginMutation(partner.id);
     setBusy(true);
     try {
       await restoreBusinessPartner(partner.id, reason.trim());
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to restore.');
+      if (mutationIsCurrent(mutation))
+        alert(err instanceof Error ? err.message : 'Failed to restore.');
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
   async function onAddCapability(cap: BusinessPartnerCapabilityCode) {
     if (!partner) return;
+    const mutation = beginMutation(partner.id);
     setBusy(true);
     try {
       await addCapability(partner.id, cap);
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to add capability.');
+      if (mutationIsCurrent(mutation)) {
+        alert(err instanceof Error ? err.message : 'Failed to add capability.');
+      }
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
   async function onRemoveCapability(cap: BusinessPartnerCapabilityCode) {
     if (!partner) return;
     if (!window.confirm(`Remove ${CAPABILITY_LABELS[cap]}?`)) return;
+    const mutation = beginMutation(partner.id);
     setBusy(true);
     try {
       await removeCapability(partner.id, cap);
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to remove capability.');
+      if (mutationIsCurrent(mutation)) {
+        alert(err instanceof Error ? err.message : 'Failed to remove capability.');
+      }
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
@@ -175,6 +220,7 @@ export default function BusinessPartnerDetailPage() {
     note: string,
   ) {
     if (!partner) return;
+    const mutation = beginMutation(partner.id);
     setBusy(true);
     try {
       await putSupplierProfile(partner.id, {
@@ -182,11 +228,14 @@ export default function BusinessPartnerDetailPage() {
         qualification_note: note || null,
         preference_tier: pref,
       });
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to save profile.');
+      if (mutationIsCurrent(mutation)) {
+        alert(err instanceof Error ? err.message : 'Failed to save profile.');
+      }
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
@@ -198,6 +247,7 @@ export default function BusinessPartnerDetailPage() {
     isPrimary: boolean;
   }) {
     if (!partner) return;
+    const mutation = beginMutation(partner.id);
     setBusy(true);
     try {
       await createContact(partner.id, {
@@ -207,39 +257,46 @@ export default function BusinessPartnerDetailPage() {
         phone: fields.phone || null,
         is_primary: fields.isPrimary,
       });
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to add contact.');
+      if (mutationIsCurrent(mutation)) {
+        alert(err instanceof Error ? err.message : 'Failed to add contact.');
+      }
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
   async function onDeactivateContact(contactId: string) {
     const reason = window.prompt('Reason:');
     if (!reason || !reason.trim()) return;
+    const mutation = beginMutation(partner?.id ?? '');
     setBusy(true);
     try {
       await deactivateContact(contactId, reason.trim());
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed.');
+      if (mutationIsCurrent(mutation)) alert(err instanceof Error ? err.message : 'Failed.');
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 
   async function onRestoreContact(contactId: string) {
     const reason = window.prompt('Reason:');
     if (!reason || !reason.trim()) return;
+    const mutation = beginMutation(partner?.id ?? '');
     setBusy(true);
     try {
       await restoreContact(contactId, reason.trim());
+      if (!mutationIsCurrent(mutation)) return;
       await refresh();
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed.');
+      if (mutationIsCurrent(mutation)) alert(err instanceof Error ? err.message : 'Failed.');
     } finally {
-      setBusy(false);
+      if (mutationIsCurrent(mutation)) setBusy(false);
     }
   }
 

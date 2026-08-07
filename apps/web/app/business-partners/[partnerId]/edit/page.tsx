@@ -44,6 +44,13 @@ export default function BusinessPartnerEditPage() {
 
   // Stale-response guards for detail-load and post-mutation refresh.
   const genRef = useRef(0);
+  const mutationRef = useRef(0);
+  const currentPartnerIdRef = useRef(partnerId);
+  if (currentPartnerIdRef.current !== partnerId) {
+    currentPartnerIdRef.current = partnerId;
+    genRef.current += 1;
+    mutationRef.current += 1;
+  }
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -55,6 +62,7 @@ export default function BusinessPartnerEditPage() {
     // Route id changed → clear old partner data immediately.
     setPartner(null);
     setError(null);
+    setSaving(false);
   }, [partnerId]);
 
   useEffect(() => {
@@ -63,7 +71,12 @@ export default function BusinessPartnerEditPage() {
       const capturedId = partnerId;
       try {
         const p = await getBusinessPartner(capturedId);
-        if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
+        if (
+          !mountedRef.current ||
+          gen !== genRef.current ||
+          capturedId !== currentPartnerIdRef.current
+        )
+          return;
         setPartner(p);
         setLegalName(p.legal_name);
         setTradingName(p.trading_name ?? '');
@@ -80,7 +93,12 @@ export default function BusinessPartnerEditPage() {
         setTaxIdentifier(p.tax_identifier ?? '');
         setNotes(p.notes ?? '');
       } catch (err) {
-        if (!mountedRef.current || gen !== genRef.current || capturedId !== partnerId) return;
+        if (
+          !mountedRef.current ||
+          gen !== genRef.current ||
+          capturedId !== currentPartnerIdRef.current
+        )
+          return;
         if (err instanceof ApiError && err.status === 404) setError('Not found.');
         else if (err instanceof ApiError && err.status === 403) setError('Forbidden.');
         else setError('Failed to load partner.');
@@ -93,6 +111,11 @@ export default function BusinessPartnerEditPage() {
   async function onSubmit(evt: React.FormEvent) {
     evt.preventDefault();
     if (!partner) return;
+    const mutation = { token: ++mutationRef.current, partnerId: partner.id };
+    const mutationIsCurrent = () =>
+      mountedRef.current &&
+      mutation.token === mutationRef.current &&
+      mutation.partnerId === currentPartnerIdRef.current;
     setSaving(true);
     setError(null);
     try {
@@ -128,8 +151,10 @@ export default function BusinessPartnerEditPage() {
         tax_identifier: taxIdentifier.trim() || null,
         notes: notes.trim() || null,
       });
+      if (!mutationIsCurrent()) return;
       router.push(`/business-partners/${partner.id}`);
     } catch (err) {
+      if (!mutationIsCurrent()) return;
       if (err instanceof ApiError) {
         const detail = err.payload?.detail;
         if (typeof detail === 'object' && detail !== null && 'message' in detail) {
@@ -141,7 +166,7 @@ export default function BusinessPartnerEditPage() {
         setError('Failed to save.');
       }
     } finally {
-      setSaving(false);
+      if (mutationIsCurrent()) setSaving(false);
     }
   }
 

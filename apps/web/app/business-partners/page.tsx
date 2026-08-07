@@ -172,9 +172,22 @@ export default function BusinessPartnersListPage() {
             data-testid="bp-org-select"
             value={orgId}
             onChange={(e) => {
-              setOrgId(e.target.value);
+              const nextOrgId = e.target.value;
+              // Invalidate the previous tenant synchronously, before
+              // React can render the new org identity. This prevents a
+              // late response or the prior rows from ever appearing
+              // under the newly-selected organization.
+              genRef.current += 1;
+              setRows([]);
+              setNextCursor(null);
+              setCursor(undefined);
+              setPrevCursors([]);
+              setForbidden(false);
+              setError(null);
+              setLoading(true);
+              setOrgId(nextOrgId);
               const url = new URL(window.location.href);
-              url.searchParams.set('organization_id', e.target.value);
+              url.searchParams.set('organization_id', nextOrgId);
               window.history.replaceState(null, '', url.toString());
             }}
             className="mt-1 block rounded border border-slate-300 px-3 py-2 text-sm"
