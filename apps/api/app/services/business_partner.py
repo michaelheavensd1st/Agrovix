@@ -466,11 +466,27 @@ class BusinessPartnerService:
         # 6.0.2 no PO / Receipt tables exist yet, but keep the
         # extension point explicit so 6.0.3 wires the check in.
         if capability == BusinessPartnerCapabilityCode.SUPPLIER:
-            # No active-document check available in 6.0.2 — see
-            # 6.0.3 for the enforcement hook. We still remove the
-            # supplier profile alongside the capability so a
-            # follow-on qualification query returns a consistent
-            # state.
+            # §2 (Release 6.0.3) — removing the supplier capability is
+            # rejected while any non-terminal Purchase Order for this
+            # partner still depends on it. Bounded dependency context;
+            # never leaks foreign-tenant IDs or PO payloads.
+            from app.repositories.purchase_order import (
+                count_non_terminal_purchase_orders_for_partner,
+            )
+
+            dependent = await count_non_terminal_purchase_orders_for_partner(
+                self.partner_repo.session, partner.id
+            )
+            if dependent > 0:
+                raise _error(
+                    "business_partner_supplier_capability_in_use",
+                    "The supplier capability cannot be removed while a "
+                    "non-terminal Purchase Order depends on it.",
+                    context={"dependent_purchase_order_count": dependent},
+                )
+            # No dependent POs — remove the supplier profile alongside
+            # the capability so a follow-on qualification query returns
+            # a consistent state.
             profile = await self.profile_repo.get_for_partner(partner.id)
             if profile is not None:
                 await self.profile_repo.session.delete(profile)
