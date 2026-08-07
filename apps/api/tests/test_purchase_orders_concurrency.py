@@ -20,10 +20,12 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid as _u
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.db import session as _db
 from app.models.business_partner import (
@@ -34,9 +36,13 @@ from app.models.business_partner import (
     BusinessPartnerQualificationStatus,
     BusinessPartnerSupplierProfile,
 )
+from app.models.farm import Farm
 from app.models.inventory import InventoryItem, InventoryItemCategory, StockUnit
+from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.organization import Organization
-from app.models.purchase_order import PurchaseOrder, PurchaseOrderStatus
+from app.models.purchase_order import PurchaseOrder, PurchaseOrderSequence, PurchaseOrderStatus
+from app.models.role import Role
+from app.models.role_assignment import RoleAssignment
 from app.models.user import User
 from app.repositories.audit_repo import AuditRepository
 from app.repositories.business_partner import (
@@ -119,8 +125,36 @@ async def _seed():
             is_verified=True,
             is_superuser=True,
         )
-        s.add_all([org, creator, approver, rejecter])
+        buyer = User(
+            email=f"b-{_u.uuid4().hex[:8]}@x.dev",
+            hashed_password="x",
+            full_name="b",
+            is_active=True,
+            is_verified=True,
+            is_superuser=False,
+        )
+        decision_actor = User(
+            email=f"d-{_u.uuid4().hex[:8]}@x.dev",
+            hashed_password="x",
+            full_name="d",
+            is_active=True,
+            is_verified=True,
+            is_superuser=False,
+        )
+        s.add_all([org, creator, approver, rejecter, buyer, decision_actor])
         await s.flush()
+        owner_role = (
+            await s.execute(select(Role).where(Role.name == "organization_owner"))
+        ).scalar_one()
+        for actor in (buyer, decision_actor):
+            s.add(OrganizationMembership(user_id=actor.id, organization_id=org.id, is_active=True))
+            s.add(
+                RoleAssignment(
+                    user_id=actor.id,
+                    role_id=owner_role.id,
+                    organization_id=org.id,
+                )
+            )
         partner = BusinessPartner(
             organization_id=org.id,
             code=f"SUP-{_u.uuid4().hex[:6]}",
@@ -158,6 +192,8 @@ async def _seed():
             "creator_id": creator.id,
             "approver_id": approver.id,
             "rejecter_id": rejecter.id,
+            "buyer_id": buyer.id,
+            "decision_actor_id": decision_actor.id,
             "partner_id": partner.id,
             "item_id": item.id,
         }
@@ -466,20 +502,22 @@ async def test_self_approval_forbidden_under_concurrency():
 
 
 @_postgres_only
-async def test_capability_removal_race_with_submit():
+async def test_capability_removal_race_with_po_create():
     ids = await _seed()
-    po_id = await _create_po(ids)
 
-    async def submit():
+    async def create():
         async with _db.AsyncSessionLocal() as s:
             try:
-                await _svc(s).submit(
+                await _svc(s).create(
                     actor=await s.get(User, ids["creator_id"]),
                     organization_id=ids["org_id"],
-                    po_id=_u.UUID(po_id),
+                    business_partner_id=ids["partner_id"],
+                    currency_code="USD",
+                    order_date=TODAY,
+                    lines=[_line(ids["item_id"])],
                 )
                 await s.commit()
-                return "submitted"
+                return "created"
             except Exception as exc:
                 await s.rollback()
                 return _code(exc)
@@ -502,23 +540,29 @@ async def test_capability_removal_race_with_submit():
                 await s.rollback()
                 return _code(exc)
 
-    outcomes = await asyncio.gather(submit(), remove_cap())
-    # The partner-row lock serialises the two. Consistent terminal state:
-    # either submit wins (cap removal blocked) or cap removal wins (submit
-    # fails the supplier-capability check).
+    outcomes = await asyncio.gather(create(), remove_cap())
+    # There is no pre-existing PO dependency: the racing create is what makes
+    # the capability material. The shared partner lock produces exactly one
+    # legal outcome pair.
     async with _db.AsyncSessionLocal() as s:
-        po = await s.get(PurchaseOrder, _u.UUID(po_id))
+        po_count = (
+            await s.execute(
+                select(func.count())
+                .select_from(PurchaseOrder)
+                .where(PurchaseOrder.organization_id == ids["org_id"])
+            )
+        ).scalar_one()
         cap = await BusinessPartnerCapabilityRepository(s).get(
             ids["partner_id"], BusinessPartnerCapabilityCode.SUPPLIER
         )
     if "removed" in outcomes:
-        # capability gone ⇒ the PO must NOT be submitted
         assert cap is None
-        assert po.status == PurchaseOrderStatus.DRAFT
+        assert po_count == 0
         assert "business_partner_not_supplier" in outcomes
     else:
         assert cap is not None
-        assert "submitted" in outcomes
+        assert po_count == 1
+        assert "created" in outcomes
         assert "business_partner_supplier_capability_in_use" in outcomes
 
 
@@ -591,3 +635,480 @@ async def test_rollback_readback_consistency():
     async with _db.AsyncSessionLocal() as s:
         po = await s.get(PurchaseOrder, _u.UUID(po_id))
     assert po.po_number == f"PO-{TODAY.year}-000001"
+
+
+async def _hold_qualification_change(ids, release: asyncio.Event, locked: asyncio.Event):
+    async with _db.AsyncSessionLocal() as s:
+        partner = await BusinessPartnerRepository(s).get_by_id(
+            ids["partner_id"], with_relations=True
+        )
+        await _bp_svc(s).upsert_supplier_profile(
+            actor=await s.get(User, ids["creator_id"]),
+            partner=partner,
+            data={
+                "qualification_status": BusinessPartnerQualificationStatus.BLOCKED,
+                "preference_tier": BusinessPartnerPreferenceTier.STANDARD,
+            },
+            request_ctx={},
+        )
+        locked.set()
+        await release.wait()
+        await s.commit()
+
+
+@_postgres_only
+async def test_submit_vs_qualification_downgrade_serializes():
+    ids = await _seed()
+    po_id = await _create_po(ids)
+    release, locked = asyncio.Event(), asyncio.Event()
+    downgrade = asyncio.create_task(_hold_qualification_change(ids, release, locked))
+    await locked.wait()
+
+    async def submit():
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                await _svc(s).submit(
+                    actor=await s.get(User, ids["buyer_id"]),
+                    organization_id=ids["org_id"],
+                    po_id=_u.UUID(po_id),
+                )
+                await s.commit()
+                return "submitted"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    submitted = asyncio.create_task(submit())
+    await asyncio.sleep(0.05)
+    release.set()
+    await downgrade
+    assert await submitted == "business_partner_blocked"
+    async with _db.AsyncSessionLocal() as s:
+        assert (await s.get(PurchaseOrder, _u.UUID(po_id))).status == PurchaseOrderStatus.DRAFT
+
+
+@_postgres_only
+async def test_approve_vs_qualification_downgrade_serializes():
+    ids = await _seed()
+    po_id = await _create_po(ids)
+    await _submit(ids, po_id)
+    release, locked = asyncio.Event(), asyncio.Event()
+    downgrade = asyncio.create_task(_hold_qualification_change(ids, release, locked))
+    await locked.wait()
+
+    async def approve():
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                await _svc(s).approve(
+                    actor=await s.get(User, ids["decision_actor_id"]),
+                    organization_id=ids["org_id"],
+                    po_id=_u.UUID(po_id),
+                )
+                await s.commit()
+                return "approved"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    approval = asyncio.create_task(approve())
+    await asyncio.sleep(0.05)
+    release.set()
+    await downgrade
+    assert await approval == "business_partner_blocked"
+    async with _db.AsyncSessionLocal() as s:
+        assert (await s.get(PurchaseOrder, _u.UUID(po_id))).status == PurchaseOrderStatus.SUBMITTED
+
+
+@_postgres_only
+async def test_supplier_deactivation_wins_against_submit():
+    ids = await _seed()
+    po_id = await _create_po(ids)
+    release, locked = asyncio.Event(), asyncio.Event()
+
+    async def deactivate():
+        async with _db.AsyncSessionLocal() as s:
+            partner = await BusinessPartnerRepository(s).get_by_id(
+                ids["partner_id"], with_relations=True
+            )
+            await _bp_svc(s).deactivate(
+                actor=await s.get(User, ids["creator_id"]),
+                partner=partner,
+                reason="governance",
+                request_ctx={},
+            )
+            locked.set()
+            await release.wait()
+            await s.commit()
+
+    deactivation = asyncio.create_task(deactivate())
+    await locked.wait()
+
+    async def submit():
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                await _svc(s).submit(
+                    actor=await s.get(User, ids["buyer_id"]),
+                    organization_id=ids["org_id"],
+                    po_id=_u.UUID(po_id),
+                )
+                await s.commit()
+                return "submitted"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    submission = asyncio.create_task(submit())
+    await asyncio.sleep(0.05)
+    release.set()
+    await deactivation
+    assert await submission == "business_partner_inactive"
+
+
+@_postgres_only
+@pytest.mark.parametrize("revocation_kind", ["membership", "assignment"])
+async def test_authorization_revocation_wins_against_submit(revocation_kind):
+    ids = await _seed()
+    po_id = await _create_po(ids)
+    release, locked = asyncio.Event(), asyncio.Event()
+
+    async def revoke():
+        async with _db.AsyncSessionLocal() as s:
+            if revocation_kind == "membership":
+                row = (
+                    await s.execute(
+                        select(OrganizationMembership).where(
+                            OrganizationMembership.user_id == ids["buyer_id"],
+                            OrganizationMembership.organization_id == ids["org_id"],
+                        )
+                    )
+                ).scalar_one()
+                row.is_active = False
+            else:
+                row = (
+                    await s.execute(
+                        select(RoleAssignment).where(
+                            RoleAssignment.user_id == ids["buyer_id"],
+                            RoleAssignment.organization_id == ids["org_id"],
+                        )
+                    )
+                ).scalar_one()
+                row.revoked_at = datetime.now(UTC)
+            await s.flush()
+            locked.set()
+            await release.wait()
+            await s.commit()
+
+    revocation = asyncio.create_task(revoke())
+    await locked.wait()
+
+    async def submit():
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                await _svc(s).submit(
+                    actor=await s.get(User, ids["buyer_id"]),
+                    organization_id=ids["org_id"],
+                    po_id=_u.UUID(po_id),
+                )
+                await s.commit()
+                return "submitted"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    submission = asyncio.create_task(submit())
+    await asyncio.sleep(0.05)
+    release.set()
+    await revocation
+    assert await submission == "not_authorized"
+
+
+@_postgres_only
+@pytest.mark.parametrize(
+    ("revocation_kind", "expected"),
+    [("farm_membership", "not_authorized"), ("farm", "not_authorized")],
+)
+async def test_farm_scope_revocation_wins_against_submit(revocation_kind, expected):
+    ids = await _seed()
+    async with _db.AsyncSessionLocal() as s:
+        farm = Farm(
+            organization_id=ids["org_id"],
+            name="Scoped farm",
+            code=f"F-{_u.uuid4().hex[:6]}",
+            is_active=True,
+        )
+        scoped = User(
+            email=f"fm-{_u.uuid4().hex[:8]}@x.dev",
+            hashed_password="x",
+            full_name="fm",
+            is_active=True,
+            is_verified=True,
+            is_superuser=False,
+        )
+        s.add_all([farm, scoped])
+        await s.flush()
+        role = (await s.execute(select(Role).where(Role.name == "farm_manager"))).scalar_one()
+        s.add_all(
+            [
+                OrganizationMembership(
+                    user_id=scoped.id, organization_id=ids["org_id"], is_active=True
+                ),
+                FarmMembership(user_id=scoped.id, farm_id=farm.id, is_active=True),
+                RoleAssignment(
+                    user_id=scoped.id,
+                    role_id=role.id,
+                    organization_id=ids["org_id"],
+                    farm_id=farm.id,
+                ),
+            ]
+        )
+        await s.commit()
+        farm_id, scoped_id = farm.id, scoped.id
+    async with _db.AsyncSessionLocal() as s:
+        po = await _svc(s).create(
+            actor=await s.get(User, ids["creator_id"]),
+            organization_id=ids["org_id"],
+            farm_id=farm_id,
+            business_partner_id=ids["partner_id"],
+            currency_code="USD",
+            order_date=TODAY,
+            lines=[_line(ids["item_id"])],
+        )
+        await s.commit()
+        po_id = po.id
+
+    release, locked = asyncio.Event(), asyncio.Event()
+
+    async def revoke():
+        async with _db.AsyncSessionLocal() as s:
+            if revocation_kind == "farm_membership":
+                row = (
+                    await s.execute(
+                        select(FarmMembership).where(
+                            FarmMembership.user_id == scoped_id,
+                            FarmMembership.farm_id == farm_id,
+                        )
+                    )
+                ).scalar_one()
+                row.is_active = False
+            else:
+                row = await s.get(Farm, farm_id)
+                row.is_active = False
+            await s.flush()
+            locked.set()
+            await release.wait()
+            await s.commit()
+
+    revocation = asyncio.create_task(revoke())
+    await locked.wait()
+
+    async def submit():
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                await _svc(s).submit(
+                    actor=await s.get(User, scoped_id),
+                    organization_id=ids["org_id"],
+                    po_id=po_id,
+                )
+                await s.commit()
+                return "submitted"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    submission = asyncio.create_task(submit())
+    await asyncio.sleep(0.05)
+    release.set()
+    await revocation
+    assert await submission == expected
+
+
+@_postgres_only
+async def test_opposing_supplier_farm_item_swaps_do_not_deadlock():
+    ids = await _seed()
+    async with _db.AsyncSessionLocal() as s:
+        partner_b = BusinessPartner(
+            organization_id=ids["org_id"],
+            code=f"SUP-{_u.uuid4().hex[:6]}",
+            legal_name="Supplier B",
+            is_active=True,
+        )
+        farm_a = Farm(
+            organization_id=ids["org_id"], name="A", code=f"A-{_u.uuid4().hex[:6]}", is_active=True
+        )
+        farm_b = Farm(
+            organization_id=ids["org_id"], name="B", code=f"B-{_u.uuid4().hex[:6]}", is_active=True
+        )
+        item_b = InventoryItem(
+            organization_id=ids["org_id"],
+            code=f"I-{_u.uuid4().hex[:6]}",
+            name="Item B",
+            category=InventoryItemCategory.FEED,
+            canonical_unit=StockUnit.KG,
+            is_active=True,
+        )
+        s.add_all([partner_b, farm_a, farm_b, item_b])
+        await s.flush()
+        s.add_all(
+            [
+                BusinessPartnerCapability(
+                    business_partner_id=partner_b.id,
+                    capability=BusinessPartnerCapabilityCode.SUPPLIER,
+                ),
+                BusinessPartnerSupplierProfile(
+                    business_partner_id=partner_b.id,
+                    qualification_status=BusinessPartnerQualificationStatus.APPROVED,
+                    preference_tier=BusinessPartnerPreferenceTier.STANDARD,
+                ),
+            ]
+        )
+        await s.commit()
+        partner_b_id, farm_a_id, farm_b_id, item_b_id = (
+            partner_b.id,
+            farm_a.id,
+            farm_b.id,
+            item_b.id,
+        )
+
+    async def create(partner_id, farm_id, item_id):
+        async with _db.AsyncSessionLocal() as s:
+            po = await _svc(s).create(
+                actor=await s.get(User, ids["creator_id"]),
+                organization_id=ids["org_id"],
+                business_partner_id=partner_id,
+                farm_id=farm_id,
+                currency_code="USD",
+                order_date=TODAY,
+                lines=[_line(item_id)],
+            )
+            await s.commit()
+            return po.id
+
+    po_a = await create(ids["partner_id"], farm_a_id, ids["item_id"])
+    po_b = await create(partner_b_id, farm_b_id, item_b_id)
+
+    async def swap(po_id, actor_id, partner_id, farm_id, item_id):
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                await _svc(s).update_draft(
+                    actor=await s.get(User, actor_id),
+                    organization_id=ids["org_id"],
+                    po_id=po_id,
+                    expected_version=1,
+                    data={
+                        "business_partner_id": partner_id,
+                        "farm_id": farm_id,
+                        "lines": [_line(item_id)],
+                    },
+                )
+                await s.commit()
+                return "updated"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(
+            swap(po_a, ids["creator_id"], partner_b_id, farm_b_id, item_b_id),
+            swap(po_b, ids["approver_id"], ids["partner_id"], farm_a_id, ids["item_id"]),
+        ),
+        timeout=10,
+    )
+    assert outcomes == ["updated", "updated"]
+    async with _db.AsyncSessionLocal() as s:
+        a, b = await s.get(PurchaseOrder, po_a), await s.get(PurchaseOrder, po_b)
+        assert (a.business_partner_id, a.farm_id) == (partner_b_id, farm_b_id)
+        assert (b.business_partner_id, b.farm_id) == (ids["partner_id"], farm_a_id)
+
+
+@_postgres_only
+@pytest.mark.parametrize("operation", ["submit", "update"])
+async def test_inventory_deactivation_wins_against_po_mutation(operation):
+    ids = await _seed()
+    po_id = _u.UUID(await _create_po(ids))
+    release, locked = asyncio.Event(), asyncio.Event()
+
+    async def deactivate():
+        async with _db.AsyncSessionLocal() as s:
+            item = await s.get(InventoryItem, ids["item_id"])
+            item.is_active = False
+            await s.flush()
+            locked.set()
+            await release.wait()
+            await s.commit()
+
+    deactivation = asyncio.create_task(deactivate())
+    await locked.wait()
+
+    async def mutate():
+        async with _db.AsyncSessionLocal() as s:
+            try:
+                svc = _svc(s)
+                actor = await s.get(User, ids["buyer_id"])
+                if operation == "submit":
+                    await svc.submit(actor=actor, organization_id=ids["org_id"], po_id=po_id)
+                else:
+                    po = await s.get(PurchaseOrder, po_id)
+                    await s.refresh(po, attribute_names=["lines"])
+                    await svc.update_draft(
+                        actor=actor,
+                        organization_id=ids["org_id"],
+                        po_id=po_id,
+                        expected_version=1,
+                        data={"lines": [_line(ids["item_id"]) | {"id": str(po.lines[0].id)}]},
+                    )
+                await s.commit()
+                return "mutated"
+            except Exception as exc:
+                await s.rollback()
+                return _code(exc)
+
+    mutation = asyncio.create_task(mutate())
+    await asyncio.sleep(0.05)
+    release.set()
+    await deactivation
+    assert await mutation == "not_found"
+
+
+@_postgres_only
+async def test_duplicate_po_number_translation_and_clean_rollback():
+    ids = await _seed()
+    await _create_po(ids)
+    async with _db.AsyncSessionLocal() as s:
+        sequence = await s.get(PurchaseOrderSequence, (ids["org_id"], TODAY.year))
+        sequence.last_value = 0
+        await s.commit()
+    try:
+        await _create_po(ids)
+    except Exception as exc:
+        assert _code(exc) == "duplicate_purchase_order_number"
+    else:  # pragma: no cover - authoritative unique constraint must fire
+        pytest.fail("Expected duplicate PO number conflict")
+    async with _db.AsyncSessionLocal() as s:
+        sequence = await s.get(PurchaseOrderSequence, (ids["org_id"], TODAY.year))
+        sequence.last_value = 1
+        await s.commit()
+    po_id = await _create_po(ids)
+    async with _db.AsyncSessionLocal() as s:
+        assert await s.get(PurchaseOrder, _u.UUID(po_id)) is not None
+
+
+@_postgres_only
+async def test_unrelated_integrity_error_is_not_mislabeled(monkeypatch):
+    ids = await _seed()
+    async with _db.AsyncSessionLocal() as s:
+        svc = _svc(s)
+
+        async def unrelated_failure(**_kwargs):
+            raise IntegrityError("statement", {}, Exception("some_other_constraint"))
+
+        monkeypatch.setattr(svc.po_repo, "create", unrelated_failure)
+        with pytest.raises(IntegrityError):
+            await svc.create(
+                actor=await s.get(User, ids["creator_id"]),
+                organization_id=ids["org_id"],
+                business_partner_id=ids["partner_id"],
+                currency_code="USD",
+                order_date=TODAY,
+                lines=[_line(ids["item_id"])],
+            )
+        await s.rollback()

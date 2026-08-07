@@ -7,7 +7,7 @@ the Postgres concurrency proofs live in
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -27,7 +27,7 @@ from app.models.farm import Farm
 from app.models.inventory import InventoryItem, InventoryItemCategory, StockUnit
 from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.organization import Organization
-from app.models.purchase_order import PurchaseOrderStatus
+from app.models.purchase_order import PurchaseOrderSequence, PurchaseOrderStatus
 from app.models.role import Role
 from app.models.role_assignment import RoleAssignment
 from app.models.user import User
@@ -39,6 +39,7 @@ from app.repositories.business_partner import (
     BusinessPartnerSupplierProfileRepository,
 )
 from app.repositories.purchase_order import (
+    MAX_PAGE_LIMIT,
     PurchaseOrderLineRepository,
     PurchaseOrderRepository,
     PurchaseOrderSequenceRepository,
@@ -307,6 +308,49 @@ async def test_subtotal_exact_quantization(db_session):
     assert _po_service(db_session).subtotal(po) == Decimal("3.333333")
 
 
+async def test_subtotal_maximum_legal_values_uses_wide_decimal_context(db_session):
+    env = await _seed_env(db_session)
+    po = await _create_draft(
+        db_session,
+        env,
+        lines=[
+            _line(
+                env["feed"].id,
+                qty="999999999999.999999",
+                price="99999999999999.999999",
+            )
+        ],
+    )
+    assert _po_service(db_session).subtotal(po) == Decimal("99999999999999999899000000.000000")
+
+
+async def test_subtotal_rounds_each_extended_amount_to_six_places(db_session):
+    env = await _seed_env(db_session)
+    po = await _create_draft(
+        db_session,
+        env,
+        lines=[
+            _line(env["feed"].id, qty="0.000001", price="0.500000"),
+            _line(env["feed2"].id, qty="0.000001", price="0.500000"),
+        ],
+    )
+    assert _po_service(db_session).subtotal(po) == Decimal("0.000002")
+
+
+async def test_decimal_rejects_float_and_unrepresentable_tiny_conversion(db_session):
+    env = await _seed_env(db_session)
+    with pytest.raises(Exception) as float_exc:
+        await _create_draft(db_session, env, lines=[_line(env["feed"].id, qty=0.1)])
+    assert float_exc.value.detail["code"] == "invalid_decimal"
+    with pytest.raises(Exception) as tiny_exc:
+        await _create_draft(
+            db_session,
+            env,
+            lines=[_line(env["feed"].id, qty="0.000001", unit="g")],
+        )
+    assert tiny_exc.value.detail["code"] == "canonical_quantity_not_representable"
+
+
 async def test_reject_more_than_six_decimals(db_session):
     env = await _seed_env(db_session)
     with pytest.raises(Exception) as exc:
@@ -453,6 +497,42 @@ async def test_line_reorder_add_remove_audit(db_session):
     )
     await db_session.commit()
     assert id_a not in [ln.id for ln in updated2.lines]
+    audits = list(
+        (
+            await db_session.execute(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.entity_id == str(po.id),
+                    AuditEvent.action == "purchase_order.update",
+                )
+                .order_by(AuditEvent.created_at.asc(), AuditEvent.id.asc())
+            )
+        ).scalars()
+    )
+    first, second = audits
+    assert first.metadata_json["added_line_count"] == 1
+    assert first.metadata_json["updated_line_count"] == 2
+    assert first.metadata_json["removed_line_count"] == 0
+    assert first.metadata_json["added_line_ids"] == sorted(first.metadata_json["added_line_ids"])
+    assert first.metadata_json["updated_line_ids"] == sorted([str(id_a), str(id_b)])
+    assert first.metadata_json["removed_line_ids"] == []
+    assert second.metadata_json["added_line_ids"] == []
+    assert second.metadata_json["removed_line_ids"] == [str(id_a)]
+
+
+async def test_line_audit_metadata_is_sorted_bounded_and_marks_truncation():
+    added = [uuid4() for _ in range(55)]
+    updated = [uuid4() for _ in range(51)]
+    removed = sorted([uuid4() for _ in range(52)], key=str)
+    meta = PurchaseOrderService._bounded_line_meta(added=added, updated=updated, removed=removed)
+    assert meta["added_line_count"] == 55
+    assert meta["updated_line_count"] == 51
+    assert meta["removed_line_count"] == 52
+    assert len(meta["added_line_ids"]) == 50
+    assert meta["added_line_ids"] == sorted(str(value) for value in added)[:50]
+    assert meta["updated_line_ids"] == sorted(str(value) for value in updated)[:50]
+    assert meta["removed_line_ids"] == [str(value) for value in removed[:50]]
+    assert meta["line_ids_truncated"] is True
 
 
 async def test_line_diff_rejects_duplicate_and_unknown_ids(db_session):
@@ -843,6 +923,88 @@ async def test_numbering_rollback_leaves_no_gap_on_next(db_session):
     )
     await db_session.commit()
     assert po.po_number == f"PO-{TODAY.year}-000001"
+
+
+async def test_duplicate_po_number_translates_and_rollback_recovers(db_session):
+    env = await _seed_env(db_session)
+    org_id, partner_id, feed_id, creator_id = (
+        env["org"].id,
+        env["partner"].id,
+        env["feed"].id,
+        env["creator"].id,
+    )
+    await _create_draft(db_session, env)
+    sequence = await db_session.get(PurchaseOrderSequence, (org_id, TODAY.year))
+    sequence.last_value = 0
+    await db_session.commit()
+    with pytest.raises(Exception) as exc:
+        await _create_draft(db_session, env)
+    assert exc.value.detail["code"] == "duplicate_purchase_order_number"
+    await db_session.rollback()
+    sequence = await db_session.get(PurchaseOrderSequence, (org_id, TODAY.year))
+    sequence.last_value = 1
+    await db_session.commit()
+    po = await _po_service(db_session).create(
+        actor=await db_session.get(User, creator_id),
+        organization_id=org_id,
+        business_partner_id=partner_id,
+        currency_code="USD",
+        order_date=TODAY,
+        lines=[_line(feed_id)],
+    )
+    await db_session.commit()
+    assert po.po_number.endswith("000002")
+
+
+async def test_repository_filters_cursor_limit_and_transition_pagination(db_session):
+    env = await _seed_env(db_session)
+    po1 = await _create_draft(
+        db_session,
+        env,
+        order_date=TODAY - timedelta(days=2),
+        supplier_reference="ALPHA-REF",
+    )
+    po2 = await _create_draft(
+        db_session,
+        env,
+        order_date=TODAY,
+        supplier_reference="BETA-REF",
+    )
+    svc = _po_service(db_session)
+    await svc.submit(actor=env["creator"], organization_id=env["org"].id, po_id=po2.id)
+    await db_session.commit()
+    # Force an exact timestamp tie so UUID is the deterministic cursor tie-breaker.
+    tied = datetime(2026, 3, 1, tzinfo=UTC)
+    po1.created_at = po2.created_at = tied
+    await db_session.commit()
+
+    repo = PurchaseOrderRepository(db_session)
+    rows, cursor = await repo.list_page(env["org"].id, limit=1)
+    assert len(rows) == 1 and cursor is not None
+    rows2, cursor2 = await repo.list_page(env["org"].id, limit=1, cursor=cursor)
+    assert len(rows2) == 1 and rows2[0].id != rows[0].id and cursor2 is None
+    assert [rows[0].id, rows2[0].id] == sorted([po1.id, po2.id], reverse=True)
+
+    filtered, _ = await repo.list_page(
+        env["org"].id,
+        statuses=[PurchaseOrderStatus.SUBMITTED, PurchaseOrderStatus.CANCELLED],
+        supplier_search="acme",
+        supplier_reference="beta",
+        order_date_from=TODAY,
+        order_date_to=TODAY,
+    )
+    assert [row.id for row in filtered] == [po2.id]
+    capped, _ = await repo.list_page(env["org"].id, limit=MAX_PAGE_LIMIT + 500)
+    assert len(capped) <= MAX_PAGE_LIMIT
+    with pytest.raises(Exception) as invalid_cursor:
+        await repo.list_page(env["org"].id, cursor="not-a-cursor")
+    assert invalid_cursor.value.status_code == 422
+
+    transitions = PurchaseOrderTransitionRepository(db_session)
+    page1, transition_cursor = await transitions.page_for_po(po2.id, limit=1)
+    page2, final_cursor = await transitions.page_for_po(po2.id, limit=1, cursor=transition_cursor)
+    assert len(page1) == len(page2) == 1
+    assert page1[0].id != page2[0].id and final_cursor is None
 
 
 # ===================================================================== #
