@@ -85,12 +85,12 @@ async def resolve_permission_scopes(
             ).scalars()
         )
 
-    active_farm_ids: set[uuid.UUID] = set()
+    active_farm_organizations: dict[uuid.UUID, uuid.UUID] = {}
     if farm_ids:
-        active_farm_ids = set(
+        active_farm_organizations = dict(
             (
                 await session.execute(
-                    select(FarmMembership.farm_id)
+                    select(FarmMembership.farm_id, Farm.organization_id)
                     .join(Farm, Farm.id == FarmMembership.farm_id)
                     .where(
                         FarmMembership.user_id == user.id,
@@ -102,7 +102,7 @@ async def resolve_permission_scopes(
                         Farm.organization_id.in_(active_organization_ids),
                     )
                 )
-            ).scalars()
+            ).all()
         )
 
     grouped: dict[tuple[uuid.UUID | None, uuid.UUID | None], set[str]] = {}
@@ -111,8 +111,10 @@ async def resolve_permission_scopes(
         farm_id = assignment.farm_id
         if organization_id is not None and organization_id not in active_organization_ids:
             continue
-        if farm_id is not None and farm_id not in active_farm_ids:
-            continue
+        if farm_id is not None:
+            farm_organization_id = active_farm_organizations.get(farm_id)
+            if farm_organization_id is None or farm_organization_id != organization_id:
+                continue
         key = (organization_id, farm_id)
         grouped.setdefault(key, set()).update(
             permission.code for permission in assignment.role.permissions
@@ -152,40 +154,38 @@ async def resolve_permissions(
         # Convention: superusers implicitly hold every permission.
         return {"platform.admin", "*"}
 
-    stmt = (
-        select(RoleAssignment)
-        .where(RoleAssignment.user_id == user.id, RoleAssignment.revoked_at.is_(None))
-        .options(selectinload(RoleAssignment.role).selectinload(Role.permissions))
-    )
-    result = await session.execute(stmt)
-    assignments = result.scalars().all()
-
     codes: set[str] = set()
-    for a in assignments:
+    # Reuse the canonical active-scope resolver so org/farm lifecycle
+    # validation cannot drift between permission-call paths. In
+    # particular, a farm-scoped grant contributes only while the exact
+    # organization membership, farm membership, farm, organization, and
+    # role assignment are all active.
+    scopes = await resolve_permission_scopes(session, user)
+    for scope in scopes:
         # Platform-scoped assignments always apply.
-        if a.organization_id is None and a.farm_id is None:
-            codes.update(p.code for p in a.role.permissions)
+        if scope.organization_id is None and scope.farm_id is None:
+            codes.update(scope.permissions)
             continue
         # Organization-scoped assignments apply when the request is
         # within (or scoped to) that organization.
-        if a.farm_id is None:
-            if organization_id is None or a.organization_id == organization_id:
-                codes.update(p.code for p in a.role.permissions)
+        if scope.farm_id is None:
+            if organization_id is None or scope.organization_id == organization_id:
+                codes.update(scope.permissions)
             continue
         # Farm-scoped assignments apply when the request targets that
         # exact farm, OR — for narrowly-marked read paths — when the
         # request is org-scoped and the assignment lives inside that
         # same organization (see include_farm_grants_in_org).
-        if farm_id is not None and a.farm_id == farm_id:
-            codes.update(p.code for p in a.role.permissions)
+        if farm_id is not None and scope.farm_id == farm_id:
+            codes.update(scope.permissions)
             continue
         if (
             include_farm_grants_in_org
             and farm_id is None
             and organization_id is not None
-            and a.organization_id == organization_id
+            and scope.organization_id == organization_id
         ):
-            codes.update(p.code for p in a.role.permissions)
+            codes.update(scope.permissions)
 
     return codes
 
