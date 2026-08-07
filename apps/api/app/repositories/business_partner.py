@@ -237,8 +237,10 @@ class BusinessPartnerSupplierProfileRepository:
         self.session = session
 
     async def get_for_partner(self, partner_id: uuid.UUID) -> BusinessPartnerSupplierProfile | None:
-        stmt = select(BusinessPartnerSupplierProfile).where(
-            BusinessPartnerSupplierProfile.business_partner_id == partner_id
+        stmt = (
+            select(BusinessPartnerSupplierProfile)
+            .where(BusinessPartnerSupplierProfile.business_partner_id == partner_id)
+            .execution_options(populate_existing=True)
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 

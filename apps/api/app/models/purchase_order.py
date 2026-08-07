@@ -21,6 +21,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
@@ -273,17 +274,17 @@ class PurchaseOrderLine(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     item_sku: Mapped[str | None] = mapped_column(String(128), nullable=True)
     description: Mapped[str] = mapped_column(String(500), nullable=False)
     line_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    ordered_quantity: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    ordered_quantity: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     ordered_unit: Mapped[str] = mapped_column(String(32), nullable=False)
     canonical_unit: Mapped[str] = mapped_column(String(32), nullable=False)
-    ordered_quantity_canonical: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
-    received_quantity: Mapped[float] = mapped_column(
+    ordered_quantity_canonical: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    received_quantity: Mapped[Decimal] = mapped_column(
         Numeric(18, 6), nullable=False, default=0, server_default="0"
     )
-    received_quantity_canonical: Mapped[float] = mapped_column(
+    received_quantity_canonical: Mapped[Decimal] = mapped_column(
         Numeric(18, 6), nullable=False, default=0, server_default="0"
     )
-    unit_price: Mapped[float] = mapped_column(Numeric(20, 6), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
 
     purchase_order: Mapped[PurchaseOrder] = relationship(back_populates="lines")
     inventory_item: Mapped[InventoryItem] = relationship("InventoryItem")

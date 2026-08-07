@@ -13,7 +13,7 @@ Concurrency primitives (Sprint 1.1 remediation):
   FOR UPDATE`` on the aggregate root.
 * :meth:`PurchaseOrderRepository.acquire_dependency_locks` — locks all
   governed dependencies in a single deterministic global order
-  (business_partner → capabilities → farm → inventory_items, each by
+  (business_partner → supplier profile → capabilities → farm → inventory_items, each by
   ascending PK) so lifecycle operations never deadlock and no
   check-then-act race can slip between validation and mutation.
 """
@@ -32,7 +32,11 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.business_partner import BusinessPartner, BusinessPartnerCapability
+from app.models.business_partner import (
+    BusinessPartner,
+    BusinessPartnerCapability,
+    BusinessPartnerSupplierProfile,
+)
 from app.models.farm import Farm
 from app.models.inventory import InventoryItem
 from app.models.purchase_order import (
@@ -193,7 +197,14 @@ class PurchaseOrderRepository:
         """Deterministic global lock order for all governed dependencies."""
         # 1) supplier row
         await self._lock_pks(BusinessPartner, [business_partner_id])
-        # 2) supplier capability rows (by ascending PK)
+        # 2) supplier profile row (qualification authority)
+        await self.session.execute(
+            select(BusinessPartnerSupplierProfile.id)
+            .where(BusinessPartnerSupplierProfile.business_partner_id == business_partner_id)
+            .order_by(BusinessPartnerSupplierProfile.id.asc())
+            .with_for_update()
+        )
+        # 3) supplier capability rows (by ascending PK)
         cap_ids = (
             (
                 await self.session.execute(
@@ -207,10 +218,10 @@ class PurchaseOrderRepository:
             .all()
         )
         _ = cap_ids
-        # 3) farm row
+        # 4) farm row
         if farm_id is not None:
             await self._lock_pks(Farm, [farm_id])
-        # 4) inventory item rows (by ascending PK)
+        # 5) inventory item rows (by ascending PK)
         await self._lock_pks(InventoryItem, list(inventory_item_ids))
 
     async def count_non_terminal_for_partner(self, partner_id: uuid.UUID) -> int:

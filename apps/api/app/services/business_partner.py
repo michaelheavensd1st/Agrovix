@@ -25,6 +25,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from app.models.business_partner import (
@@ -36,6 +37,7 @@ from app.models.business_partner import (
     BusinessPartnerQualificationStatus,
     BusinessPartnerSupplierProfile,
 )
+from app.models.organization import Organization
 from app.models.user import User
 from app.repositories.audit_repo import AuditRepository
 from app.repositories.business_partner import (
@@ -180,6 +182,23 @@ class BusinessPartnerService:
         self.profile_repo = profile_repo
         self.contact_repo = contact_repo
         self.audit_repo = audit_repo
+
+    async def _lock_supplier_governance(self, *, actor: User, partner: BusinessPartner) -> None:
+        """Enter the PO-compatible actor → org → supplier lock domain."""
+        session = self.partner_repo.session
+        await session.execute(select(User.id).where(User.id == actor.id).with_for_update())
+        await session.execute(
+            select(Organization.id)
+            .where(Organization.id == partner.organization_id)
+            .with_for_update()
+        )
+        from app.repositories.purchase_order import PurchaseOrderRepository
+
+        await PurchaseOrderRepository(session).acquire_dependency_locks(
+            business_partner_id=partner.id,
+            farm_id=None,
+            inventory_item_ids=set(),
+        )
 
     # ------------------------------------------------------------- #
     # Tenancy helper — every write and every read anchor on partner
@@ -435,6 +454,8 @@ class BusinessPartnerService:
         capability: BusinessPartnerCapabilityCode,
         request_ctx: dict,
     ) -> BusinessPartnerCapability:
+        if capability == BusinessPartnerCapabilityCode.SUPPLIER:
+            await self._lock_supplier_governance(actor=actor, partner=partner)
         existing = await self.capability_repo.get(partner.id, capability)
         if existing is not None:
             # Idempotent — return the existing row.
@@ -458,9 +479,6 @@ class BusinessPartnerService:
         capability: BusinessPartnerCapabilityCode,
         request_ctx: dict,
     ) -> None:
-        row = await self.capability_repo.get(partner.id, capability)
-        if row is None:
-            raise _tenant_hidden("Capability")
         if capability == BusinessPartnerCapabilityCode.SUPPLIER:
             # §2 (Release 6.0.3) — removing the supplier capability is
             # rejected while any non-terminal Purchase Order for this
@@ -469,16 +487,18 @@ class BusinessPartnerService:
             # row FOR UPDATE — the exact row those lifecycle operations
             # lock via their deterministic dependency-lock order — so the
             # count-then-delete cannot interleave with a status change.
-            from sqlalchemy import select as _select
-
-            await self.partner_repo.session.execute(
-                _select(BusinessPartner.id)
-                .where(BusinessPartner.id == partner.id)
-                .with_for_update()
-            )
             from app.repositories.purchase_order import (
                 count_non_terminal_purchase_orders_for_partner,
             )
+
+            # Canonical governance order shared with PO lifecycle methods:
+            # partner → supplier profile → capabilities.
+            await self._lock_supplier_governance(actor=actor, partner=partner)
+
+        row = await self.capability_repo.get(partner.id, capability)
+        if row is None:
+            raise _tenant_hidden("Capability")
+        if capability == BusinessPartnerCapabilityCode.SUPPLIER:
 
             dependent = await count_non_terminal_purchase_orders_for_partner(
                 self.partner_repo.session, partner.id
@@ -518,6 +538,9 @@ class BusinessPartnerService:
         data: dict,
         request_ctx: dict,
     ) -> BusinessPartnerSupplierProfile:
+        # Serialize qualification changes with PO submit/approve under the
+        # shared actor → org → partner → profile → capabilities lock order.
+        await self._lock_supplier_governance(actor=actor, partner=partner)
         supplier_cap = await self.capability_repo.get(
             partner.id, BusinessPartnerCapabilityCode.SUPPLIER
         )

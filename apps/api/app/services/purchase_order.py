@@ -9,7 +9,7 @@ Sprint 1.1 remediation (Milestone-1 review):
 
 1. **Transactional governance locking.** Lifecycle methods OWN their
    locking: they take an id, lock the aggregate root ``FOR UPDATE``,
-   then lock every governed dependency (supplier, capabilities, farm,
+   then lock every governed dependency (supplier, qualification, capabilities, farm,
    inventory items) in a single deterministic global order before any
    validation. No caller-supplied objects, no check-then-act windows.
 2. **In-transaction authorization revalidation.** After all locks are
@@ -31,9 +31,12 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation, localcontext
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError as SAIntegrityError
+from sqlalchemy.orm import noload
 
 from app.core.country_codes import ISO_3166_1_ALPHA_2
 from app.core.currency_codes import is_valid_currency
@@ -45,12 +48,16 @@ from app.models.business_partner import (
 )
 from app.models.farm import Farm
 from app.models.inventory import InventoryItem, StockUnit
+from app.models.membership import FarmMembership, OrganizationMembership
+from app.models.organization import Organization
 from app.models.purchase_order import (
     PurchaseOrder,
     PurchaseOrderLine,
     PurchaseOrderStatus,
     PurchaseOrderTransition,
 )
+from app.models.role import Permission, Role, role_permissions_table
+from app.models.role_assignment import RoleAssignment
 from app.models.user import User
 from app.repositories.audit_repo import AuditRepository
 from app.repositories.business_partner import BusinessPartnerRepository
@@ -67,6 +74,7 @@ _QUANTUM = Decimal(1).scaleb(-_MAX_DECIMAL_PLACES)  # Decimal('0.000001')
 # NUMERIC(18,6) → 12 integer digits; NUMERIC(20,6) → 14 integer digits.
 _MAX_QTY = Decimal(10) ** 12
 _MAX_PRICE = Decimal(10) ** 14
+_ARITHMETIC_CONTEXT = Context(prec=64, rounding=ROUND_HALF_UP)
 
 _REASON_REQUIRED = frozenset({"withdraw", "reject", "revise", "cancel"})
 
@@ -127,6 +135,12 @@ def _tenant_hidden(entity: str = "Purchase Order") -> HTTPException:
 
 
 def _parse_decimal(raw: object, *, field: str, maximum: Decimal) -> Decimal:
+    if isinstance(raw, float):
+        raise _unprocessable(
+            "invalid_decimal",
+            f"{field} must be supplied without binary floating-point conversion.",
+            context={"field": field},
+        )
     try:
         value = Decimal(str(raw))
     except (InvalidOperation, ValueError, TypeError) as exc:
@@ -172,6 +186,24 @@ def _quantize_canonical(value: Decimal, *, field: str) -> Decimal:
             context={"field": field},
         )
     return quantized
+
+
+def _quantize_result(value: Decimal, *, field: str) -> Decimal:
+    """Return a deterministic six-decimal business result.
+
+    Field values are bounded before persistence. Derived results use a
+    deliberately wider context so multiplying two legal NUMERIC values cannot
+    inherit the process-wide Decimal precision or leak InvalidOperation.
+    """
+    try:
+        with localcontext(_ARITHMETIC_CONTEXT):
+            return value.quantize(_QUANTUM, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise _unprocessable(
+            "value_out_of_range",
+            f"{field} is out of the representable range.",
+            context={"field": field},
+        ) from exc
 
 
 def _bounded(raw: object, *, field: str, maximum: int) -> str | None:
@@ -280,12 +312,137 @@ class PurchaseOrderService:
         await self.session.refresh(po, attribute_names=["lines"])
         return po
 
-    async def _lock_dependencies(self, po: PurchaseOrder) -> None:
-        item_ids = {ln.inventory_item_id for ln in po.lines}
-        await self.po_repo.acquire_dependency_locks(
-            business_partner_id=po.business_partner_id,
-            farm_id=po.farm_id,
-            inventory_item_ids=item_ids,
+    async def _lock_authorization_anchor(self, actor: User, organization_id: uuid.UUID) -> None:
+        """Acquire the global mutation anchor before any aggregate row lock."""
+        await self.po_repo._lock_pks(User, [actor.id])
+        await self.po_repo._lock_pks(Organization, [organization_id])
+
+    async def _lock_po_for_mutation(
+        self, po_id: uuid.UUID, organization_id: uuid.UUID, actor: User
+    ) -> PurchaseOrder:
+        await self._lock_authorization_anchor(actor, organization_id)
+        return await self._lock_po(po_id, organization_id)
+
+    async def _lock_authorization_dependencies(
+        self,
+        actor: User,
+        *,
+        organization_id: uuid.UUID,
+        farm_ids: set[uuid.UUID],
+    ) -> None:
+        """Lock the exact mutable rows from which PO authorization is derived.
+
+        The order is global: actor → organization → organization membership →
+        role assignments → roles → role/permission grants → farm memberships.
+        Farm aggregate rows are locked later in the governance dependency phase.
+        """
+        await self._lock_authorization_anchor(actor, organization_id)
+        await self.session.execute(
+            select(OrganizationMembership.id)
+            .where(
+                OrganizationMembership.user_id == actor.id,
+                OrganizationMembership.organization_id == organization_id,
+            )
+            .order_by(OrganizationMembership.id.asc())
+            .with_for_update()
+        )
+        assignments = list(
+            (
+                await self.session.execute(
+                    select(RoleAssignment)
+                    .where(
+                        RoleAssignment.user_id == actor.id,
+                        (RoleAssignment.organization_id == organization_id)
+                        | (RoleAssignment.organization_id.is_(None)),
+                    )
+                    .order_by(RoleAssignment.id.asc())
+                    .options(noload(RoleAssignment.role))
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        role_ids = {assignment.role_id for assignment in assignments}
+        await self.po_repo._lock_pks(Role, role_ids)
+        permission_ids: set[uuid.UUID] = set()
+        if role_ids:
+            permission_ids = set(
+                (
+                    await self.session.execute(
+                        select(role_permissions_table.c.permission_id)
+                        .where(role_permissions_table.c.role_id.in_(sorted(role_ids, key=str)))
+                        .order_by(
+                            role_permissions_table.c.role_id.asc(),
+                            role_permissions_table.c.permission_id.asc(),
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+        await self.po_repo._lock_pks(Permission, permission_ids)
+        if farm_ids:
+            await self.session.execute(
+                select(FarmMembership.id)
+                .where(
+                    FarmMembership.user_id == actor.id,
+                    FarmMembership.farm_id.in_(sorted(farm_ids, key=str)),
+                )
+                .order_by(FarmMembership.id.asc())
+                .with_for_update()
+            )
+        await self.session.refresh(actor)
+
+    async def _lock_dependencies(
+        self,
+        po: PurchaseOrder,
+        *,
+        business_partner_ids: set[uuid.UUID] | None = None,
+        farm_ids: set[uuid.UUID] | None = None,
+        inventory_item_ids: set[uuid.UUID] | None = None,
+    ) -> None:
+        """Acquire one complete, sorted union of current and requested dependencies."""
+        partner_ids = {po.business_partner_id, *(business_partner_ids or set())}
+        all_farm_ids = ({po.farm_id} if po.farm_id is not None else set()) | (farm_ids or set())
+        item_ids = {ln.inventory_item_id for ln in po.lines} | (inventory_item_ids or set())
+        # Acquire each category once. Multiple suppliers use ascending PK order,
+        # and each supplier's profile/capabilities follow immediately.
+        for partner_id in sorted(partner_ids, key=str):
+            await self.po_repo.acquire_dependency_locks(
+                business_partner_id=partner_id,
+                farm_id=None,
+                inventory_item_ids=set(),
+            )
+        await self.po_repo._lock_pks(Farm, all_farm_ids)
+        await self.po_repo._lock_pks(InventoryItem, item_ids)
+
+    async def _lock_and_authorize(
+        self,
+        po: PurchaseOrder,
+        actor: User,
+        operation: str,
+        *,
+        organization_id: uuid.UUID,
+        business_partner_ids: set[uuid.UUID] | None = None,
+        farm_ids: set[uuid.UUID] | None = None,
+        inventory_item_ids: set[uuid.UUID] | None = None,
+        authorization_farm_id: uuid.UUID | None = None,
+    ) -> None:
+        auth_farms = ({po.farm_id} if po.farm_id is not None else set()) | (farm_ids or set())
+        await self._lock_authorization_dependencies(
+            actor, organization_id=organization_id, farm_ids=auth_farms
+        )
+        await self._lock_dependencies(
+            po,
+            business_partner_ids=business_partner_ids,
+            farm_ids=farm_ids,
+            inventory_item_ids=inventory_item_ids,
+        )
+        await self._authorize(
+            actor,
+            operation,
+            organization_id=organization_id,
+            farm_id=po.farm_id if authorization_farm_id is None else authorization_farm_id,
         )
 
     async def _authorize(
@@ -545,7 +702,7 @@ class PurchaseOrderService:
         *, added: list[uuid.UUID], updated: list[uuid.UUID], removed: list[uuid.UUID]
     ) -> dict:
         def _cap(ids: list[uuid.UUID]) -> list[str]:
-            return [str(i) for i in ids[:50]]
+            return [str(i) for i in sorted(ids, key=str)[:50]]
 
         return {
             "added_line_ids": _cap(added),
@@ -596,13 +753,16 @@ class PurchaseOrderService:
         raw_lines = list(lines or [])
         item_ids = {uuid.UUID(str(ln["inventory_item_id"])) for ln in raw_lines}
 
-        # --- deterministic dependency locks BEFORE any validation ---
+        # --- authorization rows, then deterministic governed dependencies ---
+        auth_farms = {farm_id} if farm_id is not None else set()
+        await self._lock_authorization_dependencies(
+            actor, organization_id=organization_id, farm_ids=auth_farms
+        )
         await self.po_repo.acquire_dependency_locks(
             business_partner_id=business_partner_id,
             farm_id=farm_id,
             inventory_item_ids=item_ids,
         )
-        # --- authorization revalidation inside the transaction ---
         await self._authorize(actor, "create", organization_id=organization_id, farm_id=farm_id)
 
         farm = await self._load_farm(organization_id, farm_id) if farm_id is not None else None
@@ -610,24 +770,37 @@ class PurchaseOrderService:
         self._validate_supplier(partner, for_submission=False)
 
         po_number = await self.sequence_repo.allocate(organization_id, order_date.year)
-        po = await self.po_repo.create(
-            organization_id=organization_id,
-            farm_id=farm.id if farm else None,
-            business_partner_id=partner.id,
-            po_number=po_number,
-            supplier_reference=supplier_reference,
-            status=PurchaseOrderStatus.DRAFT,
-            currency_code=currency,
-            order_date=order_date,
-            expected_delivery_date=expected_delivery_date,
-            delivery_address=address,
-            notes=notes,
-            supplier_code=partner.code,
-            supplier_legal_name=partner.legal_name,
-            supplier_trading_name=partner.trading_name,
-            version=1,
-            created_by_id=actor.id,
-        )
+        try:
+            po = await self.po_repo.create(
+                organization_id=organization_id,
+                farm_id=farm.id if farm else None,
+                business_partner_id=partner.id,
+                po_number=po_number,
+                supplier_reference=supplier_reference,
+                status=PurchaseOrderStatus.DRAFT,
+                currency_code=currency,
+                order_date=order_date,
+                expected_delivery_date=expected_delivery_date,
+                delivery_address=address,
+                notes=notes,
+                supplier_code=partner.code,
+                supplier_legal_name=partner.legal_name,
+                supplier_trading_name=partner.trading_name,
+                version=1,
+                created_by_id=actor.id,
+            )
+        except SAIntegrityError as exc:
+            payload = str(exc.orig) if exc.orig is not None else str(exc)
+            known_markers = (
+                "uq_purchase_order_org_number",
+                "purchase_orders.organization_id, purchase_orders.po_number",
+            )
+            if any(marker in payload for marker in known_markers):
+                raise _conflict(
+                    "duplicate_purchase_order_number",
+                    "A Purchase Order with this number already exists in the organization.",
+                ) from exc
+            raise
         line_ids = await self._create_fresh_lines(po, raw_lines)
 
         await self._append_transition(
@@ -666,9 +839,28 @@ class PurchaseOrderService:
         request_ctx: dict | None = None,
     ) -> PurchaseOrder:
         request_ctx = request_ctx or {}
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(actor, "update", organization_id=organization_id, farm_id=po.farm_id)
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+
+        requested_partner_ids = (
+            {uuid.UUID(str(data["business_partner_id"]))}
+            if data.get("business_partner_id") is not None
+            else set()
+        )
+        requested_farm_ids = (
+            {uuid.UUID(str(data["farm_id"]))} if data.get("farm_id") is not None else set()
+        )
+        requested_item_ids = {
+            uuid.UUID(str(line["inventory_item_id"])) for line in (data.get("lines") or [])
+        }
+        await self._lock_and_authorize(
+            po,
+            actor,
+            "update",
+            organization_id=organization_id,
+            business_partner_ids=requested_partner_ids,
+            farm_ids=requested_farm_ids,
+            inventory_item_ids=requested_item_ids,
+        )
 
         if po.status != PurchaseOrderStatus.DRAFT:
             raise _conflict(
@@ -726,20 +918,12 @@ class PurchaseOrderService:
                     await self._authorize(
                         actor, "update", organization_id=organization_id, farm_id=new_farm_id
                     )
-                    await self.po_repo.acquire_dependency_locks(
-                        business_partner_id=po.business_partner_id,
-                        farm_id=new_farm_id,
-                        inventory_item_ids=set(),
-                    )
                     po.farm_id = new_farm_id
                     changed_fields.append("farm_id")
 
         if "business_partner_id" in data:
             new_partner_id = uuid.UUID(str(data["business_partner_id"]))
             if new_partner_id != po.business_partner_id:
-                await self.po_repo.acquire_dependency_locks(
-                    business_partner_id=new_partner_id, farm_id=None, inventory_item_ids=set()
-                )
                 partner = await self._load_supplier(po.organization_id, new_partner_id)
                 self._validate_supplier(partner, for_submission=False)
                 po.business_partner_id = partner.id
@@ -771,13 +955,6 @@ class PurchaseOrderService:
 
         line_change_meta: dict = {}
         if "lines" in data:
-            # New items may be referenced — lock them before building.
-            new_item_ids = {uuid.UUID(str(ln["inventory_item_id"])) for ln in (data["lines"] or [])}
-            await self.po_repo.acquire_dependency_locks(
-                business_partner_id=po.business_partner_id,
-                farm_id=None,
-                inventory_item_ids=new_item_ids,
-            )
             meta = await self._apply_line_diff(po, list(data["lines"] or []))
             if meta["added_line_count"] or meta["updated_line_count"] or meta["removed_line_count"]:
                 changed_fields.append("lines")
@@ -815,9 +992,8 @@ class PurchaseOrderService:
         request_ctx: dict | None = None,
     ) -> LifecycleResult:
         request_ctx = request_ctx or {}
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(actor, "submit", organization_id=organization_id, farm_id=po.farm_id)
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+        await self._lock_and_authorize(po, actor, "submit", organization_id=organization_id)
 
         if po.status == PurchaseOrderStatus.SUBMITTED:
             return LifecycleResult(po, replay=True)
@@ -902,11 +1078,8 @@ class PurchaseOrderService:
     ) -> LifecycleResult:
         request_ctx = request_ctx or {}
         self._require_reason("withdraw", reason)
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(
-            actor, "withdraw", organization_id=organization_id, farm_id=po.farm_id
-        )
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+        await self._lock_and_authorize(po, actor, "withdraw", organization_id=organization_id)
         if po.status == PurchaseOrderStatus.DRAFT and await self._last_operation(po) == "withdraw":
             return LifecycleResult(po, replay=True)
         if po.status != PurchaseOrderStatus.SUBMITTED:
@@ -933,9 +1106,8 @@ class PurchaseOrderService:
         request_ctx: dict | None = None,
     ) -> LifecycleResult:
         request_ctx = request_ctx or {}
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(actor, "approve", organization_id=organization_id, farm_id=po.farm_id)
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+        await self._lock_and_authorize(po, actor, "approve", organization_id=organization_id)
         # Independent-approval invariant applies to EVERY actor (§5.1).
         if actor.id == po.created_by_id:
             raise _conflict(
@@ -971,9 +1143,8 @@ class PurchaseOrderService:
     ) -> LifecycleResult:
         request_ctx = request_ctx or {}
         self._require_reason("reject", reason)
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(actor, "reject", organization_id=organization_id, farm_id=po.farm_id)
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+        await self._lock_and_authorize(po, actor, "reject", organization_id=organization_id)
         if po.status == PurchaseOrderStatus.REJECTED:
             return LifecycleResult(po, replay=True)
         if po.status != PurchaseOrderStatus.SUBMITTED:
@@ -1001,9 +1172,8 @@ class PurchaseOrderService:
     ) -> LifecycleResult:
         request_ctx = request_ctx or {}
         self._require_reason("revise", reason)
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(actor, "revise", organization_id=organization_id, farm_id=po.farm_id)
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+        await self._lock_and_authorize(po, actor, "revise", organization_id=organization_id)
         if po.status == PurchaseOrderStatus.DRAFT and await self._last_operation(po) == "revise":
             return LifecycleResult(po, replay=True)
         if po.status != PurchaseOrderStatus.REJECTED:
@@ -1031,9 +1201,8 @@ class PurchaseOrderService:
     ) -> LifecycleResult:
         request_ctx = request_ctx or {}
         self._require_reason("cancel", reason)
-        po = await self._lock_po(po_id, organization_id)
-        await self._lock_dependencies(po)
-        await self._authorize(actor, "cancel", organization_id=organization_id, farm_id=po.farm_id)
+        po = await self._lock_po_for_mutation(po_id, organization_id, actor)
+        await self._lock_and_authorize(po, actor, "cancel", organization_id=organization_id)
         if po.status == PurchaseOrderStatus.CANCELLED:
             return LifecycleResult(po, replay=True)
         cancellable = {
@@ -1074,10 +1243,12 @@ class PurchaseOrderService:
     # ================================================================= #
     @staticmethod
     def subtotal(po: PurchaseOrder) -> Decimal:
-        total = Decimal(0)
-        for line in po.lines:
-            total += Decimal(str(line.ordered_quantity)) * Decimal(str(line.unit_price))
-        return total.quantize(_QUANTUM)
+        with localcontext(_ARITHMETIC_CONTEXT):
+            total = Decimal(0)
+            for line in po.lines:
+                extended = Decimal(line.ordered_quantity) * Decimal(line.unit_price)
+                total += _quantize_result(extended, field="extended_amount")
+            return _quantize_result(total, field="subtotal")
 
     # ================================================================= #
     # Internal transition + audit machinery
