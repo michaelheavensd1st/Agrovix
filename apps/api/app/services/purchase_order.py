@@ -314,8 +314,8 @@ class PurchaseOrderService:
 
     async def _lock_authorization_anchor(self, actor: User, organization_id: uuid.UUID) -> None:
         """Acquire the global mutation anchor before any aggregate row lock."""
-        await self.po_repo._lock_pks(User, [actor.id])
         await self.po_repo._lock_pks(Organization, [organization_id])
+        await self.po_repo._lock_pks(User, [actor.id])
 
     async def _lock_po_for_mutation(
         self, po_id: uuid.UUID, organization_id: uuid.UUID, actor: User
@@ -332,7 +332,7 @@ class PurchaseOrderService:
     ) -> None:
         """Lock the exact mutable rows from which PO authorization is derived.
 
-        The order is global: actor → organization → organization membership →
+        The order is global: organization → actor → organization membership →
         role assignments → roles → role/permission grants → farm memberships.
         Farm aggregate rows are locked later in the governance dependency phase.
         """
@@ -874,6 +874,13 @@ class PurchaseOrderService:
                 "The Purchase Order was changed by another request.",
                 context={"current_version": po.version},
             )
+
+        # The current farm was locked in the complete dependency union above.
+        # Re-read its authoritative lifecycle state on every draft mutation so
+        # header-only and line-only updates cannot commit against a farm that
+        # was deactivated while the request waited for that lock.
+        if po.farm_id is not None:
+            await self._load_farm(po.organization_id, po.farm_id)
 
         changed_fields: list[str] = []
 

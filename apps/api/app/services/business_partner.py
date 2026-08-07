@@ -184,14 +184,14 @@ class BusinessPartnerService:
         self.audit_repo = audit_repo
 
     async def _lock_supplier_governance(self, *, actor: User, partner: BusinessPartner) -> None:
-        """Enter the PO-compatible actor → org → supplier lock domain."""
+        """Enter the PO-compatible organization → actor → supplier lock domain."""
         session = self.partner_repo.session
-        await session.execute(select(User.id).where(User.id == actor.id).with_for_update())
         await session.execute(
             select(Organization.id)
             .where(Organization.id == partner.organization_id)
             .with_for_update()
         )
+        await session.execute(select(User.id).where(User.id == actor.id).with_for_update())
         from app.repositories.purchase_order import PurchaseOrderRepository
 
         await PurchaseOrderRepository(session).acquire_dependency_locks(
@@ -401,6 +401,11 @@ class BusinessPartnerService:
         reason: str,
         request_ctx: dict,
     ) -> BusinessPartner:
+        supplier_capability = await self.capability_repo.get(
+            partner.id, BusinessPartnerCapabilityCode.SUPPLIER
+        )
+        if supplier_capability is not None:
+            await self._lock_supplier_governance(actor=actor, partner=partner)
         if not partner.is_active:
             return partner  # idempotent
         partner.is_active = False
@@ -539,7 +544,7 @@ class BusinessPartnerService:
         request_ctx: dict,
     ) -> BusinessPartnerSupplierProfile:
         # Serialize qualification changes with PO submit/approve under the
-        # shared actor → org → partner → profile → capabilities lock order.
+        # shared org → actor → partner → profile → capabilities lock order.
         await self._lock_supplier_governance(actor=actor, partner=partner)
         supplier_cap = await self.capability_repo.get(
             partner.id, BusinessPartnerCapabilityCode.SUPPLIER
