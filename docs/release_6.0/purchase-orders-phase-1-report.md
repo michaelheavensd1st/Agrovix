@@ -1,6 +1,6 @@
 # Release 6.0.3 — Purchase Orders — Phase 1 Draft PR Report
 
-**Status:** Sprint 1.2 remediation applied — ready for a 3rd independent review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
+**Status:** Sprint 1.3 hardening validated — ready for a 4th independent review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
 **Contract:** `docs/release_6.0/purchase-orders.md` (frozen 6.0.3) · **Base:** `0011_business_partners`
 
 > **Sprint 1.1 addendum (domain hardening / review remediation).** The independent
@@ -24,6 +24,16 @@
 > skipped**), full PostgreSQL (**520 passed / 32 skipped**), and repeated PO concurrency checks all
 > pass. Details:
 > `docs/release_6.0/purchase-orders-sprint-1.2-remediation-report.md`. **Milestone 2 not started.**
+
+> **Sprint 1.3 addendum (concurrency-test determinism).** The third independent review retained one
+> Medium blocker for permissive/incomplete concurrency proofs. Tightening those proofs exposed and
+> resolved two real High defects: stale current-farm validation during `update_draft`, and an
+> actor-before-organization PostgreSQL deadlock. The canonical prefix is now organization → actor →
+> authorization rows → PO → governed dependencies. Full SQLite (**452 passed / 107 skipped**), full
+> PostgreSQL (**527 passed / 32 skipped**), PO concurrency (**27 passed**) and three consecutive
+> concurrency runs (**81 passed**) are green. Alembic round-trip, seed, Ruff, Black, scope, and
+> whitespace gates pass; migration `0012` remains unchanged. Details:
+> `docs/release_6.0/purchase-orders-sprint-1.3-test-hardening-report.md`. **Milestone 2 not started.**
 
 ---
 
