@@ -45,13 +45,7 @@ export const PREFERENCE_LABELS: Record<PreferenceTier, string> = {
 };
 
 export type ContactRole =
-  | 'accounts'
-  | 'warehouse'
-  | 'sales'
-  | 'driver'
-  | 'managing_director'
-  | 'technical'
-  | 'other';
+  'accounts' | 'warehouse' | 'sales' | 'driver' | 'managing_director' | 'technical' | 'other';
 export const CONTACT_ROLE_LABELS: Record<ContactRole, string> = {
   accounts: 'Accounts',
   warehouse: 'Warehouse',
@@ -162,9 +156,7 @@ export async function listBusinessPartners(
   if (params.limit) q.set('limit', String(params.limit));
   const suffix = q.toString();
   return apiFetch<CursorPage<BusinessPartner>>(
-    `/v1/organizations/${params.organizationId}/business-partners${
-      suffix ? `?${suffix}` : ''
-    }`,
+    `/v1/organizations/${params.organizationId}/business-partners${suffix ? `?${suffix}` : ''}`,
   );
 }
 
@@ -200,10 +192,10 @@ export async function createBusinessPartner(
   organizationId: UUID,
   body: CreatePartnerBody,
 ): Promise<BusinessPartner> {
-  return apiFetch<BusinessPartner>(
-    `/v1/organizations/${organizationId}/business-partners`,
-    { method: 'POST', body: JSON.stringify(body) },
-  );
+  return apiFetch<BusinessPartner>(`/v1/organizations/${organizationId}/business-partners`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 export async function getBusinessPartner(id: UUID): Promise<BusinessPartner> {
@@ -242,10 +234,7 @@ export async function deactivateBusinessPartner(
   });
 }
 
-export async function restoreBusinessPartner(
-  id: UUID,
-  reason: string,
-): Promise<BusinessPartner> {
+export async function restoreBusinessPartner(id: UUID, reason: string): Promise<BusinessPartner> {
   return apiFetch<BusinessPartner>(`/v1/business-partners/${id}/restore`, {
     method: 'POST',
     body: JSON.stringify({ reason }),
@@ -256,10 +245,10 @@ export async function addCapability(
   partnerId: UUID,
   capability: BusinessPartnerCapabilityCode,
 ): Promise<BusinessPartnerCapability> {
-  return apiFetch<BusinessPartnerCapability>(
-    `/v1/business-partners/${partnerId}/capabilities`,
-    { method: 'POST', body: JSON.stringify({ capability }) },
-  );
+  return apiFetch<BusinessPartnerCapability>(`/v1/business-partners/${partnerId}/capabilities`, {
+    method: 'POST',
+    body: JSON.stringify({ capability }),
+  });
 }
 
 export async function removeCapability(
@@ -301,38 +290,38 @@ export async function createContact(
   partnerId: UUID,
   body: CreateContactBody,
 ): Promise<BusinessPartnerContact> {
-  return apiFetch<BusinessPartnerContact>(
-    `/v1/business-partners/${partnerId}/contacts`,
-    { method: 'POST', body: JSON.stringify(body) },
-  );
+  return apiFetch<BusinessPartnerContact>(`/v1/business-partners/${partnerId}/contacts`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
 }
 
 export async function updateContact(
   contactId: UUID,
   body: Partial<CreateContactBody>,
 ): Promise<BusinessPartnerContact> {
-  return apiFetch<BusinessPartnerContact>(
-    `/v1/business-partner-contacts/${contactId}`,
-    { method: 'PATCH', body: JSON.stringify(body) },
-  );
+  return apiFetch<BusinessPartnerContact>(`/v1/business-partner-contacts/${contactId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
 }
 
 export async function deactivateContact(
   contactId: UUID,
   reason: string,
 ): Promise<BusinessPartnerContact> {
-  return apiFetch<BusinessPartnerContact>(
-    `/v1/business-partner-contacts/${contactId}/deactivate`,
-    { method: 'POST', body: JSON.stringify({ reason }) },
-  );
+  return apiFetch<BusinessPartnerContact>(`/v1/business-partner-contacts/${contactId}/deactivate`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
 }
 
 export async function restoreContact(
   contactId: UUID,
   reason: string,
 ): Promise<BusinessPartnerContact> {
-  return apiFetch<BusinessPartnerContact>(
-    `/v1/business-partner-contacts/${contactId}/restore`,
-    { method: 'POST', body: JSON.stringify({ reason }) },
-  );
+  return apiFetch<BusinessPartnerContact>(`/v1/business-partner-contacts/${contactId}/restore`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
 }

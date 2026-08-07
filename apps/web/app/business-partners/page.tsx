@@ -150,8 +150,7 @@ export default function BusinessPartnersListPage() {
         <div>
           <h1 className="text-3xl font-semibold">Business Partners</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Suppliers, customers, contractors, and other partners for this
-            organization.
+            Suppliers, customers, contractors, and other partners for this organization.
           </p>
         </div>
         {canCreate && orgId && (
@@ -256,16 +255,24 @@ export default function BusinessPartnersListPage() {
           Loading business partners…
         </div>
       ) : forbidden ? (
-        <div className="rounded border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900" data-testid="bp-forbidden">
-          You do not have permission to view business partners in this
-          organization.
+        <div
+          className="rounded border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900"
+          data-testid="bp-forbidden"
+        >
+          You do not have permission to view business partners in this organization.
         </div>
       ) : error ? (
-        <div className="rounded border border-red-300 bg-red-50 p-4 text-sm text-red-800" data-testid="bp-error">
+        <div
+          className="rounded border border-red-300 bg-red-50 p-4 text-sm text-red-800"
+          data-testid="bp-error"
+        >
           {error}
         </div>
       ) : rows.length === 0 ? (
-        <div className="rounded border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500" data-testid="bp-empty">
+        <div
+          className="rounded border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500"
+          data-testid="bp-empty"
+        >
           No business partners match these filters.
         </div>
       ) : (
@@ -284,7 +291,11 @@ export default function BusinessPartnersListPage() {
             </thead>
             <tbody>
               {rows.map((p) => (
-                <tr key={p.id} className="border-t hover:bg-slate-50" data-testid={`bp-row-${p.code}`}>
+                <tr
+                  key={p.id}
+                  className="border-t hover:bg-slate-50"
+                  data-testid={`bp-row-${p.code}`}
+                >
                   <td className="px-3 py-2 font-mono text-xs">{p.code}</td>
                   <td className="px-3 py-2">
                     <div className="font-medium">{p.legal_name}</div>

@@ -327,9 +327,7 @@ export default function NewBusinessPartnerPage() {
 
         {supplierChecked && (
           <section className="space-y-3" data-testid="bp-create-supplier-profile">
-            <h2 className="text-sm font-semibold uppercase text-slate-500">
-              Supplier profile
-            </h2>
+            <h2 className="text-sm font-semibold uppercase text-slate-500">Supplier profile</h2>
             <div className="grid grid-cols-2 gap-3">
               <label className="block">
                 <span className="text-xs font-medium">Qualification</span>

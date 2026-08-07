@@ -244,12 +244,19 @@ export default function BusinessPartnerDetailPage() {
   }
 
   if (loading && !partner) {
-    return <div className="px-6 py-8 text-slate-500" data-testid="bp-detail-loading">Loading…</div>;
+    return (
+      <div className="px-6 py-8 text-slate-500" data-testid="bp-detail-loading">
+        Loading…
+      </div>
+    );
   }
   if (error) {
     return (
       <div className="px-6 py-8">
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800" data-testid="bp-detail-error">
+        <div
+          className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800"
+          data-testid="bp-detail-error"
+        >
           {error}
         </div>
       </div>
@@ -260,7 +267,10 @@ export default function BusinessPartnerDetailPage() {
   return (
     <div className="px-6 py-8 max-w-4xl mx-auto space-y-8">
       <div>
-        <Link href={`/business-partners?organization_id=${orgId}`} className="text-sm text-slate-500 hover:underline">
+        <Link
+          href={`/business-partners?organization_id=${orgId}`}
+          className="text-sm text-slate-500 hover:underline"
+        >
           ← Back to partners
         </Link>
       </div>
@@ -269,7 +279,10 @@ export default function BusinessPartnerDetailPage() {
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-semibold">{partner.legal_name}</h1>
             {!partner.is_active && (
-              <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-700" data-testid="bp-detail-inactive">
+              <span
+                className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-700"
+                data-testid="bp-detail-inactive"
+              >
                 Inactive
               </span>
             )}
@@ -316,16 +329,19 @@ export default function BusinessPartnerDetailPage() {
 
       {/* Address + contact conveniences */}
       <section>
-        <h2 className="text-xs font-semibold uppercase text-slate-500 mb-2">
-          Primary address
-        </h2>
+        <h2 className="text-xs font-semibold uppercase text-slate-500 mb-2">Primary address</h2>
         <div className="text-sm text-slate-700" data-testid="bp-detail-primary-address">
           {(() => {
             const a = partner.primary_address;
             if (!a) return '—';
-            const parts = [a.line1, a.line2, a.city, a.region, a.postal_code, a.country_code].filter(
-              Boolean,
-            );
+            const parts = [
+              a.line1,
+              a.line2,
+              a.city,
+              a.region,
+              a.postal_code,
+              a.country_code,
+            ].filter(Boolean);
             return parts.length ? parts.join(', ') : '—';
           })()}
         </div>
@@ -344,9 +360,7 @@ export default function BusinessPartnerDetailPage() {
           </div>
           <div>
             <dt className="text-xs uppercase text-slate-500">Tax identifier</dt>
-            <dd data-testid="bp-detail-tax-identifier">
-              {partner.tax_identifier ?? '—'}
-            </dd>
+            <dd data-testid="bp-detail-tax-identifier">{partner.tax_identifier ?? '—'}</dd>
           </div>
         </dl>
       </section>
@@ -441,7 +455,9 @@ function SupplierProfileSection({
   busy: boolean;
 }) {
   const profile = partner.supplier_profile;
-  const [qual, setQual] = useState<QualificationStatus>(profile?.qualification_status ?? 'unqualified');
+  const [qual, setQual] = useState<QualificationStatus>(
+    profile?.qualification_status ?? 'unqualified',
+  );
   const [pref, setPref] = useState<PreferenceTier>(profile?.preference_tier ?? 'standard');
   const [note, setNote] = useState<string>(profile?.qualification_note ?? '');
 
@@ -466,7 +482,9 @@ function SupplierProfileSection({
               className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100"
             >
               {Object.entries(QUALIFICATION_LABELS).map(([v, l]) => (
-                <option key={v} value={v}>{l}</option>
+                <option key={v} value={v}>
+                  {l}
+                </option>
               ))}
             </select>
           </label>
@@ -480,7 +498,9 @@ function SupplierProfileSection({
               className="mt-1 block w-full rounded border border-slate-300 px-3 py-2 text-sm disabled:bg-slate-100"
             >
               {Object.entries(PREFERENCE_LABELS).map(([v, l]) => (
-                <option key={v} value={v}>{l}</option>
+                <option key={v} value={v}>
+                  {l}
+                </option>
               ))}
             </select>
           </label>
@@ -524,7 +544,13 @@ function ContactsSection({
 }: {
   partner: BusinessPartner;
   canUpdate: boolean;
-  onAddContact: (f: { name: string; role: ContactRole; email: string; phone: string; isPrimary: boolean }) => Promise<void>;
+  onAddContact: (f: {
+    name: string;
+    role: ContactRole;
+    email: string;
+    phone: string;
+    isPrimary: boolean;
+  }) => Promise<void>;
   onDeactivateContact: (id: string) => Promise<void>;
   onRestoreContact: (id: string) => Promise<void>;
   busy: boolean;
@@ -538,7 +564,10 @@ function ContactsSection({
   async function submit() {
     if (!name.trim()) return;
     await onAddContact({ name: name.trim(), role, email, phone, isPrimary });
-    setName(''); setEmail(''); setPhone(''); setIsPrimary(false);
+    setName('');
+    setEmail('');
+    setPhone('');
+    setIsPrimary(false);
   }
 
   return (
@@ -549,12 +578,18 @@ function ContactsSection({
           <div className="p-4 text-sm text-slate-500">No contacts.</div>
         )}
         {partner.contacts.map((c) => (
-          <div key={c.id} className="flex items-center justify-between p-3" data-testid={`bp-contact-${c.id}`}>
+          <div
+            key={c.id}
+            className="flex items-center justify-between p-3"
+            data-testid={`bp-contact-${c.id}`}
+          >
             <div>
               <div className="text-sm font-medium">
                 {c.name}
                 {c.is_primary && (
-                  <span className="ml-2 rounded bg-emerald-100 px-1.5 text-xs text-emerald-800">Primary</span>
+                  <span className="ml-2 rounded bg-emerald-100 px-1.5 text-xs text-emerald-800">
+                    Primary
+                  </span>
                 )}
                 {!c.is_active && (
                   <span className="ml-2 rounded bg-slate-200 px-1.5 text-xs">Inactive</span>
@@ -596,7 +631,10 @@ function ContactsSection({
       </div>
 
       {canUpdate && (
-        <div className="mt-4 rounded border border-dashed border-slate-300 p-3" data-testid="bp-add-contact-form">
+        <div
+          className="mt-4 rounded border border-dashed border-slate-300 p-3"
+          data-testid="bp-add-contact-form"
+        >
           <div className="grid grid-cols-2 gap-2">
             <input
               type="text"
@@ -613,7 +651,9 @@ function ContactsSection({
               className="rounded border border-slate-300 px-2 py-1 text-sm"
             >
               {Object.entries(CONTACT_ROLE_LABELS).map(([v, l]) => (
-                <option key={v} value={v}>{l}</option>
+                <option key={v} value={v}>
+                  {l}
+                </option>
               ))}
             </select>
             <input
@@ -632,7 +672,11 @@ function ContactsSection({
             />
           </div>
           <label className="mt-2 flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={isPrimary} onChange={(e) => setIsPrimary(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={isPrimary}
+              onChange={(e) => setIsPrimary(e.target.checked)}
+            />
             Primary for this role
           </label>
           <div className="mt-2 flex justify-end">

@@ -244,10 +244,7 @@ describe('NewBusinessPartnerPage', () => {
 
   it('submits the create payload with the supplier capability included by default', async () => {
     mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
-      if (
-        path === `/v1/organizations/${ORG.id}/business-partners` &&
-        init?.method === 'POST'
-      ) {
+      if (path === `/v1/organizations/${ORG.id}/business-partners` && init?.method === 'POST') {
         const body = JSON.parse((init.body as string) ?? '{}');
         expect(body.code).toBe('ACME-01');
         expect(body.legal_name).toBe('Acme');
@@ -294,7 +291,9 @@ describe('NewBusinessPartnerPage', () => {
     render(<NewBusinessPartnerPage />);
     fireEvent.change(screen.getByTestId('bp-create-code'), { target: { value: 'full-01' } });
     fireEvent.change(screen.getByTestId('bp-create-legal-name'), { target: { value: 'Full' } });
-    fireEvent.change(screen.getByTestId('bp-create-addr-line1'), { target: { value: '1 Silk Rd' } });
+    fireEvent.change(screen.getByTestId('bp-create-addr-line1'), {
+      target: { value: '1 Silk Rd' },
+    });
     fireEvent.change(screen.getByTestId('bp-create-addr-city'), { target: { value: 'Mumbai' } });
     fireEvent.change(screen.getByTestId('bp-create-addr-country-code'), {
       target: { value: 'in' },

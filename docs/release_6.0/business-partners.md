@@ -10,28 +10,28 @@ Canonical contract: [`docs/architecture/release-6.0-purchase-to-stock.md`](../ar
 
 ## §4.1 Partner header contract
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `code` | `VARCHAR(64)` | Uppercased, regex `^[A-Z0-9][A-Z0-9._-]{0,63}$`; unique within an organization across ALL lifecycle states (never recycled). |
-| `legal_name` | `VARCHAR(255)` | Required, non-blank. |
-| `trading_name` | `VARCHAR(255)` | Optional. |
-| `primary_address` | `JSONB` | Bounded object with the frozen keys `{line1, line2, city, region, postal_code, country_code}`. Extra keys are rejected (`extra="forbid"`). `country_code` inside is ISO 3166-1 alpha-2. |
-| `email` | `VARCHAR(320)` | Optional partner-level convenience contact. Does NOT replace multi-contact. |
-| `phone` | `VARCHAR(80)` | Optional partner-level convenience contact. |
-| `country_code` | `CHAR(2)` | Optional ISO 3166-1 alpha-2 (uppercased at the API layer; length enforced at the DB layer). |
-| `tax_identifier` | `VARCHAR(80)` | Optional reference identifier. Not interpreted (no tax logic). |
-| `notes` | `VARCHAR(2000)` | Optional free text. |
-| `metadata` | `JSONB` | Bounded (≤ 4 KiB serialised); no keys matching `password/secret/token/api_key/credential/authorization`; not for secrets, not for audit-payload duplication. Intended use: presentation hints, external-system correlation IDs. |
-| `is_active` | `BOOLEAN` | Lifecycle state (deactivate / restore are idempotent). |
+| Field             | Type            | Notes                                                                                                                                                                                                                           |
+| ----------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `code`            | `VARCHAR(64)`   | Uppercased, regex `^[A-Z0-9][A-Z0-9._-]{0,63}$`; unique within an organization across ALL lifecycle states (never recycled).                                                                                                    |
+| `legal_name`      | `VARCHAR(255)`  | Required, non-blank.                                                                                                                                                                                                            |
+| `trading_name`    | `VARCHAR(255)`  | Optional.                                                                                                                                                                                                                       |
+| `primary_address` | `JSONB`         | Bounded object with the frozen keys `{line1, line2, city, region, postal_code, country_code}`. Extra keys are rejected (`extra="forbid"`). `country_code` inside is ISO 3166-1 alpha-2.                                         |
+| `email`           | `VARCHAR(320)`  | Optional partner-level convenience contact. Does NOT replace multi-contact.                                                                                                                                                     |
+| `phone`           | `VARCHAR(80)`   | Optional partner-level convenience contact.                                                                                                                                                                                     |
+| `country_code`    | `CHAR(2)`       | Optional ISO 3166-1 alpha-2 (uppercased at the API layer; length enforced at the DB layer).                                                                                                                                     |
+| `tax_identifier`  | `VARCHAR(80)`   | Optional reference identifier. Not interpreted (no tax logic).                                                                                                                                                                  |
+| `notes`           | `VARCHAR(2000)` | Optional free text.                                                                                                                                                                                                             |
+| `metadata`        | `JSONB`         | Bounded (≤ 4 KiB serialised); no keys matching `password/secret/token/api_key/credential/authorization`; not for secrets, not for audit-payload duplication. Intended use: presentation hints, external-system correlation IDs. |
+| `is_active`       | `BOOLEAN`       | Lifecycle state (deactivate / restore are idempotent).                                                                                                                                                                          |
 
 ## Concepts
 
-| Concept | Location | Notes |
-| --- | --- | --- |
-| **Business Partner** | `business_partners` | Aggregate root, organization-owned, `code` unique within an organization across all lifecycle states. |
-| **Capabilities** | `business_partner_capabilities` | A partner may be a supplier, customer, transporter, contractor, veterinary service, laboratory, consultant, or other. Multiple capabilities are supported on a single partner. |
-| **Supplier profile** | `business_partner_supplier_profiles` | One-to-one with a partner that has the `supplier` capability. Carries qualification status + preference tier. |
-| **Contacts** | `business_partner_contacts` | Named contacts with a role. At most one *active primary* contact is allowed per `(partner, role)`. |
+| Concept              | Location                             | Notes                                                                                                                                                                          |
+| -------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Business Partner** | `business_partners`                  | Aggregate root, organization-owned, `code` unique within an organization across all lifecycle states.                                                                          |
+| **Capabilities**     | `business_partner_capabilities`      | A partner may be a supplier, customer, transporter, contractor, veterinary service, laboratory, consultant, or other. Multiple capabilities are supported on a single partner. |
+| **Supplier profile** | `business_partner_supplier_profiles` | One-to-one with a partner that has the `supplier` capability. Carries qualification status + preference tier.                                                                  |
+| **Contacts**         | `business_partner_contacts`          | Named contacts with a role. At most one _active primary_ contact is allowed per `(partner, role)`.                                                                             |
 
 **Frozen enums** (do not extend without an architecture pass):
 
@@ -43,7 +43,7 @@ Canonical contract: [`docs/architecture/release-6.0-purchase-to-stock.md`](../ar
 ## Business rules
 
 1. **Code normalization**: `code` is uppercased and validated against `^[A-Z0-9][A-Z0-9._-]{0,63}$` on write.
-2. **Unique code per organization**: enforced by a UNIQUE constraint across *all* lifecycle states — codes are never recycled.
+2. **Unique code per organization**: enforced by a UNIQUE constraint across _all_ lifecycle states — codes are never recycled.
 3. **Non-empty invariant**: `code` and `legal_name` are enforced non-blank at the DB layer via CHECK constraints and at the API layer via schema validators.
 4. **Supplier profile requires supplier capability**: writing a supplier profile without the `supplier` capability returns a frozen 409 `supplier_profile_requires_supplier_capability` envelope.
 5. **Qualification is server-controlled**: setting `qualification_status` to anything other than `unqualified` stamps `qualified_by_id` and `qualified_at` from the acting user; resetting to `unqualified` clears both.
@@ -90,7 +90,7 @@ Contacts:
   "detail": {
     "code": "business_partner_code_conflict",
     "message": "A partner with this code already exists in this organization.",
-    "context": {"code": "ACME-01"}
+    "context": { "code": "ACME-01" }
   }
 }
 ```
@@ -114,15 +114,15 @@ Permissions (all organization-scoped):
 
 Role grants (per canonical §12):
 
-| Role | read | create | update | deactivate |
-| --- | :-: | :-: | :-: | :-: |
-| `owner` | ✅ | ✅ | ✅ | ✅ |
-| `farm_director` | ✅ | ✅ | ✅ | ❌ |
-| `farm_manager` | ✅ (scoped) | ❌ | ❌ | ❌ |
-| `supervisor` | ✅ (scoped) | ❌ | ❌ | ❌ |
-| `storekeeper` | ✅ (scoped) | ❌ | ❌ | ❌ |
-| `accountant` | ✅ | ❌ | ❌ | ❌ |
-| `viewer` | ✅ | ❌ | ❌ | ❌ |
+| Role            |    read     | create | update | deactivate |
+| --------------- | :---------: | :----: | :----: | :--------: |
+| `owner`         |     ✅      |   ✅   |   ✅   |     ✅     |
+| `farm_director` |     ✅      |   ✅   |   ✅   |     ❌     |
+| `farm_manager`  | ✅ (scoped) |   ❌   |   ❌   |     ❌     |
+| `supervisor`    | ✅ (scoped) |   ❌   |   ❌   |     ❌     |
+| `storekeeper`   | ✅ (scoped) |   ❌   |   ❌   |     ❌     |
+| `accountant`    |     ✅      |   ❌   |   ❌   |     ❌     |
+| `viewer`        |     ✅      |   ❌   |   ❌   |     ❌     |
 
 **Tenant isolation**: non-members of the owning organization receive a 404 (existence hidden). The endpoint layer first loads the partner and then hands the resolved `organization_id` to `require_permission`, whose membership check runs before the permission code check.
 

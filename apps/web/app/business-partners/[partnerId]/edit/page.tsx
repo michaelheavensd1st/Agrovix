@@ -149,7 +149,10 @@ export default function BusinessPartnerEditPage() {
   if (!partner) {
     return (
       <div className="px-6 py-8">
-        <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800" data-testid="bp-edit-error">
+        <div
+          className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800"
+          data-testid="bp-edit-error"
+        >
           {error ?? 'Partner not found.'}
         </div>
       </div>
@@ -159,7 +162,10 @@ export default function BusinessPartnerEditPage() {
   return (
     <div className="px-6 py-8 max-w-3xl mx-auto">
       <div className="mb-4">
-        <Link href={`/business-partners/${partner.id}`} className="text-sm text-slate-500 hover:underline">
+        <Link
+          href={`/business-partners/${partner.id}`}
+          className="text-sm text-slate-500 hover:underline"
+        >
           ← Back to partner
         </Link>
       </div>
@@ -300,12 +306,18 @@ export default function BusinessPartnerEditPage() {
           />
         </label>
         {error && (
-          <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800" data-testid="bp-edit-error">
+          <div
+            className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800"
+            data-testid="bp-edit-error"
+          >
             {error}
           </div>
         )}
         <div className="flex justify-end gap-3">
-          <Link href={`/business-partners/${partner.id}`} className="rounded border border-slate-300 px-4 py-2 text-sm">
+          <Link
+            href={`/business-partners/${partner.id}`}
+            className="rounded border border-slate-300 px-4 py-2 text-sm"
+          >
             Cancel
           </Link>
           <button
