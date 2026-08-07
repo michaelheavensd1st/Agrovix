@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 // ---- hoisted mocks ----------------------------------------------- //
@@ -43,11 +43,23 @@ import { apiFetch } from '@/lib/api';
 import BusinessPartnerListPage from '@/app/business-partners/page';
 import NewBusinessPartnerPage from '@/app/business-partners/new/page';
 import BusinessPartnerDetailPage from '@/app/business-partners/[partnerId]/page';
+import EditBusinessPartnerPage from '@/app/business-partners/[partnerId]/edit/page';
 
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
 
 // ---- fixtures ---------------------------------------------------- //
 const ORG = { id: 'org-A', name: 'Aegis Foods', slug: 'aegis' };
+const ORG_B = { id: 'org-B', name: 'Beacon Foods', slug: 'beacon' };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 const OWNER_USER = {
   id: 'user-owner',
@@ -228,6 +240,73 @@ describe('BusinessPartnerListPage', () => {
     await waitFor(() => {
       expect(screen.getByTestId('bp-forbidden')).toBeInTheDocument();
     });
+  });
+
+  it('ignores a late prior-tenant success and keeps the new tenant authoritative', async () => {
+    const oldRequest = deferred<any>();
+    const newRequest = deferred<any>();
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/organizations') return Promise.resolve([ORG, ORG_B]);
+      if (path.startsWith(`/v1/organizations/${ORG.id}/business-partners`)) {
+        return oldRequest.promise;
+      }
+      if (path.startsWith(`/v1/organizations/${ORG_B.id}/business-partners`)) {
+        return newRequest.promise;
+      }
+      return Promise.resolve(null);
+    });
+    render(<BusinessPartnerListPage />);
+    const orgSelect = await screen.findByTestId('bp-org-select');
+    fireEvent.change(orgSelect, { target: { value: ORG_B.id } });
+
+    await act(async () => {
+      newRequest.resolve({
+        items: [makePartner({ id: 'bp-B', code: 'BEACON', legal_name: 'Beacon Partner' })],
+        next_cursor: null,
+      });
+    });
+    expect(await screen.findByText('Beacon Partner')).toBeInTheDocument();
+
+    await act(async () => {
+      oldRequest.resolve({
+        items: [makePartner({ code: 'STALE-A', legal_name: 'Stale A Partner' })],
+        next_cursor: null,
+      });
+    });
+    expect(screen.queryByText('Stale A Partner')).toBeNull();
+    expect(screen.getByText('Beacon Partner')).toBeInTheDocument();
+  });
+
+  it('ignores a late prior-tenant error after the new tenant has loaded', async () => {
+    const { ApiError } = await import('@/lib/api');
+    const oldRequest = deferred<any>();
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/organizations') return Promise.resolve([ORG, ORG_B]);
+      if (path.startsWith(`/v1/organizations/${ORG.id}/business-partners`)) {
+        return oldRequest.promise;
+      }
+      if (path.startsWith(`/v1/organizations/${ORG_B.id}/business-partners`)) {
+        return Promise.resolve({
+          items: [makePartner({ id: 'bp-B', code: 'BEACON', legal_name: 'Beacon Partner' })],
+          next_cursor: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+    render(<BusinessPartnerListPage />);
+    fireEvent.change(await screen.findByTestId('bp-org-select'), {
+      target: { value: ORG_B.id },
+    });
+    expect(await screen.findByText('Beacon Partner')).toBeInTheDocument();
+
+    await act(async () => {
+      oldRequest.reject(new ApiError(403, { detail: 'stale tenant error' } as any));
+    });
+    expect(screen.queryByTestId('bp-forbidden')).toBeNull();
+    expect(screen.queryByTestId('bp-error')).toBeNull();
+    expect(screen.getByText('Beacon Partner')).toBeInTheDocument();
   });
 });
 
@@ -431,6 +510,19 @@ describe('BusinessPartnerDetailPage', () => {
     });
   });
 
+  it('uses the shared 401 authentication path and redirects to login', async () => {
+    const { ApiError } = await import('@/lib/api');
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') {
+        return Promise.reject(new ApiError(401, { detail: 'expired' } as any));
+      }
+      if (path === '/v1/business-partners/bp-1') return new Promise(() => {});
+      return Promise.resolve(null);
+    });
+    render(<BusinessPartnerDetailPage />);
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith('/login'));
+  });
+
   it('discards a stale response when the route partner id changes mid-flight', async () => {
     // First mount: bp-1 slow, then remount for bp-2 fast → the bp-1
     // response must be ignored so the header never flashes back.
@@ -483,5 +575,220 @@ describe('BusinessPartnerDetailPage', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(screen.queryByTestId('bp-detail-error')).toBeNull();
     expect(screen.getByText('Second')).toBeInTheDocument();
+  });
+
+  it('renders a null primary address without leaking placeholder structure', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/business-partners/bp-1') {
+        return Promise.resolve(makePartner({ primary_address: null }));
+      }
+      return Promise.resolve(null);
+    });
+    render(<BusinessPartnerDetailPage />);
+    await waitFor(() => expect(screen.getByText('Acme Feeds Ltd.')).toBeInTheDocument());
+    expect(screen.getByTestId('bp-detail-primary-address')).toHaveTextContent('—');
+  });
+
+  it.each([
+    ['success', null],
+    ['403', 403],
+    ['404', 404],
+    ['generic error', 500],
+  ])('ignores a stale post-mutation %s after the route changes', async (_label, status) => {
+    const { ApiError } = await import('@/lib/api');
+    const mutation = deferred<any>();
+    const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('route changed');
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/business-partners/bp-1' && !init?.method) {
+        return Promise.resolve(makePartner());
+      }
+      if (path === '/v1/business-partners/bp-1/deactivate') return mutation.promise;
+      if (path === '/v1/business-partners/bp-2') {
+        return Promise.resolve(makePartner({ id: 'bp-2', legal_name: 'Current Partner' }));
+      }
+      return Promise.resolve(null);
+    });
+    const { rerender } = render(<BusinessPartnerDetailPage />);
+    fireEvent.click(await screen.findByTestId('bp-detail-deactivate'));
+    useParamsMock.mockReturnValue({ partnerId: 'bp-2' });
+    rerender(<BusinessPartnerDetailPage />);
+    expect(await screen.findByText('Current Partner')).toBeInTheDocument();
+
+    await act(async () => {
+      if (status === null) mutation.resolve(makePartner({ is_active: false }));
+      else mutation.reject(new ApiError(status, { detail: 'stale mutation' } as any));
+    });
+    expect(screen.getByText('Current Partner')).toBeInTheDocument();
+    expect(screen.queryByTestId('bp-detail-error')).toBeNull();
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(
+      mockedApiFetch.mock.calls.filter((call: any[]) => call[0] === '/v1/business-partners/bp-1'),
+    ).toHaveLength(1);
+    promptSpy.mockRestore();
+    alertSpy.mockRestore();
+  });
+
+  it('does not update state when unmounted during a mutation', async () => {
+    const mutation = deferred<any>();
+    const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('unmounted');
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/business-partners/bp-1' && !init?.method) {
+        return Promise.resolve(makePartner());
+      }
+      if (path === '/v1/business-partners/bp-1/deactivate') return mutation.promise;
+      return Promise.resolve(null);
+    });
+    const { unmount } = render(<BusinessPartnerDetailPage />);
+    fireEvent.click(await screen.findByTestId('bp-detail-deactivate'));
+    unmount();
+    await act(async () => mutation.reject(new Error('late failure')));
+    expect(alertSpy).not.toHaveBeenCalled();
+    promptSpy.mockRestore();
+    alertSpy.mockRestore();
+  });
+
+  it('supports permitted qualification and contact lifecycle mutations', async () => {
+    const contact = {
+      id: 'contact-1',
+      business_partner_id: 'bp-1',
+      name: 'Alice',
+      job_title: null,
+      email: null,
+      phone: null,
+      contact_role: 'accounts',
+      is_primary: true,
+      is_active: true,
+      deactivated_at: null,
+      deactivation_reason: null,
+      created_at: '2026-02-01T00:00:00.000Z',
+      updated_at: '2026-02-01T00:00:00.000Z',
+    };
+    let current = makePartner({ contacts: [contact] });
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('lifecycle');
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve(OWNER_USER);
+      if (path === '/v1/business-partners/bp-1' && !init?.method) {
+        return Promise.resolve(current);
+      }
+      if (path.endsWith('/supplier-profile') && init?.method === 'PUT') {
+        return Promise.resolve(current.supplier_profile);
+      }
+      if (path.endsWith('/contacts') && init?.method === 'POST') return Promise.resolve(contact);
+      if (path.endsWith('/deactivate') && path.includes('contact-1')) {
+        current = makePartner({ contacts: [{ ...contact, is_active: false }] });
+        return Promise.resolve(current.contacts[0]);
+      }
+      if (path.endsWith('/restore') && path.includes('contact-1')) {
+        current = makePartner({ contacts: [contact] });
+        return Promise.resolve(contact);
+      }
+      return Promise.resolve(null);
+    });
+    render(<BusinessPartnerDetailPage />);
+    await screen.findByTestId('bp-detail-save-supplier-profile');
+    fireEvent.change(screen.getByTestId('bp-detail-qualification'), {
+      target: { value: 'blocked' },
+    });
+    fireEvent.click(screen.getByTestId('bp-detail-save-supplier-profile'));
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(
+        '/v1/business-partners/bp-1/supplier-profile',
+        expect.objectContaining({ method: 'PUT' }),
+      ),
+    );
+    fireEvent.change(screen.getByTestId('bp-add-contact-name'), {
+      target: { value: 'New Contact' },
+    });
+    fireEvent.click(screen.getByTestId('bp-add-contact-submit'));
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(
+        '/v1/business-partners/bp-1/contacts',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    fireEvent.click(screen.getByTestId('bp-contact-deactivate-contact-1'));
+    await waitFor(() => expect(screen.getByTestId('bp-contact-restore-contact-1')).toBeVisible());
+    fireEvent.click(screen.getByTestId('bp-contact-restore-contact-1'));
+    await waitFor(() =>
+      expect(screen.getByTestId('bp-contact-deactivate-contact-1')).toBeVisible(),
+    );
+    promptSpy.mockRestore();
+  });
+
+  it('disables qualification changes for a read-only user', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(VIEWER_USER);
+      if (path === '/v1/business-partners/bp-1') return Promise.resolve(makePartner());
+      return Promise.resolve(null);
+    });
+    render(<BusinessPartnerDetailPage />);
+    expect(await screen.findByTestId('bp-detail-qualification')).toBeDisabled();
+    expect(screen.queryByTestId('bp-detail-save-supplier-profile')).toBeNull();
+  });
+});
+
+describe('EditBusinessPartnerPage', () => {
+  beforeEach(() => {
+    mockedApiFetch.mockReset();
+    routerPush.mockReset();
+    useParamsMock.mockReturnValue({ partnerId: 'bp-1' });
+  });
+  afterEach(() => vi.clearAllMocks());
+
+  it.each([
+    [403, 'Forbidden.'],
+    [404, 'Not found.'],
+  ])('renders the stable edit error for %i', async (status, message) => {
+    const { ApiError } = await import('@/lib/api');
+    mockedApiFetch.mockRejectedValue(new ApiError(status, { detail: message } as any));
+    render(<EditBusinessPartnerPage />);
+    expect(await screen.findByTestId('bp-edit-error')).toHaveTextContent(message);
+  });
+
+  it('ignores a stale edit load after the route changes', async () => {
+    const oldLoad = deferred<any>();
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/business-partners/bp-1') return oldLoad.promise;
+      if (path === '/v1/business-partners/bp-2') {
+        return Promise.resolve(makePartner({ id: 'bp-2', legal_name: 'Current Edit' }));
+      }
+      return Promise.resolve(null);
+    });
+    const { rerender } = render(<EditBusinessPartnerPage />);
+    useParamsMock.mockReturnValue({ partnerId: 'bp-2' });
+    rerender(<EditBusinessPartnerPage />);
+    expect(await screen.findByDisplayValue('Current Edit')).toBeInTheDocument();
+    await act(async () => oldLoad.resolve(makePartner({ legal_name: 'Stale Edit' })));
+    expect(screen.queryByDisplayValue('Stale Edit')).toBeNull();
+    expect(screen.getByDisplayValue('Current Edit')).toBeInTheDocument();
+  });
+
+  it('ignores a mutation completion after the edit route changes', async () => {
+    const mutation = deferred<any>();
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/business-partners/bp-1' && !init?.method) {
+        return Promise.resolve(makePartner());
+      }
+      if (path === '/v1/business-partners/bp-1' && init?.method === 'PATCH') {
+        return mutation.promise;
+      }
+      if (path === '/v1/business-partners/bp-2') {
+        return Promise.resolve(makePartner({ id: 'bp-2', legal_name: 'Current Edit' }));
+      }
+      return Promise.resolve(null);
+    });
+    const { rerender } = render(<EditBusinessPartnerPage />);
+    fireEvent.click(await screen.findByTestId('bp-edit-submit'));
+    useParamsMock.mockReturnValue({ partnerId: 'bp-2' });
+    rerender(<EditBusinessPartnerPage />);
+    expect(await screen.findByDisplayValue('Current Edit')).toBeInTheDocument();
+    await act(async () => mutation.resolve(makePartner({ legal_name: 'Saved Stale Edit' })));
+    expect(routerPush).not.toHaveBeenCalledWith('/business-partners/bp-1');
+    expect(screen.getByDisplayValue('Current Edit')).toBeInTheDocument();
   });
 });

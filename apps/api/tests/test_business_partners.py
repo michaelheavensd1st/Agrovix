@@ -22,7 +22,9 @@ Coverage per Phase 7 of the frozen implementation plan
 
 from __future__ import annotations
 
+import asyncio
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -32,6 +34,10 @@ from sqlalchemy import select
 
 from app.db import session as _db
 from app.models.audit import AuditEvent
+from app.models.farm import Farm
+from app.models.membership import FarmMembership, OrganizationMembership
+from app.models.role_assignment import RoleAssignment
+from app.models.user import User
 from tests._helpers import (
     create_farm,
     create_org,
@@ -564,6 +570,41 @@ async def test_contact_create_list_and_primary_invariant(
         },
     )
     assert r.status_code == 201
+
+
+@_postgres_only
+async def test_concurrent_primary_contact_creation_returns_stable_conflict(
+    client: AsyncClient,
+) -> None:
+    ctx = await _new_owner_org(client)
+    p = await _create_partner(client, ctx["org_id"], code="CTC-RACE")
+    endpoint = f"/api/v1/business-partners/{p['id']}/contacts"
+
+    first, second = await asyncio.gather(
+        client.post(
+            endpoint,
+            json={"name": "Primary A", "contact_role": "accounts", "is_primary": True},
+        ),
+        client.post(
+            endpoint,
+            json={"name": "Primary B", "contact_role": "accounts", "is_primary": True},
+        ),
+    )
+
+    assert sorted((first.status_code, second.status_code)) == [201, 409]
+    conflict = first if first.status_code == 409 else second
+    assert conflict.json()["detail"]["code"] == "business_partner_contact_primary_conflict"
+
+    # The losing transaction must be rolled back cleanly and leave exactly one
+    # active primary for the constrained (partner, contact_role) tuple.
+    listed = await client.get(endpoint, params={"include_inactive": True})
+    assert listed.status_code == 200, listed.text
+    active_primaries = [
+        contact
+        for contact in listed.json()["items"]
+        if contact["contact_role"] == "accounts" and contact["is_active"] and contact["is_primary"]
+    ]
+    assert len(active_primaries) == 1
 
 
 async def test_contact_update_deactivate_restore(
@@ -1294,12 +1335,10 @@ async def test_farm_manager_can_update_but_not_deactivate(
         role_name="farm_manager",
         farm_id=farm_id,
     )
-    # Read attempt: farm_manager has `business_partner.read` on paper,
-    # but the grant is farm-scoped while the endpoint enforces an
-    # org-scoped permission check. Accept both 200 (if permission
-    # resolver escalates farm→org) or 403 (documented scope gap).
+    # Frozen §12 model: an active farm-scoped read grant widens only
+    # Business Partner reads within the same organization.
     r = await client.get(f"/api/v1/business-partners/{p['id']}")
-    assert r.status_code in (200, 403), r.text
+    assert r.status_code == 200, r.text
     # Cannot create (impl reserves create for farm_director+).
     r = await client.post(
         f"/api/v1/organizations/{ctx['org_id']}/business-partners",
@@ -1750,6 +1789,91 @@ async def test_farm_scoped_role_can_read_org_partner(client: AsyncClient, role_n
     assert r.status_code == 200, r.text
 
 
+@pytest.mark.parametrize(
+    "invalid_scope",
+    [
+        "revoked_assignment",
+        "inactive_membership",
+        "inactive_farm",
+        "deleted_farm",
+        "inactive_org_membership",
+    ],
+)
+async def test_stale_farm_scope_does_not_grant_partner_read(
+    client: AsyncClient,
+    invalid_scope: str,
+) -> None:
+    """An active org membership must not revive a stale farm grant."""
+    ctx = await _new_owner_org(client)
+    farm_id = await _create_farm(client, ctx["org_id"])
+    partner = await _create_partner(client, ctx["org_id"], code=f"STALE-{invalid_scope[:3]}")
+    scoped = f"stale-{invalid_scope}-{uuid4().hex[:6]}@agrovix.dev"
+    await create_verified_user(scoped)
+    await invite_and_accept(
+        client,
+        inviter_email=ctx["owner"],
+        invitee_email=scoped,
+        org_id=ctx["org_id"],
+        role_name="farm_manager",
+        farm_id=farm_id,
+    )
+    if invalid_scope == "inactive_org_membership":
+        # Keep the user valid and active in another tenant. That unrelated
+        # membership must not revive the stale assignment in the target org.
+        await create_org(client, slug=f"other-{uuid4().hex[:6]}")
+
+    async with _db.AsyncSessionLocal() as session:
+        user = (await session.execute(select(User).where(User.email == scoped))).scalar_one()
+        org_membership = (
+            await session.execute(
+                select(OrganizationMembership).where(
+                    OrganizationMembership.user_id == user.id,
+                    OrganizationMembership.organization_id == uuid_from(ctx["org_id"]),
+                )
+            )
+        ).scalar_one()
+        assert org_membership.is_active is True
+
+        if invalid_scope == "revoked_assignment":
+            assignment = (
+                await session.execute(
+                    select(RoleAssignment).where(
+                        RoleAssignment.user_id == user.id,
+                        RoleAssignment.farm_id == uuid_from(farm_id),
+                    )
+                )
+            ).scalar_one()
+            assignment.revoked_at = datetime.now(UTC)
+            session.add(assignment)
+        elif invalid_scope == "inactive_membership":
+            membership = (
+                await session.execute(
+                    select(FarmMembership).where(
+                        FarmMembership.user_id == user.id,
+                        FarmMembership.farm_id == uuid_from(farm_id),
+                    )
+                )
+            ).scalar_one()
+            membership.is_active = False
+            session.add(membership)
+        elif invalid_scope in {"inactive_farm", "deleted_farm"}:
+            farm = await session.get(Farm, uuid_from(farm_id))
+            assert farm is not None
+            if invalid_scope == "inactive_farm":
+                farm.is_active = False
+            else:
+                farm.deleted_at = datetime.now(UTC)
+            session.add(farm)
+        else:
+            org_membership.is_active = False
+            session.add(org_membership)
+        await session.commit()
+
+    response = await client.get(f"/api/v1/business-partners/{partner['id']}")
+    expected = 404 if invalid_scope == "inactive_org_membership" else 403
+    assert response.status_code == expected, response.text
+
+
 @pytest.mark.parametrize("role_name", ["farm_manager", "supervisor", "storekeeper"])
 async def test_farm_scoped_role_cannot_mutate_partner(client: AsyncClient, role_name: str) -> None:
     ctx = await _new_owner_org(client)
@@ -1973,7 +2097,7 @@ async def test_country_code_valid_iso_accepted(client: AsyncClient, code: str) -
     assert r.json()["country_code"] == code
 
 
-@pytest.mark.parametrize("bad", ["ZZ", "QQ", "XX", "ZY"])
+@pytest.mark.parametrize("bad", ["XK", "ZZ", "QQ", "XX", "ZY"])
 async def test_country_code_reserved_or_nonexistent_rejected(client: AsyncClient, bad: str) -> None:
     ctx = await _new_owner_org(client)
     r = await client.post(
