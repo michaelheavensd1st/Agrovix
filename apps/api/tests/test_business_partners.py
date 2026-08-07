@@ -1870,8 +1870,7 @@ async def test_stale_farm_scope_does_not_grant_partner_read(
         await session.commit()
 
     response = await client.get(f"/api/v1/business-partners/{partner['id']}")
-    expected = 404 if invalid_scope == "inactive_org_membership" else 403
-    assert response.status_code == expected, response.text
+    assert response.status_code == 403, response.text
 
 
 @pytest.mark.parametrize("role_name", ["farm_manager", "supervisor", "storekeeper"])

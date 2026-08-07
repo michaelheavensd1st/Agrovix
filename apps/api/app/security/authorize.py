@@ -155,37 +155,41 @@ async def resolve_permissions(
         return {"platform.admin", "*"}
 
     codes: set[str] = set()
-    # Reuse the canonical active-scope resolver so org/farm lifecycle
-    # validation cannot drift between permission-call paths. In
-    # particular, a farm-scoped grant contributes only while the exact
-    # organization membership, farm membership, farm, organization, and
-    # role assignment are all active.
-    scopes = await resolve_permission_scopes(session, user)
-    for scope in scopes:
-        # Platform-scoped assignments always apply.
-        if scope.organization_id is None and scope.farm_id is None:
-            codes.update(scope.permissions)
-            continue
-        # Organization-scoped assignments apply when the request is
-        # within (or scoped to) that organization.
-        if scope.farm_id is None:
-            if organization_id is None or scope.organization_id == organization_id:
+    if include_farm_grants_in_org:
+        # The Business Partner read-widening path must use canonical active
+        # scopes so a stale farm assignment cannot become an org-wide grant.
+        # Other permission paths retain their established lifecycle behavior;
+        # their resource services perform the relevant locked status checks.
+        scopes = await resolve_permission_scopes(session, user)
+        for scope in scopes:
+            applies = (
+                (scope.organization_id is None and scope.farm_id is None)
+                or (scope.farm_id is None and scope.organization_id == organization_id)
+                or (farm_id is not None and scope.farm_id == farm_id)
+                or (
+                    farm_id is None
+                    and organization_id is not None
+                    and scope.organization_id == organization_id
+                )
+            )
+            if applies:
                 codes.update(scope.permissions)
-            continue
-        # Farm-scoped assignments apply when the request targets that
-        # exact farm, OR — for narrowly-marked read paths — when the
-        # request is org-scoped and the assignment lives inside that
-        # same organization (see include_farm_grants_in_org).
-        if farm_id is not None and scope.farm_id == farm_id:
-            codes.update(scope.permissions)
-            continue
-        if (
-            include_farm_grants_in_org
-            and farm_id is None
-            and organization_id is not None
-            and scope.organization_id == organization_id
-        ):
-            codes.update(scope.permissions)
+        return codes
+
+    stmt = (
+        select(RoleAssignment)
+        .where(RoleAssignment.user_id == user.id, RoleAssignment.revoked_at.is_(None))
+        .options(selectinload(RoleAssignment.role).selectinload(Role.permissions))
+    )
+    assignments = (await session.execute(stmt)).scalars().all()
+    for assignment in assignments:
+        if assignment.organization_id is None and assignment.farm_id is None:
+            codes.update(permission.code for permission in assignment.role.permissions)
+        elif assignment.farm_id is None:
+            if organization_id is None or assignment.organization_id == organization_id:
+                codes.update(permission.code for permission in assignment.role.permissions)
+        elif farm_id is not None and assignment.farm_id == farm_id:
+            codes.update(permission.code for permission in assignment.role.permissions)
 
     return codes
 
