@@ -1,6 +1,6 @@
 # Release 6.0.3 — Purchase Orders — Phase 1 Draft PR Report
 
-**Status:** Sprint 1.3 hardening validated — ready for a 4th independent review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
+**Status:** Sprint 1.4 remediation validated — ready for a 5th independent domain review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
 **Contract:** `docs/release_6.0/purchase-orders.md` (frozen 6.0.3) · **Base:** `0011_business_partners`
 
 > **Sprint 1.1 addendum (domain hardening / review remediation).** The independent
@@ -34,6 +34,18 @@
 > concurrency runs (**81 passed**) are green. Alembic round-trip, seed, Ruff, Black, scope, and
 > whitespace gates pass; migration `0012` remains unchanged. Details:
 > `docs/release_6.0/purchase-orders-sprint-1.3-test-hardening-report.md`. **Milestone 2 not started.**
+
+> **Sprint 1.4 addendum (authoritative readback / concurrency proof hardening).** The fourth
+> independent review returned BLOCK (1 High / 2 Medium / 1 Low). Farm validation now forces a
+> post-lock `populate_existing` reread, including a PostgreSQL proof with an unexpired preloaded
+> Farm. The unrelated database-error proof now uses the real repository and PostgreSQL CHECK
+> constraint, with translation classification tested separately. Lifecycle races assert committed
+> actors, timestamps, transition order, and audit attribution. PO concurrency is **29 passed** and
+> three consecutive runs are **87 passed**; full SQLite is **452 passed / 109 skipped** and full
+> PostgreSQL is **529 passed / 32 skipped**. Ruff, Black, whitespace, Alembic round-trip, and seed
+> gates pass. Migration `0012` remains byte-identical. The sole remaining Low issue is future
+> organization-anchor contention monitoring. Details:
+> `docs/release_6.0/purchase-orders-sprint-1.4-remediation-report.md`. **Milestone 2 not started.**
 
 ---
 
@@ -85,6 +97,10 @@ The Purchase Order aggregate domain, exactly as scoped:
 | `alembic upgrade head` | **pass** (single head `0012_purchase_orders`) |
 | `alembic downgrade base → upgrade head` round-trip | **pass** |
 | `python -m app.seed` (post-migrate) | **pass** |
+
+Sprint 1.4 latest totals: targeted PO domain **54 passed**; PO PostgreSQL concurrency **29 passed**;
+three consecutive concurrency runs **87 passed**; SQLite full API suite **452 passed / 109 skipped**;
+PostgreSQL full API suite **529 passed / 32 skipped**.
 
 No regressions in Business Partners, inventory, tenancy, or RBAC suites.
 
