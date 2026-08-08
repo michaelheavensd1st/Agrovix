@@ -21,10 +21,11 @@ import asyncio
 import os
 import uuid as _u
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.db import session as _db
@@ -41,7 +42,12 @@ from app.models.farm import Farm
 from app.models.inventory import InventoryItem, InventoryItemCategory, StockUnit
 from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.organization import Organization
-from app.models.purchase_order import PurchaseOrder, PurchaseOrderSequence, PurchaseOrderStatus
+from app.models.purchase_order import (
+    PurchaseOrder,
+    PurchaseOrderSequence,
+    PurchaseOrderStatus,
+    PurchaseOrderTransition,
+)
 from app.models.role import Role
 from app.models.role_assignment import RoleAssignment
 from app.models.user import User
@@ -235,6 +241,38 @@ def _code(exc: Exception) -> str:
     return getattr(exc, "detail", {}).get("code", "err") if hasattr(exc, "detail") else "err"
 
 
+async def _committed_history(session, po_id):
+    transitions = list(
+        (
+            await session.execute(
+                select(PurchaseOrderTransition)
+                .where(PurchaseOrderTransition.purchase_order_id == po_id)
+                .order_by(
+                    PurchaseOrderTransition.occurred_at.asc(),
+                    PurchaseOrderTransition.id.asc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    audits = list(
+        (
+            await session.execute(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.entity_type == "purchase_order",
+                    AuditEvent.entity_id == str(po_id),
+                )
+                .order_by(AuditEvent.created_at.asc(), AuditEvent.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return transitions, audits
+
+
 # --------------------------------------------------------------------- #
 @_postgres_only
 async def test_concurrent_sequence_allocation_unique_monotonic():
@@ -375,20 +413,44 @@ async def test_submit_vs_cancel_serialize():
     }
     async with _db.AsyncSessionLocal() as s:
         po = await s.get(PurchaseOrder, _u.UUID(po_id))
-        transition_count = await PurchaseOrderTransitionRepository(s).count_for_po(po.id)
-        audit_count = (
-            await s.execute(
-                select(func.count())
-                .select_from(AuditEvent)
-                .where(
-                    AuditEvent.entity_type == "purchase_order",
-                    AuditEvent.entity_id == str(po.id),
-                )
-            )
-        ).scalar_one()
+        transitions, audits = await _committed_history(s, po.id)
         assert po.status == PurchaseOrderStatus.CANCELLED
-        assert po.version == transition_count
-        assert (po.version, audit_count) in {(3, 5), (2, 3)}
+        assert po.cancelled_by_id == ids["creator_id"]
+        assert po.cancelled_at is not None
+        assert po.version == len(transitions)
+        if outcomes[0] == "submitted":
+            assert po.version == 3
+            assert po.submitted_by_id == ids["creator_id"]
+            assert po.submitted_at is not None
+            assert [row.metadata_json["operation"] for row in transitions] == [
+                "create",
+                "submit",
+                "cancel",
+            ]
+            assert [row.actor_id for row in transitions] == [ids["creator_id"]] * 3
+            assert [row.action for row in audits] == [
+                "purchase_order.create",
+                "purchase_order.submit",
+                "purchase_order.transition",
+                "purchase_order.cancel",
+                "purchase_order.transition",
+            ]
+            assert [row.actor_id for row in audits] == [ids["creator_id"]] * 5
+        else:
+            assert po.version == 2
+            assert po.submitted_by_id is None
+            assert po.submitted_at is None
+            assert [row.metadata_json["operation"] for row in transitions] == [
+                "create",
+                "cancel",
+            ]
+            assert [row.actor_id for row in transitions] == [ids["creator_id"]] * 2
+            assert [row.action for row in audits] == [
+                "purchase_order.create",
+                "purchase_order.cancel",
+                "purchase_order.transition",
+            ]
+            assert [row.actor_id for row in audits] == [ids["creator_id"]] * 3
 
 
 @_postgres_only
@@ -477,20 +539,46 @@ async def test_approve_vs_cancel_serialize():
     }
     async with _db.AsyncSessionLocal() as s:
         po = await s.get(PurchaseOrder, _u.UUID(po_id))
-        transition_count = await PurchaseOrderTransitionRepository(s).count_for_po(po.id)
-        audit_count = (
-            await s.execute(
-                select(func.count())
-                .select_from(AuditEvent)
-                .where(
-                    AuditEvent.entity_type == "purchase_order",
-                    AuditEvent.entity_id == str(po.id),
-                )
-            )
-        ).scalar_one()
+        transitions, audits = await _committed_history(s, po.id)
         assert po.status == PurchaseOrderStatus.CANCELLED
-        assert po.version == transition_count
-        assert (po.version, audit_count) in {(4, 7), (3, 5)}
+        assert po.submitted_by_id == ids["creator_id"]
+        assert po.submitted_at is not None
+        assert po.cancelled_by_id == ids["approver_id"]
+        assert po.cancelled_at is not None
+        assert po.version == len(transitions)
+        expected_operations = ["create", "submit"]
+        expected_actions = [
+            "purchase_order.create",
+            "purchase_order.submit",
+            "purchase_order.transition",
+        ]
+        expected_actors = [ids["creator_id"], ids["creator_id"]]
+        expected_audit_actors = [ids["creator_id"]] * 3
+        if outcomes[0] == "approved":
+            assert po.version == 4
+            assert po.approved_by_id == ids["approver_id"]
+            assert po.approved_at is not None
+            expected_operations += ["approve", "cancel"]
+            expected_actions += [
+                "purchase_order.approve",
+                "purchase_order.transition",
+                "purchase_order.cancel",
+                "purchase_order.transition",
+            ]
+            expected_actors += [ids["approver_id"], ids["approver_id"]]
+            expected_audit_actors += [ids["approver_id"]] * 4
+        else:
+            assert po.version == 3
+            assert po.approved_by_id is None
+            assert po.approved_at is None
+            expected_operations += ["cancel"]
+            expected_actions += ["purchase_order.cancel", "purchase_order.transition"]
+            expected_actors += [ids["approver_id"]]
+            expected_audit_actors += [ids["approver_id"]] * 2
+        assert [row.metadata_json["operation"] for row in transitions] == expected_operations
+        assert [row.actor_id for row in transitions] == expected_actors
+        assert [row.action for row in audits] == expected_actions
+        assert [row.actor_id for row in audits] == expected_audit_actors
 
 
 @_postgres_only
@@ -548,9 +636,43 @@ async def test_self_approval_forbidden_under_concurrency():
     assert approver_outcome == "approved"
     async with _db.AsyncSessionLocal() as s:
         po = await s.get(PurchaseOrder, _u.UUID(po_id))
+        transitions, audits = await _committed_history(s, po.id)
         assert po.status == PurchaseOrderStatus.APPROVED
         assert po.version == 3
-        assert await PurchaseOrderTransitionRepository(s).count_for_po(po.id) == 3
+        assert po.approved_by_id == ids["approver_id"]
+        assert po.approved_at is not None
+        assert [row.metadata_json["operation"] for row in transitions] == [
+            "create",
+            "submit",
+            "approve",
+        ]
+        assert [row.actor_id for row in transitions] == [
+            ids["creator_id"],
+            ids["creator_id"],
+            ids["approver_id"],
+        ]
+        assert [row.action for row in audits] == [
+            "purchase_order.create",
+            "purchase_order.submit",
+            "purchase_order.transition",
+            "purchase_order.approve",
+            "purchase_order.transition",
+        ]
+        assert [row.actor_id for row in audits] == [
+            ids["creator_id"],
+            ids["creator_id"],
+            ids["creator_id"],
+            ids["approver_id"],
+            ids["approver_id"],
+        ]
+        assert not any(
+            row.metadata_json["operation"] == "approve" and row.actor_id == ids["creator_id"]
+            for row in transitions
+        )
+        assert not any(
+            row.action == "purchase_order.approve" and row.actor_id == ids["creator_id"]
+            for row in audits
+        )
 
 
 @_postgres_only
@@ -936,20 +1058,26 @@ async def test_role_assignment_revocation_wins_against_approval():
 
     async with _db.AsyncSessionLocal() as s:
         po = await s.get(PurchaseOrder, po_id)
-        audit_count = (
-            await s.execute(
-                select(func.count())
-                .select_from(AuditEvent)
-                .where(
-                    AuditEvent.entity_type == "purchase_order",
-                    AuditEvent.entity_id == str(po_id),
-                )
-            )
-        ).scalar_one()
+        transitions, audits = await _committed_history(s, po_id)
         assert po.status == PurchaseOrderStatus.SUBMITTED
         assert po.version == 2
-        assert await PurchaseOrderTransitionRepository(s).count_for_po(po_id) == 2
-        assert audit_count == 3
+        assert po.submitted_by_id == ids["creator_id"]
+        assert po.submitted_at is not None
+        assert po.approved_by_id is None
+        assert po.approved_at is None
+        assert [row.metadata_json["operation"] for row in transitions] == ["create", "submit"]
+        assert [row.actor_id for row in transitions] == [
+            ids["creator_id"],
+            ids["creator_id"],
+        ]
+        assert [row.action for row in audits] == [
+            "purchase_order.create",
+            "purchase_order.submit",
+            "purchase_order.transition",
+        ]
+        assert [row.actor_id for row in audits] == [ids["creator_id"]] * 3
+        assert not any(row.metadata_json["operation"] == "approve" for row in transitions)
+        assert not any(row.action == "purchase_order.approve" for row in audits)
 
 
 @_postgres_only
@@ -1259,6 +1387,71 @@ async def test_farm_deactivation_wins_against_update_draft():
 
 
 @_postgres_only
+async def test_preloaded_farm_external_deactivation_is_authoritatively_reread():
+    """An unexpired identity-map Farm must not survive the post-lock reread."""
+    ids = await _seed()
+    async with _db.AsyncSessionLocal() as setup:
+        farm = Farm(
+            organization_id=ids["org_id"],
+            name="Preloaded governance farm",
+            code=f"PF-{_u.uuid4().hex[:6]}",
+            is_active=True,
+        )
+        setup.add(farm)
+        await setup.commit()
+        farm_id = farm.id
+        po = await _svc(setup).create(
+            actor=await setup.get(User, ids["creator_id"]),
+            organization_id=ids["org_id"],
+            farm_id=farm_id,
+            business_partner_id=ids["partner_id"],
+            currency_code="USD",
+            order_date=TODAY,
+            lines=[_line(ids["item_id"])],
+        )
+        await setup.commit()
+        po_id = po.id
+
+    async with _db.AsyncSessionLocal() as session_a:
+        cached_farm = await session_a.get(Farm, farm_id)
+        assert cached_farm.is_active is True
+
+        async with _db.AsyncSessionLocal() as session_b:
+            current_farm = await session_b.get(Farm, farm_id)
+            current_farm.is_active = False
+            await session_b.commit()
+
+        # Do not expire or refresh cached_farm: production must replace its
+        # stale state after acquiring the deterministic dependency lock.
+        assert cached_farm.is_active is True
+        with pytest.raises(Exception) as exc:
+            await _svc(session_a).update_draft(
+                actor=await session_a.get(User, ids["creator_id"]),
+                organization_id=ids["org_id"],
+                po_id=po_id,
+                expected_version=1,
+                data={"notes": "must not survive authoritative readback"},
+            )
+        assert _code(exc.value) == "not_found"
+        await session_a.rollback()
+
+    async with _db.AsyncSessionLocal() as readback:
+        po = await readback.get(PurchaseOrder, po_id)
+        await readback.refresh(po, attribute_names=["lines"])
+        farm = await readback.get(Farm, farm_id)
+        transitions, audits = await _committed_history(readback, po_id)
+        assert po.status == PurchaseOrderStatus.DRAFT
+        assert po.version == 1
+        assert po.farm_id == farm_id
+        assert po.notes is None
+        assert len(po.lines) == 1
+        assert Decimal(str(po.lines[0].ordered_quantity)) == Decimal("10.000000")
+        assert farm.is_active is False
+        assert [row.metadata_json["operation"] for row in transitions] == ["create"]
+        assert [row.action for row in audits] == ["purchase_order.create"]
+
+
+@_postgres_only
 @pytest.mark.parametrize("operation", ["submit", "update"])
 async def test_inventory_deactivation_wins_against_po_mutation(operation):
     ids = await _seed()
@@ -1359,18 +1552,75 @@ async def test_duplicate_po_number_translation_and_clean_rollback():
 
 
 @_postgres_only
-async def test_real_unrelated_integrity_error_is_not_mislabeled(monkeypatch):
+async def test_real_repository_unrelated_integrity_error_and_clean_rollback():
+    """Prove PostgreSQL and the real repository reject an unrelated CHECK.
+
+    PurchaseOrderService.create() prevents this delivery-date state by design,
+    so this is intentionally a repository/integration proof. Production
+    service validation remains in force and is not bypassed in application
+    code.
+    """
+    ids = await _seed()
+    async with _db.AsyncSessionLocal() as s:
+        before = (
+            await s.execute(
+                select(func.count())
+                .select_from(PurchaseOrder)
+                .where(PurchaseOrder.organization_id == ids["org_id"])
+            )
+        ).scalar_one()
+        with pytest.raises(IntegrityError) as exc:
+            await PurchaseOrderRepository(s).create(
+                organization_id=ids["org_id"],
+                farm_id=None,
+                business_partner_id=ids["partner_id"],
+                po_number=f"PO-{TODAY.year}-999999",
+                supplier_reference=None,
+                status=PurchaseOrderStatus.DRAFT,
+                currency_code="USD",
+                order_date=TODAY,
+                expected_delivery_date=date(2026, 3, 31),
+                delivery_address=None,
+                notes=None,
+                supplier_code="SUP",
+                supplier_legal_name="Constraint proof supplier",
+                supplier_trading_name=None,
+                version=1,
+                created_by_id=ids["creator_id"],
+            )
+        assert "ck_purchase_order_delivery_after_order" in str(exc.value)
+        assert "duplicate_purchase_order_number" not in str(exc.value)
+        await s.rollback()
+        after = (
+            await s.execute(
+                select(func.count())
+                .select_from(PurchaseOrder)
+                .where(PurchaseOrder.organization_id == ids["org_id"])
+            )
+        ).scalar_one()
+        assert after == before == 0
+        assert await s.get(PurchaseOrderSequence, (ids["org_id"], TODAY.year)) is None
+
+    po_id = await _create_po(ids)
+    async with _db.AsyncSessionLocal() as s:
+        po = await s.get(PurchaseOrder, _u.UUID(po_id))
+        sequence = await s.get(PurchaseOrderSequence, (ids["org_id"], TODAY.year))
+        assert po.po_number == f"PO-{TODAY.year}-000001"
+        assert sequence.last_value == 1
+
+
+@_postgres_only
+async def test_service_reraises_unrecognized_integrity_error(monkeypatch):
+    """Unit-isolate the narrow translation branch; the prior test is the DB proof."""
     ids = await _seed()
     async with _db.AsyncSessionLocal() as s:
         svc = _svc(s)
-        original_create = svc.po_repo.create
 
         async def unrelated_failure(**_kwargs):
-            # A real PostgreSQL NOT NULL violation, deliberately unrelated to
-            # uq_purchase_order_org_number, must escape as IntegrityError.
-            await s.execute(
-                text("INSERT INTO purchase_orders (id) VALUES (:id)"),
-                {"id": _u.uuid4()},
+            raise IntegrityError(
+                "INSERT purchase_orders",
+                {},
+                Exception("ck_purchase_order_delivery_after_order"),
             )
 
         monkeypatch.setattr(svc.po_repo, "create", unrelated_failure)
@@ -1385,14 +1635,3 @@ async def test_real_unrelated_integrity_error_is_not_mislabeled(monkeypatch):
             )
         assert "duplicate_purchase_order_number" not in str(exc.value)
         await s.rollback()
-        monkeypatch.setattr(svc.po_repo, "create", original_create)
-        po = await svc.create(
-            actor=await s.get(User, ids["creator_id"]),
-            organization_id=ids["org_id"],
-            business_partner_id=ids["partner_id"],
-            currency_code="USD",
-            order_date=TODAY,
-            lines=[_line(ids["item_id"])],
-        )
-        await s.commit()
-        assert po.po_number == f"PO-{TODAY.year}-000001"
