@@ -485,7 +485,15 @@ class PurchaseOrderService:
         return partner
 
     async def _load_farm(self, organization_id: uuid.UUID, farm_id: uuid.UUID) -> Farm:
-        farm = await self.session.get(Farm, farm_id)
+        # Farm dependency rows are locked before this loader is called. Force
+        # the subsequent validation read to overwrite any unexpired identity-
+        # map state that predates that lock; session.get() may otherwise return
+        # a cached Farm without issuing an authoritative post-lock SELECT.
+        farm = (
+            await self.session.execute(
+                select(Farm).where(Farm.id == farm_id).execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         if farm is None or farm.organization_id != organization_id:
             raise _tenant_hidden("Farm")
         if farm.deleted_at is not None or not farm.is_active:
