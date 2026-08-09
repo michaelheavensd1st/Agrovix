@@ -13,19 +13,19 @@ existing PO repository, and API integration tests in `tests/test_purchase_orders
 
 The endpoint matrix is:
 
-| Method | Path | Permission |
-| --- | --- | --- |
-| GET | `/api/v1/organizations/{organization_id}/purchase-orders` | `purchase_order.read` |
-| POST | `/api/v1/organizations/{organization_id}/purchase-orders` | `purchase_order.create` |
-| GET | `/api/v1/purchase-orders/{purchase_order_id}` | `purchase_order.read` |
-| PATCH | `/api/v1/purchase-orders/{purchase_order_id}` | `purchase_order.update` |
-| POST | `/api/v1/purchase-orders/{purchase_order_id}/submit` | `purchase_order.submit` |
-| POST | `/api/v1/purchase-orders/{purchase_order_id}/withdraw` | `purchase_order.update` |
-| POST | `/api/v1/purchase-orders/{purchase_order_id}/approve` | `purchase_order.approve` |
-| POST | `/api/v1/purchase-orders/{purchase_order_id}/reject` | `purchase_order.reject` |
-| POST | `/api/v1/purchase-orders/{purchase_order_id}/revise` | `purchase_order.update` |
-| POST | `/api/v1/purchase-orders/{purchase_order_id}/cancel` | `purchase_order.cancel` |
-| GET | `/api/v1/purchase-orders/{purchase_order_id}/transitions` | `purchase_order.read` |
+| Method | Path                                                      | Permission               |
+| ------ | --------------------------------------------------------- | ------------------------ |
+| GET    | `/api/v1/organizations/{organization_id}/purchase-orders` | `purchase_order.read`    |
+| POST   | `/api/v1/organizations/{organization_id}/purchase-orders` | `purchase_order.create`  |
+| GET    | `/api/v1/purchase-orders/{purchase_order_id}`             | `purchase_order.read`    |
+| PATCH  | `/api/v1/purchase-orders/{purchase_order_id}`             | `purchase_order.update`  |
+| POST   | `/api/v1/purchase-orders/{purchase_order_id}/submit`      | `purchase_order.submit`  |
+| POST   | `/api/v1/purchase-orders/{purchase_order_id}/withdraw`    | `purchase_order.update`  |
+| POST   | `/api/v1/purchase-orders/{purchase_order_id}/approve`     | `purchase_order.approve` |
+| POST   | `/api/v1/purchase-orders/{purchase_order_id}/reject`      | `purchase_order.reject`  |
+| POST   | `/api/v1/purchase-orders/{purchase_order_id}/revise`      | `purchase_order.update`  |
+| POST   | `/api/v1/purchase-orders/{purchase_order_id}/cancel`      | `purchase_order.cancel`  |
+| GET    | `/api/v1/purchase-orders/{purchase_order_id}/transitions` | `purchase_order.read`    |
 
 Routes resolve authenticated users and tenant/farm visibility, then delegate mutations to the
 approved `PurchaseOrderService`. They do not implement transitions, number allocation, supplier or

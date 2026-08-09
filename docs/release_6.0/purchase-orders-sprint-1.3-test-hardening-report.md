@@ -75,23 +75,23 @@ PO, and exactly one create plus one update audit per PO.
 
 ## Validation evidence
 
-| Gate | Sprint 1.3 result |
-| --- | --- |
-| Confirmed farm/update PostgreSQL race | **1 passed** |
-| Required PostgreSQL regression subset | **12 passed** |
-| Targeted PO domain suite | **54 passed** |
-| SQLite full suite | **452 passed, 107 skipped** |
-| PostgreSQL full suite | **527 passed, 32 skipped** |
-| PO PostgreSQL concurrency | **27 passed** |
-| Three consecutive PO concurrency runs | **81 passed** |
-| Ruff | pass |
-| Black | pass |
-| `git diff --check` | pass |
-| Alembic single head | `0012_purchase_orders` |
-| Upgrade → downgrade base → re-upgrade | pass |
-| `app.seed` after re-upgrade | pass |
-| Migration 0012 modified | no |
-| Scope scan | pass |
+| Gate                                  | Sprint 1.3 result           |
+| ------------------------------------- | --------------------------- |
+| Confirmed farm/update PostgreSQL race | **1 passed**                |
+| Required PostgreSQL regression subset | **12 passed**               |
+| Targeted PO domain suite              | **54 passed**               |
+| SQLite full suite                     | **452 passed, 107 skipped** |
+| PostgreSQL full suite                 | **527 passed, 32 skipped**  |
+| PO PostgreSQL concurrency             | **27 passed**               |
+| Three consecutive PO concurrency runs | **81 passed**               |
+| Ruff                                  | pass                        |
+| Black                                 | pass                        |
+| `git diff --check`                    | pass                        |
+| Alembic single head                   | `0012_purchase_orders`      |
+| Upgrade → downgrade base → re-upgrade | pass                        |
+| `app.seed` after re-upgrade           | pass                        |
+| Migration 0012 modified               | no                          |
+| Scope scan                            | pass                        |
 
 The temporary PostgreSQL environment was reprovisioned for the fix proofs and used for the complete
 PostgreSQL suite and migration/seed gate.

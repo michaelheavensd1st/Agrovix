@@ -67,22 +67,22 @@ chooses the serialization.
 
 ## Validation evidence
 
-| Gate | Sprint 1.4 result |
-| --- | --- |
-| Required PostgreSQL targeted set | **9 passed** |
-| Targeted PO domain suite | **54 passed** |
-| PO PostgreSQL concurrency | **29 passed** |
-| Three consecutive PO concurrency runs | **87 passed** |
-| SQLite full API suite | **452 passed / 109 skipped** |
-| PostgreSQL full API suite | **529 passed / 32 skipped** |
-| Ruff (`apps/api`) | pass |
-| Black (`apps/api`, 131 files) | pass |
-| `git diff --check` | pass |
-| Alembic heads | one: `0012_purchase_orders` |
-| Upgrade → downgrade base → re-upgrade | pass |
-| `app.seed` after re-upgrade | pass |
-| Migration `0012` modified | no; working copy and HEAD hash `53d53e6eb868cf07462a0f7d7b6b38289789d838` |
-| Scope scan | pass |
+| Gate                                  | Sprint 1.4 result                                                         |
+| ------------------------------------- | ------------------------------------------------------------------------- |
+| Required PostgreSQL targeted set      | **9 passed**                                                              |
+| Targeted PO domain suite              | **54 passed**                                                             |
+| PO PostgreSQL concurrency             | **29 passed**                                                             |
+| Three consecutive PO concurrency runs | **87 passed**                                                             |
+| SQLite full API suite                 | **452 passed / 109 skipped**                                              |
+| PostgreSQL full API suite             | **529 passed / 32 skipped**                                               |
+| Ruff (`apps/api`)                     | pass                                                                      |
+| Black (`apps/api`, 131 files)         | pass                                                                      |
+| `git diff --check`                    | pass                                                                      |
+| Alembic heads                         | one: `0012_purchase_orders`                                               |
+| Upgrade → downgrade base → re-upgrade | pass                                                                      |
+| `app.seed` after re-upgrade           | pass                                                                      |
+| Migration `0012` modified             | no; working copy and HEAD hash `53d53e6eb868cf07462a0f7d7b6b38289789d838` |
+| Scope scan                            | pass                                                                      |
 
 ## Scope and remaining risk
 

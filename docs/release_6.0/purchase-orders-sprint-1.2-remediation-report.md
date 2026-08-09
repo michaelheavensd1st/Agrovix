@@ -66,22 +66,22 @@ the 50-ID cap, and `line_ids_truncated`.
 
 ## Validation evidence
 
-| Gate | Sprint 1.2 local result |
-| --- | --- |
-| Ruff | pass |
-| Black | pass |
-| Python compilation | pass |
-| PO test collection | 74 collected; 25 PostgreSQL concurrency cases |
-| Decimal boundary smoke | pass |
-| SQLite full suite | **447 passed, 105 skipped** |
-| PostgreSQL full suite | **520 passed, 32 skipped** |
-| PO PostgreSQL concurrency | **25 passed**; three consecutive runs **75 passed** |
-| Alembic single head | `0012_purchase_orders` |
-| Migration 0012 modified | no |
-| Alembic upgrade → downgrade base → re-upgrade | pass |
-| `app.seed` | pass |
-| Scope scan | pass |
-| `git diff --check` | pass |
+| Gate                                          | Sprint 1.2 local result                             |
+| --------------------------------------------- | --------------------------------------------------- |
+| Ruff                                          | pass                                                |
+| Black                                         | pass                                                |
+| Python compilation                            | pass                                                |
+| PO test collection                            | 74 collected; 25 PostgreSQL concurrency cases       |
+| Decimal boundary smoke                        | pass                                                |
+| SQLite full suite                             | **447 passed, 105 skipped**                         |
+| PostgreSQL full suite                         | **520 passed, 32 skipped**                          |
+| PO PostgreSQL concurrency                     | **25 passed**; three consecutive runs **75 passed** |
+| Alembic single head                           | `0012_purchase_orders`                              |
+| Migration 0012 modified                       | no                                                  |
+| Alembic upgrade → downgrade base → re-upgrade | pass                                                |
+| `app.seed`                                    | pass                                                |
+| Scope scan                                    | pass                                                |
+| `git diff --check`                            | pass                                                |
 
 Both database engines and the PostgreSQL migration round trip were rerun independently on this head.
 
