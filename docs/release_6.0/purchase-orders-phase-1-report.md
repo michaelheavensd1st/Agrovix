@@ -1,6 +1,6 @@
 # Release 6.0.3 — Purchase Orders — Phase 1 Draft PR Report
 
-**Status:** Sprint 1.4 remediation validated — ready for a 5th independent domain review · **Scope:** Backend domain layer only (no REST endpoints, no frontend)
+**Status:** Milestone 1 published; Milestone 2 REST API implemented for independent review · **Scope:** Backend domain and REST API only (no frontend)
 **Contract:** `docs/release_6.0/purchase-orders.md` (frozen 6.0.3) · **Base:** `0011_business_partners`
 
 > **Sprint 1.1 addendum (domain hardening / review remediation).** The independent
@@ -46,6 +46,12 @@
 > gates pass. Migration `0012` remains byte-identical. The sole remaining Low issue is future
 > organization-anchor contention monitoring. Details:
 > `docs/release_6.0/purchase-orders-sprint-1.4-remediation-report.md`. **Milestone 2 not started.**
+
+> **Milestone 2 addendum (REST API).** The frozen eleven-endpoint Purchase Order REST contract,
+> Pydantic schemas, tenant/farm-aware read adapter, exact decimal serialization, lifecycle replay
+> header wiring, cursor pagination, and route-level tests are implemented on top of the approved
+> domain service. No frontend or Release 6.0.4 scope is included. Details:
+> `docs/release_6.0/purchase-orders-milestone-2-report.md`.
 
 ---
 
