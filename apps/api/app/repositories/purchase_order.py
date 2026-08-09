@@ -247,6 +247,8 @@ class PurchaseOrderRepository:
         supplier_reference: str | None = None,
         order_date_from: date | None = None,
         order_date_to: date | None = None,
+        expected_delivery_from: date | None = None,
+        expected_delivery_to: date | None = None,
         cursor: str | None = None,
         limit: int | None = None,
     ) -> tuple[list[PurchaseOrder], str | None]:
@@ -255,9 +257,8 @@ class PurchaseOrderRepository:
         Filters compose (AND):
 
         * ``statuses`` — repeatable status membership filter.
-        * ``supplier_search`` — po_number / legal_name / trading_name (ci).
-        * ``supplier_reference`` — case-insensitive substring on the header
-          supplier reference.
+        * ``supplier_search`` — PO number / supplier snapshots / reference (ci).
+        * ``supplier_reference`` — optional dedicated reference substring filter.
         * ``order_date_from`` / ``order_date_to`` — inclusive date window.
         """
         limit = _clamp_limit(limit)
@@ -274,8 +275,10 @@ class PurchaseOrderRepository:
             base = base.where(
                 or_(
                     func.lower(PurchaseOrder.po_number).like(like),
+                    func.lower(PurchaseOrder.supplier_code).like(like),
                     func.lower(PurchaseOrder.supplier_legal_name).like(like),
                     func.lower(func.coalesce(PurchaseOrder.supplier_trading_name, "")).like(like),
+                    func.lower(func.coalesce(PurchaseOrder.supplier_reference, "")).like(like),
                 )
             )
         if supplier_reference:
@@ -287,6 +290,10 @@ class PurchaseOrderRepository:
             base = base.where(PurchaseOrder.order_date >= order_date_from)
         if order_date_to is not None:
             base = base.where(PurchaseOrder.order_date <= order_date_to)
+        if expected_delivery_from is not None:
+            base = base.where(PurchaseOrder.expected_delivery_date >= expected_delivery_from)
+        if expected_delivery_to is not None:
+            base = base.where(PurchaseOrder.expected_delivery_date <= expected_delivery_to)
         if cursor:
             cur_ts, cur_id = decode_po_cursor(cursor)
             base = base.where(
