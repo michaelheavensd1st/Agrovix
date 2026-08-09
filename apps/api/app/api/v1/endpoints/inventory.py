@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.endpoints.production import _enforce_prod_permission
-from app.deps import CurrentUser, DBSession, RequestCtx, get_audit_repository
+from app.deps import CurrentUser, DBSession, RequestCtx, get_audit_repository, require_permission
 from app.models.farm import Farm
 from app.models.inventory import Warehouse
 from app.models.membership import FarmMembership, OrganizationMembership
@@ -417,6 +417,9 @@ async def create_item(
 @router.get(
     "/organizations/{organization_id}/inventory-items",
     response_model=list[InventoryItemPublic],
+    dependencies=[
+        Depends(require_permission("inventory_item.read", include_farm_grants_in_org=True))
+    ],
     tags=["inventory-items"],
 )
 async def list_items(
@@ -426,13 +429,6 @@ async def list_items(
     item_repo: Annotated[InventoryItemRepository, Depends(get_item_repo)],
 ) -> list[InventoryItemPublic]:
     await _assert_org_membership(session, user, organization_id)
-    await _enforce_prod_permission(
-        user=user,
-        session=session,
-        code="inventory_item.read",
-        organization_id=organization_id,
-        farm_id=None,
-    )
     return [
         InventoryItemPublic.model_validate(r) for r in await item_repo.list_for_org(organization_id)
     ]
