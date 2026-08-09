@@ -17,7 +17,7 @@ import requests
 
 PUBLIC_URL = os.environ.get(
     "REACT_APP_BACKEND_URL",
-    "https://phase-one-launch.preview.emergentagent.com",
+    "https://harvest-stack.preview.emergentagent.com",
 ).rstrip("/")
 LOCAL_URL = "http://localhost:8001"
 
