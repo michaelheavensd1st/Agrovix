@@ -102,6 +102,7 @@ export default function PurchaseOrderDetailPage() {
   const [transitionsError, setTransitionsError] = useState<string | null>(null);
   const [transitionIdentity, setTransitionIdentity] = useState<string | null>(null);
   const [transitionRevision, setTransitionRevision] = useState(0);
+  const [transitionNavigationPending, setTransitionNavigationPending] = useState(false);
   const [lifecycleError, setLifecycleError] = useState<{
     purchaseOrderId: string;
     message: string;
@@ -109,12 +110,15 @@ export default function PurchaseOrderDetailPage() {
   const [pendingMutation, setPendingMutation] = useState<{
     purchaseOrderId: string;
     token: number;
+    visitGeneration: number;
     operation: PurchaseOrderLifecycleOperation;
   } | null>(null);
   const detailGenerationRef = useRef(0);
   const transitionGenerationRef = useRef(0);
+  const transitionNavigationLockRef = useRef(false);
   const activeMutationsRef = useRef(new Map<string, number>());
   const nextMutationTokenRef = useRef(0);
+  const routeVisitGenerationRef = useRef(0);
   const focusStatusAfterRefreshRef = useRef<string | null>(null);
   const statusAnnouncementRef = useRef<HTMLDivElement>(null);
   const currentIdRef = useRef(purchaseOrderId);
@@ -124,10 +128,14 @@ export default function PurchaseOrderDetailPage() {
   returnToRef.current = pathname;
 
   if (currentIdRef.current !== purchaseOrderId) {
+    const previousId = currentIdRef.current;
     currentIdRef.current = purchaseOrderId;
+    routeVisitGenerationRef.current += 1;
+    activeMutationsRef.current.delete(previousId);
     focusStatusAfterRefreshRef.current = null;
     detailGenerationRef.current += 1;
     transitionGenerationRef.current += 1;
+    transitionNavigationLockRef.current = false;
   }
 
   useEffect(() => {
@@ -136,6 +144,7 @@ export default function PurchaseOrderDetailPage() {
       mountedRef.current = false;
       detailGenerationRef.current += 1;
       transitionGenerationRef.current += 1;
+      routeVisitGenerationRef.current += 1;
     };
   }, []);
 
@@ -176,6 +185,8 @@ export default function PurchaseOrderDetailPage() {
     setPreviousTransitionCursors([]);
     setTransitionsError(null);
     setTransitionIdentity(null);
+    transitionNavigationLockRef.current = false;
+    setTransitionNavigationPending(false);
     void getPurchaseOrder(capturedId, controller.signal)
       .then((po) => {
         if (!isCurrent()) return;
@@ -237,12 +248,27 @@ export default function PurchaseOrderDetailPage() {
           setTransitionsError('You do not have permission to view transition history.');
         } else if (caught instanceof ApiError && caught.status === 404) {
           setTransitionsError('Transition history is unavailable.');
+        } else if (
+          transitionCursor &&
+          caught instanceof ApiError &&
+          [400, 422].includes(caught.status)
+        ) {
+          setTransitionCursor(undefined);
+          setPreviousTransitionCursors([]);
+          toast(
+            'That transition-history page is no longer valid. Returned to the first page.',
+            'info',
+          );
         } else {
           setTransitionsError('Unable to load transition history.');
         }
       })
       .finally(() => {
-        if (isCurrent()) setTransitionsLoading(false);
+        if (isCurrent()) {
+          transitionNavigationLockRef.current = false;
+          setTransitionNavigationPending(false);
+          setTransitionsLoading(false);
+        }
       });
     return () => controller.abort();
   }, [purchaseOrder, router, transitionCursor]);
@@ -274,13 +300,17 @@ export default function PurchaseOrderDetailPage() {
   const visibleNextTransitionCursor = transitionsAreCurrent ? nextTransitionCursor : null;
 
   function nextTransitions() {
-    if (!nextTransitionCursor) return;
+    if (!nextTransitionCursor || transitionNavigationLockRef.current) return;
+    transitionNavigationLockRef.current = true;
+    setTransitionNavigationPending(true);
     setPreviousTransitionCursors((existing) => [...existing, transitionCursor || '']);
     setTransitionCursor(nextTransitionCursor);
   }
 
   function previousTransitions() {
-    if (previousTransitionCursors.length === 0) return;
+    if (previousTransitionCursors.length === 0 || transitionNavigationLockRef.current) return;
+    transitionNavigationLockRef.current = true;
+    setTransitionNavigationPending(true);
     const previous = previousTransitionCursors[previousTransitionCursors.length - 1];
     setPreviousTransitionCursors((existing) => existing.slice(0, -1));
     setTransitionCursor(previous || undefined);
@@ -293,12 +323,14 @@ export default function PurchaseOrderDetailPage() {
     const capturedId = purchaseOrderId;
     if (!capturedId || activeMutationsRef.current.has(capturedId)) return { kind: 'failed' };
     const token = ++nextMutationTokenRef.current;
+    const visitGeneration = routeVisitGenerationRef.current;
     activeMutationsRef.current.set(capturedId, token);
-    setPendingMutation({ purchaseOrderId: capturedId, token, operation });
+    setPendingMutation({ purchaseOrderId: capturedId, token, visitGeneration, operation });
     setLifecycleError(null);
     const isCurrent = () =>
       mountedRef.current &&
       currentIdRef.current === capturedId &&
+      routeVisitGenerationRef.current === visitGeneration &&
       activeMutationsRef.current.get(capturedId) === token;
     try {
       const result = await runLifecycleOperation(capturedId, operation, reason);
@@ -374,7 +406,11 @@ export default function PurchaseOrderDetailPage() {
         activeMutationsRef.current.delete(capturedId);
       if (mountedRef.current)
         setPendingMutation((current) =>
-          current?.purchaseOrderId === capturedId && current.token === token ? null : current,
+          current?.purchaseOrderId === capturedId &&
+          current.token === token &&
+          current.visitGeneration === visitGeneration
+            ? null
+            : current,
         );
     }
   }
@@ -432,7 +468,10 @@ export default function PurchaseOrderDetailPage() {
         purchaseOrder={visiblePurchaseOrder}
         user={user}
         pendingOperation={
-          pendingMutation?.purchaseOrderId === purchaseOrderId ? pendingMutation.operation : null
+          pendingMutation?.purchaseOrderId === purchaseOrderId &&
+          pendingMutation.visitGeneration === routeVisitGenerationRef.current
+            ? pendingMutation.operation
+            : null
         }
         error={lifecycleError?.purchaseOrderId === purchaseOrderId ? lifecycleError.message : null}
         onAction={performLifecycleAction}
@@ -444,6 +483,7 @@ export default function PurchaseOrderDetailPage() {
         error={visibleTransitionsError}
         nextCursor={visibleNextTransitionCursor}
         canGoBack={previousTransitionCursors.length > 0}
+        navigationPending={transitionNavigationPending}
         onNext={nextTransitions}
         onPrevious={previousTransitions}
       />

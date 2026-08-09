@@ -209,6 +209,59 @@ describe('PurchaseOrdersPage', () => {
     ).toBe(true);
   });
 
+  it.each([
+    [
+      'organization-wide grant',
+      [{ organization_id: ORG_A.id, farm_id: null, permissions: ['purchase_order.create'] }],
+      '',
+      true,
+    ],
+    [
+      'applicable farm grant',
+      [{ organization_id: ORG_A.id, farm_id: FARM_A.id, permissions: ['purchase_order.create'] }],
+      `&farm_id=${FARM_A.id}`,
+      true,
+    ],
+    [
+      'wrong organization grant',
+      [{ organization_id: ORG_B.id, farm_id: null, permissions: ['purchase_order.create'] }],
+      '',
+      false,
+    ],
+    [
+      'wrong farm grant',
+      [{ organization_id: ORG_A.id, farm_id: 'farm-B', permissions: ['purchase_order.create'] }],
+      `&farm_id=${FARM_A.id}`,
+      false,
+    ],
+    ['revoked scope', [], '', false],
+  ] as const)('gates create navigation for %s', async (_label, scopes, query, visible) => {
+    window.history.replaceState({}, '', `/purchase-orders?organization_id=${ORG_A.id}${query}`);
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me')
+        return Promise.resolve({
+          ...USER,
+          permission_scopes: [
+            { organization_id: ORG_A.id, farm_id: null, permissions: ['purchase_order.read'] },
+            ...scopes,
+          ],
+        } as never);
+      const value = bootstrap(path);
+      if (value !== undefined) return Promise.resolve(value as never);
+      if (path.includes('/purchase-orders'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve([] as never);
+    });
+    render(<PurchaseOrdersPage />);
+    await screen.findByTestId('ape-empty');
+    expect(Boolean(screen.queryByTestId('po-create-link'))).toBe(visible);
+    if (visible)
+      expect(screen.getByTestId('po-create-link')).toHaveAttribute(
+        'href',
+        `/purchase-orders/new?organization_id=${ORG_A.id}`,
+      );
+  });
+
   it('shows loading and then responsive rows/cards with snapshot values and exact money', async () => {
     const request = deferred<{ items: PurchaseOrder[]; next_cursor: null }>();
     mockedApiFetch.mockImplementation((path: string) => {
@@ -259,7 +312,10 @@ describe('PurchaseOrdersPage', () => {
       return Promise.resolve([] as never);
     });
     render(<PurchaseOrdersPage />);
-    expect(await screen.findByTestId('ape-error')).toHaveTextContent('network unavailable');
+    expect(await screen.findByTestId('ape-error')).toHaveTextContent(
+      'Something went wrong. Please try again.',
+    );
+    expect(screen.queryByText('network unavailable')).not.toBeInTheDocument();
   });
 
   it('writes composed filters with repeated statuses and clears cursor', async () => {
@@ -324,6 +380,124 @@ describe('PurchaseOrdersPage', () => {
     fireEvent.click(screen.getByTestId('po-page-previous'));
     expect(await screen.findByTestId('po-row-po-1')).toBeInTheDocument();
     expect(new URLSearchParams(window.location.search).get('cursor')).toBeNull();
+  });
+
+  it('locks rapid repeated Next and Previous navigation without duplicating cursor history', async () => {
+    const pageTwo = deferred<{ items: PurchaseOrder[]; next_cursor: null }>();
+    const returnToFirst = deferred<{ items: PurchaseOrder[]; next_cursor: string }>();
+    let firstPageLoads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      const value = bootstrap(path);
+      if (value !== undefined) return Promise.resolve(value as never);
+      if (path.includes('cursor=opaque-page-two')) return pageTwo.promise as never;
+      if (path.includes('/purchase-orders')) {
+        firstPageLoads += 1;
+        if (firstPageLoads === 1)
+          return Promise.resolve({ items: [makePO()], next_cursor: 'opaque-page-two' } as never);
+        return returnToFirst.promise as never;
+      }
+      return Promise.resolve([] as never);
+    });
+    render(<PurchaseOrdersPage />);
+    await screen.findByTestId('po-row-po-1');
+    const next = screen.getByTestId('po-page-next');
+    fireEvent.click(next);
+    fireEvent.click(next);
+    expect(routerPush).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('po-list-loading')).toBeInTheDocument();
+
+    await act(() =>
+      pageTwo.resolve({
+        items: [makePO({ id: 'po-2', po_number: 'PO-2' })],
+        next_cursor: null,
+      }),
+    );
+    await screen.findByTestId('po-row-po-2');
+    const previous = screen.getByTestId('po-page-previous');
+    fireEvent.click(previous);
+    fireEvent.click(previous);
+    expect(routerPush).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('po-list-loading')).toBeInTheDocument();
+
+    await act(() => returnToFirst.resolve({ items: [makePO()], next_cursor: 'opaque-page-two' }));
+    expect(await screen.findByTestId('po-row-po-1')).toBeInTheDocument();
+    expect(screen.getByTestId('po-page-previous')).toBeDisabled();
+  });
+
+  it('recovers an expired cursor reached through locked Next navigation', async () => {
+    let expiredRequests = 0;
+    let firstPageLoads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      const value = bootstrap(path);
+      if (value !== undefined) return Promise.resolve(value as never);
+      if (path.includes('cursor=expired-opaque')) {
+        expiredRequests += 1;
+        return Promise.reject(new ApiError(422, { detail: 'raw expired cursor detail' }));
+      }
+      if (path.includes('cursor=valid-opaque'))
+        return Promise.resolve({
+          items: [makePO({ id: 'po-valid', po_number: 'PO-VALID' })],
+          next_cursor: null,
+        } as never);
+      if (path.includes('/purchase-orders')) {
+        firstPageLoads += 1;
+        return Promise.resolve({
+          items: [makePO()],
+          next_cursor: firstPageLoads === 1 ? 'expired-opaque' : 'valid-opaque',
+        } as never);
+      }
+      return Promise.resolve([] as never);
+    });
+    render(<PurchaseOrdersPage />);
+    await screen.findByTestId('po-row-po-1');
+    const expiredNext = screen.getByTestId('po-page-next');
+    fireEvent.click(expiredNext);
+    fireEvent.click(expiredNext);
+
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get('cursor')).toBeNull(),
+    );
+    expect(expiredRequests).toBe(1);
+    expect(await screen.findByTestId('po-row-po-1')).toBeInTheDocument();
+    expect(screen.getByTestId('po-page-previous')).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId('po-page-next'));
+    expect(await screen.findByTestId('po-row-po-valid')).toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).get('cursor')).toBe('valid-opaque');
+    expect(screen.queryByText('raw expired cursor detail')).not.toBeInTheDocument();
+  });
+
+  it('traverses three opaque pages and unwinds Previous history deterministically', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      const value = bootstrap(path);
+      if (value !== undefined) return Promise.resolve(value as never);
+      if (path.includes('cursor=opaque-three'))
+        return Promise.resolve({
+          items: [makePO({ id: 'po-3', po_number: 'PO-3' })],
+          next_cursor: null,
+        } as never);
+      if (path.includes('cursor=opaque-two'))
+        return Promise.resolve({
+          items: [makePO({ id: 'po-2', po_number: 'PO-2' })],
+          next_cursor: 'opaque-three',
+        } as never);
+      if (path.includes('/purchase-orders'))
+        return Promise.resolve({ items: [makePO()], next_cursor: 'opaque-two' } as never);
+      return Promise.resolve([] as never);
+    });
+    render(<PurchaseOrdersPage />);
+    await screen.findByTestId('po-row-po-1');
+    fireEvent.click(screen.getByTestId('po-page-next'));
+    await screen.findByTestId('po-row-po-2');
+    fireEvent.click(screen.getByTestId('po-page-next'));
+    await screen.findByTestId('po-row-po-3');
+    fireEvent.click(screen.getByTestId('po-page-previous'));
+    await screen.findByTestId('po-row-po-2');
+    expect(new URLSearchParams(window.location.search).get('cursor')).toBe('opaque-two');
+    fireEvent.click(screen.getByTestId('po-page-previous'));
+    await screen.findByTestId('po-row-po-1');
+    expect(new URLSearchParams(window.location.search).get('cursor')).toBeNull();
+    expect(screen.getByTestId('po-page-previous')).toBeDisabled();
   });
 
   it('binds previous cursor history to URL-driven organization identity', async () => {

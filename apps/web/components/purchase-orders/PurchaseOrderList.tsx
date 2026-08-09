@@ -96,16 +96,21 @@ export function PurchaseOrderList({
             className="rounded-xl border border-border bg-card p-4"
             data-testid={`po-card-${po.id}`}
           >
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <Link href={`/purchase-orders/${po.id}`} className="font-medium hover:underline">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <Link
+                  href={`/purchase-orders/${po.id}`}
+                  className="break-words font-medium hover:underline"
+                >
                   {po.po_number}
                 </Link>
-                <p className="mt-1 text-sm">{po.supplier_trading_name || po.supplier_legal_name}</p>
+                <p className="mt-1 break-words text-sm">
+                  {po.supplier_trading_name || po.supplier_legal_name}
+                </p>
               </div>
               <PurchaseOrderStatusBadge status={po.status} />
             </div>
-            <dl className="mt-4 grid grid-cols-2 gap-3 text-sm">
+            <dl className="mt-4 grid gap-3 text-sm min-[375px]:grid-cols-2">
               <div>
                 <dt className="text-muted-foreground">Farm</dt>
                 <dd>

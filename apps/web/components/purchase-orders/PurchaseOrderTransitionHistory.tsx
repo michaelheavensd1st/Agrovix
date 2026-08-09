@@ -8,6 +8,7 @@ export function PurchaseOrderTransitionHistory({
   error,
   nextCursor,
   canGoBack,
+  navigationPending,
   onNext,
   onPrevious,
 }: {
@@ -17,6 +18,7 @@ export function PurchaseOrderTransitionHistory({
   error: string | null;
   nextCursor: string | null;
   canGoBack: boolean;
+  navigationPending: boolean;
   onNext: () => void;
   onPrevious: () => void;
 }) {
@@ -68,17 +70,21 @@ export function PurchaseOrderTransitionHistory({
                   timeStyle: 'short',
                 }).format(new Date(transition.occurred_at))}
               </p>
-              {transition.reason && <p className="mt-2 text-sm">{transition.reason}</p>}
+              {transition.reason && <p className="mt-2 break-words text-sm">{transition.reason}</p>}
             </li>
           ))}
         </ol>
       )}
       {!loading && !error && (canGoBack || nextCursor) && (
-        <nav className="mt-4 flex justify-end gap-2" aria-label="Transition history pages">
+        <nav
+          className="mt-4 flex flex-wrap justify-end gap-2"
+          aria-label="Transition history pages"
+          aria-busy={navigationPending}
+        >
           <button
             type="button"
             onClick={onPrevious}
-            disabled={!canGoBack}
+            disabled={!canGoBack || navigationPending}
             data-testid="po-transitions-previous"
             className="rounded-md border border-border px-3 py-1.5 text-sm disabled:opacity-50"
           >
@@ -87,7 +93,7 @@ export function PurchaseOrderTransitionHistory({
           <button
             type="button"
             onClick={onNext}
-            disabled={!nextCursor}
+            disabled={!nextCursor || navigationPending}
             data-testid="po-transitions-next"
             className="rounded-md border border-border px-3 py-1.5 text-sm disabled:opacity-50"
           >

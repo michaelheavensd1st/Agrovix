@@ -35,16 +35,16 @@ export function PurchaseOrderDetail({
           ← Back to purchase orders
         </Link>
         <div className="mt-4 flex flex-wrap items-start justify-between gap-3">
-          <div>
+          <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-3">
-              <h1 className="font-display text-3xl">{po.po_number}</h1>
+              <h1 className="break-words font-display text-3xl">{po.po_number}</h1>
               <PurchaseOrderStatusBadge status={po.status} />
             </div>
-            <p className="mt-1 text-muted-foreground">
+            <p className="mt-1 break-words text-muted-foreground">
               {supplier} · {po.supplier_code}
             </p>
           </div>
-          <dl className="text-right text-sm">
+          <dl className="max-w-full text-left text-sm sm:text-right">
             <dt className="text-muted-foreground">Version</dt>
             <dd>v{po.version}</dd>
             <dt className="mt-2 text-muted-foreground">Farm scope</dt>
@@ -55,7 +55,7 @@ export function PurchaseOrderDetail({
 
       <section className="grid gap-6 lg:grid-cols-2">
         <InfoSection title="Commercial summary">
-          <dl className="grid grid-cols-2 gap-4 text-sm">
+          <dl className="grid gap-4 text-sm min-[375px]:grid-cols-2">
             <Info label="Currency" value={po.currency_code} />
             <Info
               label="Subtotal"

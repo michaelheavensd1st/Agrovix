@@ -398,6 +398,86 @@ describe('Draft create route', () => {
 });
 
 describe('Draft edit route', () => {
+  it('keeps only the second A edit load current across A to B to A', async () => {
+    const firstA = deferred<PurchaseOrder>();
+    const poB = deferred<PurchaseOrder>();
+    const secondA = deferred<PurchaseOrder>();
+    let aLoads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(user as never);
+      if (path === '/v1/purchase-orders/po-1') {
+        aLoads += 1;
+        return (aLoads === 1 ? firstA.promise : secondA.promise) as never;
+      }
+      if (path === '/v1/purchase-orders/po-2') return poB.promise as never;
+      return Promise.resolve({} as never);
+    });
+    const view = render(<EditPurchaseOrderPage />);
+    await waitFor(() => expect(aLoads).toBe(1));
+    act(() => {
+      paramsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
+      view.rerender(<EditPurchaseOrderPage />);
+    });
+    await waitFor(() =>
+      expect(mockedApiFetch.mock.calls.some(([path]) => path === '/v1/purchase-orders/po-2')).toBe(
+        true,
+      ),
+    );
+    act(() => {
+      paramsMock.mockReturnValue({ purchaseOrderId: 'po-1' });
+      view.rerender(<EditPurchaseOrderPage />);
+    });
+    await waitFor(() => expect(aLoads).toBe(2));
+    await act(() => secondA.resolve(po({ po_number: 'PO-A2', version: 12 })));
+    expect(await screen.findByText('Edit PO-A2')).toBeInTheDocument();
+
+    await act(() => firstA.reject(new ApiError(401, { detail: 'stale A login detail' })));
+    await act(() => poB.resolve(po({ id: 'po-2', po_number: 'PO-B-STALE' })));
+    expect(screen.getByText('Edit PO-A2')).toBeInTheDocument();
+    expect(screen.queryByText(/PO-B-STALE|stale A login detail/)).not.toBeInTheDocument();
+    expect(routerPush).not.toHaveBeenCalledWith(expect.stringContaining('/login'));
+  });
+
+  it('ignores an A1 conflict refresh after returning to a new A edit visit', async () => {
+    const staleRefresh = deferred<PurchaseOrder>();
+    let aGets = 0;
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve(user as never);
+      if (path === '/v1/purchase-orders/po-1' && init?.method === 'PATCH')
+        return Promise.reject(
+          new ApiError(409, {
+            detail: { code: 'purchase_order_version_conflict', message: 'raw conflict' } as never,
+          }),
+        );
+      if (path === '/v1/purchase-orders/po-1') {
+        aGets += 1;
+        if (aGets === 1) return Promise.resolve(po({ po_number: 'PO-A1' }) as never);
+        if (aGets === 2) return staleRefresh.promise as never;
+        return Promise.resolve(po({ po_number: 'PO-A2', version: 8 }) as never);
+      }
+      if (path === '/v1/purchase-orders/po-2')
+        return Promise.resolve(po({ id: 'po-2', po_number: 'PO-B' }) as never);
+      return Promise.resolve({} as never);
+    });
+    const view = render(<EditPurchaseOrderPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Save mock' }));
+    await waitFor(() => expect(aGets).toBe(2));
+    act(() => {
+      paramsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
+      view.rerender(<EditPurchaseOrderPage />);
+    });
+    await screen.findByText('Edit PO-B');
+    act(() => {
+      paramsMock.mockReturnValue({ purchaseOrderId: 'po-1' });
+      view.rerender(<EditPurchaseOrderPage />);
+    });
+    expect(await screen.findByText('Edit PO-A2')).toBeInTheDocument();
+    await act(() => staleRefresh.reject(new ApiError(401, { detail: 'stale refresh login' })));
+    expect(screen.getByText('Edit PO-A2')).toBeInTheDocument();
+    expect(screen.queryByTestId('po-conflict-panel')).not.toBeInTheDocument();
+    expect(routerPush).not.toHaveBeenCalledWith(expect.stringContaining('/login'));
+  });
+
   it('never renders PO A form under PO B and rejects late A data', async () => {
     const poB = deferred<PurchaseOrder>();
     mockedApiFetch.mockImplementation((path: string) => {
@@ -520,5 +600,34 @@ describe('Draft edit route', () => {
     fireEvent.click(screen.getByRole('button', { name: /Discard local edits/ }));
     expect(await screen.findByText('Version 4')).toBeInTheDocument();
     expect(screen.queryByTestId('po-conflict-panel')).not.toBeInTheDocument();
+  });
+
+  it('redirects a nested conflict-refresh 401 without exposing selector or backend errors', async () => {
+    let gets = 0;
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve(user as never);
+      if (path === '/v1/purchase-orders/po-1' && init?.method === 'PATCH')
+        return Promise.reject(
+          new ApiError(409, {
+            detail: { code: 'purchase_order_version_conflict', message: 'changed' } as never,
+          }),
+        );
+      if (path === '/v1/purchase-orders/po-1') {
+        gets += 1;
+        if (gets === 1) return Promise.resolve(po() as never);
+        return Promise.reject(new ApiError(401, { detail: 'raw refresh token detail' }));
+      }
+      return Promise.resolve({} as never);
+    });
+    window.history.replaceState({}, '', '/purchase-orders/po-1/edit');
+    render(<EditPurchaseOrderPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Save mock' }));
+    await waitFor(() =>
+      expect(routerPush).toHaveBeenCalledWith(
+        `/login?returnTo=${encodeURIComponent('/purchase-orders/po-1/edit')}`,
+      ),
+    );
+    expect(screen.queryByText(/raw refresh token detail/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/latest version could not be loaded/)).not.toBeInTheDocument();
   });
 });

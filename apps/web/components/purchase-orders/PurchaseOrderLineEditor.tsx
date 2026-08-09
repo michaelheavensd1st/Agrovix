@@ -42,7 +42,7 @@ export function PurchaseOrderLineEditor({
 
   return (
     <fieldset className="space-y-3" disabled={disabled}>
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <legend className="font-display text-lg">Lines</legend>
         <button
           type="button"
@@ -208,7 +208,7 @@ export function PurchaseOrderLineEditor({
                     not shown.
                   </p>
                 )}
-                <div className="flex justify-end gap-2 md:col-span-6">
+                <div className="flex flex-wrap justify-end gap-2 md:col-span-6">
                   <button
                     type="button"
                     onClick={() => move(index, -1)}

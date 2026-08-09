@@ -219,6 +219,26 @@ describe('PurchaseOrder lifecycle controls', () => {
   });
 
   it.each([
+    ['wrong organization', 'org-2', 'farm-1'],
+    ['wrong farm', 'org-1', 'farm-2'],
+  ])('suppresses actions for a %s scoped grant', (_label, organizationId, farmId) => {
+    const scoped: CurrentUser = {
+      ...USER,
+      permissions: [],
+      permission_scopes: [
+        {
+          organization_id: organizationId,
+          farm_id: farmId,
+          permissions: ['purchase_order.update', 'purchase_order.reject'],
+        },
+      ],
+    };
+    renderActions('SUBMITTED', { user: scoped });
+    expect(screen.queryByTestId('po-action-withdraw')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('po-action-reject')).not.toBeInTheDocument();
+  });
+
+  it.each([
     ['submit', 'DRAFT', undefined],
     ['withdraw', 'SUBMITTED', 'Needed changes'],
     ['approve', 'SUBMITTED', 'Looks good'],
@@ -280,6 +300,25 @@ describe('PurchaseOrder lifecycle controls', () => {
     dismiss();
     expect(screen.queryByTestId('po-lifecycle-dialog')).not.toBeInTheDocument();
     await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it('contains forward and reverse Tab focus within the lifecycle dialog', () => {
+    renderActions('SUBMITTED');
+    const trigger = screen.getByTestId('po-action-reject');
+    fireEvent.click(trigger);
+    const reason = screen.getByLabelText(/Reason/);
+    const confirm = screen.getByTestId('po-lifecycle-confirm');
+
+    reason.focus();
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
+    expect(confirm).toHaveFocus();
+
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(reason).toHaveFocus();
+
+    trigger.focus();
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(reason).toHaveFocus();
   });
 });
 
@@ -581,5 +620,132 @@ describe('PurchaseOrder lifecycle detail integration', () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+  });
+
+  it.each([
+    ['success', false, null],
+    ['replay', true, null],
+    ['failure', false, new ApiError(500, { detail: 'raw stale failure' })],
+    [
+      'conflict',
+      false,
+      new ApiError(409, {
+        detail: {
+          code: 'purchase_order_transition_conflict',
+          message: 'raw stale conflict',
+        } as never,
+      }),
+    ],
+  ] as const)(
+    'ignores stale A1 lifecycle %s after navigating A to B to A',
+    async (_label, replayed, failure) => {
+      const oldA = deferred<{ purchaseOrder: PurchaseOrder; replayed: boolean }>();
+      submitMock.mockReturnValue(oldA.promise);
+      let aReads = 0;
+      mockedApiFetch.mockImplementation((path: string) => {
+        if (path === '/v1/auth/me') return Promise.resolve(USER as never);
+        if (path === '/v1/purchase-orders/po-1') {
+          aReads += 1;
+          return Promise.resolve(makePO({ po_number: `PO-A-${aReads}` }) as never);
+        }
+        if (path === '/v1/purchase-orders/po-2')
+          return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-B' }) as never);
+        if (path.includes('/transitions'))
+          return Promise.resolve({ items: [], next_cursor: null } as never);
+        return Promise.resolve(null as never);
+      });
+      const view = render(<PurchaseOrderDetailPage />);
+      expect(await screen.findByText('PO-A-1')).toBeInTheDocument();
+      await confirmAction('po-action-submit');
+
+      act(() => {
+        useParamsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
+        view.rerender(<PurchaseOrderDetailPage />);
+      });
+      expect(await screen.findByText('PO-B')).toBeInTheDocument();
+      act(() => {
+        useParamsMock.mockReturnValue({ purchaseOrderId: 'po-1' });
+        view.rerender(<PurchaseOrderDetailPage />);
+      });
+      expect(await screen.findByText('PO-A-2')).toBeInTheDocument();
+      const currentAction = screen.getByTestId('po-action-submit');
+      currentAction.focus();
+      const readsBeforeCompletion = aReads;
+
+      await act(async () => {
+        if (failure) oldA.reject(failure);
+        else
+          oldA.resolve({
+            purchaseOrder: makePO({ status: 'SUBMITTED', po_number: 'PO-A1-STALE' }),
+            replayed,
+          });
+        try {
+          await oldA.promise;
+        } catch {
+          // The rendered route must ignore this obsolete failure.
+        }
+        await Promise.resolve();
+      });
+
+      expect(screen.getByText('PO-A-2')).toBeInTheDocument();
+      expect(screen.queryByText('PO-A1-STALE')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('po-lifecycle-error')).not.toBeInTheDocument();
+      expect(toastMock).not.toHaveBeenCalled();
+      expect(aReads).toBe(readsBeforeCompletion);
+      expect(currentAction).toHaveFocus();
+      expect(screen.getByTestId('po-lifecycle-status-focus')).not.toHaveFocus();
+    },
+  );
+
+  it('keeps an A2 lifecycle mutation pending when obsolete A1 cleanup completes', async () => {
+    const oldA = deferred<{ purchaseOrder: PurchaseOrder; replayed: boolean }>();
+    const newA = deferred<{ purchaseOrder: PurchaseOrder; replayed: boolean }>();
+    submitMock.mockReturnValueOnce(oldA.promise).mockReturnValueOnce(newA.promise);
+    let aReads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(USER as never);
+      if (path === '/v1/purchase-orders/po-1') {
+        aReads += 1;
+        return Promise.resolve(makePO({ po_number: `PO-A-${aReads}` }) as never);
+      }
+      if (path === '/v1/purchase-orders/po-2')
+        return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-B' }) as never);
+      if (path.includes('/transitions'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve(null as never);
+    });
+    const view = render(<PurchaseOrderDetailPage />);
+    expect(await screen.findByText('PO-A-1')).toBeInTheDocument();
+    await confirmAction('po-action-submit');
+    act(() => {
+      useParamsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
+      view.rerender(<PurchaseOrderDetailPage />);
+    });
+    await screen.findByText('PO-B');
+    act(() => {
+      useParamsMock.mockReturnValue({ purchaseOrderId: 'po-1' });
+      view.rerender(<PurchaseOrderDetailPage />);
+    });
+    await screen.findByText('PO-A-2');
+    await confirmAction('po-action-submit');
+    expect(submitMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('po-lifecycle-confirm')).toBeDisabled();
+
+    await act(async () => {
+      oldA.resolve({ purchaseOrder: makePO({ status: 'SUBMITTED' }), replayed: false });
+      await oldA.promise;
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('po-lifecycle-confirm')).toBeDisabled();
+    expect(toastMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      newA.resolve({ purchaseOrder: makePO({ status: 'SUBMITTED', version: 2 }), replayed: false });
+      await newA.promise;
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith('Purchase Order submit completed.', 'success'),
+    );
   });
 });

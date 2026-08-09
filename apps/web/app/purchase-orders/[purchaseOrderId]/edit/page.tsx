@@ -120,7 +120,15 @@ export default function EditPurchaseOrderPage() {
         try {
           const latest = await getPurchaseOrder(current.id);
           if (generation === generationRef.current) setConflict(latest);
-        } catch {
+        } catch (refreshError) {
+          if (
+            generation === generationRef.current &&
+            refreshError instanceof ApiError &&
+            refreshError.status === 401
+          ) {
+            router.push(`/login?returnTo=${encodeURIComponent(pathname)}`);
+            return;
+          }
           if (generation === generationRef.current)
             setError(
               'The Draft changed elsewhere, but the latest version could not be loaded. Your edits remain on screen.',
@@ -215,6 +223,9 @@ export default function EditPurchaseOrderPage() {
         externalErrors={fieldErrors}
         generalError={error}
         optionsRevision={optionsRevision}
+        user={user}
+        farmPermission="purchase_order.update"
+        onUnauthorized={() => router.push(`/login?returnTo=${encodeURIComponent(pathname)}`)}
         onSubmit={submit}
         onCancel={() => router.push(`/purchase-orders/${current.id}`)}
       />

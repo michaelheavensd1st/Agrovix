@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 const { routerPush, stableRouter, useParamsMock, renderedDetailIds, renderedTransitionPoIds } =
@@ -260,6 +260,57 @@ describe('PurchaseOrderDetailPage', () => {
     ).toBe(true);
   });
 
+  it('locks rapid transition Next and Previous activation and preserves page boundaries', async () => {
+    const pageTwo = deferred<{ items: PurchaseOrderTransition[]; next_cursor: null }>();
+    const returnToFirst = deferred<{ items: PurchaseOrderTransition[]; next_cursor: string }>();
+    let firstPageLoads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(USER as never);
+      if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
+      if (path.includes('cursor=opaque-history-two')) return pageTwo.promise as never;
+      if (path.includes('/transitions')) {
+        firstPageLoads += 1;
+        if (firstPageLoads === 1)
+          return Promise.resolve({
+            items: [transition()],
+            next_cursor: 'opaque-history-two',
+          } as never);
+        return returnToFirst.promise as never;
+      }
+      return Promise.resolve(null as never);
+    });
+    render(<PurchaseOrderDetailPage />);
+    await screen.findByTestId('po-transition-transition-1');
+    const next = screen.getByTestId('po-transitions-next');
+    fireEvent.click(next);
+    fireEvent.click(next);
+    expect(screen.getByTestId('po-transitions-loading')).toBeInTheDocument();
+    expect(
+      mockedApiFetch.mock.calls.filter(([path]) =>
+        String(path).includes('cursor=opaque-history-two'),
+      ),
+    ).toHaveLength(1);
+
+    await act(() =>
+      pageTwo.resolve({
+        items: [transition({ id: 'transition-2', operation: 'cancel', to_status: 'CANCELLED' })],
+        next_cursor: null,
+      }),
+    );
+    await screen.findByTestId('po-transition-transition-2');
+    const previous = screen.getByTestId('po-transitions-previous');
+    fireEvent.click(previous);
+    fireEvent.click(previous);
+    expect(screen.getByTestId('po-transitions-loading')).toBeInTheDocument();
+    expect(firstPageLoads).toBe(2);
+
+    await act(() =>
+      returnToFirst.resolve({ items: [transition()], next_cursor: 'opaque-history-two' }),
+    );
+    expect(await screen.findByTestId('po-transition-transition-1')).toBeInTheDocument();
+    expect(screen.getByTestId('po-transitions-previous')).toBeDisabled();
+  });
+
   it('rejects a stale detail response after a route change', async () => {
     const oldPO = deferred<PurchaseOrder>();
     mockedApiFetch.mockImplementation((path: string) => {
@@ -371,5 +422,118 @@ describe('PurchaseOrderDetailPage', () => {
       oldHistory.resolve({ items: [transition({ id: 'transition-stale' })], next_cursor: null }),
     );
     expect(screen.queryByTestId('po-transition-transition-stale')).not.toBeInTheDocument();
+  });
+
+  it('keeps the newest PO A detail and history across an overlapping A to B to A route sequence', async () => {
+    const firstA = deferred<PurchaseOrder>();
+    const poB = deferred<PurchaseOrder>();
+    const secondA = deferred<PurchaseOrder>();
+    const historyA = deferred<{ items: PurchaseOrderTransition[]; next_cursor: null }>();
+    let aLoads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(USER as never);
+      if (path === '/v1/purchase-orders/po-1') {
+        aLoads += 1;
+        return (aLoads === 1 ? firstA.promise : secondA.promise) as never;
+      }
+      if (path === '/v1/purchase-orders/po-2') return poB.promise as never;
+      if (path.includes('/po-1/transitions')) return historyA.promise as never;
+      if (path.includes('/po-2/transitions'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve(null as never);
+    });
+    const view = render(<PurchaseOrderDetailPage />);
+    await waitFor(() => expect(aLoads).toBe(1));
+    act(() => {
+      useParamsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
+      view.rerender(<PurchaseOrderDetailPage />);
+    });
+    await waitFor(() =>
+      expect(mockedApiFetch.mock.calls.some(([path]) => path === '/v1/purchase-orders/po-2')).toBe(
+        true,
+      ),
+    );
+    act(() => {
+      useParamsMock.mockReturnValue({ purchaseOrderId: 'po-1' });
+      view.rerender(<PurchaseOrderDetailPage />);
+    });
+    await waitFor(() => expect(aLoads).toBe(2));
+
+    await act(() => secondA.resolve(makePO({ po_number: 'PO-A-CURRENT' })));
+    await act(() =>
+      historyA.resolve({
+        items: [transition({ id: 'transition-a-current', reason: 'Current A' })],
+        next_cursor: null,
+      }),
+    );
+    expect(await screen.findByText('PO-A-CURRENT')).toBeInTheDocument();
+    expect(await screen.findByTestId('po-transition-transition-a-current')).toBeInTheDocument();
+
+    await act(() => firstA.resolve(makePO({ po_number: 'PO-A-STALE' })));
+    await act(() => poB.resolve(makePO({ id: 'po-2', po_number: 'PO-B-STALE' })));
+    expect(screen.queryByText('PO-A-STALE')).not.toBeInTheDocument();
+    expect(screen.queryByText('PO-B-STALE')).not.toBeInTheDocument();
+    expect(screen.getByText('PO-A-CURRENT')).toBeInTheDocument();
+  });
+
+  it('renders only A2 transition history after overlapping A to B to A history requests', async () => {
+    const historyA1 = deferred<{ items: PurchaseOrderTransition[]; next_cursor: null }>();
+    const historyB = deferred<{ items: PurchaseOrderTransition[]; next_cursor: null }>();
+    const historyA2 = deferred<{ items: PurchaseOrderTransition[]; next_cursor: null }>();
+    let aHistoryLoads = 0;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/auth/me') return Promise.resolve(USER as never);
+      if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
+      if (path === '/v1/purchase-orders/po-2')
+        return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-B' }) as never);
+      if (path.includes('/po-1/transitions')) {
+        aHistoryLoads += 1;
+        return (aHistoryLoads === 1 ? historyA1.promise : historyA2.promise) as never;
+      }
+      if (path.includes('/po-2/transitions')) return historyB.promise as never;
+      return Promise.resolve(null as never);
+    });
+    const view = render(<PurchaseOrderDetailPage />);
+    await waitFor(() => expect(aHistoryLoads).toBe(1));
+    act(() => {
+      useParamsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
+      view.rerender(<PurchaseOrderDetailPage />);
+    });
+    await waitFor(() =>
+      expect(
+        mockedApiFetch.mock.calls.some(([path]) => String(path).includes('/po-2/transitions')),
+      ).toBe(true),
+    );
+    act(() => {
+      useParamsMock.mockReturnValue({ purchaseOrderId: 'po-1' });
+      view.rerender(<PurchaseOrderDetailPage />);
+    });
+    await waitFor(() => expect(aHistoryLoads).toBe(2));
+
+    await act(() =>
+      historyA2.resolve({
+        items: [transition({ id: 'transition-a2', reason: 'A2 current history' })],
+        next_cursor: null,
+      }),
+    );
+    expect(await screen.findByTestId('po-transition-transition-a2')).toBeInTheDocument();
+
+    await act(() =>
+      historyA1.resolve({
+        items: [transition({ id: 'transition-a1', reason: 'A1 stale history' })],
+        next_cursor: null,
+      }),
+    );
+    await act(() =>
+      historyB.resolve({
+        items: [
+          transition({ id: 'transition-b', purchase_order_id: 'po-2', reason: 'B stale history' }),
+        ],
+        next_cursor: null,
+      }),
+    );
+    expect(screen.getByTestId('po-transition-transition-a2')).toBeInTheDocument();
+    expect(screen.queryByTestId('po-transition-transition-a1')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('po-transition-transition-b')).not.toBeInTheDocument();
   });
 });

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import type { PurchaseOrder } from '@/lib/purchase-orders';
 
 export function PurchaseOrderConflictPanel({
@@ -12,8 +13,14 @@ export function PurchaseOrderConflictPanel({
   onDiscard: () => void;
 }) {
   const editable = latest.status === 'DRAFT';
+  const panelRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    panelRef.current?.focus();
+  }, [latest.id, latest.version]);
   return (
     <section
+      ref={panelRef}
+      tabIndex={-1}
       role="alert"
       aria-labelledby="po-conflict-title"
       data-testid="po-conflict-panel"

@@ -17,6 +17,8 @@ import type {
   UpdatePurchaseOrderBody,
 } from '@/lib/purchase-orders';
 import type { Farm } from '@/lib/types';
+import type { CurrentUser } from '@/lib/types';
+import { hasScopedPermission } from '@/lib/permissions';
 import {
   PurchaseOrderLineEditor,
   type PurchaseOrderLineFormValue,
@@ -78,6 +80,21 @@ const DELIVERY_ERROR_CODES = new Set([
   'invalid_country_code',
   'purchase_order_invalid_delivery_date',
 ]);
+const APPROVED_DOMAIN_MESSAGES: Record<string, string> = {
+  invalid_currency: 'Use a supported three-letter currency code.',
+  purchase_order_invalid_delivery_date: 'Expected delivery cannot be before the order date.',
+  invalid_delivery_address: 'Review the delivery address and try again.',
+  invalid_country_code: 'Use a supported two-letter delivery country code.',
+  business_partner_inactive: 'The selected supplier is inactive.',
+  business_partner_not_supplier: 'Select a business partner that is available as a supplier.',
+  business_partner_not_approved: 'The selected supplier is not approved for purchasing.',
+  business_partner_blocked: 'The selected supplier is blocked for purchasing.',
+  supplier_unavailable: 'The selected supplier is no longer available.',
+  unit_incompatible: 'Select a unit compatible with the inventory item.',
+  ordered_unit_mismatch: 'The selected unit does not match the ordered unit.',
+  purchase_order_line_note_required: 'Add a note for this Purchase Order line.',
+};
+const SAVE_FALLBACK = 'Unable to save this Draft. Review the form and try again.';
 
 function normalizeValidationLocation(location: unknown[]): string | null {
   const parts = location.filter((part) => part !== 'body').map(String);
@@ -131,11 +148,7 @@ export function mapPurchaseOrderFormError(caught: unknown): {
   fields: PurchaseOrderFormErrors;
   message: string;
 } {
-  if (!(caught instanceof ApiError))
-    return {
-      fields: {},
-      message: caught instanceof Error ? caught.message : 'Unable to save this Draft.',
-    };
+  if (!(caught instanceof ApiError)) return { fields: {}, message: SAVE_FALLBACK };
   if (caught.status >= 500)
     return { fields: {}, message: 'Something went wrong. Please try again.' };
 
@@ -144,9 +157,9 @@ export function mapPurchaseOrderFormError(caught: unknown): {
   if (Array.isArray(detail)) {
     for (const entry of detail as Array<{ loc?: unknown[]; msg?: string }>) {
       const field = normalizeValidationLocation(entry.loc ?? []);
-      if (field) fields[field] = entry.msg ?? 'Invalid value.';
+      if (field) fields[field] = 'Review this value and try again.';
     }
-    return { fields, message: 'Unable to save this Draft.' };
+    return { fields, message: SAVE_FALLBACK };
   }
   if (detail && typeof detail === 'object') {
     const object = detail as {
@@ -154,12 +167,13 @@ export function mapPurchaseOrderFormError(caught: unknown): {
       message?: string;
       context?: Record<string, unknown>;
     };
-    const message = object.message ?? 'Unable to save this Draft.';
+    const approvedMessage = object.code ? APPROVED_DOMAIN_MESSAGES[object.code] : undefined;
+    const message = approvedMessage ?? SAVE_FALLBACK;
     const field = normalizeDomainField(object.code, object.context ?? {}, message);
-    if (field) fields[field] = message;
+    if (field && approvedMessage) fields[field] = message;
     return { fields, message };
   }
-  return { fields, message: typeof detail === 'string' ? detail : 'Unable to save this Draft.' };
+  return { fields, message: SAVE_FALLBACK };
 }
 
 let newLineSequence = 0;
@@ -340,6 +354,9 @@ export function PurchaseOrderForm({
   externalErrors = {},
   generalError,
   optionsRevision = 0,
+  user,
+  farmPermission,
+  onUnauthorized,
   onSubmit,
   onCancel,
 }: {
@@ -350,6 +367,9 @@ export function PurchaseOrderForm({
   externalErrors?: PurchaseOrderFormErrors;
   generalError?: string | null;
   optionsRevision?: number;
+  user?: CurrentUser | null;
+  farmPermission?: 'purchase_order.create' | 'purchase_order.update';
+  onUnauthorized?: () => void;
   onSubmit: (values: PurchaseOrderFormValues) => void;
   onCancel: () => void;
 }) {
@@ -362,6 +382,8 @@ export function PurchaseOrderForm({
   const [optionsIdentity, setOptionsIdentity] = useState<string | null>(null);
   const [optionsLoading, setOptionsLoading] = useState(true);
   const generationRef = useRef(0);
+  const onUnauthorizedRef = useRef(onUnauthorized);
+  onUnauthorizedRef.current = onUnauthorized;
   const summaryRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const errors = { ...externalErrors, ...localErrors };
@@ -381,6 +403,12 @@ export function PurchaseOrderForm({
     setFarms([]);
     setSuppliers([]);
     setItems([]);
+    setLocalErrors((current) => {
+      if (!current.options) return current;
+      const next = { ...current };
+      delete next.options;
+      return next;
+    });
     void Promise.all([
       apiFetch<Farm[]>(`/v1/organizations/${organizationId}/farms`, { signal: controller.signal }),
       listBusinessPartners({
@@ -409,6 +437,10 @@ export function PurchaseOrderForm({
           (caught instanceof DOMException && caught.name === 'AbortError')
         )
           return;
+        if (caught instanceof ApiError && caught.status === 401) {
+          onUnauthorizedRef.current?.();
+          return;
+        }
         setLocalErrors({
           options:
             caught instanceof ApiError && caught.status >= 500
@@ -425,7 +457,14 @@ export function PurchaseOrderForm({
     };
   }, [optionsRevision, organizationId, requestedOptionsIdentity, supplierSearch]);
   const visible = optionsIdentity === requestedOptionsIdentity;
-  const visibleFarms = visible ? farms : [];
+  const visibleFarms = visible
+    ? farms.filter(
+        (farm) =>
+          !user ||
+          !farmPermission ||
+          hasScopedPermission(user, farmPermission, { organizationId, farmId: farm.id }),
+      )
+    : [];
   const visibleSuppliers = visible ? suppliers : [];
   const visibleItems = visible ? items : [];
   const dirty = useMemo(
@@ -504,7 +543,11 @@ export function PurchaseOrderForm({
           error={errors.farm_id}
           testId="po-form-farm"
         >
-          <option value="">Organization-wide</option>
+          {(!user ||
+            !farmPermission ||
+            hasScopedPermission(user, farmPermission, { organizationId })) && (
+            <option value="">Organization-wide</option>
+          )}
           {visibleFarms.map((farm) => (
             <option key={farm.id} value={farm.id}>
               {farm.code} — {farm.name}

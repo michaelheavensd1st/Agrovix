@@ -166,6 +166,11 @@ function NewPurchaseOrderInner() {
         externalErrors={fieldErrors}
         generalError={error}
         optionsRevision={optionsRevision}
+        user={user}
+        farmPermission="purchase_order.create"
+        onUnauthorized={() =>
+          router.push(`/login?returnTo=${encodeURIComponent(`${pathname}?${searchKey}`)}`)
+        }
         onSubmit={submit}
         onCancel={() =>
           router.push(`/purchase-orders?organization_id=${encodeURIComponent(organizationId)}`)

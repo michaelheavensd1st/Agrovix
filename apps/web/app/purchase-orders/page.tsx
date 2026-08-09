@@ -2,9 +2,10 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import { ApiError, apiFetch } from '@/lib/api';
 import { listBusinessPartners } from '@/lib/business-partners';
-import { friendlyError, SkeletonRows, toast } from '@/components/ui-polish';
+import { SkeletonRows, toast } from '@/components/ui-polish';
 import { EmptyState, ErrorBanner, ForbiddenBanner } from '@/components/ape-ui';
 import {
   PurchaseOrderFilters,
@@ -18,6 +19,7 @@ import {
   type PurchaseOrderStatus,
 } from '@/lib/purchase-orders';
 import type { CurrentUser, Farm, Organization } from '@/lib/types';
+import { hasScopedPermission } from '@/lib/permissions';
 
 const DEFAULT_FILTERS: PurchaseOrderFiltersValue = {
   farmId: '',
@@ -67,6 +69,23 @@ function hasAnyReadPermission(user: CurrentUser | null, organizationId: string):
   );
 }
 
+function hasApplicablePermission(
+  user: CurrentUser | null,
+  permission: string,
+  organizationId: string,
+  farmId?: string,
+): boolean {
+  if (!user) return false;
+  if (hasScopedPermission(user, permission, { organizationId, ...(farmId ? { farmId } : {}) }))
+    return true;
+  if (farmId) return false;
+  return (user.permission_scopes ?? []).some(
+    (scope) =>
+      scope.organization_id === organizationId &&
+      (scope.permissions.includes('*') || scope.permissions.includes(permission)),
+  );
+}
+
 function listViewIdentity(
   organizationId: string,
   filters: PurchaseOrderFiltersValue,
@@ -103,10 +122,8 @@ function listScopeIdentity(organizationId: string, filters: PurchaseOrderFilters
 }
 
 function purchaseOrderListError(caught: unknown): string {
-  if (caught instanceof ApiError && caught.status >= 500) {
-    return 'Something went wrong. Please try again.';
-  }
-  return friendlyError(caught);
+  void caught;
+  return 'Something went wrong. Please try again.';
 }
 
 export default function PurchaseOrdersPage() {
@@ -150,8 +167,10 @@ function PurchaseOrdersInner() {
   const [error, setError] = useState<string | null>(null);
   const [committedViewIdentity, setCommittedViewIdentity] = useState<string | null>(null);
   const [optionsOrganizationId, setOptionsOrganizationId] = useState<string | null>(null);
+  const [paginationPending, setPaginationPending] = useState(false);
   const generationRef = useRef(0);
   const optionsGenerationRef = useRef(0);
+  const paginationLockRef = useRef(false);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -255,6 +274,16 @@ function PurchaseOrdersInner() {
   }, [organizationId]);
 
   const clearCursor = useCallback(() => {
+    if (paginationLockRef.current) return;
+    paginationLockRef.current = true;
+    setPaginationPending(true);
+    const next = new URLSearchParams(searchKey);
+    next.delete('cursor');
+    setPreviousCursorState({ identity: null, cursors: [] });
+    router.replace(`${pathname}?${next.toString()}`);
+  }, [pathname, router, searchKey]);
+
+  const recoverInvalidCursor = useCallback(() => {
     const next = new URLSearchParams(searchKey);
     next.delete('cursor');
     setPreviousCursorState({ identity: null, cursors: [] });
@@ -310,18 +339,22 @@ function PurchaseOrdersInner() {
           setError('This purchase-order scope is unavailable.');
         } else if (cursor && caught instanceof ApiError && [400, 422].includes(caught.status)) {
           toast('That page link is no longer valid. Returned to the first page.', 'info');
-          clearCursor();
+          recoverInvalidCursor();
         } else {
           setError(purchaseOrderListError(caught));
         }
         setCommittedViewIdentity(currentViewIdentity);
       })
       .finally(() => {
-        if (isCurrent()) setLoading(false);
+        if (isCurrent()) {
+          paginationLockRef.current = false;
+          setPaginationPending(false);
+          setLoading(false);
+        }
       });
     return () => controller.abort();
   }, [
-    clearCursor,
+    recoverInvalidCursor,
     cursor,
     currentViewIdentity,
     filters,
@@ -351,6 +384,8 @@ function PurchaseOrdersInner() {
     setRows([]);
     setNextCursor(null);
     setPreviousCursorState({ identity: null, cursors: [] });
+    paginationLockRef.current = false;
+    setPaginationPending(false);
     setLoading(true);
     router.replace(`${pathname}?${next.toString()}`);
   }
@@ -364,12 +399,16 @@ function PurchaseOrdersInner() {
     setSuppliers([]);
     setNextCursor(null);
     setPreviousCursorState({ identity: null, cursors: [] });
+    paginationLockRef.current = false;
+    setPaginationPending(false);
     setLoading(true);
     router.replace(`${pathname}?organization_id=${encodeURIComponent(nextOrganizationId)}`);
   }
 
   function goNext() {
-    if (!nextCursor) return;
+    if (!nextCursor || paginationLockRef.current) return;
+    paginationLockRef.current = true;
+    setPaginationPending(true);
     setPreviousCursorState((existing) => ({
       identity: currentScopeIdentity,
       cursors: [
@@ -383,7 +422,9 @@ function PurchaseOrdersInner() {
   }
 
   function goPrevious() {
-    if (previousCursors.length === 0) return;
+    if (previousCursors.length === 0 || paginationLockRef.current) return;
+    paginationLockRef.current = true;
+    setPaginationPending(true);
     const previous = previousCursors[previousCursors.length - 1];
     setPreviousCursorState({
       identity: currentScopeIdentity,
@@ -397,6 +438,12 @@ function PurchaseOrdersInner() {
 
   const activeOrganization = organizations?.find((org) => org.id === organizationId) ?? null;
   const farmNames = useMemo(() => new Map(farms.map((farm) => [farm.id, farm.name])), [farms]);
+  const permissionVisibleFarms = visibleFarms.filter((farm) =>
+    hasScopedPermission(user, 'purchase_order.read', {
+      organizationId,
+      farmId: farm.id,
+    }),
+  );
 
   return (
     <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6" data-testid="po-list-page">
@@ -410,6 +457,15 @@ function PurchaseOrdersInner() {
             <p className="mt-1 text-sm text-muted-foreground">{activeOrganization.name}</p>
           )}
         </div>
+        {hasApplicablePermission(user, 'purchase_order.create', organizationId, filters.farmId) && (
+          <Link
+            href={`/purchase-orders/new?organization_id=${encodeURIComponent(organizationId)}`}
+            data-testid="po-create-link"
+            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
+          >
+            Create Purchase Order
+          </Link>
+        )}
         {organizations && organizations.length > 1 && (
           <label className="text-sm">
             <span className="mr-2 text-muted-foreground">Organization</span>
@@ -432,7 +488,7 @@ function PurchaseOrdersInner() {
       {organizationId && (
         <PurchaseOrderFilters
           value={filters}
-          farms={visibleFarms.map((farm) => ({
+          farms={permissionVisibleFarms.map((farm) => ({
             id: farm.id,
             label: `${farm.code} — ${farm.name}`,
           }))}
@@ -477,7 +533,7 @@ function PurchaseOrdersInner() {
           <button
             type="button"
             onClick={goPrevious}
-            disabled={previousCursors.length === 0}
+            disabled={previousCursors.length === 0 || paginationPending}
             data-testid="po-page-previous"
             className="rounded-md border border-border px-3 py-1.5 text-sm disabled:opacity-50"
           >
@@ -486,7 +542,7 @@ function PurchaseOrdersInner() {
           <button
             type="button"
             onClick={goNext}
-            disabled={!visibleNextCursor}
+            disabled={!visibleNextCursor || paginationPending}
             data-testid="po-page-next"
             className="rounded-md border border-border px-3 py-1.5 text-sm disabled:opacity-50"
           >

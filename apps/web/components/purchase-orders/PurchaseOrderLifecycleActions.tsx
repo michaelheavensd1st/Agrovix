@@ -90,6 +90,7 @@ export function PurchaseOrderLifecycleActions({
   const dialogTitleRef = useRef<HTMLHeadingElement>(null);
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   const invokingActionRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   const context = useMemo(
     () => ({
@@ -121,6 +122,27 @@ export function PurchaseOrderLifecycleActions({
     if (!selected) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && !pendingOperation) closeDialog();
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialogTitleRef.current?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialogRef.current?.contains(active))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (active === last || !dialogRef.current?.contains(active))) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -232,7 +254,10 @@ export function PurchaseOrderLifecycleActions({
           aria-describedby="po-lifecycle-dialog-description"
           data-testid="po-lifecycle-dialog"
         >
-          <div className="w-full max-w-md rounded-2xl border border-border bg-card p-5 shadow-lg">
+          <div
+            ref={dialogRef}
+            className="max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-border bg-card p-4 shadow-lg sm:p-5"
+          >
             <h2
               id="po-lifecycle-dialog-title"
               className="font-display text-lg"
@@ -281,7 +306,7 @@ export function PurchaseOrderLifecycleActions({
                 {error}
               </p>
             )}
-            <div className="mt-5 flex justify-end gap-2">
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
               <button
                 type="button"
                 onClick={() => closeDialog()}

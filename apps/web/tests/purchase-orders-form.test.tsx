@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 vi.mock('@/lib/api', async () => {
@@ -19,6 +19,7 @@ import {
 } from '@/components/purchase-orders/PurchaseOrderForm';
 import { PurchaseOrderConflictPanel } from '@/components/purchase-orders/PurchaseOrderConflictPanel';
 import type { PurchaseOrder } from '@/lib/purchase-orders';
+import type { CurrentUser } from '@/lib/types';
 
 const mockedApiFetch = vi.mocked(apiFetch);
 
@@ -88,10 +89,12 @@ function line(id: string, item: string) {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 beforeEach(() => {
@@ -159,6 +162,171 @@ beforeEach(() => {
 });
 
 describe('PurchaseOrderForm semantics', () => {
+  it('restricts create and edit farm choices to the applicable scoped permission', async () => {
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path.includes('/farms'))
+        return Promise.resolve([
+          { id: 'farm-1', organization_id: 'org-1', code: 'F1', name: 'Farm One', is_active: true },
+          { id: 'farm-2', organization_id: 'org-1', code: 'F2', name: 'Farm Two', is_active: true },
+        ] as never);
+      if (path.includes('/business-partners'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve([] as never);
+    });
+    const scopedUser: CurrentUser = {
+      id: 'u1',
+      email: 'u@example.test',
+      full_name: 'Scoped user',
+      is_active: true,
+      is_verified: true,
+      is_superuser: false,
+      permissions: [],
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.create', 'purchase_order.update'],
+        },
+        {
+          organization_id: 'org-2',
+          farm_id: 'farm-2',
+          permissions: ['purchase_order.create', 'purchase_order.update'],
+        },
+      ],
+    };
+    const props = {
+      organizationId: 'org-1',
+      submitting: false,
+      user: scopedUser,
+      onSubmit: vi.fn(),
+      onCancel: vi.fn(),
+    };
+    const view = render(
+      <PurchaseOrderForm {...props} mode="create" farmPermission="purchase_order.create" />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: /Farm One/ })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole('option', { name: /Farm Two/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Organization-wide' })).not.toBeInTheDocument();
+
+    view.rerender(
+      <PurchaseOrderForm
+        {...props}
+        mode="edit"
+        initial={po()}
+        farmPermission="purchase_order.update"
+      />,
+    );
+    expect(screen.getByRole('option', { name: /Farm One/ })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Farm Two/ })).not.toBeInTheDocument();
+  });
+
+  it('routes selector 401 through the authentication callback without exposing details', async () => {
+    const onUnauthorized = vi.fn();
+    mockedApiFetch.mockRejectedValue(
+      new ApiError(401, { detail: 'raw expired-session backend detail' }),
+    );
+    render(
+      <PurchaseOrderForm
+        mode="create"
+        organizationId="org-1"
+        submitting={false}
+        onUnauthorized={onUnauthorized}
+        onSubmit={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/raw expired-session/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Unable to load form options.')).not.toBeInTheDocument();
+  });
+
+  it('ignores a stale selector 401 after the form organization changes', async () => {
+    const oldFarmRequest = deferred<never>();
+    const onUnauthorized = vi.fn();
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path.includes('/org-1/farms')) return oldFarmRequest.promise;
+      if (path.includes('/business-partners'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve([] as never);
+    });
+    const props = {
+      mode: 'create' as const,
+      submitting: false,
+      onUnauthorized,
+      onSubmit: vi.fn(),
+      onCancel: vi.fn(),
+    };
+    const view = render(<PurchaseOrderForm {...props} organizationId="org-1" />);
+    view.rerender(<PurchaseOrderForm {...props} organizationId="org-2" />);
+    await waitFor(() => expect(screen.getByTestId('po-form-submit')).toBeEnabled());
+    await act(async () => {
+      oldFarmRequest.reject(new ApiError(401, { detail: 'stale session detail' }));
+      try {
+        await oldFarmRequest.promise;
+      } catch {
+        // Expected obsolete rejection.
+      }
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(screen.queryByText(/stale session detail/)).not.toBeInTheDocument();
+  });
+
+  it('clears a current selector error after a successful reload', async () => {
+    let failing = true;
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (failing) return Promise.reject(new ApiError(500, { detail: 'raw selector failure' }));
+      if (path.includes('/farms'))
+        return Promise.resolve([
+          { id: 'farm-recovered', code: 'REC', name: 'Recovered Farm', is_active: true },
+        ] as never);
+      if (path.includes('/business-partners'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve([] as never);
+    });
+    const props = {
+      mode: 'create' as const,
+      organizationId: 'org-1',
+      submitting: false,
+      onSubmit: vi.fn(),
+      onCancel: vi.fn(),
+    };
+    const view = render(<PurchaseOrderForm {...props} optionsRevision={0} />);
+    expect(await screen.findByText('Something went wrong. Please try again.')).toBeInTheDocument();
+    failing = false;
+    view.rerender(<PurchaseOrderForm {...props} optionsRevision={1} />);
+    expect(await screen.findByRole('option', { name: /Recovered Farm/ })).toBeInTheDocument();
+    expect(screen.queryByText('Something went wrong. Please try again.')).not.toBeInTheDocument();
+    expect(screen.queryByText(/raw selector failure/)).not.toBeInTheDocument();
+  });
+
+  it('does not let stale selector success clear a newer selector failure', async () => {
+    const oldFarms = deferred<never[]>();
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path.includes('/org-1/farms')) return oldFarms.promise as never;
+      if (path.includes('/org-2/'))
+        return Promise.reject(new ApiError(500, { detail: 'new current failure' }));
+      if (path.includes('/business-partners'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      return Promise.resolve([] as never);
+    });
+    const props = {
+      mode: 'create' as const,
+      submitting: false,
+      onSubmit: vi.fn(),
+      onCancel: vi.fn(),
+    };
+    const view = render(<PurchaseOrderForm {...props} organizationId="org-1" />);
+    view.rerender(<PurchaseOrderForm {...props} organizationId="org-2" />);
+    expect(await screen.findByText('Something went wrong. Please try again.')).toBeInTheDocument();
+    await act(async () => {
+      oldFarms.resolve([]);
+      await oldFarms.promise;
+    });
+    expect(screen.getByText('Something went wrong. Please try again.')).toBeInTheDocument();
+  });
+
   it('builds create payloads with exact maximum Decimal strings and no client IDs', () => {
     const values = purchaseOrderFormValues();
     values.businessPartnerId = 'bp-1';
@@ -317,8 +485,34 @@ describe('PurchaseOrderForm semantics', () => {
       />,
     );
     expect(screen.getByRole('alert')).toHaveTextContent('version 4');
+    expect(screen.getByRole('alert')).toHaveFocus();
     expect(screen.getByRole('button', { name: 'Review latest' })).toBeEnabled();
     expect(screen.getByRole('button', { name: /Discard local edits/ })).toBeEnabled();
+  });
+
+  it('sanitizes ambiguous form errors while retaining structured field attribution', () => {
+    const hostile = 'SQLSTATE driver stack SELECT secret FROM tenant';
+    const ambiguous = mapPurchaseOrderFormError(new ApiError(422, { detail: hostile }));
+    expect(ambiguous).toEqual({
+      fields: {},
+      message: 'Unable to save this Draft. Review the form and try again.',
+    });
+    const indexed = mapPurchaseOrderFormError(
+      new ApiError(422, {
+        detail: [{ loc: ['body', 'currency_code'], msg: hostile }] as never,
+      }),
+    );
+    expect(indexed.fields.currency_code).toBe('Review this value and try again.');
+    expect(JSON.stringify(indexed)).not.toContain(hostile);
+
+    const recognized = mapPurchaseOrderFormError(
+      domainError('invalid_currency', hostile, { field: 'currency_code' }),
+    );
+    expect(recognized).toEqual({
+      fields: { currency_code: 'Use a supported three-letter currency code.' },
+      message: 'Use a supported three-letter currency code.',
+    });
+    expect(JSON.stringify(recognized)).not.toContain(hostile);
   });
 
   it('maps an unsupported domain currency to the rendered currency control and focuses it', async () => {
@@ -340,7 +534,7 @@ describe('PurchaseOrderForm semantics', () => {
     const currency = screen.getByTestId('po-form-currency');
     await waitFor(() => expect(currency).toHaveFocus());
     expect(currency).toHaveAttribute('aria-invalid', 'true');
-    expect(currency).toHaveAccessibleDescription(/official ISO 4217/);
+    expect(currency).toHaveAccessibleDescription('Use a supported three-letter currency code.');
     expect(screen.queryByText(/"code"|"context"/)).not.toBeInTheDocument();
   });
 
@@ -370,7 +564,9 @@ describe('PurchaseOrderForm semantics', () => {
     const countryInput = screen.getByTestId('po-form-address-countryCode');
     await waitFor(() => expect(countryInput).toHaveFocus());
     expect(countryInput).toHaveAttribute('aria-invalid', 'true');
-    expect(countryInput).toHaveAccessibleDescription(/country is invalid/);
+    expect(countryInput).toHaveAccessibleDescription(
+      'Use a supported two-letter delivery country code.',
+    );
 
     const line1 = mapPurchaseOrderFormError(
       domainError('invalid_delivery_address', 'delivery_address.line1 is invalid.', {
@@ -383,7 +579,7 @@ describe('PurchaseOrderForm semantics', () => {
     const line1Input = screen.getByTestId('po-form-address-line1');
     await waitFor(() => expect(line1Input).toHaveFocus());
     expect(line1Input).toHaveAttribute('aria-invalid', 'true');
-    expect(line1Input).toHaveAccessibleDescription(/line1 is invalid/);
+    expect(line1Input).toHaveAccessibleDescription('Review the delivery address and try again.');
   });
 
   it('preserves indexed Pydantic line mapping and leaves ambiguous fields summary-only', async () => {
@@ -413,7 +609,8 @@ describe('PurchaseOrderForm semantics', () => {
     );
     const price = screen.getByTestId('po-line-0-price');
     await waitFor(() => expect(price).toHaveFocus());
-    expect(price).toHaveAccessibleDescription('Enter a legal price.');
+    expect(price).toHaveAccessibleDescription('Review this value and try again.');
+    expect(screen.queryByText('Enter a legal price.')).not.toBeInTheDocument();
 
     const ambiguous = mapPurchaseOrderFormError(
       domainError('unknown_rule', 'Review the supplied Draft.', { field: 'mystery' }),
@@ -427,7 +624,9 @@ describe('PurchaseOrderForm semantics', () => {
       />,
     );
     await waitFor(() => expect(screen.getByRole('alert')).toHaveFocus());
-    expect(screen.getByText('Review the supplied Draft.')).toBeInTheDocument();
+    expect(
+      screen.getByText('Unable to save this Draft. Review the form and try again.'),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/"mystery"/)).not.toBeInTheDocument();
   });
 });
