@@ -210,7 +210,47 @@ describe('InventoryItemListPage — authorization', () => {
     });
     render(<InventoryItemListPage />);
     await waitFor(() => expect(routerPush).toHaveBeenCalledWith('/login'));
+    expect(
+      mockedApiFetch.mock.calls.filter(
+        ([path]) => path === `/v1/organizations/${ORG_A.id}/inventory-items`,
+      ),
+    ).toHaveLength(1);
     expect(toastSpy).not.toHaveBeenCalled();
+  });
+
+  it('an obsolete post-unmount 401 cannot redirect or write visible state', async () => {
+    const dA = deferred<InventoryItem[]>();
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return dA.promise;
+      return Promise.resolve([]);
+    });
+
+    try {
+      const { container, unmount } = render(<InventoryItemListPage />);
+      await waitFor(() =>
+        expect(screen.getByTestId('item-list-org-name')).toHaveTextContent(ORG_A.name),
+      );
+      await waitFor(() =>
+        expect(mockedApiFetch).toHaveBeenCalledWith(
+          `/v1/organizations/${ORG_A.id}/inventory-items`,
+        ),
+      );
+
+      unmount();
+      await act(async () => {
+        dA.reject(new ApiError(401, {}));
+        await expect(dA.promise).rejects.toBeInstanceOf(ApiError);
+      });
+
+      expect(routerPush).not.toHaveBeenCalledWith('/login');
+      expect(toastSpy).not.toHaveBeenCalled();
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+      expect(container).toBeEmptyDOMElement();
+    } finally {
+      consoleErrorSpy.mockRestore();
+    }
   });
 
   it('list 403 shows the org-scope banner, no redirect, no toast', async () => {
@@ -228,28 +268,77 @@ describe('InventoryItemListPage — authorization', () => {
 
   it('obsolete org-A response cannot overwrite org-B', async () => {
     const dA = deferred<InventoryItem[]>();
+    const dB = deferred<InventoryItem[]>();
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return dA.promise;
-      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`)
-        return Promise.resolve([
-          makeItem({ id: 'b-1', code: 'BEACON-1', organization_id: ORG_B.id }),
-        ]);
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return dB.promise;
       return Promise.resolve([]);
     });
     render(<InventoryItemListPage />);
-    await waitFor(() => expect(screen.getByTestId('item-list-org-selector')).toBeInTheDocument());
-    fireEvent.change(screen.getByTestId('item-list-org-selector'), {
+    const selector = await screen.findByTestId('item-list-org-selector');
+    await waitFor(() => expect(selector).toHaveValue(ORG_A.id));
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/organizations/${ORG_A.id}/inventory-items`),
+    );
+    fireEvent.change(selector, {
       target: { value: ORG_B.id },
+    });
+    await waitFor(() => expect(selector).toHaveValue(ORG_B.id));
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/organizations/${ORG_B.id}/inventory-items`),
+    );
+    await act(async () => {
+      dB.resolve([makeItem({ id: 'b-1', code: 'BEACON-1', organization_id: ORG_B.id })]);
+      await dB.promise;
     });
     await waitFor(() => expect(screen.getByTestId('item-row-BEACON-1')).toBeInTheDocument());
     await act(async () => {
       dA.resolve([makeItem({ id: 'a-stale', code: 'STALE-A' })]);
-      await Promise.resolve();
-      await Promise.resolve();
+      await dA.promise;
     });
     expect(screen.queryByTestId('item-row-STALE-A')).not.toBeInTheDocument();
     expect(screen.getByTestId('item-row-BEACON-1')).toBeInTheDocument();
+  });
+
+  it('obsolete org-A 401 cannot redirect or overwrite org-B', async () => {
+    const dA = deferred<InventoryItem[]>();
+    const dB = deferred<InventoryItem[]>();
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return dA.promise;
+      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return dB.promise;
+      return Promise.resolve([]);
+    });
+    render(<InventoryItemListPage />);
+    const selector = await screen.findByTestId('item-list-org-selector');
+    await waitFor(() => expect(selector).toHaveValue(ORG_A.id));
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/organizations/${ORG_A.id}/inventory-items`),
+    );
+
+    fireEvent.change(selector, { target: { value: ORG_B.id } });
+    await waitFor(() => expect(selector).toHaveValue(ORG_B.id));
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/organizations/${ORG_B.id}/inventory-items`),
+    );
+    await act(async () => {
+      dB.resolve([makeItem({ id: 'b-1', code: 'BEACON-1', organization_id: ORG_B.id })]);
+      await dB.promise;
+    });
+    await waitFor(() => expect(screen.getByTestId('item-row-BEACON-1')).toBeInTheDocument());
+
+    await act(async () => {
+      dA.reject(new ApiError(401, {}));
+      await expect(dA.promise).rejects.toBeInstanceOf(ApiError);
+    });
+
+    expect(routerPush).not.toHaveBeenCalledWith('/login');
+    expect(selector).toHaveValue(ORG_B.id);
+    expect(screen.getByTestId('item-list-org-name')).toHaveTextContent(ORG_B.name);
+    expect(screen.getByTestId('item-row-BEACON-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('item-forbidden-org')).not.toBeInTheDocument();
+    expect(toastSpy).not.toHaveBeenCalled();
   });
 });
 
