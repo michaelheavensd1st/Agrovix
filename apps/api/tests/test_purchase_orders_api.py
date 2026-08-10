@@ -27,10 +27,11 @@ from app.models.membership import FarmMembership, OrganizationMembership
 from app.models.purchase_order import (
     PurchaseOrder,
     PurchaseOrderLine,
+    PurchaseOrderSequence,
     PurchaseOrderStatus,
     PurchaseOrderTransition,
 )
-from app.models.role import Role
+from app.models.role import Permission, Role, RoleScope
 from app.models.role_assignment import RoleAssignment
 from app.models.user import User
 from tests._helpers import create_org, create_verified_user, switch_user
@@ -112,6 +113,42 @@ async def _assign_role(email: str, org_id: UUID, role_name: str, farm_id: UUID |
             )
         if farm_id is not None:
             session.add(FarmMembership(user_id=user.id, farm_id=farm_id, is_active=True))
+        session.add(
+            RoleAssignment(
+                user_id=user.id,
+                role_id=role.id,
+                organization_id=org_id,
+                farm_id=farm_id,
+            )
+        )
+        await session.commit()
+
+
+async def _assign_custom_role(
+    email: str, org_id: UUID, permission_codes: set[str], *, farm_id: UUID | None = None
+) -> None:
+    async with _db.AsyncSessionLocal() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        permissions = list(
+            (
+                await session.execute(
+                    select(Permission).where(Permission.code.in_(permission_codes))
+                )
+            ).scalars()
+        )
+        assert {permission.code for permission in permissions} == permission_codes
+        role = Role(
+            name=f"po-custom-{uuid4().hex}",
+            description="Purchase Order authorization regression role",
+            scope=RoleScope.FARM if farm_id is not None else RoleScope.ORGANIZATION,
+            is_system=False,
+            permissions=permissions,
+        )
+        session.add(role)
+        session.add(OrganizationMembership(user_id=user.id, organization_id=org_id, is_active=True))
+        if farm_id is not None:
+            session.add(FarmMembership(user_id=user.id, farm_id=farm_id, is_active=True))
+        await session.flush()
         session.add(
             RoleAssignment(
                 user_id=user.id,
@@ -555,6 +592,273 @@ async def test_farm_manager_update_submit_and_decision_permissions(client: Async
     await switch_user(client, owner_email)
 
 
+async def test_farm_scoped_update_cannot_clear_or_cross_assign_farm(
+    client: AsyncClient,
+) -> None:
+    owner_email, org_id = await _owner_org(client)
+    deps = await _dependencies(org_id)
+    other_deps = await _dependencies(org_id)
+    po = await _create_po(client, org_id, deps, farm=True)
+
+    manager_email = f"po-farm-update-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(manager_email)
+    await _assign_custom_role(
+        manager_email,
+        org_id,
+        {"purchase_order.read", "purchase_order.update"},
+        farm_id=deps["farm"],
+    )
+    await switch_user(client, manager_email)
+
+    allowed = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={"expected_version": 1, "notes": "allowed farm update"},
+    )
+    assert allowed.status_code == 200, allowed.text
+    version = allowed.json()["version"]
+
+    cross_farm = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={"expected_version": version, "farm_id": str(other_deps["farm"])},
+    )
+    assert cross_farm.status_code == 403
+
+    cleared = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={"expected_version": version, "farm_id": None},
+    )
+    assert cleared.status_code == 403
+
+    current, _ = await _fresh_po(po["id"])
+    assert current.farm_id == deps["farm"]
+    assert current.version == version
+    assert current.notes == "allowed farm update"
+
+    await switch_user(client, owner_email)
+    org_clear = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={"expected_version": version, "farm_id": None},
+    )
+    assert org_clear.status_code == 200, org_clear.text
+    assert org_clear.json()["farm_id"] is None
+
+
+async def test_farm_destination_denials_are_indistinguishable_and_atomic(
+    client: AsyncClient,
+) -> None:
+    owner_email, org_id = await _owner_org(client)
+    deps = await _dependencies(org_id)
+    other_deps = await _dependencies(org_id)
+    inactive_deps = await _dependencies(org_id)
+    async with _db.AsyncSessionLocal() as session:
+        inactive_farm = await session.get(Farm, inactive_deps["farm"])
+        inactive_farm.is_active = False
+        await session.commit()
+
+    _foreign_owner, foreign_org_id = await _owner_org(client)
+    foreign_deps = await _dependencies(foreign_org_id)
+    await switch_user(client, owner_email)
+    po = await _create_po(client, org_id, deps, farm=True)
+
+    manager_email = f"po-farm-update-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(manager_email)
+    await _assign_custom_role(
+        manager_email,
+        org_id,
+        {"purchase_order.read", "purchase_order.update"},
+        farm_id=deps["farm"],
+    )
+    await switch_user(client, manager_email)
+
+    allowed = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={"expected_version": 1, "notes": "allowed farm update"},
+    )
+    assert allowed.status_code == 200, allowed.text
+    version = allowed.json()["version"]
+
+    async with _db.AsyncSessionLocal() as session:
+        transitions_before = list(
+            (
+                await session.execute(
+                    select(PurchaseOrderTransition)
+                    .where(PurchaseOrderTransition.purchase_order_id == po["id"])
+                    .order_by(PurchaseOrderTransition.id)
+                )
+            ).scalars()
+        )
+        audits_before = list(
+            (
+                await session.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.entity_id == po["id"])
+                    .order_by(AuditEvent.id)
+                )
+            ).scalars()
+        )
+        transition_snapshot = [
+            (row.id, row.from_status, row.to_status, row.reason, row.metadata_json)
+            for row in transitions_before
+        ]
+        audit_snapshot = [
+            (row.id, row.action, row.farm_id, row.metadata_json) for row in audits_before
+        ]
+
+    current_before, lines_before = await _fresh_po(po["id"])
+    line_snapshot = [
+        (
+            line.id,
+            line.line_number,
+            line.inventory_item_id,
+            line.ordered_quantity,
+            line.unit_price,
+            line.description,
+        )
+        for line in lines_before
+    ]
+
+    candidate_farm_ids = (
+        other_deps["farm"],
+        foreign_deps["farm"],
+        uuid4(),
+        inactive_deps["farm"],
+    )
+    denial_contracts = []
+    for candidate_farm_id in candidate_farm_ids:
+        denied = await client.patch(
+            f"/api/v1/purchase-orders/{po['id']}",
+            json={"expected_version": version, "farm_id": str(candidate_farm_id)},
+        )
+        denial_contracts.append((denied.status_code, denied.json()))
+    assert all(contract == denial_contracts[0] for contract in denial_contracts)
+    assert denial_contracts[0][0] == 403
+    assert denial_contracts[0][1]["detail"]["code"] == "not_authorized"
+
+    combined_denial = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={
+            "expected_version": version,
+            "farm_id": None,
+            "notes": "must not persist",
+            "currency_code": "EUR",
+            "order_date": "2026-09-01",
+            "expected_delivery_date": "2026-09-02",
+            "supplier_reference": "must-not-persist",
+            "lines": [
+                {
+                    **_line(deps["item"], quantity="99.000000", price="7.000000"),
+                    "id": str(lines_before[0].id),
+                }
+            ],
+        },
+    )
+    assert (combined_denial.status_code, combined_denial.json()) == denial_contracts[0]
+
+    current, lines_after = await _fresh_po(po["id"])
+    assert current.farm_id == deps["farm"]
+    assert current.version == version
+    assert current.notes == current_before.notes == "allowed farm update"
+    assert current.currency_code == current_before.currency_code == "USD"
+    assert current.order_date == current_before.order_date == TODAY
+    assert current.expected_delivery_date == current_before.expected_delivery_date
+    assert current.supplier_reference == current_before.supplier_reference == "SUP-REF-001"
+    assert current.business_partner_id == current_before.business_partner_id
+    assert current.status == current_before.status == PurchaseOrderStatus.DRAFT
+    assert [
+        (
+            line.id,
+            line.line_number,
+            line.inventory_item_id,
+            line.ordered_quantity,
+            line.unit_price,
+            line.description,
+        )
+        for line in lines_after
+    ] == line_snapshot
+
+    async with _db.AsyncSessionLocal() as session:
+        transitions_after = list(
+            (
+                await session.execute(
+                    select(PurchaseOrderTransition)
+                    .where(PurchaseOrderTransition.purchase_order_id == po["id"])
+                    .order_by(PurchaseOrderTransition.id)
+                )
+            ).scalars()
+        )
+        audits_after = list(
+            (
+                await session.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.entity_id == po["id"])
+                    .order_by(AuditEvent.id)
+                )
+            ).scalars()
+        )
+    assert [
+        (row.id, row.from_status, row.to_status, row.reason, row.metadata_json)
+        for row in transitions_after
+    ] == transition_snapshot
+    assert [
+        (row.id, row.action, row.farm_id, row.metadata_json) for row in audits_after
+    ] == audit_snapshot
+
+    await switch_user(client, owner_email)
+    org_clear = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={"expected_version": version, "farm_id": None},
+    )
+    assert org_clear.status_code == 200, org_clear.text
+    assert org_clear.json()["farm_id"] is None
+
+    org_reassign = await client.patch(
+        f"/api/v1/purchase-orders/{po['id']}",
+        json={
+            "expected_version": org_clear.json()["version"],
+            "farm_id": str(other_deps["farm"]),
+        },
+    )
+    assert org_reassign.status_code == 200, org_reassign.text
+    assert org_reassign.json()["farm_id"] == str(other_deps["farm"])
+
+
+async def test_withdraw_requires_update_not_submit_permission(client: AsyncClient) -> None:
+    owner_email, org_id = await _owner_org(client)
+    deps = await _dependencies(org_id)
+    po = await _create_po(client, org_id, deps)
+    assert (await client.post(f"/api/v1/purchase-orders/{po['id']}/submit")).status_code == 200
+
+    updater_email = f"po-withdraw-update-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(updater_email)
+    await _assign_custom_role(
+        updater_email, org_id, {"purchase_order.read", "purchase_order.update"}
+    )
+    await switch_user(client, updater_email)
+    withdrawn = await client.post(
+        f"/api/v1/purchase-orders/{po['id']}/withdraw", json={"reason": "update required"}
+    )
+    assert withdrawn.status_code == 200, withdrawn.text
+    assert withdrawn.json()["status"] == "DRAFT"
+    assert (await client.post(f"/api/v1/purchase-orders/{po['id']}/submit")).status_code == 403
+
+    await switch_user(client, owner_email)
+    assert (await client.post(f"/api/v1/purchase-orders/{po['id']}/submit")).status_code == 200
+
+    submitter_email = f"po-withdraw-submit-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(submitter_email)
+    await _assign_custom_role(
+        submitter_email, org_id, {"purchase_order.read", "purchase_order.submit"}
+    )
+    await switch_user(client, submitter_email)
+    denied = await client.post(
+        f"/api/v1/purchase-orders/{po['id']}/withdraw", json={"reason": "not update"}
+    )
+    assert denied.status_code == 403
+
+    current, _ = await _fresh_po(po["id"])
+    assert current.status == PurchaseOrderStatus.SUBMITTED
+
+
 async def test_supplier_qualification_is_revalidated_at_submit(client: AsyncClient) -> None:
     _email, org_id = await _owner_org(client)
     deps = await _dependencies(org_id, approved=False)
@@ -587,6 +891,43 @@ async def test_invalid_decimal_foreign_supplier_and_stale_governance(client: Asy
         await session.commit()
     stale = await client.post(f"/api/v1/purchase-orders/{po['id']}/submit")
     assert stale.status_code == 404
+
+
+async def test_order_year_validation_precedes_sequence_allocation(client: AsyncClient) -> None:
+    _email, org_id = await _owner_org(client)
+    deps = await _dependencies(org_id)
+    async with _db.AsyncSessionLocal() as session:
+        sequence_before = (
+            await session.execute(select(func.count()).select_from(PurchaseOrderSequence))
+        ).scalar_one()
+        po_before = (
+            await session.execute(select(func.count()).select_from(PurchaseOrder))
+        ).scalar_one()
+
+    rejected = await _post_po(client, org_id, deps, order_date="1999-12-31")
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "invalid_order_date"
+    assert rejected.json()["detail"]["message"] == "order_date year must be between 2000 and 9999."
+    response_text = rejected.text.lower()
+    assert all(marker not in response_text for marker in ("sql", "constraint", "driver", "trace"))
+
+    async with _db.AsyncSessionLocal() as session:
+        sequence_after = (
+            await session.execute(select(func.count()).select_from(PurchaseOrderSequence))
+        ).scalar_one()
+        po_after = (
+            await session.execute(select(func.count()).select_from(PurchaseOrder))
+        ).scalar_one()
+    assert sequence_after == sequence_before
+    assert po_after == po_before
+
+    lower = await _post_po(client, org_id, deps, order_date="2000-01-01")
+    assert lower.status_code == 201, lower.text
+    assert lower.json()["po_number"].startswith("PO-2000-")
+
+    upper = await _post_po(client, org_id, deps, order_date="9999-12-31")
+    assert upper.status_code == 201, upper.text
+    assert upper.json()["po_number"].startswith("PO-9999-")
 
 
 async def test_authorization_revoked_after_load_returns_forbidden(client: AsyncClient) -> None:

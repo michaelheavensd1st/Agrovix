@@ -47,7 +47,7 @@ from app.repositories.purchase_order import (
     _clamp_limit,
 )
 from app.services.business_partner import BusinessPartnerService
-from app.services.purchase_order import PurchaseOrderService
+from app.services.purchase_order import _OPERATION_PERMISSION, PurchaseOrderService
 
 pytestmark = pytest.mark.asyncio
 
@@ -761,6 +761,14 @@ async def test_withdraw_and_replay(db_session):
     )
     await db_session.commit()
     assert r2.replay is True
+
+
+async def test_lifecycle_operation_permission_mapping_contract():
+    assert _OPERATION_PERMISSION["submit"] == "purchase_order.submit"
+    assert _OPERATION_PERMISSION["withdraw"] == "purchase_order.update"
+    assert _OPERATION_PERMISSION["approve"] == "purchase_order.approve"
+    assert _OPERATION_PERMISSION["reject"] == "purchase_order.reject"
+    assert _OPERATION_PERMISSION["cancel"] == "purchase_order.cancel"
 
 
 async def test_reject_revise_flow(db_session):

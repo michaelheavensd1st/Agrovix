@@ -75,6 +75,8 @@ _QUANTUM = Decimal(1).scaleb(-_MAX_DECIMAL_PLACES)  # Decimal('0.000001')
 _MAX_QTY = Decimal(10) ** 12
 _MAX_PRICE = Decimal(10) ** 14
 _ARITHMETIC_CONTEXT = Context(prec=64, rounding=ROUND_HALF_UP)
+_MIN_SEQUENCE_YEAR = 2000
+_MAX_SEQUENCE_YEAR = 9999
 
 _REASON_REQUIRED = frozenset({"withdraw", "reject", "revise", "cancel"})
 
@@ -84,7 +86,7 @@ _OPERATION_PERMISSION: dict[str, str] = {
     "create": "purchase_order.create",
     "update": "purchase_order.update",
     "submit": "purchase_order.submit",
-    "withdraw": "purchase_order.submit",
+    "withdraw": "purchase_order.update",
     "approve": "purchase_order.approve",
     "reject": "purchase_order.reject",
     "revise": "purchase_order.update",
@@ -742,6 +744,11 @@ class PurchaseOrderService:
         request_ctx: dict | None = None,
     ) -> PurchaseOrder:
         request_ctx = request_ctx or {}
+        if not _MIN_SEQUENCE_YEAR <= order_date.year <= _MAX_SEQUENCE_YEAR:
+            raise _unprocessable(
+                "invalid_order_date",
+                f"order_date year must be between {_MIN_SEQUENCE_YEAR} and {_MAX_SEQUENCE_YEAR}.",
+            )
         currency = (currency_code or "").upper()
         if not is_valid_currency(currency):
             raise _unprocessable(
@@ -890,6 +897,31 @@ class PurchaseOrderService:
         if po.farm_id is not None:
             await self._load_farm(po.organization_id, po.farm_id)
 
+        # Complete any elevated farm-scope authorization and destination
+        # validation before applying *any* requested mutation.  In particular,
+        # authorize a non-null destination before loading it so an unauthorized
+        # caller receives the same bounded denial regardless of whether the
+        # candidate UUID names a same-org, foreign, inactive, or missing farm.
+        authorized_farm_id = po.farm_id
+        if "farm_id" in data:
+            requested_farm_id = data["farm_id"]
+            if requested_farm_id is None:
+                authorized_farm_id = None
+                if po.farm_id is not None:
+                    await self._authorize(
+                        actor, "update", organization_id=organization_id, farm_id=None
+                    )
+            else:
+                authorized_farm_id = uuid.UUID(str(requested_farm_id))
+                if authorized_farm_id != po.farm_id:
+                    await self._authorize(
+                        actor,
+                        "update",
+                        organization_id=organization_id,
+                        farm_id=authorized_farm_id,
+                    )
+                    await self._load_farm(po.organization_id, authorized_farm_id)
+
         changed_fields: list[str] = []
 
         if "currency_code" in data:
@@ -919,22 +951,9 @@ class PurchaseOrderService:
             po.expected_delivery_date = data["expected_delivery_date"]
             changed_fields.append("expected_delivery_date")
 
-        if "farm_id" in data:
-            new_farm_id = data["farm_id"]
-            if new_farm_id is None:
-                if po.farm_id is not None:
-                    po.farm_id = None
-                    changed_fields.append("farm_id")
-            else:
-                new_farm_id = uuid.UUID(str(new_farm_id))
-                if new_farm_id != po.farm_id:
-                    await self._load_farm(po.organization_id, new_farm_id)
-                    # Authorize on the destination farm scope too.
-                    await self._authorize(
-                        actor, "update", organization_id=organization_id, farm_id=new_farm_id
-                    )
-                    po.farm_id = new_farm_id
-                    changed_fields.append("farm_id")
+        if "farm_id" in data and authorized_farm_id != po.farm_id:
+            po.farm_id = authorized_farm_id
+            changed_fields.append("farm_id")
 
         if "business_partner_id" in data:
             new_partner_id = uuid.UUID(str(data["business_partner_id"]))
