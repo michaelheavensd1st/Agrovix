@@ -25,6 +25,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
 from app.models.business_partner import (
@@ -36,6 +37,7 @@ from app.models.business_partner import (
     BusinessPartnerQualificationStatus,
     BusinessPartnerSupplierProfile,
 )
+from app.models.organization import Organization
 from app.models.user import User
 from app.repositories.audit_repo import AuditRepository
 from app.repositories.business_partner import (
@@ -180,6 +182,23 @@ class BusinessPartnerService:
         self.profile_repo = profile_repo
         self.contact_repo = contact_repo
         self.audit_repo = audit_repo
+
+    async def _lock_supplier_governance(self, *, actor: User, partner: BusinessPartner) -> None:
+        """Enter the PO-compatible organization → actor → supplier lock domain."""
+        session = self.partner_repo.session
+        await session.execute(
+            select(Organization.id)
+            .where(Organization.id == partner.organization_id)
+            .with_for_update()
+        )
+        await session.execute(select(User.id).where(User.id == actor.id).with_for_update())
+        from app.repositories.purchase_order import PurchaseOrderRepository
+
+        await PurchaseOrderRepository(session).acquire_dependency_locks(
+            business_partner_id=partner.id,
+            farm_id=None,
+            inventory_item_ids=set(),
+        )
 
     # ------------------------------------------------------------- #
     # Tenancy helper — every write and every read anchor on partner
@@ -382,6 +401,11 @@ class BusinessPartnerService:
         reason: str,
         request_ctx: dict,
     ) -> BusinessPartner:
+        supplier_capability = await self.capability_repo.get(
+            partner.id, BusinessPartnerCapabilityCode.SUPPLIER
+        )
+        if supplier_capability is not None:
+            await self._lock_supplier_governance(actor=actor, partner=partner)
         if not partner.is_active:
             return partner  # idempotent
         partner.is_active = False
@@ -435,6 +459,8 @@ class BusinessPartnerService:
         capability: BusinessPartnerCapabilityCode,
         request_ctx: dict,
     ) -> BusinessPartnerCapability:
+        if capability == BusinessPartnerCapabilityCode.SUPPLIER:
+            await self._lock_supplier_governance(actor=actor, partner=partner)
         existing = await self.capability_repo.get(partner.id, capability)
         if existing is not None:
             # Idempotent — return the existing row.
@@ -458,19 +484,40 @@ class BusinessPartnerService:
         capability: BusinessPartnerCapabilityCode,
         request_ctx: dict,
     ) -> None:
+        if capability == BusinessPartnerCapabilityCode.SUPPLIER:
+            # §2 (Release 6.0.3) — removing the supplier capability is
+            # rejected while any non-terminal Purchase Order for this
+            # partner still depends on it. To make this race-free against
+            # a concurrent PO submit/approve, we FIRST lock the supplier
+            # row FOR UPDATE — the exact row those lifecycle operations
+            # lock via their deterministic dependency-lock order — so the
+            # count-then-delete cannot interleave with a status change.
+            from app.repositories.purchase_order import (
+                count_non_terminal_purchase_orders_for_partner,
+            )
+
+            # Canonical governance order shared with PO lifecycle methods:
+            # partner → supplier profile → capabilities.
+            await self._lock_supplier_governance(actor=actor, partner=partner)
+
         row = await self.capability_repo.get(partner.id, capability)
         if row is None:
             raise _tenant_hidden("Capability")
-        # §4.3 — supplier capability removal must preserve the
-        # dependency rule with active non-terminal documents. In
-        # 6.0.2 no PO / Receipt tables exist yet, but keep the
-        # extension point explicit so 6.0.3 wires the check in.
         if capability == BusinessPartnerCapabilityCode.SUPPLIER:
-            # No active-document check available in 6.0.2 — see
-            # 6.0.3 for the enforcement hook. We still remove the
-            # supplier profile alongside the capability so a
-            # follow-on qualification query returns a consistent
-            # state.
+
+            dependent = await count_non_terminal_purchase_orders_for_partner(
+                self.partner_repo.session, partner.id
+            )
+            if dependent > 0:
+                raise _error(
+                    "business_partner_supplier_capability_in_use",
+                    "The supplier capability cannot be removed while a "
+                    "non-terminal Purchase Order depends on it.",
+                    context={"dependent_purchase_order_count": dependent},
+                )
+            # No dependent POs — remove the supplier profile alongside
+            # the capability so a follow-on qualification query returns
+            # a consistent state.
             profile = await self.profile_repo.get_for_partner(partner.id)
             if profile is not None:
                 await self.profile_repo.session.delete(profile)
@@ -496,6 +543,9 @@ class BusinessPartnerService:
         data: dict,
         request_ctx: dict,
     ) -> BusinessPartnerSupplierProfile:
+        # Serialize qualification changes with PO submit/approve under the
+        # shared org → actor → partner → profile → capabilities lock order.
+        await self._lock_supplier_governance(actor=actor, partner=partner)
         supplier_cap = await self.capability_repo.get(
             partner.id, BusinessPartnerCapabilityCode.SUPPLIER
         )

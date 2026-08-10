@@ -84,7 +84,15 @@ function InventoryItemListInner() {
   const [createError, setCreateError] = useState<string | null>(null);
 
   const orgGenerationRef = useRef(0);
+  const mountedRef = useRef(false);
   const currentOrgIdRef = useRef<string>('');
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      orgGenerationRef.current += 1;
+    };
+  }, []);
   useEffect(() => {
     currentOrgIdRef.current = orgId;
   }, [orgId]);
@@ -168,7 +176,8 @@ function InventoryItemListInner() {
     if (!orgId) return;
     const capturedOrgId = orgId;
     const generation = ++orgGenerationRef.current;
-    const isCurrent = () => orgGenerationRef.current === generation && capturedOrgId === orgId;
+    const isCurrent = () =>
+      mountedRef.current && orgGenerationRef.current === generation && capturedOrgId === orgId;
     setLoading(true);
     try {
       const list = await apiFetch<InventoryItem[]>(
@@ -179,6 +188,7 @@ function InventoryItemListInner() {
       setForbidden((f) => (f?.scope === 'org' ? null : f));
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
+        if (!isCurrent()) return;
         router.push('/login');
         return;
       }

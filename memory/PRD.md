@@ -2528,3 +2528,66 @@ SCOPE (Release 6.0.3+).
 * **Release 6.0.4+** — Purchase Receipts, receipt → inventory
   transaction bridge.
 
+
+---
+
+## Release 6.0.3 — Purchase Orders — Phase 1 (Backend domain) — 2026-06
+
+**Scope built (domain only; NO endpoints/frontend):** Alembic migration `0012_purchase_orders`
+(status enum + 4 tables + permission/grant seeding, reversible downgrade); domain models
+(`PurchaseOrder`, `PurchaseOrderLine`, `PurchaseOrderSequence`, `PurchaseOrderTransition`);
+repositories (org/year number allocation, `SELECT … FOR UPDATE`, scoped cursor paging);
+service (full state machine, optimistic `version`, snapshot freeze, supplier governance,
+independent-approval invariant, append-only transitions + replay idempotency, bounded audit,
+exact decimals + canonical unit conversion); 7 PO permissions + role grants; ISO 4217 validator;
+Business-Partner supplier-capability-removal guard.
+
+**Files:** `app/models/purchase_order.py`, `app/repositories/purchase_order.py`,
+`app/services/purchase_order.py`, `app/core/currency_codes.py`,
+`alembic/versions/0012_purchase_orders.py`, edits to `app/security/permissions.py`,
+`app/services/business_partner.py`, `app/models/__init__.py`;
+tests `tests/test_purchase_orders.py` (26) + `tests/test_purchase_orders_concurrency.py` (6).
+
+**Gate:** ruff + black clean; SQLite suite 424 passed; PostgreSQL suite 478 passed / 32 skipped;
+alembic upgrade→downgrade→upgrade round-trip clean (head `0012`); seed OK.
+
+**Out of scope (deferred to later 6.0.3 phases / 6.0.4):** REST endpoints, request/response
+schemas, frontend routes, Purchase Receipts, inventory mutations, warehouse receiving, AP,
+payments. See `docs/release_6.0/purchase-orders-phase-1-report.md`.
+
+**Next:** Phase 2 — API layer (permission deps + tenant scope, Pydantic schemas, idempotency
+header, cursor pagination wiring). Awaiting review before starting.
+
+
+---
+
+## Release 6.0.3 — Purchase Orders — Sprint 1.1 (Domain Hardening / Review Remediation) — 2026-06
+
+Independent Milestone-1 review returned BLOCK (0 Critical, 4 High, 6 Medium, 3 Low). All
+findings remediated in the backend domain layer only (no endpoints/frontend/6.0.4):
+
+- **Transactional governance locking** — lifecycle methods own locking; aggregate root
+  `FOR UPDATE` + deterministic global dependency-lock order
+  (business_partner → capabilities → farm → inventory_items, ascending PK); no check-then-act.
+- **In-transaction authorization revalidation** — `resolve_permission_scopes` re-checked under
+  lock (active org/farm membership, active role assignment, active org/farm).
+- **Submission rebuild** — `submit` re-derives + revalidates the whole document from
+  authoritative locked data, then freezes snapshots.
+- **Stable line identity** — UUID-preserving add/update/reorder/remove; rejects duplicate/unknown
+  ids; audit distinguishes added/updated/removed line ids.
+- **Exact 6-dp decimals** end-to-end (quantization + representability), **delivery-address /
+  ISO-3166 / bounded-string** validation, **dual received-accumulator** cancel guard.
+- **Repository foundations** — date/status/supplier/supplier-ref filters, cursor + transition
+  pagination, hard `MAX_PAGE_LIMIT`. **Numbering** tests (year boundary, per-year, rollback).
+
+**Files (5):** `app/services/purchase_order.py`, `app/repositories/purchase_order.py`,
+`app/services/business_partner.py` (supplier-row lock), `tests/test_purchase_orders.py` (43),
+`tests/test_purchase_orders_concurrency.py` (13). Migration `0012` unchanged.
+
+**Gate:** ruff + black clean; `git diff --check` clean; SQLite 441 passed / 93 skipped;
+PostgreSQL 502 passed / 32 skipped; alembic upgrade→downgrade→re-upgrade clean (single head
+`0012`); seed OK. Reports:
+`docs/release_6.0/purchase-orders-sprint-1.1-remediation-report.md`.
+
+**Status:** Ready for a second independent Codex review. **Milestone 2 not started.**
+
