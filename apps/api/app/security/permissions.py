@@ -102,6 +102,9 @@ ALL_PERMISSIONS: tuple[PermissionDef, ...] = (
     PermissionDef("purchase_order.approve", "Approve submitted Purchase Orders"),
     PermissionDef("purchase_order.reject", "Reject submitted Purchase Orders"),
     PermissionDef("purchase_order.cancel", "Cancel Purchase Orders"),
+    # --- Release 6.0.4 — Purchase Receipts ------------------------- #
+    PermissionDef("purchase_receipt.create", "Post Purchase Receipts"),
+    PermissionDef("purchase_receipt.read", "Read Purchase Receipts"),
 )
 
 
@@ -183,6 +186,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "purchase_order.approve",
             "purchase_order.reject",
             "purchase_order.cancel",
+            "purchase_receipt.create",
+            "purchase_receipt.read",
         ),
     ),
     RoleDef(
@@ -235,6 +240,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "purchase_order.approve",
             "purchase_order.reject",
             "purchase_order.cancel",
+            "purchase_receipt.create",
+            "purchase_receipt.read",
         ),
     ),
     RoleDef(
@@ -273,6 +280,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             "purchase_order.create",
             "purchase_order.update",
             "purchase_order.submit",
+            "purchase_receipt.create",
+            "purchase_receipt.read",
         ),
     ),
     RoleDef(
@@ -295,6 +304,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             # Release 6.0.2 — read-only on partners.
             "business_partner.read",
             "purchase_order.read",
+            "purchase_receipt.read",
         ),
     ),
     RoleDef(
@@ -320,6 +330,8 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             # Release 6.0.2 — read-only on partners.
             "business_partner.read",
             "purchase_order.read",
+            "purchase_receipt.create",
+            "purchase_receipt.read",
         ),
     ),
     RoleDef(
@@ -358,6 +370,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             # Release 6.0.2 — accountants can read partners.
             "business_partner.read",
             "purchase_order.read",
+            "purchase_receipt.read",
         ),
     ),
     RoleDef(
@@ -393,6 +406,7 @@ ROLE_DEFINITIONS: tuple[RoleDef, ...] = (
             # Release 6.0.2 — viewers can read partners.
             "business_partner.read",
             "purchase_order.read",
+            "purchase_receipt.read",
         ),
     ),
 )

@@ -5,8 +5,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
+import { useState } from 'react';
 
 const { routerPush, stableRouter, useParamsMock } = vi.hoisted(() => {
   const push = vi.fn();
@@ -34,6 +35,7 @@ vi.mock('@/components/ui-polish', async () => {
 import { apiFetch, ApiError } from '@/lib/api';
 import WarehouseListPage from '@/app/inventory/warehouses/page';
 import WarehouseDetailPage from '@/app/inventory/warehouses/[warehouseId]/page';
+import { WarehouseSearch } from '@/components/warehouses/warehouse-search';
 import {
   ACTIVITY_CONCURRENCY,
   ACTIVITY_LIMIT,
@@ -46,6 +48,86 @@ const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
 
 const ORG_A = { id: 'org-A', name: 'Aegis', slug: 'aegis' };
 const ORG_B = { id: 'org-B', name: 'Beacon', slug: 'beacon' };
+
+describe('WarehouseSearch debounce lifecycle', () => {
+  afterEach(() => vi.useRealTimers());
+
+  function UnstableCallbackHarness({ onChange }: { onChange: (value: string) => void }) {
+    const [, setEmissionCount] = useState(0);
+    return (
+      <WarehouseSearch
+        onDebouncedChange={(value) => {
+          onChange(value);
+          setEmissionCount((count) => count + 1);
+        }}
+        debounceMs={200}
+      />
+    );
+  }
+
+  it('emits normal input once without rescheduling after a callback-driven parent rerender', () => {
+    vi.useFakeTimers();
+    const onChange = vi.fn();
+    render(<UnstableCallbackHarness onChange={onChange} />);
+
+    fireEvent.change(screen.getByTestId('warehouse-search'), { target: { value: 'cold' } });
+    act(() => vi.advanceTimersByTime(200));
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenLastCalledWith('cold');
+    expect(vi.getTimerCount()).toBe(0);
+
+    act(() => vi.advanceTimersByTime(400));
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('collapses repeated typing to the latest value after the 200 ms delay', () => {
+    vi.useFakeTimers();
+    const onChange = vi.fn();
+    render(<UnstableCallbackHarness onChange={onChange} />);
+    const search = screen.getByTestId('warehouse-search');
+
+    fireEvent.change(search, { target: { value: 'c' } });
+    fireEvent.change(search, { target: { value: 'co' } });
+    fireEvent.change(search, { target: { value: 'cold' } });
+    act(() => vi.advanceTimersByTime(199));
+    expect(onChange).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(1));
+    expect(onChange).toHaveBeenCalledOnce();
+    expect(onChange).toHaveBeenCalledWith('cold');
+  });
+
+  it('uses the latest callback identity when the prop changes before expiry', () => {
+    vi.useFakeTimers();
+    const firstCallback = vi.fn();
+    const latestCallback = vi.fn();
+    const view = render(<WarehouseSearch onDebouncedChange={firstCallback} debounceMs={200} />);
+
+    fireEvent.change(screen.getByTestId('warehouse-search'), { target: { value: 'main' } });
+    view.rerender(<WarehouseSearch onDebouncedChange={latestCallback} debounceMs={200} />);
+    act(() => vi.advanceTimersByTime(200));
+
+    expect(firstCallback).not.toHaveBeenCalled();
+    expect(latestCallback).toHaveBeenCalledOnce();
+    expect(latestCallback).toHaveBeenCalledWith('main');
+  });
+
+  it('cancels a pending callback when unmounted before the debounce fires', () => {
+    vi.useFakeTimers();
+    const onDebouncedChange = vi.fn();
+    const { unmount } = render(
+      <WarehouseSearch onDebouncedChange={onDebouncedChange} debounceMs={200} />,
+    );
+
+    expect(vi.getTimerCount()).toBe(1);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+
+    act(() => vi.advanceTimersByTime(200));
+    expect(onDebouncedChange).not.toHaveBeenCalled();
+  });
+});
 
 function makeWarehouse(over: Partial<Warehouse> = {}): Warehouse {
   return {

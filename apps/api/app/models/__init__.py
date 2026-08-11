@@ -47,6 +47,11 @@ from app.models.purchase_order import (
     PurchaseOrderStatus,
     PurchaseOrderTransition,
 )
+from app.models.purchase_receipt import (
+    PurchaseReceipt,
+    PurchaseReceiptLine,
+    PurchaseReceiptSequence,
+)
 from app.models.refresh_token import RefreshToken
 from app.models.role import Permission, Role, RoleScope, role_permissions_table
 from app.models.role_assignment import RoleAssignment
@@ -93,6 +98,9 @@ __all__ = [
     "PurchaseOrderSequence",
     "PurchaseOrderStatus",
     "PurchaseOrderTransition",
+    "PurchaseReceipt",
+    "PurchaseReceiptLine",
+    "PurchaseReceiptSequence",
     "RefreshToken",
     "Role",
     "RoleAssignment",

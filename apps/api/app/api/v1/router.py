@@ -15,6 +15,7 @@ from app.api.v1.endpoints import (
     organizations,
     production,
     purchase_orders,
+    purchase_receipts,
     role_assignments,
     version,
 )
@@ -33,3 +34,4 @@ api_v1_router.include_router(production.router, tags=["production"])
 api_v1_router.include_router(inventory.router, tags=["inventory"])
 api_v1_router.include_router(business_partners.router, tags=["business-partners"])
 api_v1_router.include_router(purchase_orders.router, tags=["purchase-orders"])
+api_v1_router.include_router(purchase_receipts.router, tags=["purchase-receipts"])
