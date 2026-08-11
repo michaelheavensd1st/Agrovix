@@ -134,10 +134,51 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
     expect(mocks.create.mock.calls[1][2]).toBe('stable-key');
   });
 
+  it.each([
+    [502, true],
+    [503, false],
+    [504, true],
+  ])('treats HTTP %s as uncertain and retries the identical attempt', async (status, replayed) => {
+    const randomUUID = vi.fn(() => `gateway-key-${status}`);
+    vi.stubGlobal('crypto', { randomUUID });
+    mocks.create
+      .mockRejectedValueOnce(new ApiError(status, { detail: 'gateway failure' }))
+      .mockResolvedValueOnce({ receipt: {}, replayed });
+    const { props } = renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    await screen.findByRole('button', { name: 'Retry same receipt' });
+
+    const firstPayload = mocks.create.mock.calls[0][1];
+    const firstSerializedBody = JSON.stringify(firstPayload);
+    expect(screen.getByLabelText('Warehouse')).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry same receipt' }));
+    await waitFor(() => expect(props.onCompleted).toHaveBeenCalledWith(replayed));
+
+    expect(randomUUID).toHaveBeenCalledTimes(1);
+    expect(mocks.create.mock.calls[1][1]).toBe(firstPayload);
+    expect(JSON.stringify(mocks.create.mock.calls[1][1])).toBe(firstSerializedBody);
+    expect(mocks.create.mock.calls[1][2]).toBe(`gateway-key-${status}`);
+  });
+
+  it.each([
+    [400, 'idempotency_key_required'],
+    [409, 'purchase_order_over_receipt'],
+    [422, 'invalid_quantity'],
+  ])('keeps HTTP %s %s definitive', async (status, code) => {
+    vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'definitive-key') });
+    mocks.create.mockRejectedValue(new ApiError(status, { detail: { code } } as never));
+    renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Post receipt' })).toBeEnabled());
+    expect(screen.queryByRole('button', { name: 'Retry same receipt' })).not.toBeInTheDocument();
+  });
+
   it('discards a stale warehouse response after PO context changes', async () => {
     const oldRequest = deferred<(typeof WH_A)[]>();
-    mocks.warehouses.mockImplementation((org: string) =>
-      org === 'org-1'
+    mocks.warehouses.mockImplementation((po: string) =>
+      po === 'po-1'
         ? oldRequest.promise
         : Promise.resolve([{ ...WH_B, organization_id: 'org-2', farm_id: null }]),
     );
@@ -147,6 +188,28 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
     oldRequest.resolve([WH_A]);
     await Promise.resolve();
     expect(screen.queryByRole('option', { name: /Warehouse A/ })).not.toBeInTheDocument();
+  });
+
+  it('never displays a warehouse assigned to another farm', async () => {
+    mocks.warehouses.mockResolvedValue([
+      WH_A,
+      { ...WH_B, id: 'wh-other', farm_id: 'farm-other', name: 'Other Farm Warehouse' },
+    ]);
+    renderForm();
+    await screen.findByRole('option', { name: /Warehouse A/ });
+    expect(screen.queryByRole('option', { name: /Other Farm Warehouse/ })).not.toBeInTheDocument();
+  });
+
+  it('surfaces receipt warehouse authorization failure without raw UUID fallback', async () => {
+    mocks.warehouses.mockRejectedValue(
+      new ApiError(403, { detail: { code: 'not_authorized' } } as never),
+    );
+    renderForm();
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Warehouse choices are unavailable with your current permissions.',
+    );
+    expect(screen.getByLabelText('Warehouse')).toBeDisabled();
+    expect(screen.queryByRole('textbox', { name: /warehouse/i })).not.toBeInTheDocument();
   });
 
   it('discards A locations that resolve after B and preserves only B in the payload', async () => {
@@ -303,7 +366,7 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
     expect(mocks.create.mock.calls[1][1].lines[0].quantity).toBe('1.250000');
   });
 
-  it('traps Shift+Tab from the title and ignores a late submission after PO change', async () => {
+  it('resets busy on PO change and ignores a late submission from the old PO', async () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'late-key' });
     const posted = deferred<{ receipt: object; replayed: boolean }>();
     mocks.create.mockReturnValue(posted.promise);
@@ -314,9 +377,21 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
     expect(screen.getByRole('button', { name: 'Post receipt' })).toHaveFocus();
     fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    expect(screen.getByRole('button', { name: 'Posting…' })).toBeDisabled();
     view.rerender(<PurchaseReceiptForm {...view.props} purchaseOrder={PO_TWO} />);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Post receipt' })).toBeDisabled(),
+    );
+    expect(screen.queryByRole('button', { name: 'Posting…' })).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'previous Purchase Order may have completed',
+    );
     posted.resolve({ receipt: {}, replayed: false });
-    await Promise.resolve();
+    await waitFor(() => expect(view.props.onCompleted).not.toHaveBeenCalled());
+    expect(screen.getByRole('heading', { name: /Receive PO-2/ })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'previous Purchase Order may have completed',
+    );
     expect(view.props.onCompleted).not.toHaveBeenCalled();
   });
 });

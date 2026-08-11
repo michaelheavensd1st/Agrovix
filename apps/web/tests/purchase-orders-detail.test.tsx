@@ -585,7 +585,7 @@ describe('PurchaseOrderDetailPage', () => {
           return Promise.resolve({ items: [], next_cursor: null } as never);
         if (path.includes('/receipts?'))
           return Promise.resolve({ items: [], next_cursor: null } as never);
-        if (path.includes('/warehouses')) return Promise.resolve([] as never);
+        if (path.includes('/receipt-warehouses')) return Promise.resolve([] as never);
         return Promise.resolve(null as never);
       });
       render(<PurchaseOrderDetailPage />);
@@ -615,7 +615,7 @@ describe('PurchaseOrderDetailPage', () => {
       if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
       if (path.includes('/transitions') || path.includes('/receipts?'))
         return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/warehouses'))
+      if (path.includes('/receipt-warehouses'))
         return Promise.resolve([{ id: 'wh-1', name: 'Main', code: 'MAIN' }] as never);
       return Promise.resolve(null as never);
     });
@@ -667,7 +667,7 @@ describe('PurchaseOrderDetailPage', () => {
           receiptLoads += 1;
           return Promise.resolve({ items: [], next_cursor: null } as never);
         }
-        if (path.includes('/warehouses')) {
+        if (path.includes('/receipt-warehouses')) {
           warehouseLoads += 1;
           return Promise.resolve([] as never);
         }
@@ -704,7 +704,7 @@ describe('PurchaseOrderDetailPage', () => {
       }
       if (path.includes('/transitions') || path.includes('/receipts?'))
         return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/warehouses')) return Promise.resolve([] as never);
+      if (path.includes('/receipt-warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
     render(<PurchaseOrderDetailPage />);
@@ -739,7 +739,7 @@ describe('PurchaseOrderDetailPage', () => {
         return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-TWO' }) as never);
       if (path.includes('/transitions') || path.includes('/receipts?'))
         return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/warehouses')) return Promise.resolve([] as never);
+      if (path.includes('/receipt-warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
     const view = render(
@@ -806,7 +806,7 @@ describe('PurchaseOrderDetailPage', () => {
           next_cursor: 'opaque-receipt',
         } as never);
       }
-      if (path.includes('/warehouses'))
+      if (path.includes('/receipt-warehouses'))
         return Promise.resolve([{ id: 'wh-1', name: 'Main', code: 'MAIN' }] as never);
       return Promise.resolve(null as never);
     });
@@ -864,7 +864,7 @@ describe('PurchaseOrderDetailPage', () => {
           next_cursor: firstLoads === 1 ? 'invalid-opaque' : null,
         } as never);
       }
-      if (path.includes('/warehouses')) return Promise.resolve([] as never);
+      if (path.includes('/receipt-warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
     render(<PurchaseOrderDetailPage />);
@@ -913,7 +913,7 @@ describe('PurchaseOrderDetailPage', () => {
         } as never);
       if (path.includes('/transitions'))
         return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/warehouses')) return Promise.resolve([] as never);
+      if (path.includes('/receipt-warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
     const view = render(<PurchaseOrderDetailPage />);

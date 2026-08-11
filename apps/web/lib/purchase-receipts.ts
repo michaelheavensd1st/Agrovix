@@ -57,11 +57,9 @@ export interface PurchaseReceiptPage {
 
 export interface WarehouseOption {
   id: string;
-  organization_id: string;
   farm_id: string | null;
   code: string;
   name: string;
-  status: 'active' | 'maintenance' | 'closed';
 }
 
 export interface StorageLocationOption {
@@ -113,10 +111,10 @@ export async function createPurchaseReceipt(
 }
 
 export function listReceiptWarehouses(
-  organizationId: string,
+  purchaseOrderId: string,
   signal?: AbortSignal,
 ): Promise<WarehouseOption[]> {
-  return apiFetch(`/v1/organizations/${organizationId}/warehouses`, { signal });
+  return apiFetch(`/v1/purchase-orders/${purchaseOrderId}/receipt-warehouses`, { signal });
 }
 
 export function listReceiptStorageLocations(

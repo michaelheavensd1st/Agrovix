@@ -6,6 +6,7 @@ import {
   createPurchaseReceipt,
   getPurchaseReceipt,
   listPurchaseReceipts,
+  listReceiptWarehouses,
 } from '@/lib/purchase-receipts';
 
 describe('Purchase Receipt API client', () => {
@@ -23,6 +24,15 @@ describe('Purchase Receipt API client', () => {
     expect(url.searchParams.get('limit')).toBe('200');
     await getPurchaseReceipt('receipt-1');
     expect(vi.mocked(apiFetch).mock.calls[1][0]).toBe('/v1/purchase-receipts/receipt-1');
+  });
+
+  it('discovers receipt warehouses through the PO-scoped contract', async () => {
+    vi.mocked(apiFetch).mockResolvedValue([] as never);
+    const controller = new AbortController();
+    await listReceiptWarehouses('po-1', controller.signal);
+    expect(apiFetch).toHaveBeenCalledWith('/v1/purchase-orders/po-1/receipt-warehouses', {
+      signal: controller.signal,
+    });
   });
 
   it('preserves exact payload strings, line order and idempotency key', async () => {

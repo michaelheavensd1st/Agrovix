@@ -28,7 +28,12 @@ type LineValue = {
   storageLocationId: string;
   expiryDate: string;
 };
-type Attempt = { key: string; payload: PurchaseReceiptInput; uncertain: boolean };
+type Attempt = {
+  purchaseOrderId: string;
+  key: string;
+  payload: PurchaseReceiptInput;
+  uncertain: boolean;
+};
 export type ReceiptAuthoritativeFailure =
   'purchase-order-changed' | 'warehouse-changed' | 'authorization-changed';
 
@@ -49,6 +54,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_received_at: 'Enter a valid received date and time.',
   not_authorized: 'You no longer have permission to receive this Purchase Order.',
 };
+
+const AMBIGUOUS_HTTP_STATUSES = new Set([502, 503, 504]);
 
 function nullable(value: string): string | null {
   return value.trim() || null;
@@ -104,6 +111,8 @@ export function PurchaseReceiptForm({
   const dialogRef = useRef<HTMLDivElement>(null);
   const currentPurchaseOrderIdRef = useRef(purchaseOrder.id);
   const currentContextRef = useRef('');
+  const resetContextRef = useRef('');
+  const mutationGenerationRef = useRef(0);
   const currentWarehouseIdRef = useRef('');
   const warehouseGenerationRef = useRef(0);
   const locationGenerationRef = useRef(0);
@@ -112,6 +121,7 @@ export function PurchaseReceiptForm({
   const renderedContext = `${purchaseOrder.id}\u0000${purchaseOrder.organization_id}\u0000${purchaseOrder.farm_id ?? ''}`;
   if (currentContextRef.current !== renderedContext) {
     currentContextRef.current = renderedContext;
+    mutationGenerationRef.current += 1;
     currentWarehouseIdRef.current = '';
     locationGenerationRef.current += 1;
   }
@@ -123,6 +133,27 @@ export function PurchaseReceiptForm({
     };
   }, []);
   useEffect(() => {
+    if (resetContextRef.current === renderedContext) return;
+    resetContextRef.current = renderedContext;
+    submitLockRef.current = false;
+    setBusy(false);
+    currentWarehouseIdRef.current = '';
+    setWarehouseId('');
+    setSupplierReference('');
+    setReceivedAt('');
+    setNotes('');
+    setLines(initialLines);
+    setLocations([]);
+    setLocationError(null);
+    setErrors({});
+    setGeneralError(null);
+    setAttempt((current) =>
+      current && current.purchaseOrderId !== purchaseOrder.id
+        ? { ...current, uncertain: true }
+        : current,
+    );
+  }, [initialLines, purchaseOrder.id, renderedContext]);
+  useEffect(() => {
     if (open && !wasOpenRef.current) {
       currentWarehouseIdRef.current = '';
       locationGenerationRef.current += 1;
@@ -133,12 +164,13 @@ export function PurchaseReceiptForm({
       setLines(initialLines);
       setErrors({});
       setGeneralError(null);
-      setAttempt(null);
+      setAttempt((current) => (current?.uncertain ? current : null));
     } else if (!open && wasOpenRef.current) {
       currentWarehouseIdRef.current = '';
       locationGenerationRef.current += 1;
       setLocations([]);
       setLocationError(null);
+      setAttempt((current) => (current ? { ...current, uncertain: true } : current));
     }
     wasOpenRef.current = open;
   }, [initialLines, open]);
@@ -152,7 +184,7 @@ export function PurchaseReceiptForm({
     const controller = new AbortController();
     setWarehouses([]);
     setOptionsError(null);
-    void listReceiptWarehouses(purchaseOrder.organization_id, controller.signal)
+    void listReceiptWarehouses(purchaseOrder.id, controller.signal)
       .then((items) => {
         if (
           !mountedRef.current ||
@@ -163,10 +195,7 @@ export function PurchaseReceiptForm({
         setWarehouses(
           items.filter(
             (warehouse) =>
-              warehouse.status !== 'closed' &&
-              (purchaseOrder.farm_id
-                ? warehouse.farm_id === null || warehouse.farm_id === purchaseOrder.farm_id
-                : warehouse.farm_id === null),
+              warehouse.farm_id === null || warehouse.farm_id === purchaseOrder.farm_id,
           ),
         );
       })
@@ -185,7 +214,7 @@ export function PurchaseReceiptForm({
         );
       });
     return () => controller.abort();
-  }, [open, purchaseOrder.farm_id, purchaseOrder.organization_id]);
+  }, [open, purchaseOrder.farm_id, purchaseOrder.id]);
 
   useEffect(() => {
     setLocations([]);
@@ -290,6 +319,9 @@ export function PurchaseReceiptForm({
         line.ordered_quantity,
         line.received_quantity,
       );
+      // Network exceptions and explicit gateway timeout/unavailable responses can occur after
+      // the API committed. Other application 5xx responses remain definitive unless the proxy
+      // contract identifies them as ambiguous in the future.
       if (
         !isPositivePurchaseOrderDecimal(value.quantity) ||
         value.quantity.replace('.', '').length > 18
@@ -335,17 +367,32 @@ export function PurchaseReceiptForm({
   async function send(current: Attempt) {
     setBusy(true);
     setGeneralError(null);
-    const capturedPurchaseOrderId = purchaseOrder.id;
+    const capturedGeneration = mutationGenerationRef.current;
     try {
-      const result = await createPurchaseReceipt(purchaseOrder.id, current.payload, current.key);
-      if (!mountedRef.current || currentPurchaseOrderIdRef.current !== capturedPurchaseOrderId)
+      const result = await createPurchaseReceipt(
+        current.purchaseOrderId,
+        current.payload,
+        current.key,
+      );
+      if (
+        !mountedRef.current ||
+        mutationGenerationRef.current !== capturedGeneration ||
+        currentPurchaseOrderIdRef.current !== current.purchaseOrderId
+      )
         return;
       setAttempt(null);
       onCompleted(result.replayed);
     } catch (caught) {
-      if (!mountedRef.current || currentPurchaseOrderIdRef.current !== capturedPurchaseOrderId)
+      if (
+        !mountedRef.current ||
+        mutationGenerationRef.current !== capturedGeneration ||
+        currentPurchaseOrderIdRef.current !== current.purchaseOrderId
+      )
         return;
-      if (!(caught instanceof ApiError)) {
+      if (
+        !(caught instanceof ApiError) ||
+        (caught instanceof ApiError && AMBIGUOUS_HTTP_STATUSES.has(caught.status))
+      ) {
         setAttempt({ ...current, uncertain: true });
         setGeneralError(
           'The result is uncertain. Retry the exact same receipt or explicitly abandon this attempt.',
@@ -414,9 +461,14 @@ export function PurchaseReceiptForm({
         }
       }
     } finally {
-      submitLockRef.current = false;
-      if (mountedRef.current && currentPurchaseOrderIdRef.current === capturedPurchaseOrderId)
+      if (
+        mountedRef.current &&
+        mutationGenerationRef.current === capturedGeneration &&
+        currentPurchaseOrderIdRef.current === current.purchaseOrderId
+      ) {
+        submitLockRef.current = false;
         setBusy(false);
+      }
     }
   }
 
@@ -428,7 +480,12 @@ export function PurchaseReceiptForm({
       submitLockRef.current = false;
       return;
     }
-    const next = { key: crypto.randomUUID(), payload, uncertain: false };
+    const next = {
+      purchaseOrderId: purchaseOrder.id,
+      key: crypto.randomUUID(),
+      payload,
+      uncertain: false,
+    };
     setAttempt(next);
     void send(next);
   }
@@ -444,6 +501,7 @@ export function PurchaseReceiptForm({
   if (!open) return null;
 
   const frozen = attempt !== null;
+  const attemptBelongsToCurrentPurchaseOrder = attempt?.purchaseOrderId === purchaseOrder.id;
   return (
     <div
       className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
@@ -465,6 +523,11 @@ export function PurchaseReceiptForm({
         {generalError && (
           <div className="mt-4" role="alert">
             <ErrorBanner message={generalError} />
+          </div>
+        )}
+        {attempt && !attemptBelongsToCurrentPurchaseOrder && (
+          <div className="mt-4" role="alert">
+            <ErrorBanner message="A receipt attempt from the previous Purchase Order may have completed. Return to that Purchase Order to retry it, or explicitly abandon it before starting another receipt." />
           </div>
         )}
         {optionsError && (
@@ -645,7 +708,7 @@ export function PurchaseReceiptForm({
           >
             Cancel
           </button>
-          {attempt?.uncertain ? (
+          {attempt?.uncertain && attemptBelongsToCurrentPurchaseOrder ? (
             <button
               type="button"
               disabled={busy}

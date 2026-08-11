@@ -17,6 +17,7 @@ from app.schemas.purchase_receipt import (
     PurchaseReceiptCommand,
     PurchaseReceiptPage,
     PurchaseReceiptResponse,
+    ReceiptWarehouseOption,
 )
 from app.security.authorize import PermissionScope, resolve_permission_scopes
 from app.services.purchase_receipt import PurchaseReceiptService
@@ -165,6 +166,23 @@ async def create_purchase_receipt(
         response.status_code = status.HTTP_200_OK
         response.headers["X-Idempotent-Replay"] = "true"
     return _response(receipt)
+
+
+@router.get(
+    "/purchase-orders/{po_id}/receipt-warehouses",
+    response_model=list[ReceiptWarehouseOption],
+)
+async def list_receipt_warehouses(
+    po_id: uuid.UUID,
+    user: CurrentUser,
+    session: DBSession,
+) -> list[ReceiptWarehouseOption]:
+    po, scopes = await _load_visible_po(session, user, po_id)
+    _require("purchase_receipt.create", scopes, po)
+    rows = await PurchaseReceiptRepository(session).list_receipt_warehouses(
+        po.organization_id, po.farm_id
+    )
+    return [ReceiptWarehouseOption.model_validate(row) for row in rows]
 
 
 @router.get("/purchase-orders/{po_id}/receipts", response_model=PurchaseReceiptPage)

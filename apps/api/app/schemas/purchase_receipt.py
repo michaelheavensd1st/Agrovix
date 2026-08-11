@@ -15,6 +15,17 @@ DecimalString = Annotated[
 ]
 
 
+class ReceiptWarehouseOption(BaseModel):
+    """Minimal warehouse projection used by Purchase Receiving selection."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    farm_id: uuid.UUID | None
+    name: str
+    code: str
+
+
 class PurchaseReceiptLineCommand(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

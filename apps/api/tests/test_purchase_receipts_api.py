@@ -344,6 +344,10 @@ async def _post_with_sql(client: AsyncClient, seed, *, key: str):
     [
         ("POST", "/api/v1/purchase-orders/00000000-0000-0000-0000-000000000001/receipts"),
         ("GET", "/api/v1/purchase-orders/00000000-0000-0000-0000-000000000001/receipts"),
+        (
+            "GET",
+            "/api/v1/purchase-orders/00000000-0000-0000-0000-000000000001/receipt-warehouses",
+        ),
         ("GET", "/api/v1/purchase-receipts/00000000-0000-0000-0000-000000000001"),
     ],
 )
@@ -351,6 +355,128 @@ async def test_receipt_routes_require_authentication(client: AsyncClient, method
     client.cookies.clear()
     response = await client.request(method, path, json={} if method == "POST" else None)
     assert response.status_code == 401
+
+
+async def _seed_receipt_warehouse_matrix(seed: dict[str, UUID | str]) -> dict[str, UUID]:
+    async with _db.AsyncSessionLocal() as session:
+        other_farm = Farm(
+            organization_id=seed["organization_id"],
+            name="Other Farm",
+            code=f"OF-{uuid4().hex[:8]}",
+            is_active=True,
+        )
+        foreign_org = Organization(
+            name="Foreign Receipt Org", slug=f"foreign-receipt-{uuid4().hex}", is_active=True
+        )
+        session.add_all([other_farm, foreign_org])
+        await session.flush()
+        warehouses = {
+            "shared": Warehouse(
+                organization_id=seed["organization_id"],
+                farm_id=None,
+                name="A Shared Warehouse",
+                code="SHARED",
+                status=WarehouseStatus.ACTIVE,
+            ),
+            "maintenance": Warehouse(
+                organization_id=seed["organization_id"],
+                farm_id=seed["farm_id"],
+                name="B Maintenance Warehouse",
+                code="MAINT",
+                status=WarehouseStatus.MAINTENANCE,
+            ),
+            "other_farm": Warehouse(
+                organization_id=seed["organization_id"],
+                farm_id=other_farm.id,
+                name="Other Farm Warehouse",
+                code="OTHER",
+                status=WarehouseStatus.ACTIVE,
+            ),
+            "closed": Warehouse(
+                organization_id=seed["organization_id"],
+                farm_id=seed["farm_id"],
+                name="Closed Warehouse",
+                code="CLOSED",
+                status=WarehouseStatus.CLOSED,
+            ),
+            "foreign": Warehouse(
+                organization_id=foreign_org.id,
+                farm_id=None,
+                name="Foreign Warehouse",
+                code="FOREIGN",
+                status=WarehouseStatus.ACTIVE,
+            ),
+        }
+        session.add_all(warehouses.values())
+        await session.commit()
+        return {name: warehouse.id for name, warehouse in warehouses.items()}
+
+
+async def test_receipt_warehouse_discovery_filters_and_orders_candidates(client: AsyncClient):
+    seed = await _seed(client)
+    matrix = await _seed_receipt_warehouse_matrix(seed)
+    response = await client.get(f"/api/v1/purchase-orders/{seed['po_id']}/receipt-warehouses")
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert [row["name"] for row in rows] == [
+        "A Shared Warehouse",
+        "B Maintenance Warehouse",
+        "Receipt Warehouse",
+    ]
+    ids = [row["id"] for row in rows]
+    assert len(ids) == len(set(ids))
+    assert str(matrix["shared"]) in ids
+    assert str(matrix["maintenance"]) in ids
+    assert str(matrix["other_farm"]) not in ids
+    assert str(matrix["closed"]) not in ids
+    assert str(matrix["foreign"]) not in ids
+    assert set(rows[0]) == {"id", "farm_id", "name", "code"}
+
+
+async def test_farm_scoped_creator_discovers_receipt_warehouses_without_org_wide_inventory_read(
+    client: AsyncClient,
+):
+    seed = await _seed(client, role_name="farm_manager", farm_scoped=True)
+    matrix = await _seed_receipt_warehouse_matrix(seed)
+    organization_list = await client.get(
+        f"/api/v1/organizations/{seed['organization_id']}/warehouses"
+    )
+    assert organization_list.status_code == 403
+
+    response = await client.get(f"/api/v1/purchase-orders/{seed['po_id']}/receipt-warehouses")
+    assert response.status_code == 200, response.text
+    ids = {row["id"] for row in response.json()}
+    assert str(seed["warehouse_id"]) in ids
+    assert str(matrix["shared"]) in ids
+    assert str(matrix["maintenance"]) in ids
+    assert str(matrix["other_farm"]) not in ids
+
+
+async def test_receipt_warehouse_discovery_requires_create_permission(client: AsyncClient):
+    seed = await _seed(client)
+    await _add_role_user(
+        client,
+        seed["organization_id"],
+        "worker",
+        farm_id=seed["farm_id"],
+    )
+    response = await client.get(f"/api/v1/purchase-orders/{seed['po_id']}/receipt-warehouses")
+    assert response.status_code == 403
+    assert response.json()["detail"] == {
+        "code": "not_authorized",
+        "message": "Not authorized.",
+        "context": {"required": "purchase_receipt.create"},
+    }
+
+
+async def test_receipt_warehouse_discovery_hides_inaccessible_purchase_order(client: AsyncClient):
+    inaccessible = await _seed(client)
+    await _seed(client)
+    response = await client.get(
+        f"/api/v1/purchase-orders/{inaccessible['po_id']}/receipt-warehouses"
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "not_found"
 
 
 async def test_create_exact_replay_response_and_single_side_effect(client: AsyncClient):

@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.models.inventory import Warehouse, WarehouseStatus
 from app.models.membership import OrganizationMembership
 from app.models.purchase_order import PurchaseOrder, PurchaseOrderLine
 from app.models.purchase_receipt import PurchaseReceipt, PurchaseReceiptSequence
@@ -186,6 +187,25 @@ class PurchaseReceiptRepository:
             _visibility_predicate(PurchaseOrder, user_id, scopes),
         )
         return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def list_receipt_warehouses(
+        self, organization_id: uuid.UUID, farm_id: uuid.UUID | None
+    ) -> list[Warehouse]:
+        """Return operational warehouses eligible for a PO receipt in stable order."""
+        farm_scope = Warehouse.farm_id.is_(None)
+        if farm_id is not None:
+            farm_scope = or_(farm_scope, Warehouse.farm_id == farm_id)
+        statement = (
+            select(Warehouse)
+            .where(
+                Warehouse.organization_id == organization_id,
+                farm_scope,
+                Warehouse.deleted_at.is_(None),
+                Warehouse.status != WarehouseStatus.CLOSED,
+            )
+            .order_by(Warehouse.name.asc(), Warehouse.code.asc(), Warehouse.id.asc())
+        )
+        return list((await self.session.execute(statement)).scalars().all())
 
     async def get_visible_by_id(
         self,
