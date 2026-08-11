@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  comparePurchaseOrderDecimals,
   canonicalPurchaseOrderDecimal,
   formatPurchaseOrderDecimal,
   formatPurchaseOrderMoney,
+  isPositivePurchaseOrderDecimal,
   isPurchaseOrderDecimal,
   parsePurchaseOrderDecimal,
+  subtractPurchaseOrderDecimals,
 } from '@/lib/purchase-order-decimals';
 
 describe('Purchase Order Decimal helpers', () => {
@@ -54,6 +57,15 @@ describe('Purchase Order Decimal helpers', () => {
     expect(isPurchaseOrderDecimal('1.1234567')).toBe(false);
     expect(isPurchaseOrderDecimal('1e3')).toBe(false);
     expect(() => parsePurchaseOrderDecimal('NaN')).toThrow();
+  });
+
+  it('computes receipt remaining quantities without binary floating point', () => {
+    expect(subtractPurchaseOrderDecimals('999999999999.999999', '0.000001')).toBe(
+      '999999999999.999998',
+    );
+    expect(comparePurchaseOrderDecimals('0.100000', '0.099999')).toBe(1);
+    expect(isPositivePurchaseOrderDecimal('0.000001')).toBe(true);
+    expect(isPositivePurchaseOrderDecimal('0.000000')).toBe(false);
   });
 
   it('loads safely when Intl.supportedValuesOf is unavailable', async () => {

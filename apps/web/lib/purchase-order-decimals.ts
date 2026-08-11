@@ -73,6 +73,22 @@ export function canonicalPurchaseOrderDecimal(value: string): string {
   return parsePurchaseOrderDecimal(value).toFixed(6, Decimal.ROUND_HALF_UP);
 }
 
+export function isPositivePurchaseOrderDecimal(value: string): boolean {
+  try {
+    return parsePurchaseOrderDecimal(value).greaterThan(0);
+  } catch {
+    return false;
+  }
+}
+
+export function subtractPurchaseOrderDecimals(left: string, right: string): string {
+  return parsePurchaseOrderDecimal(left).minus(parsePurchaseOrderDecimal(right)).toFixed(6);
+}
+
+export function comparePurchaseOrderDecimals(left: string, right: string): number {
+  return parsePurchaseOrderDecimal(left).comparedTo(parsePurchaseOrderDecimal(right));
+}
+
 export function formatPurchaseOrderDecimal(
   value: string,
   options: { minimumFractionDigits?: number; maximumFractionDigits?: number } = {},

@@ -26,6 +26,17 @@ import {
   withdrawPurchaseOrder,
 } from '@/lib/purchase-orders';
 import type { CurrentUser } from '@/lib/types';
+import { hasScopedPermission } from '@/lib/permissions';
+import {
+  listPurchaseReceipts,
+  listReceiptWarehouses,
+  type PurchaseReceipt,
+} from '@/lib/purchase-receipts';
+import { PurchaseReceiptHistory } from '@/components/purchase-orders/PurchaseReceiptHistory';
+import {
+  PurchaseReceiptForm,
+  type ReceiptAuthoritativeFailure,
+} from '@/components/purchase-orders/PurchaseReceiptForm';
 
 function lifecycleConflictMessage(error: ApiError): string {
   const detail = error.payload.detail;
@@ -103,6 +114,18 @@ export default function PurchaseOrderDetailPage() {
   const [transitionIdentity, setTransitionIdentity] = useState<string | null>(null);
   const [transitionRevision, setTransitionRevision] = useState(0);
   const [transitionNavigationPending, setTransitionNavigationPending] = useState(false);
+  const [receipts, setReceipts] = useState<PurchaseReceipt[]>([]);
+  const [receiptCursor, setReceiptCursor] = useState<string | undefined>();
+  const [nextReceiptCursor, setNextReceiptCursor] = useState<string | null>(null);
+  const [previousReceiptCursors, setPreviousReceiptCursors] = useState<string[]>([]);
+  const [receiptsLoading, setReceiptsLoading] = useState(false);
+  const [receiptsError, setReceiptsError] = useState<string | null>(null);
+  const [receiptIdentity, setReceiptIdentity] = useState<string | null>(null);
+  const [receiptRevision, setReceiptRevision] = useState(0);
+  const [receiptNavigationPending, setReceiptNavigationPending] = useState(false);
+  const [receiveOpen, setReceiveOpen] = useState(false);
+  const [authRevision, setAuthRevision] = useState(0);
+  const [warehouseLabels, setWarehouseLabels] = useState(new Map<string, string>());
   const [lifecycleError, setLifecycleError] = useState<{
     purchaseOrderId: string;
     message: string;
@@ -115,15 +138,21 @@ export default function PurchaseOrderDetailPage() {
   } | null>(null);
   const detailGenerationRef = useRef(0);
   const transitionGenerationRef = useRef(0);
+  const receiptGenerationRef = useRef(0);
+  const receiptOptionsGenerationRef = useRef(0);
+  const receiptNavigationLockRef = useRef(false);
   const transitionNavigationLockRef = useRef(false);
   const activeMutationsRef = useRef(new Map<string, number>());
   const nextMutationTokenRef = useRef(0);
   const routeVisitGenerationRef = useRef(0);
   const focusStatusAfterRefreshRef = useRef<string | null>(null);
+  const focusReceiptAfterRefreshRef = useRef<string | null>(null);
   const statusAnnouncementRef = useRef<HTMLDivElement>(null);
+  const receivingHeadingRef = useRef<HTMLHeadingElement>(null);
   const currentIdRef = useRef(purchaseOrderId);
   const mountedRef = useRef(true);
   const returnToRef = useRef(pathname);
+  const receiveButtonRef = useRef<HTMLButtonElement>(null);
 
   returnToRef.current = pathname;
 
@@ -133,9 +162,14 @@ export default function PurchaseOrderDetailPage() {
     routeVisitGenerationRef.current += 1;
     activeMutationsRef.current.delete(previousId);
     focusStatusAfterRefreshRef.current = null;
+    focusReceiptAfterRefreshRef.current = null;
     detailGenerationRef.current += 1;
     transitionGenerationRef.current += 1;
+    receiptGenerationRef.current += 1;
+    receiptOptionsGenerationRef.current += 1;
     transitionNavigationLockRef.current = false;
+    receiptNavigationLockRef.current = false;
+    setReceiveOpen(false);
   }
 
   useEffect(() => {
@@ -144,6 +178,8 @@ export default function PurchaseOrderDetailPage() {
       mountedRef.current = false;
       detailGenerationRef.current += 1;
       transitionGenerationRef.current += 1;
+      receiptGenerationRef.current += 1;
+      receiptOptionsGenerationRef.current += 1;
       routeVisitGenerationRef.current += 1;
     };
   }, []);
@@ -162,7 +198,7 @@ export default function PurchaseOrderDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [router]);
+  }, [authRevision, router]);
 
   useEffect(() => {
     if (!purchaseOrderId) return;
@@ -187,6 +223,14 @@ export default function PurchaseOrderDetailPage() {
     setTransitionIdentity(null);
     transitionNavigationLockRef.current = false;
     setTransitionNavigationPending(false);
+    setReceipts([]);
+    setReceiptCursor(undefined);
+    setNextReceiptCursor(null);
+    setPreviousReceiptCursors([]);
+    setReceiptsError(null);
+    setReceiptIdentity(null);
+    receiptNavigationLockRef.current = false;
+    setReceiptNavigationPending(false);
     void getPurchaseOrder(capturedId, controller.signal)
       .then((po) => {
         if (!isCurrent()) return;
@@ -275,6 +319,64 @@ export default function PurchaseOrderDetailPage() {
 
   useEffect(() => loadTransitions(), [loadTransitions, transitionRevision]);
 
+  const receiptContext = visiblePermissionContext(purchaseOrder);
+  const canReadReceipts = hasScopedPermission(user, 'purchase_receipt.read', receiptContext);
+  const canCreateReceipt = hasScopedPermission(user, 'purchase_receipt.create', receiptContext);
+
+  useEffect(() => {
+    if (!purchaseOrder || !canReadReceipts) {
+      setReceipts([]);
+      setReceiptIdentity(null);
+      return;
+    }
+    const generation = ++receiptGenerationRef.current;
+    const capturedId = purchaseOrder.id;
+    const identity = `${capturedId}\u0000${receiptCursor ?? ''}`;
+    const controller = new AbortController();
+    setReceiptsLoading(true);
+    setReceiptsError(null);
+    setReceipts([]);
+    setNextReceiptCursor(null);
+    setReceiptIdentity(identity);
+    void listPurchaseReceipts(capturedId, { cursor: receiptCursor, limit: 50, signal: controller.signal })
+      .then((page) => {
+        if (generation !== receiptGenerationRef.current || capturedId !== currentIdRef.current) return;
+        setReceipts(page.items);
+        setNextReceiptCursor(page.next_cursor);
+      })
+      .catch((caught) => {
+        if (generation !== receiptGenerationRef.current || (caught instanceof DOMException && caught.name === 'AbortError')) return;
+        if (caught instanceof ApiError && caught.status === 401) router.push(`/login?returnTo=${encodeURIComponent(returnToRef.current)}`);
+        else if (caught instanceof ApiError && caught.status === 403) setReceiptsError('You do not have permission to view receipt history.');
+        else if (caught instanceof ApiError && caught.status === 404) setReceiptsError('Receipt history is unavailable.');
+        else if (receiptCursor && caught instanceof ApiError && caught.status === 422) {
+          setReceiptCursor(undefined); setPreviousReceiptCursors([]);
+          toast('That receipt-history page is no longer valid. Returned to the first page.', 'info');
+        } else setReceiptsError('Unable to load receipt history.');
+      })
+      .finally(() => {
+        if (generation === receiptGenerationRef.current) {
+          receiptNavigationLockRef.current = false;
+          setReceiptNavigationPending(false);
+          setReceiptsLoading(false);
+        }
+      });
+    return () => controller.abort();
+  }, [canReadReceipts, purchaseOrder, receiptCursor, receiptRevision, router]);
+
+  useEffect(() => {
+    if (!purchaseOrder || (!canReadReceipts && !canCreateReceipt)) return;
+    const generation = ++receiptOptionsGenerationRef.current;
+    const controller = new AbortController();
+    const capturedId = purchaseOrder.id;
+    setWarehouseLabels(new Map());
+    void listReceiptWarehouses(purchaseOrder.organization_id, controller.signal).then((warehouses) => {
+      if (generation !== receiptOptionsGenerationRef.current || capturedId !== currentIdRef.current) return;
+      setWarehouseLabels(new Map(warehouses.map((warehouse) => [warehouse.id, `${warehouse.name} (${warehouse.code})`])));
+    }).catch(() => undefined);
+    return () => controller.abort();
+  }, [canCreateReceipt, canReadReceipts, purchaseOrder]);
+
   useEffect(() => {
     if (
       focusStatusAfterRefreshRef.current !== purchaseOrderId ||
@@ -285,6 +387,25 @@ export default function PurchaseOrderDetailPage() {
       return;
     focusStatusAfterRefreshRef.current = null;
     statusAnnouncementRef.current?.focus();
+  }, [detailIdentity, loading, purchaseOrder, purchaseOrderId]);
+
+  useEffect(() => {
+    if (
+      focusReceiptAfterRefreshRef.current !== purchaseOrderId ||
+      detailIdentity !== purchaseOrderId ||
+      !purchaseOrder ||
+      loading
+    )
+      return;
+    focusReceiptAfterRefreshRef.current = null;
+    if (
+      ['APPROVED', 'PARTIALLY_RECEIVED'].includes(purchaseOrder.status) &&
+      receiveButtonRef.current
+    ) {
+      receiveButtonRef.current.focus();
+    } else {
+      (receivingHeadingRef.current ?? statusAnnouncementRef.current)?.focus();
+    }
   }, [detailIdentity, loading, purchaseOrder, purchaseOrderId]);
 
   const detailIsCurrent = detailIdentity === purchaseOrderId;
@@ -316,6 +437,24 @@ export default function PurchaseOrderDetailPage() {
     setTransitionCursor(previous || undefined);
   }
 
+  function closeReceive({ restoreFocus = true }: { restoreFocus?: boolean } = {}) {
+    setReceiveOpen(false);
+    if (restoreFocus) window.setTimeout(() => receiveButtonRef.current?.focus(), 0);
+  }
+
+  function refreshAfterReceiptFailure(failure: ReceiptAuthoritativeFailure) {
+    closeReceive();
+    if (failure === 'authorization-changed') {
+      setAuthRevision((revision) => revision + 1);
+      return;
+    }
+    if (failure === 'purchase-order-changed') {
+      setReceiptCursor(undefined);
+      setPreviousReceiptCursors([]);
+      setDetailRevision((revision) => revision + 1);
+    }
+  }
+
   async function performLifecycleAction(
     operation: PurchaseOrderLifecycleOperation,
     reason?: string,
@@ -337,6 +476,7 @@ export default function PurchaseOrderDetailPage() {
       if (!isCurrent()) return { kind: 'failed' };
       detailGenerationRef.current += 1;
       transitionGenerationRef.current += 1;
+      receiptGenerationRef.current += 1;
       focusStatusAfterRefreshRef.current = capturedId;
       setLoading(true);
       setPurchaseOrder(result.purchaseOrder);
@@ -348,6 +488,9 @@ export default function PurchaseOrderDetailPage() {
       setNextTransitionCursor(null);
       setDetailRevision((revision) => revision + 1);
       setTransitionRevision((revision) => revision + 1);
+      setReceiptCursor(undefined);
+      setPreviousReceiptCursors([]);
+      setReceiptRevision((revision) => revision + 1);
       if (result.replayed) {
         toast(
           'This lifecycle action was already applied. Current state has been refreshed.',
@@ -487,6 +630,35 @@ export default function PurchaseOrderDetailPage() {
         onNext={nextTransitions}
         onPrevious={previousTransitions}
       />
+      {(canCreateReceipt || canReadReceipts) && (
+        <section className="rounded-xl border border-border bg-card p-5" data-testid="purchase-receiving">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div><h2 ref={receivingHeadingRef} tabIndex={-1} className="font-display text-xl">Receiving</h2><p className="mt-1 text-sm text-muted-foreground">Receive ordered goods and review immutable posted receipts.</p></div>
+            {canCreateReceipt && ['APPROVED', 'PARTIALLY_RECEIVED'].includes(visiblePurchaseOrder.status) && <button ref={receiveButtonRef} type="button" className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground" onClick={() => setReceiveOpen(true)} data-testid="receive-po-action">Receive purchase order</button>}
+          </div>
+        </section>
+      )}
+      {canReadReceipts && (
+        <PurchaseReceiptHistory
+          purchaseOrder={visiblePurchaseOrder}
+          receipts={receiptIdentity === `${visiblePurchaseOrder.id}\u0000${receiptCursor ?? ''}` ? receipts : []}
+          warehouseLabels={warehouseLabels}
+          currentUserId={user?.id ?? null}
+          loading={receiptsLoading || receiptIdentity !== `${visiblePurchaseOrder.id}\u0000${receiptCursor ?? ''}`}
+          error={receiptsError}
+          nextCursor={nextReceiptCursor}
+          canGoBack={previousReceiptCursors.length > 0}
+          navigationPending={receiptNavigationPending}
+          onNext={() => { if (!nextReceiptCursor || receiptNavigationLockRef.current) return; receiptNavigationLockRef.current = true; setReceiptNavigationPending(true); setPreviousReceiptCursors((current) => [...current, receiptCursor ?? '']); setReceiptCursor(nextReceiptCursor); }}
+          onPrevious={() => { if (!previousReceiptCursors.length || receiptNavigationLockRef.current) return; receiptNavigationLockRef.current = true; setReceiptNavigationPending(true); const prior = previousReceiptCursors.at(-1) ?? ''; setPreviousReceiptCursors((current) => current.slice(0, -1)); setReceiptCursor(prior || undefined); }}
+        />
+      )}
+      {canCreateReceipt && <PurchaseReceiptForm purchaseOrder={visiblePurchaseOrder} open={receiveOpen} onClose={() => closeReceive()} onAuthoritativeFailure={refreshAfterReceiptFailure} onCompleted={(replayed) => { focusReceiptAfterRefreshRef.current = visiblePurchaseOrder.id; closeReceive({ restoreFocus: false }); toast(replayed ? 'This receipt was already recorded. Current data has been refreshed.' : 'Purchase receipt posted.', replayed ? 'info' : 'success'); setReceiptCursor(undefined); setPreviousReceiptCursors([]); setDetailRevision((revision) => revision + 1); }} />}
     </main>
   );
+}
+
+function visiblePermissionContext(purchaseOrder: PurchaseOrder | null) {
+  if (!purchaseOrder) return null;
+  return { organizationId: purchaseOrder.organization_id, ...(purchaseOrder.farm_id ? { farmId: purchaseOrder.farm_id } : {}) };
 }
