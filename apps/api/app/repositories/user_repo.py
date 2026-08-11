@@ -20,6 +20,21 @@ class UserRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_id_for_update(self, user_id: uuid.UUID) -> User | None:
+        """Lock one active-or-disabled, non-deleted user as a security root.
+
+        Credential mutation services must acquire this lock before locking
+        any dependent recovery-token or refresh-token row.
+        """
+        stmt = (
+            select(User)
+            .where(User.id == user_id, User.deleted_at.is_(None))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def get_by_email(self, email: str) -> User | None:
         stmt = select(User).where(User.email == email.lower(), User.deleted_at.is_(None))
         result = await self.session.execute(stmt)

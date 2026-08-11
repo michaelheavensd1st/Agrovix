@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     web_app_url: str = Field(default="http://localhost:3000")
     verification_token_expire_hours: int = Field(default=24)
     invitation_token_expire_days: int = Field(default=14)
+    password_recovery_token_expire_minutes: int = Field(default=60, ge=15, le=120)
 
     # --- Auth policy ---
     allow_unverified_login: bool = Field(default=False)  # dev override
