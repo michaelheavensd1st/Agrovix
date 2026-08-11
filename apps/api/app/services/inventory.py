@@ -112,6 +112,7 @@ class InventoryService:
     # requests contend for the transaction locks concurrently. Never
     # set in production code paths.
     _reversal_lock_barrier: ClassVar[object | None] = None
+    _transfer_before_authorization_lock_signal: ClassVar[object | None] = None
 
     # Sprint 5.4.6 — one-way "warehouse locks acquired" signal. The
     # reverser calls ``.set()`` on this event immediately AFTER it has
@@ -819,6 +820,65 @@ class InventoryService:
         )
         return tx
 
+    async def post_receipt_under_locks(
+        self,
+        *,
+        actor: User,
+        warehouse: Warehouse,
+        item: InventoryItem,
+        lot: InventoryLot,
+        quantity_canonical: Decimal,
+        reference_id: uuid.UUID,
+        reason: str | None,
+        request_ctx: dict,
+        metadata_json: dict | None = None,
+    ) -> InventoryTransaction:
+        """Post one purchasing receipt row inside caller-owned locks.
+
+        Purchase receiving owns authorization, request idempotency, the outer
+        transaction, and deterministic warehouse/item/lot locks.  This method
+        deliberately does none of those jobs; it only revalidates the locked
+        stock topology and reuses the immutable ledger insertion invariant.
+        """
+        self._assert_warehouse_status_allows(warehouse, InventoryTransactionType.RECEIPT)
+        if quantity_canonical <= 0:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": "invalid_receipt_quantity",
+                    "message": "Receipt quantity must be positive.",
+                    "context": {},
+                },
+            )
+        if item.organization_id != warehouse.organization_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Inventory item not found.")
+        if lot.warehouse_id != warehouse.id or lot.item_id != item.id or lot.deleted_at is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "lot_association_changed",
+                    "message": "Lot topology changed.",
+                    "context": {},
+                },
+            )
+        return await self._post_ledger(
+            actor=actor,
+            organization_id=warehouse.organization_id,
+            farm_id=warehouse.farm_id,
+            warehouse=warehouse,
+            item=item,
+            lot=lot,
+            tx_type=InventoryTransactionType.RECEIPT,
+            quantity_canonical=quantity_canonical,
+            reason=reason,
+            idempotency_key=None,
+            payload_hash="",
+            reference_type="purchase_receipt_line",
+            reference_id=reference_id,
+            request_ctx=request_ctx,
+            metadata_json=metadata_json,
+        )
+
     # ---------------------------------------------------------------- #
     # High-level operations
     # ---------------------------------------------------------------- #
@@ -1129,6 +1189,26 @@ class InventoryService:
                 if hasattr(pre_res, "__await__"):
                     await pre_res
 
+        # Global intersecting order: authorization advisory lock always
+        # precedes warehouse/farm/organization row locks.  The unlocked probe
+        # is used only to discover lock namespaces; every business and
+        # authorization decision is made from the rows locked below.
+        probed_whs = list(
+            (
+                await self.session.execute(
+                    select(Warehouse).where(
+                        Warehouse.id.in_(sorted({warehouse_id, dst_warehouse_id}, key=str))
+                    )
+                )
+            ).scalars()
+        )
+        advisory_attempt = type(self)._transfer_before_authorization_lock_signal
+        if advisory_attempt is not None:
+            advisory_attempt.set()
+        await acquire_org_authorization_locks(
+            self.session, {warehouse.organization_id for warehouse in probed_whs}
+        )
+
         # (1) Bulk-lock BOTH warehouses FOR UPDATE in ascending id
         # order. This is the ONLY place we acquire warehouse locks
         # in the transfer path — deterministic across every caller
@@ -1174,21 +1254,12 @@ class InventoryService:
         for oid in org_ids:
             if oid not in org_by_id:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
-        # (4) Sprint 5.4.12 — AUTHORIZATION ADVISORY LOCK.
-        # Acquire the transaction-scoped per-organization
-        # authorization advisory lock BEFORE any read against
-        # ``organization_memberships`` / ``farm_memberships`` /
-        # ``role_assignments`` / ``roles`` / ``role_permissions``.
-        # Every mutation of those tables acquires the SAME lock
-        # first (see :mod:`app.services._authorization_lock` and
-        # its callers in :mod:`app.services.invitation_service`,
-        # :mod:`app.services.organization_service`). Two orgs are
-        # independent — a transfer within org A does not block
-        # authorization work on org B.
-        await acquire_org_authorization_locks(
-            self.session,
-            {warehouse.organization_id, dst_warehouse.organization_id},
-        )
+        # The authorization advisory lock was acquired before topology rows.
+        # Revalidate the probe under the authoritative warehouse locks.
+        if {warehouse.organization_id for warehouse in locked_whs} != {
+            warehouse.organization_id for warehouse in probed_whs
+        }:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Warehouse not found.")
 
         # Sprint 5.4.11 test hook — locks + advisory lock are now
         # held. Race tests wait on this signal to know that a
