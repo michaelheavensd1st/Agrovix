@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from app.models.audit import AuditEvent
     from app.models.invitation import Invitation
     from app.models.membership import FarmMembership, OrganizationMembership
+    from app.models.password_recovery import PasswordRecoveryToken
     from app.models.refresh_token import RefreshToken
     from app.models.role_assignment import RoleAssignment
     from app.models.verification import EmailVerificationToken
@@ -43,6 +44,9 @@ class User(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     verification_tokens: Mapped[list[EmailVerificationToken]] = relationship(
         "EmailVerificationToken", back_populates="user", cascade="all, delete-orphan"
+    )
+    password_recovery_tokens: Mapped[list[PasswordRecoveryToken]] = relationship(
+        "PasswordRecoveryToken", back_populates="user", cascade="all, delete-orphan"
     )
     role_assignments: Mapped[list[RoleAssignment]] = relationship(
         "RoleAssignment",
