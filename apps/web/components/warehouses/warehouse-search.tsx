@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { debounce } from '@/lib/inventory-warehouses';
 
 /**
@@ -21,14 +21,16 @@ export function WarehouseSearch({
   testId?: string;
 }) {
   const [raw, setRaw] = useState('');
+  const callbackRef = useRef(onDebouncedChange);
   useEffect(() => {
-    const emit = debounce((v: string) => onDebouncedChange(v), debounceMs);
+    callbackRef.current = onDebouncedChange;
+  }, [onDebouncedChange]);
+
+  useEffect(() => {
+    const emit = debounce((v: string) => callbackRef.current(v), debounceMs);
     emit(raw);
-    // The debounce timer's cleanup is intentionally not surfaced;
-    // once the input unmounts the timer's callback becomes a no-op
-    // because `onDebouncedChange` will be a stale reference to a
-    // now-detached parent.
-  }, [raw, debounceMs, onDebouncedChange]);
+    return () => emit.cancel();
+  }, [raw, debounceMs]);
   return (
     <input
       type="search"

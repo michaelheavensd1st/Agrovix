@@ -60,13 +60,22 @@ vi.mock('@/components/purchase-orders/PurchaseOrderTransitionHistory', async () 
 });
 
 vi.mock('@/components/purchase-orders/PurchaseReceiptForm', () => ({
-  PurchaseReceiptForm: ({ open, onClose, onCompleted }: { open: boolean; onClose: () => void; onCompleted: (replayed: boolean) => void }) => open ? (
-    <div role="dialog" aria-label="Mock receive dialog">
-      <button onClick={onClose}>Cancel receipt</button>
-      <button onClick={() => onCompleted(false)}>Complete created receipt</button>
-      <button onClick={() => onCompleted(true)}>Complete replayed receipt</button>
-    </div>
-  ) : null,
+  PurchaseReceiptForm: ({
+    open,
+    onClose,
+    onCompleted,
+  }: {
+    open: boolean;
+    onClose: () => void;
+    onCompleted: (replayed: boolean) => void;
+  }) =>
+    open ? (
+      <div role="dialog" aria-label="Mock receive dialog">
+        <button onClick={onClose}>Cancel receipt</button>
+        <button onClick={() => onCompleted(false)}>Complete created receipt</button>
+        <button onClick={() => onCompleted(true)}>Complete replayed receipt</button>
+      </div>
+    ) : null,
 }));
 
 import { ApiError, apiFetch } from '@/lib/api';
@@ -549,38 +558,72 @@ describe('PurchaseOrderDetailPage', () => {
 
   it.each([
     { label: 'read-only', permissions: ['purchase_receipt.read'], history: true, create: false },
-    { label: 'create-only', permissions: ['purchase_receipt.create'], history: false, create: true },
+    {
+      label: 'create-only',
+      permissions: ['purchase_receipt.create'],
+      history: false,
+      create: true,
+    },
     { label: 'neither', permissions: [], history: false, create: false },
-  ])('applies $label receipt presentation without unauthorized history requests', async ({ permissions, history, create }) => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', ...permissions] }] };
-    mockedApiFetch.mockImplementation((path: string) => {
-      if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
-      if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
-      if (path.includes('/transitions')) return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/receipts?')) return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/warehouses')) return Promise.resolve([] as never);
-      return Promise.resolve(null as never);
-    });
-    render(<PurchaseOrderDetailPage />);
-    await screen.findByTestId('po-detail');
-    if (history) expect(await screen.findByTestId('receipt-history')).toBeInTheDocument();
-    else expect(screen.queryByTestId('receipt-history')).not.toBeInTheDocument();
-    expect(Boolean(screen.queryByTestId('receive-po-action'))).toBe(create);
-    expect(mockedApiFetch.mock.calls.some(([path]) => String(path).includes('/receipts?'))).toBe(history);
-  });
+  ])(
+    'applies $label receipt presentation without unauthorized history requests',
+    async ({ permissions, history, create }) => {
+      const scopedUser = {
+        ...USER,
+        permission_scopes: [
+          {
+            organization_id: 'org-1',
+            farm_id: 'farm-1',
+            permissions: ['purchase_order.read', ...permissions],
+          },
+        ],
+      };
+      mockedApiFetch.mockImplementation((path: string) => {
+        if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
+        if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
+        if (path.includes('/transitions'))
+          return Promise.resolve({ items: [], next_cursor: null } as never);
+        if (path.includes('/receipts?'))
+          return Promise.resolve({ items: [], next_cursor: null } as never);
+        if (path.includes('/warehouses')) return Promise.resolve([] as never);
+        return Promise.resolve(null as never);
+      });
+      render(<PurchaseOrderDetailPage />);
+      await screen.findByTestId('po-detail');
+      if (history) expect(await screen.findByTestId('receipt-history')).toBeInTheDocument();
+      else expect(screen.queryByTestId('receipt-history')).not.toBeInTheDocument();
+      expect(Boolean(screen.queryByTestId('receive-po-action'))).toBe(create);
+      expect(mockedApiFetch.mock.calls.some(([path]) => String(path).includes('/receipts?'))).toBe(
+        history,
+      );
+    },
+  );
 
   it('restores focus to Receive and does not eagerly request every warehouse location', async () => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'] }] };
+    const scopedUser = {
+      ...USER,
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'],
+        },
+      ],
+    };
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
       if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
-      if (path.includes('/transitions') || path.includes('/receipts?')) return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('/warehouses')) return Promise.resolve([{ id: 'wh-1', name: 'Main', code: 'MAIN' }] as never);
+      if (path.includes('/transitions') || path.includes('/receipts?'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      if (path.includes('/warehouses'))
+        return Promise.resolve([{ id: 'wh-1', name: 'Main', code: 'MAIN' }] as never);
       return Promise.resolve(null as never);
     });
     render(<PurchaseOrderDetailPage />);
     const receive = await screen.findByTestId('receive-po-action');
-    expect(mockedApiFetch.mock.calls.some(([path]) => String(path).includes('/storage-locations'))).toBe(false);
+    expect(
+      mockedApiFetch.mock.calls.some(([path]) => String(path).includes('/storage-locations')),
+    ).toBe(false);
     fireEvent.click(receive);
     fireEvent.click(screen.getByRole('button', { name: 'Cancel receipt' }));
     await waitFor(() => expect(receive).toHaveFocus());
@@ -589,32 +632,78 @@ describe('PurchaseOrderDetailPage', () => {
   it.each([
     ['Complete created receipt', false],
     ['Complete replayed receipt', true],
-  ] as const)('performs one bounded authoritative refresh after %s', async (buttonName, _replayed) => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'] }] };
-    let poLoads = 0; let transitionLoads = 0; let receiptLoads = 0; let warehouseLoads = 0;
-    mockedApiFetch.mockImplementation((path: string) => {
-      if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
-      if (path === '/v1/purchase-orders/po-1') { poLoads += 1; return Promise.resolve(makePO({ version: poLoads }) as never); }
-      if (path.includes('/transitions')) { transitionLoads += 1; return Promise.resolve({ items: [], next_cursor: null } as never); }
-      if (path.includes('/receipts?')) { receiptLoads += 1; return Promise.resolve({ items: [], next_cursor: null } as never); }
-      if (path.includes('/warehouses')) { warehouseLoads += 1; return Promise.resolve([] as never); }
-      return Promise.resolve(null as never);
-    });
-    render(<PurchaseOrderDetailPage />);
-    fireEvent.click(await screen.findByTestId('receive-po-action'));
-    fireEvent.click(screen.getByRole('button', { name: buttonName }));
-    await waitFor(() => expect(poLoads).toBe(2));
-    await waitFor(() => expect([transitionLoads, receiptLoads, warehouseLoads]).toEqual([2, 2, 2]));
-    await waitFor(() => expect(screen.getByTestId('receive-po-action')).toHaveFocus());
-  });
+  ] as const)(
+    'performs one bounded authoritative refresh after %s',
+    async (buttonName, _replayed) => {
+      const scopedUser = {
+        ...USER,
+        permission_scopes: [
+          {
+            organization_id: 'org-1',
+            farm_id: 'farm-1',
+            permissions: [
+              'purchase_order.read',
+              'purchase_receipt.create',
+              'purchase_receipt.read',
+            ],
+          },
+        ],
+      };
+      let poLoads = 0;
+      let transitionLoads = 0;
+      let receiptLoads = 0;
+      let warehouseLoads = 0;
+      mockedApiFetch.mockImplementation((path: string) => {
+        if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
+        if (path === '/v1/purchase-orders/po-1') {
+          poLoads += 1;
+          return Promise.resolve(makePO({ version: poLoads }) as never);
+        }
+        if (path.includes('/transitions')) {
+          transitionLoads += 1;
+          return Promise.resolve({ items: [], next_cursor: null } as never);
+        }
+        if (path.includes('/receipts?')) {
+          receiptLoads += 1;
+          return Promise.resolve({ items: [], next_cursor: null } as never);
+        }
+        if (path.includes('/warehouses')) {
+          warehouseLoads += 1;
+          return Promise.resolve([] as never);
+        }
+        return Promise.resolve(null as never);
+      });
+      render(<PurchaseOrderDetailPage />);
+      fireEvent.click(await screen.findByTestId('receive-po-action'));
+      fireEvent.click(screen.getByRole('button', { name: buttonName }));
+      await waitFor(() => expect(poLoads).toBe(2));
+      await waitFor(() =>
+        expect([transitionLoads, receiptLoads, warehouseLoads]).toEqual([2, 2, 2]),
+      );
+      await waitFor(() => expect(screen.getByTestId('receive-po-action')).toHaveFocus());
+    },
+  );
 
   it('focuses the Receiving heading after a terminal receipt removes the Receive control', async () => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'] }] };
+    const scopedUser = {
+      ...USER,
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'],
+        },
+      ],
+    };
     let poLoads = 0;
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
-      if (path === '/v1/purchase-orders/po-1') { poLoads += 1; return Promise.resolve(makePO(poLoads === 1 ? {} : { status: 'RECEIVED' }) as never); }
-      if (path.includes('/transitions') || path.includes('/receipts?')) return Promise.resolve({ items: [], next_cursor: null } as never);
+      if (path === '/v1/purchase-orders/po-1') {
+        poLoads += 1;
+        return Promise.resolve(makePO(poLoads === 1 ? {} : { status: 'RECEIVED' }) as never);
+      }
+      if (path.includes('/transitions') || path.includes('/receipts?'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
       if (path.includes('/warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
@@ -626,22 +715,48 @@ describe('PurchaseOrderDetailPage', () => {
   });
 
   it('does not move focus in a new PO context when an old receipt refresh finishes', async () => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'] }] };
+    const scopedUser = {
+      ...USER,
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.read', 'purchase_receipt.create', 'purchase_receipt.read'],
+        },
+      ],
+    };
     const oldRefresh = deferred<PurchaseOrder>();
     let poOneLoads = 0;
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
-      if (path === '/v1/purchase-orders/po-1') { poOneLoads += 1; return poOneLoads === 1 ? Promise.resolve(makePO() as never) : oldRefresh.promise as never; }
-      if (path === '/v1/purchase-orders/po-2') return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-TWO' }) as never);
-      if (path.includes('/transitions') || path.includes('/receipts?')) return Promise.resolve({ items: [], next_cursor: null } as never);
+      if (path === '/v1/purchase-orders/po-1') {
+        poOneLoads += 1;
+        return poOneLoads === 1
+          ? Promise.resolve(makePO() as never)
+          : (oldRefresh.promise as never);
+      }
+      if (path === '/v1/purchase-orders/po-2')
+        return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-TWO' }) as never);
+      if (path.includes('/transitions') || path.includes('/receipts?'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
       if (path.includes('/warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
-    const view = render(<><button>New context target</button><PurchaseOrderDetailPage /></>);
+    const view = render(
+      <>
+        <button>New context target</button>
+        <PurchaseOrderDetailPage />
+      </>,
+    );
     fireEvent.click(await screen.findByTestId('receive-po-action'));
     fireEvent.click(screen.getByRole('button', { name: 'Complete created receipt' }));
     useParamsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
-    view.rerender(<><button>New context target</button><PurchaseOrderDetailPage /></>);
+    view.rerender(
+      <>
+        <button>New context target</button>
+        <PurchaseOrderDetailPage />
+      </>,
+    );
     await screen.findByText('PO-TWO');
     screen.getByRole('button', { name: 'New context target' }).focus();
     await act(() => oldRefresh.resolve(makePO({ version: 5 })));
@@ -649,16 +764,50 @@ describe('PurchaseOrderDetailPage', () => {
   });
 
   it('traverses forward and backward using an opaque receipt cursor', async () => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.read'] }] };
-    const receipt = (id: string, grn: string) => ({ id, organization_id: 'org-1', purchase_order_id: 'po-1', farm_id: 'farm-1', warehouse_id: 'wh-1', grn, supplier_delivery_reference: null, received_at: '2026-08-11T10:00:00Z', received_by_id: 'user-1', notes: null, created_at: '2026-08-11T10:00:00Z', lines: [] });
+    const scopedUser = {
+      ...USER,
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.read', 'purchase_receipt.read'],
+        },
+      ],
+    };
+    const receipt = (id: string, grn: string) => ({
+      id,
+      organization_id: 'org-1',
+      purchase_order_id: 'po-1',
+      farm_id: 'farm-1',
+      warehouse_id: 'wh-1',
+      grn,
+      supplier_delivery_reference: null,
+      received_at: '2026-08-11T10:00:00Z',
+      received_by_id: 'user-1',
+      notes: null,
+      created_at: '2026-08-11T10:00:00Z',
+      lines: [],
+    });
     let firstLoads = 0;
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
       if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
-      if (path.includes('/transitions')) return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('cursor=opaque-receipt')) return Promise.resolve({ items: [receipt('r-2', 'GRN-SECOND')], next_cursor: null } as never);
-      if (path.includes('/receipts?')) { firstLoads += 1; return Promise.resolve({ items: [receipt('r-1', 'GRN-FIRST')], next_cursor: 'opaque-receipt' } as never); }
-      if (path.includes('/warehouses')) return Promise.resolve([{ id: 'wh-1', name: 'Main', code: 'MAIN' }] as never);
+      if (path.includes('/transitions'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      if (path.includes('cursor=opaque-receipt'))
+        return Promise.resolve({
+          items: [receipt('r-2', 'GRN-SECOND')],
+          next_cursor: null,
+        } as never);
+      if (path.includes('/receipts?')) {
+        firstLoads += 1;
+        return Promise.resolve({
+          items: [receipt('r-1', 'GRN-FIRST')],
+          next_cursor: 'opaque-receipt',
+        } as never);
+      }
+      if (path.includes('/warehouses'))
+        return Promise.resolve([{ id: 'wh-1', name: 'Main', code: 'MAIN' }] as never);
       return Promise.resolve(null as never);
     });
     render(<PurchaseOrderDetailPage />);
@@ -666,7 +815,9 @@ describe('PurchaseOrderDetailPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(await screen.findByText('GRN-SECOND')).toBeInTheDocument();
     expect(screen.queryByText('GRN-FIRST')).not.toBeInTheDocument();
-    expect(mockedApiFetch.mock.calls.some(([path]) => String(path).includes('cursor=opaque-receipt'))).toBe(true);
+    expect(
+      mockedApiFetch.mock.calls.some(([path]) => String(path).includes('cursor=opaque-receipt')),
+    ).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
     await waitFor(() => expect(firstLoads).toBe(2));
     expect(await screen.findByText('GRN-FIRST')).toBeInTheDocument();
@@ -674,15 +825,45 @@ describe('PurchaseOrderDetailPage', () => {
   });
 
   it('safely recovers an invalid opaque receipt cursor', async () => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.read'] }] };
-    const receipt = { id: 'r-1', organization_id: 'org-1', purchase_order_id: 'po-1', farm_id: 'farm-1', warehouse_id: 'wh-1', grn: 'GRN-FIRST', supplier_delivery_reference: null, received_at: '2026-08-11T10:00:00Z', received_by_id: 'user-1', notes: null, created_at: '2026-08-11T10:00:00Z', lines: [] };
+    const scopedUser = {
+      ...USER,
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.read', 'purchase_receipt.read'],
+        },
+      ],
+    };
+    const receipt = {
+      id: 'r-1',
+      organization_id: 'org-1',
+      purchase_order_id: 'po-1',
+      farm_id: 'farm-1',
+      warehouse_id: 'wh-1',
+      grn: 'GRN-FIRST',
+      supplier_delivery_reference: null,
+      received_at: '2026-08-11T10:00:00Z',
+      received_by_id: 'user-1',
+      notes: null,
+      created_at: '2026-08-11T10:00:00Z',
+      lines: [],
+    };
     let firstLoads = 0;
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
       if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
-      if (path.includes('/transitions')) return Promise.resolve({ items: [], next_cursor: null } as never);
-      if (path.includes('cursor=invalid-opaque')) return Promise.reject(new ApiError(422, { detail: { code: 'invalid_cursor' } } as never));
-      if (path.includes('/receipts?')) { firstLoads += 1; return Promise.resolve({ items: [receipt], next_cursor: firstLoads === 1 ? 'invalid-opaque' : null } as never); }
+      if (path.includes('/transitions'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
+      if (path.includes('cursor=invalid-opaque'))
+        return Promise.reject(new ApiError(422, { detail: { code: 'invalid_cursor' } } as never));
+      if (path.includes('/receipts?')) {
+        firstLoads += 1;
+        return Promise.resolve({
+          items: [receipt],
+          next_cursor: firstLoads === 1 ? 'invalid-opaque' : null,
+        } as never);
+      }
       if (path.includes('/warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
@@ -694,16 +875,44 @@ describe('PurchaseOrderDetailPage', () => {
   });
 
   it('rejects a stale receipt-history response after a PO route change', async () => {
-    const scopedUser = { ...USER, permission_scopes: [{ organization_id: 'org-1', farm_id: 'farm-1', permissions: ['purchase_order.read', 'purchase_receipt.read'] }] };
-    const row = (id: string, po: string, grn: string) => ({ id, organization_id: 'org-1', purchase_order_id: po, farm_id: 'farm-1', warehouse_id: 'wh-1', grn, supplier_delivery_reference: null, received_at: '2026-08-11T10:00:00Z', received_by_id: 'user-1', notes: null, created_at: '2026-08-11T10:00:00Z', lines: [] });
+    const scopedUser = {
+      ...USER,
+      permission_scopes: [
+        {
+          organization_id: 'org-1',
+          farm_id: 'farm-1',
+          permissions: ['purchase_order.read', 'purchase_receipt.read'],
+        },
+      ],
+    };
+    const row = (id: string, po: string, grn: string) => ({
+      id,
+      organization_id: 'org-1',
+      purchase_order_id: po,
+      farm_id: 'farm-1',
+      warehouse_id: 'wh-1',
+      grn,
+      supplier_delivery_reference: null,
+      received_at: '2026-08-11T10:00:00Z',
+      received_by_id: 'user-1',
+      notes: null,
+      created_at: '2026-08-11T10:00:00Z',
+      lines: [],
+    });
     const oldHistory = deferred<{ items: Array<ReturnType<typeof row>>; next_cursor: null }>();
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/auth/me') return Promise.resolve(scopedUser as never);
       if (path === '/v1/purchase-orders/po-1') return Promise.resolve(makePO() as never);
-      if (path === '/v1/purchase-orders/po-2') return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-TWO' }) as never);
+      if (path === '/v1/purchase-orders/po-2')
+        return Promise.resolve(makePO({ id: 'po-2', po_number: 'PO-TWO' }) as never);
       if (path.includes('/po-1/receipts?')) return oldHistory.promise as never;
-      if (path.includes('/po-2/receipts?')) return Promise.resolve({ items: [row('r-2', 'po-2', 'GRN-CURRENT')], next_cursor: null } as never);
-      if (path.includes('/transitions')) return Promise.resolve({ items: [], next_cursor: null } as never);
+      if (path.includes('/po-2/receipts?'))
+        return Promise.resolve({
+          items: [row('r-2', 'po-2', 'GRN-CURRENT')],
+          next_cursor: null,
+        } as never);
+      if (path.includes('/transitions'))
+        return Promise.resolve({ items: [], next_cursor: null } as never);
       if (path.includes('/warehouses')) return Promise.resolve([] as never);
       return Promise.resolve(null as never);
     });
@@ -712,7 +921,9 @@ describe('PurchaseOrderDetailPage', () => {
     useParamsMock.mockReturnValue({ purchaseOrderId: 'po-2' });
     view.rerender(<PurchaseOrderDetailPage />);
     expect(await screen.findByText('GRN-CURRENT')).toBeInTheDocument();
-    await act(() => oldHistory.resolve({ items: [row('r-old', 'po-1', 'GRN-STALE')], next_cursor: null }));
+    await act(() =>
+      oldHistory.resolve({ items: [row('r-old', 'po-1', 'GRN-STALE')], next_cursor: null }),
+    );
     expect(screen.queryByText('GRN-STALE')).not.toBeInTheDocument();
   });
 });

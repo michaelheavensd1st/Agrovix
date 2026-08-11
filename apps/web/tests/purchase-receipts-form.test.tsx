@@ -15,7 +15,8 @@ vi.mock('next/navigation', () => ({
   usePathname: () => '/purchase-orders/po-1',
 }));
 vi.mock('@/lib/purchase-receipts', async () => {
-  const actual = await vi.importActual<typeof import('@/lib/purchase-receipts')>('@/lib/purchase-receipts');
+  const actual =
+    await vi.importActual<typeof import('@/lib/purchase-receipts')>('@/lib/purchase-receipts');
   return {
     ...actual,
     createPurchaseReceipt: mocks.create,
@@ -25,17 +26,46 @@ vi.mock('@/lib/purchase-receipts', async () => {
 });
 
 const PO = {
-  id: 'po-1', organization_id: 'org-1', farm_id: 'farm-1', po_number: 'PO-1',
-  lines: [{ id: 'line-1', line_number: 1, item_name: 'Feed', ordered_quantity: '10.000000', received_quantity: '2.000000', ordered_unit: 'kg' }],
+  id: 'po-1',
+  organization_id: 'org-1',
+  farm_id: 'farm-1',
+  po_number: 'PO-1',
+  lines: [
+    {
+      id: 'line-1',
+      line_number: 1,
+      item_name: 'Feed',
+      ordered_quantity: '10.000000',
+      received_quantity: '2.000000',
+      ordered_unit: 'kg',
+    },
+  ],
 } as PurchaseOrder;
 const PO_TWO = { ...PO, id: 'po-2', organization_id: 'org-2', farm_id: null, po_number: 'PO-2' };
-const WH_A = { id: 'wh-a', organization_id: 'org-1', farm_id: 'farm-1', code: 'A', name: 'Warehouse A', status: 'active' };
-const WH_B = { id: 'wh-b', organization_id: 'org-1', farm_id: 'farm-1', code: 'B', name: 'Warehouse B', status: 'active' };
+const WH_A = {
+  id: 'wh-a',
+  organization_id: 'org-1',
+  farm_id: 'farm-1',
+  code: 'A',
+  name: 'Warehouse A',
+  status: 'active',
+};
+const WH_B = {
+  id: 'wh-b',
+  organization_id: 'org-1',
+  farm_id: 'farm-1',
+  code: 'B',
+  name: 'Warehouse B',
+  status: 'active',
+};
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
   return { promise, resolve, reject };
 }
 
@@ -52,7 +82,9 @@ function renderForm(overrides: Partial<React.ComponentProps<typeof PurchaseRecei
 }
 
 async function fill(warehouse = 'wh-a', quantity = '0.000001', lot = ' LOT-1 ') {
-  await waitFor(() => expect(screen.getByRole('option', { name: /Warehouse A/ })).toBeInTheDocument());
+  await waitFor(() =>
+    expect(screen.getByRole('option', { name: /Warehouse A/ })).toBeInTheDocument(),
+  );
   fireEvent.change(screen.getByLabelText('Warehouse'), { target: { value: warehouse } });
   fireEvent.click(screen.getByLabelText(/1. Feed/));
   fireEvent.change(screen.getByLabelText('Quantity (kg)'), { target: { value: quantity } });
@@ -61,7 +93,10 @@ async function fill(warehouse = 'wh-a', quantity = '0.000001', lot = ' LOT-1 ') 
 
 describe('PurchaseReceiptForm adversarial behavior', () => {
   beforeEach(() => {
-    mocks.create.mockReset(); mocks.warehouses.mockReset(); mocks.locations.mockReset(); mocks.push.mockReset();
+    mocks.create.mockReset();
+    mocks.warehouses.mockReset();
+    mocks.locations.mockReset();
+    mocks.push.mockReset();
     mocks.warehouses.mockResolvedValue([WH_A, WH_B]);
     mocks.locations.mockResolvedValue([]);
   });
@@ -71,9 +106,11 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
     mocks.create.mockReturnValue(posted.promise);
     const randomUUID = vi.fn(() => 'only-key');
     vi.stubGlobal('crypto', { randomUUID });
-    const { props } = renderForm(); await fill();
+    const { props } = renderForm();
+    await fill();
     const submit = screen.getByRole('button', { name: 'Post receipt' });
-    fireEvent.click(submit); fireEvent.click(submit);
+    fireEvent.click(submit);
+    fireEvent.click(submit);
     expect(randomUUID).toHaveBeenCalledTimes(1);
     expect(mocks.create).toHaveBeenCalledTimes(1);
     posted.resolve({ receipt: {}, replayed: false });
@@ -82,8 +119,12 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
 
   it('retries uncertainty with the identical frozen payload and key', async () => {
     vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'stable-key') });
-    mocks.create.mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce({ receipt: {}, replayed: true });
-    const { props } = renderForm(); await fill(); fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    mocks.create
+      .mockRejectedValueOnce(new TypeError('network'))
+      .mockResolvedValueOnce({ receipt: {}, replayed: true });
+    const { props } = renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
     await screen.findByRole('button', { name: 'Retry same receipt' });
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
     const frozenPayload = mocks.create.mock.calls[0][1];
@@ -94,8 +135,12 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
   });
 
   it('discards a stale warehouse response after PO context changes', async () => {
-    const oldRequest = deferred<typeof WH_A[]>();
-    mocks.warehouses.mockImplementation((org: string) => org === 'org-1' ? oldRequest.promise : Promise.resolve([{ ...WH_B, organization_id: 'org-2', farm_id: null }]));
+    const oldRequest = deferred<(typeof WH_A)[]>();
+    mocks.warehouses.mockImplementation((org: string) =>
+      org === 'org-1'
+        ? oldRequest.promise
+        : Promise.resolve([{ ...WH_B, organization_id: 'org-2', farm_id: null }]),
+    );
     const view = renderForm();
     view.rerender(<PurchaseReceiptForm {...view.props} purchaseOrder={PO_TWO} />);
     await screen.findByRole('option', { name: /Warehouse B/ });
@@ -105,17 +150,30 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
   });
 
   it('discards A locations that resolve after B and preserves only B in the payload', async () => {
-    const locationsA = deferred<Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>>();
-    const locationsB = deferred<Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>>();
-    mocks.locations.mockImplementation((id: string) => id === 'wh-a' ? locationsA.promise : locationsB.promise);
+    const locationsA =
+      deferred<
+        Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>
+      >();
+    const locationsB =
+      deferred<
+        Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>
+      >();
+    mocks.locations.mockImplementation((id: string) =>
+      id === 'wh-a' ? locationsA.promise : locationsB.promise,
+    );
     vi.stubGlobal('crypto', { randomUUID: () => 'key-b' });
     mocks.create.mockResolvedValue({ receipt: {}, replayed: false });
-    renderForm(); await fill();
+    renderForm();
+    await fill();
     fireEvent.change(screen.getByLabelText('Warehouse'), { target: { value: 'wh-b' } });
-    locationsB.resolve([{ id: 'loc-b', warehouse_id: 'wh-b', name: 'Bin B', code: 'B1', deleted_at: null }]);
+    locationsB.resolve([
+      { id: 'loc-b', warehouse_id: 'wh-b', name: 'Bin B', code: 'B1', deleted_at: null },
+    ]);
     await screen.findByRole('option', { name: /Bin B/ });
     fireEvent.change(screen.getByLabelText('Storage location'), { target: { value: 'loc-b' } });
-    locationsA.resolve([{ id: 'loc-a', warehouse_id: 'wh-a', name: 'Bin A', code: 'A1', deleted_at: null }]);
+    locationsA.resolve([
+      { id: 'loc-a', warehouse_id: 'wh-a', name: 'Bin A', code: 'A1', deleted_at: null },
+    ]);
     await Promise.resolve();
     expect(screen.getByRole('option', { name: /Bin B/ })).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /Bin A/ })).not.toBeInTheDocument();
@@ -127,24 +185,36 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
   });
 
   it('discards a pending location response when the warehouse is cleared', async () => {
-    const locationsA = deferred<Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>>();
+    const locationsA =
+      deferred<
+        Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>
+      >();
     mocks.locations.mockReturnValue(locationsA.promise);
-    renderForm(); await fill();
+    renderForm();
+    await fill();
     fireEvent.change(screen.getByLabelText('Warehouse'), { target: { value: '' } });
-    locationsA.resolve([{ id: 'loc-a', warehouse_id: 'wh-a', name: 'Bin A', code: 'A1', deleted_at: null }]);
+    locationsA.resolve([
+      { id: 'loc-a', warehouse_id: 'wh-a', name: 'Bin A', code: 'A1', deleted_at: null },
+    ]);
     await Promise.resolve();
     expect(screen.queryByRole('option', { name: /Bin A/ })).not.toBeInTheDocument();
     expect(screen.getByLabelText('Warehouse')).toHaveValue('');
   });
 
   it('discards a pending location response across close and reopen', async () => {
-    const locationsA = deferred<Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>>();
+    const locationsA =
+      deferred<
+        Array<{ id: string; warehouse_id: string; name: string; code: string; deleted_at: null }>
+      >();
     mocks.locations.mockReturnValue(locationsA.promise);
-    const view = renderForm(); await fill();
+    const view = renderForm();
+    await fill();
     view.rerender(<PurchaseReceiptForm {...view.props} open={false} />);
     view.rerender(<PurchaseReceiptForm {...view.props} open />);
     await waitFor(() => expect(screen.getByLabelText('Warehouse')).toHaveValue(''));
-    locationsA.resolve([{ id: 'loc-a', warehouse_id: 'wh-a', name: 'Bin A', code: 'A1', deleted_at: null }]);
+    locationsA.resolve([
+      { id: 'loc-a', warehouse_id: 'wh-a', name: 'Bin A', code: 'A1', deleted_at: null },
+    ]);
     await Promise.resolve();
     expect(screen.queryByRole('option', { name: /Bin A/ })).not.toBeInTheDocument();
     expect(screen.getByLabelText(/1. Feed/)).not.toBeChecked();
@@ -159,15 +229,25 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
     ['not_authorized', 'authorization-changed'],
   ] as const)('reports authoritative %s invalidation', async (code, outcome) => {
     vi.stubGlobal('crypto', { randomUUID: () => 'conflict-key' });
-    mocks.create.mockRejectedValue(new ApiError(code === 'not_authorized' ? 403 : 409, { detail: { code } } as never));
-    const { props } = renderForm(); await fill(); fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    mocks.create.mockRejectedValue(
+      new ApiError(code === 'not_authorized' ? 403 : 409, { detail: { code } } as never),
+    );
+    const { props } = renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
     await waitFor(() => expect(props.onAuthoritativeFailure).toHaveBeenCalledWith(outcome));
   });
 
   it('maps FastAPI line validation with stable accessible error association', async () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'validation-key' });
-    mocks.create.mockRejectedValue(new ApiError(422, { detail: [{ loc: ['body', 'lines', 0, 'quantity'], msg: 'internal text' }] } as never));
-    renderForm(); await fill(); fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    mocks.create.mockRejectedValue(
+      new ApiError(422, {
+        detail: [{ loc: ['body', 'lines', 0, 'quantity'], msg: 'internal text' }],
+      } as never),
+    );
+    renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
     const quantity = screen.getByLabelText('Quantity (kg)');
     await waitFor(() => expect(quantity).toHaveAttribute('aria-invalid', 'true'));
     expect(quantity).toHaveAttribute('aria-describedby', 'receipt-error-line-1-quantity');
@@ -176,8 +256,12 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
 
   it('treats payload conflict as definitively resolved with ordinary dismissal', async () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'conflict-key' });
-    mocks.create.mockRejectedValue(new ApiError(409, { detail: { code: 'idempotency_key_payload_conflict' } } as never));
-    const { props } = renderForm(); await fill(); fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    mocks.create.mockRejectedValue(
+      new ApiError(409, { detail: { code: 'idempotency_key_payload_conflict' } } as never),
+    );
+    const { props } = renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
     await screen.findByText(/could not be replayed/);
     expect(screen.queryByRole('button', { name: 'Abandon attempt' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
@@ -186,8 +270,14 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
 
   it('maps a missing idempotency key without exposing the raw backend code', async () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'missing-key' });
-    mocks.create.mockRejectedValue(new ApiError(400, { detail: { code: 'idempotency_key_required', message: 'internal' } } as never));
-    renderForm(); await fill(); fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    mocks.create.mockRejectedValue(
+      new ApiError(400, {
+        detail: { code: 'idempotency_key_required', message: 'internal' },
+      } as never),
+    );
+    renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('could not be safely identified');
     expect(screen.queryByText('idempotency_key_required')).not.toBeInTheDocument();
   });
@@ -195,8 +285,12 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
   it('explicitly abandons uncertainty, resets on reopen, and creates a new edited attempt', async () => {
     const randomUUID = vi.fn().mockReturnValueOnce('first-key').mockReturnValueOnce('second-key');
     vi.stubGlobal('crypto', { randomUUID });
-    mocks.create.mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce({ receipt: {}, replayed: false });
-    const view = renderForm(); await fill(); fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
+    mocks.create
+      .mockRejectedValueOnce(new TypeError('network'))
+      .mockResolvedValueOnce({ receipt: {}, replayed: false });
+    const view = renderForm();
+    await fill();
+    fireEvent.click(screen.getByRole('button', { name: 'Post receipt' }));
     await screen.findByRole('button', { name: 'Abandon attempt' });
     fireEvent.click(screen.getByRole('button', { name: 'Abandon attempt' }));
     view.rerender(<PurchaseReceiptForm {...view.props} open={false} />);
@@ -211,8 +305,10 @@ describe('PurchaseReceiptForm adversarial behavior', () => {
 
   it('traps Shift+Tab from the title and ignores a late submission after PO change', async () => {
     vi.stubGlobal('crypto', { randomUUID: () => 'late-key' });
-    const posted = deferred<{ receipt: object; replayed: boolean }>(); mocks.create.mockReturnValue(posted.promise);
-    const view = renderForm(); await fill();
+    const posted = deferred<{ receipt: object; replayed: boolean }>();
+    mocks.create.mockReturnValue(posted.promise);
+    const view = renderForm();
+    await fill();
     const title = screen.getByRole('heading', { name: /Receive PO-1/ });
     expect(title).toHaveFocus();
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });

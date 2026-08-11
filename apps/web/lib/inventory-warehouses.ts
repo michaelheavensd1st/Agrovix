@@ -346,16 +346,27 @@ export function inspectActivityFanOut(
 // Debounce helper (search).
 // ------------------------------------------------------------------- //
 
+export type DebouncedFunction<A extends unknown[]> = ((...args: A) => void) & {
+  cancel: () => void;
+};
+
 export function debounce<A extends unknown[]>(
   fn: (...args: A) => void,
   wait: number,
-): (...args: A) => void {
+): DebouncedFunction<A> {
   let timer: ReturnType<typeof setTimeout> | null = null;
-  return (...args: A) => {
+  const debounced = (...args: A) => {
     if (timer !== null) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = null;
       fn(...args);
     }, wait);
   };
+  debounced.cancel = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  return debounced;
 }
