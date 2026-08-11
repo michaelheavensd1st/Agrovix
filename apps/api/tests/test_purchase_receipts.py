@@ -613,7 +613,10 @@ async def test_whole_request_rolls_back_after_second_ledger_failure(
             await verification.scalar(
                 select(func.count())
                 .select_from(InventoryTransaction)
-                .where(InventoryTransaction.reference_type == "purchase_receipt_line")
+                .where(
+                    InventoryTransaction.organization_id == identifiers[0],
+                    InventoryTransaction.reference_type == "purchase_receipt_line",
+                )
             )
             == 0
         )
@@ -630,6 +633,288 @@ async def test_whole_request_rolls_back_after_second_ledger_failure(
             ).scalars()
         )
         assert all(Decimal(line.received_quantity) == 0 for line in persisted_lines)
+        assert (
+            await verification.scalar(
+                select(func.count())
+                .select_from(PurchaseOrderTransition)
+                .where(PurchaseOrderTransition.purchase_order_id == identifiers[3])
+            )
+            == 0
+        )
+        assert (
+            await verification.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.action == "purchase_receipt.post",
+                    AuditEvent.organization_id == identifiers[0],
+                )
+            )
+            == 0
+        )
+
+
+@_postgres_only
+async def test_release_reconciliation_repeated_mixed_receipts_from_independent_session(
+    db_session, _engine
+):
+    org, actor, _farm, warehouse, po, lines, _items = await _seed(db_session, two_lines=True)
+    identifiers = (org.id, actor.id, warehouse.id, po.id, lines[0].id, lines[1].id)
+    await db_session.commit()
+    factory = async_sessionmaker(_engine, expire_on_commit=False)
+
+    async with factory() as first_session, first_session.begin():
+        org_id, actor_id, warehouse_id, po_id, first_line_id, second_line_id = identifiers
+        first_receipt, replay = await PurchaseReceiptService(first_session).post(
+            actor=await first_session.get(User, actor_id),
+            organization_id=org_id,
+            purchase_order_id=po_id,
+            command=PurchaseReceiptCommand.model_validate(
+                {
+                    "warehouse_id": warehouse_id,
+                    "received_at": "2026-08-10T12:00:00Z",
+                    "lines": [
+                        {
+                            "purchase_order_line_id": first_line_id,
+                            "lot_code": "MIXED-FIRST",
+                            "quantity": "4.000000",
+                        },
+                        {
+                            "purchase_order_line_id": second_line_id,
+                            "lot_code": "MIXED-COMPLETE",
+                            "quantity": "10.000000",
+                        },
+                    ],
+                }
+            ),
+            idempotency_key="release-mixed-first",
+            request_ctx={"request_id": "release-mixed-first-request"},
+        )
+        assert replay is False
+        first_receipt_id = first_receipt.id
+
+    async with factory() as second_session, second_session.begin():
+        org_id, actor_id, warehouse_id, po_id, first_line_id, _second_line_id = identifiers
+        second_receipt, replay = await PurchaseReceiptService(second_session).post(
+            actor=await second_session.get(User, actor_id),
+            organization_id=org_id,
+            purchase_order_id=po_id,
+            command=PurchaseReceiptCommand.model_validate(
+                {
+                    "warehouse_id": warehouse_id,
+                    "received_at": "2026-08-10T13:00:00Z",
+                    "lines": [
+                        {
+                            "purchase_order_line_id": first_line_id,
+                            "lot_code": "MIXED-FINAL",
+                            "quantity": "6.000000",
+                        }
+                    ],
+                }
+            ),
+            idempotency_key="release-mixed-final",
+            request_ctx={"request_id": "release-mixed-final-request"},
+        )
+        assert replay is False
+        second_receipt_id = second_receipt.id
+
+    async with factory() as verification:
+        persisted_po = await verification.get(PurchaseOrder, identifiers[3])
+        persisted_lines = list(
+            (
+                await verification.execute(
+                    select(PurchaseOrderLine)
+                    .where(PurchaseOrderLine.purchase_order_id == identifiers[3])
+                    .order_by(PurchaseOrderLine.line_number)
+                )
+            ).scalars()
+        )
+        receipts = list(
+            (
+                await verification.execute(
+                    select(PurchaseReceipt)
+                    .where(PurchaseReceipt.purchase_order_id == identifiers[3])
+                    .order_by(PurchaseReceipt.received_at)
+                )
+            ).scalars()
+        )
+        receipt_lines = list(
+            (
+                await verification.execute(
+                    select(PurchaseReceiptLine)
+                    .join(PurchaseReceipt)
+                    .where(PurchaseReceipt.purchase_order_id == identifiers[3])
+                    .order_by(PurchaseReceipt.received_at, PurchaseReceiptLine.line_number)
+                )
+            ).scalars()
+        )
+        transactions = list(
+            (
+                await verification.execute(
+                    select(InventoryTransaction)
+                    .where(
+                        InventoryTransaction.reference_type == "purchase_receipt_line",
+                        InventoryTransaction.reference_id.in_([line.id for line in receipt_lines]),
+                    )
+                    .order_by(InventoryTransaction.created_at, InventoryTransaction.id)
+                )
+            ).scalars()
+        )
+        transitions = list(
+            (
+                await verification.execute(
+                    select(PurchaseOrderTransition)
+                    .where(PurchaseOrderTransition.purchase_order_id == identifiers[3])
+                    .order_by(PurchaseOrderTransition.occurred_at)
+                )
+            ).scalars()
+        )
+        audits = list(
+            (
+                await verification.execute(
+                    select(AuditEvent)
+                    .where(
+                        AuditEvent.action == "purchase_receipt.post",
+                        AuditEvent.organization_id == identifiers[0],
+                    )
+                    .order_by(AuditEvent.created_at)
+                )
+            ).scalars()
+        )
+
+        assert [receipt.id for receipt in receipts] == [first_receipt_id, second_receipt_id]
+        assert [receipt.grn for receipt in receipts] == ["GRN-2026-000001", "GRN-2026-000002"]
+        assert len(receipt_lines) == len(transactions) == 3
+        assert len({line.inventory_lot_id for line in receipt_lines}) == 3
+        assert {tx.reference_id for tx in transactions} == {line.id for line in receipt_lines}
+        assert all(tx.transaction_type == InventoryTransactionType.RECEIPT for tx in transactions)
+        assert all(
+            Decimal(tx.quantity)
+            == next(
+                Decimal(line.quantity_canonical)
+                for line in receipt_lines
+                if line.id == tx.reference_id
+            )
+            for tx in transactions
+        )
+        for line in persisted_lines:
+            matching = [entry for entry in receipt_lines if entry.purchase_order_line_id == line.id]
+            assert sum((Decimal(entry.quantity) for entry in matching), Decimal(0)) == Decimal(
+                line.received_quantity
+            )
+            assert sum(
+                (Decimal(entry.quantity_canonical) for entry in matching), Decimal(0)
+            ) == Decimal(line.received_quantity_canonical)
+            assert Decimal(line.received_quantity) == Decimal(line.ordered_quantity)
+            assert Decimal(line.received_quantity_canonical) == Decimal(
+                line.ordered_quantity_canonical
+            )
+        assert persisted_po.status == PurchaseOrderStatus.RECEIVED
+        assert persisted_po.version == 5
+        assert [(row.from_status, row.to_status) for row in transitions] == [
+            (PurchaseOrderStatus.APPROVED, PurchaseOrderStatus.PARTIALLY_RECEIVED),
+            (PurchaseOrderStatus.PARTIALLY_RECEIVED, PurchaseOrderStatus.RECEIVED),
+        ]
+        assert [row.metadata_json["purchase_receipt_id"] for row in transitions] == [
+            str(first_receipt_id),
+            str(second_receipt_id),
+        ]
+        assert len(audits) == 2
+        assert {audit.entity_id for audit in audits} == {
+            str(first_receipt_id),
+            str(second_receipt_id),
+        }
+
+
+@_postgres_only
+async def test_real_lot_conflict_rolls_back_prior_lot_and_all_receipt_state(db_session, _engine):
+    org, actor, _farm, warehouse, po, lines, items = await _seed(db_session)
+    conflicting_lot = InventoryLot(
+        item_id=items[0].id,
+        warehouse_id=warehouse.id,
+        lot_code="Z-ROLLBACK-CONFLICT",
+        expiry_date=date(2026, 12, 31),
+    )
+    db_session.add(conflicting_lot)
+    await db_session.commit()
+    identifiers = (org.id, actor.id, warehouse.id, po.id, lines[0].id)
+    factory = async_sessionmaker(_engine, expire_on_commit=False)
+
+    with pytest.raises(HTTPException) as exc:
+        async with factory() as failing_session, failing_session.begin():
+            org_id, actor_id, warehouse_id, po_id, line_id = identifiers
+            await PurchaseReceiptService(failing_session).post(
+                actor=await failing_session.get(User, actor_id),
+                organization_id=org_id,
+                purchase_order_id=po_id,
+                command=PurchaseReceiptCommand.model_validate(
+                    {
+                        "warehouse_id": warehouse_id,
+                        "lines": [
+                            {
+                                "purchase_order_line_id": line_id,
+                                "lot_code": "A-ROLLBACK-CREATED",
+                                "quantity": "1.000000",
+                            },
+                            {
+                                "purchase_order_line_id": line_id,
+                                "lot_code": "Z-ROLLBACK-CONFLICT",
+                                "quantity": "1.000000",
+                            },
+                        ],
+                    }
+                ),
+                idempotency_key="real-domain-rollback",
+                request_ctx={"request_id": "real-domain-rollback-request"},
+            )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "lot_attribute_conflict"
+
+    async with factory() as verification:
+        assert (
+            await verification.scalar(
+                select(func.count())
+                .select_from(PurchaseReceipt)
+                .where(PurchaseReceipt.purchase_order_id == identifiers[3])
+            )
+            == 0
+        )
+        assert (
+            await verification.scalar(
+                select(func.count())
+                .select_from(PurchaseReceiptLine)
+                .where(PurchaseReceiptLine.purchase_order_line_id == identifiers[4])
+            )
+            == 0
+        )
+        assert (
+            await verification.scalar(
+                select(func.count())
+                .select_from(InventoryLot)
+                .where(
+                    InventoryLot.warehouse_id == identifiers[2],
+                    InventoryLot.lot_code == "A-ROLLBACK-CREATED",
+                )
+            )
+            == 0
+        )
+        assert (
+            await verification.scalar(
+                select(func.count())
+                .select_from(InventoryTransaction)
+                .where(
+                    InventoryTransaction.organization_id == identifiers[0],
+                    InventoryTransaction.reference_type == "purchase_receipt_line",
+                )
+            )
+            == 0
+        )
+        persisted_po = await verification.get(PurchaseOrder, identifiers[3])
+        persisted_line = await verification.get(PurchaseOrderLine, identifiers[4])
+        assert persisted_po.status == PurchaseOrderStatus.APPROVED
+        assert persisted_po.version == 3
+        assert Decimal(persisted_line.received_quantity) == Decimal("0.000000")
+        assert Decimal(persisted_line.received_quantity_canonical) == Decimal("0.000000")
         assert (
             await verification.scalar(
                 select(func.count())
