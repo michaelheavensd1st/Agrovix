@@ -49,11 +49,17 @@ _RECOVERY_REQUEST_MESSAGE = (
     "If an eligible account exists, password recovery instructions will be sent."
 )
 _recovery_delivery_tasks: set[asyncio.Task[None]] = set()
+_recovery_delivery_tails: dict[str, asyncio.Task[None]] = {}
 
 
 async def _deliver_recovery_operational(
-    *, email_sender: EmailSender, delivery: RecoveryDelivery
+    *,
+    email_sender: EmailSender,
+    delivery: RecoveryDelivery,
+    predecessor: asyncio.Task[None] | None,
 ) -> None:
+    if predecessor is not None:
+        await predecessor
     try:
         await deliver_recovery_email(
             email_sender=email_sender,
@@ -79,12 +85,25 @@ def _schedule_recovery_delivery(*, email_sender: EmailSender, delivery: Recovery
     in-process handoff has an at-most-once gap: a process crash after commit
     and before/during delivery can leave a valid token whose email was not sent.
     """
+    account_key = delivery.to.strip().lower()
+    predecessor = _recovery_delivery_tails.get(account_key)
     task = asyncio.create_task(
-        _deliver_recovery_operational(email_sender=email_sender, delivery=delivery),
+        _deliver_recovery_operational(
+            email_sender=email_sender,
+            delivery=delivery,
+            predecessor=predecessor,
+        ),
         name="password-recovery-email-delivery",
     )
     _recovery_delivery_tasks.add(task)
-    task.add_done_callback(_recovery_delivery_tasks.discard)
+    _recovery_delivery_tails[account_key] = task
+
+    def release_references(completed: asyncio.Task[None]) -> None:
+        _recovery_delivery_tasks.discard(completed)
+        if _recovery_delivery_tails.get(account_key) is completed:
+            _recovery_delivery_tails.pop(account_key, None)
+
+    task.add_done_callback(release_references)
 
 
 def _to_public(

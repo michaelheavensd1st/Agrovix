@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
@@ -22,7 +23,7 @@ from app.models.refresh_token import RefreshToken
 from app.models.user import User
 from app.repositories.password_recovery import PasswordRecoveryTokenRepository
 from app.repositories.user_repo import UserRepository
-from app.services.password_recovery import PasswordRecoveryKernel
+from app.services.password_recovery import PasswordRecoveryKernel, hash_recovery_token
 
 pytestmark = pytest.mark.asyncio
 
@@ -59,10 +60,43 @@ class RecordingLimiter:
         return True, 0
 
 
+class SequencedSender(EmailSender):
+    def __init__(self, *, fail_first: bool = False) -> None:
+        self.fail_first = fail_first
+        self.messages: list[EmailMessage] = []
+        self.entered = [asyncio.Event(), asyncio.Event()]
+        self.release_first = asyncio.Event()
+
+    async def send(self, message: EmailMessage) -> None:
+        index = len(self.messages)
+        self.messages.append(message)
+        self.entered[index].set()
+        if index == 0:
+            await self.release_first.wait()
+            if self.fail_first:
+                raise RuntimeError("injected first-delivery failure")
+
+
+class PerRecipientSender(EmailSender):
+    def __init__(self, blocked_recipient: str) -> None:
+        self.blocked_recipient = blocked_recipient
+        self.entered: dict[str, asyncio.Event] = {}
+        self.release_blocked = asyncio.Event()
+
+    async def send(self, message: EmailMessage) -> None:
+        self.entered.setdefault(message.to, asyncio.Event()).set()
+        if message.to == self.blocked_recipient:
+            await self.release_blocked.wait()
+
+
 async def _drain_recovery_deliveries() -> None:
     tasks = tuple(auth_endpoints._recovery_delivery_tasks)
     if tasks:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=3)
+
+
+def _message_token(message: EmailMessage) -> str:
+    return parse_qs(urlparse(message.context["reset_url"]).query)["token"][0]
 
 
 async def _create_user(password: str = "Original-Password!2026") -> User:
@@ -183,6 +217,90 @@ async def test_eligible_response_does_not_wait_for_provider_and_matches_ineligib
 
     sender.release.set()
     await _drain_recovery_deliveries()
+
+
+async def test_same_account_deliveries_follow_committed_issuance_order(
+    client: AsyncClient,
+) -> None:
+    user = await _create_user()
+    sender = SequencedSender()
+    app.dependency_overrides[get_email_sender_dep] = lambda: sender
+
+    first = await client.post("/api/v1/auth/recovery/request", json={"email": user.email})
+    await asyncio.wait_for(sender.entered[0].wait(), timeout=3)
+    second = await client.post("/api/v1/auth/recovery/request", json={"email": user.email})
+
+    assert first.status_code == second.status_code == 202
+    assert not sender.entered[1].is_set()
+    sender.release_first.set()
+    await asyncio.wait_for(sender.entered[1].wait(), timeout=3)
+    await _drain_recovery_deliveries()
+
+    first_token, second_token = map(_message_token, sender.messages)
+    from app.db import session as db
+
+    async with db.AsyncSessionLocal() as session:
+        first_row = await session.scalar(
+            select(PasswordRecoveryToken).where(
+                PasswordRecoveryToken.token_hash == hash_recovery_token(first_token)
+            )
+        )
+        second_row = await session.scalar(
+            select(PasswordRecoveryToken).where(
+                PasswordRecoveryToken.token_hash == hash_recovery_token(second_token)
+            )
+        )
+        assert first_row is not None and first_row.invalidated_at is not None
+        assert second_row is not None
+        assert second_row.invalidated_at is None and second_row.consumed_at is None
+    assert not auth_endpoints._recovery_delivery_tails
+
+
+async def test_failed_delivery_releases_same_account_successor(client: AsyncClient) -> None:
+    user = await _create_user()
+    sender = SequencedSender(fail_first=True)
+    app.dependency_overrides[get_email_sender_dep] = lambda: sender
+
+    await client.post("/api/v1/auth/recovery/request", json={"email": user.email})
+    await asyncio.wait_for(sender.entered[0].wait(), timeout=3)
+    await client.post("/api/v1/auth/recovery/request", json={"email": user.email})
+    assert not sender.entered[1].is_set()
+
+    sender.release_first.set()
+    await asyncio.wait_for(sender.entered[1].wait(), timeout=3)
+    await _drain_recovery_deliveries()
+
+    second_token = _message_token(sender.messages[1])
+    from app.db import session as db
+
+    async with db.AsyncSessionLocal() as session:
+        latest = await session.scalar(
+            select(PasswordRecoveryToken).where(
+                PasswordRecoveryToken.token_hash == hash_recovery_token(second_token)
+            )
+        )
+        assert latest is not None and latest.invalidated_at is None
+    assert not auth_endpoints._recovery_delivery_tails
+
+
+async def test_different_accounts_deliver_independently(client: AsyncClient) -> None:
+    blocked_user = await _create_user()
+    independent_user = await _create_user()
+    sender = PerRecipientSender(blocked_user.email)
+    app.dependency_overrides[get_email_sender_dep] = lambda: sender
+
+    blocked = await client.post("/api/v1/auth/recovery/request", json={"email": blocked_user.email})
+    await asyncio.wait_for(sender.entered[blocked_user.email].wait(), timeout=3)
+    independent = await client.post(
+        "/api/v1/auth/recovery/request", json={"email": independent_user.email}
+    )
+
+    assert blocked.status_code == independent.status_code == 202
+    await asyncio.wait_for(sender.entered[independent_user.email].wait(), timeout=3)
+    assert not sender.release_blocked.is_set()
+    sender.release_blocked.set()
+    await _drain_recovery_deliveries()
+    assert not auth_endpoints._recovery_delivery_tails
 
 
 async def test_ip_limiter_precedes_email_and_blocked_ip_does_not_charge_victim(
