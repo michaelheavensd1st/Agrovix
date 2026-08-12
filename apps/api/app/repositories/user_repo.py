@@ -40,6 +40,16 @@ class UserRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_email_for_update(self, email: str) -> User | None:
+        stmt = (
+            select(User)
+            .where(User.email == email.strip().lower(), User.deleted_at.is_(None))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def create(
         self,
         *,
@@ -62,6 +72,12 @@ class UserRepository:
         self.session.add(user)
         await self.session.flush()
         await self.session.refresh(user)
+        return user
+
+    async def set_password_hash(self, user: User, hashed_password: str) -> User:
+        user.hashed_password = hashed_password
+        self.session.add(user)
+        await self.session.flush()
         return user
 
     async def soft_delete(self, user: User) -> None:
