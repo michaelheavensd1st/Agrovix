@@ -44,6 +44,7 @@ from app.repositories.role_repo import (
 from app.repositories.user_repo import UserRepository
 from app.repositories.verification_repo import VerificationTokenRepository
 from app.security.authorize import has_permission, resolve_permissions
+from app.services.admin_user_service import AdminUserService
 from app.services.auth_service import AuthService
 from app.services.invitation_service import InvitationService, RoleAssignmentService
 from app.services.organization_service import FarmService, OrganizationService
@@ -161,6 +162,22 @@ def get_password_recovery_service(
         audit_repo=audit_repo,
         rate_limiter=rate_limiter,
         email_sender=email_sender,
+    )
+
+
+def get_admin_user_service(
+    user_repo: Annotated[UserRepository, Depends(get_user_repository)],
+    recovery_repo: Annotated[
+        PasswordRecoveryTokenRepository, Depends(get_password_recovery_repository)
+    ],
+    refresh_repo: Annotated[RefreshTokenRepository, Depends(get_refresh_token_repository)],
+    audit_repo: Annotated[AuditRepository, Depends(get_audit_repository)],
+) -> AdminUserService:
+    return AdminUserService(
+        user_repo=user_repo,
+        recovery_repo=recovery_repo,
+        refresh_repo=refresh_repo,
+        audit_repo=audit_repo,
     )
 
 

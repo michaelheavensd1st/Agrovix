@@ -80,6 +80,13 @@ class UserRepository:
         await self.session.flush()
         return user
 
+    async def set_active(self, user: User, *, is_active: bool) -> User:
+        user.is_active = is_active
+        self.session.add(user)
+        await self.session.flush()
+        await self.session.refresh(user)
+        return user
+
     async def soft_delete(self, user: User) -> None:
         user.deleted_at = datetime.now(UTC)
         user.is_active = False
