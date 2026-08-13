@@ -15,7 +15,7 @@ from app.repositories.user_repo import UserRepository
 
 
 class AdminUserService:
-    """Mutate user security state in one caller-owned transaction."""
+    """Read the platform directory and mutate security state when requested."""
 
     def __init__(
         self,
@@ -37,6 +37,26 @@ class AdminUserService:
         self.recovery_repo = recovery_repo
         self.refresh_repo = refresh_repo
         self.audit_repo = audit_repo
+
+    async def list_directory(
+        self,
+        *,
+        search: str | None,
+        is_active: bool | None,
+        is_verified: bool | None,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[User], int]:
+        normalized_search = search.strip() if search is not None else None
+        if not normalized_search:
+            normalized_search = None
+        return await self.user_repo.search_admin_directory(
+            search=normalized_search,
+            is_active=is_active,
+            is_verified=is_verified,
+            limit=limit,
+            offset=offset,
+        )
 
     async def inspect(self, *, target_id: uuid.UUID) -> User:
         target = await self.user_repo.get_by_id(target_id)

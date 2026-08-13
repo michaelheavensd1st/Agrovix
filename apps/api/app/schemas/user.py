@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -54,6 +55,18 @@ class AdminUserPublic(BaseModel):
     is_superuser: bool
     created_at: datetime
     updated_at: datetime
+
+
+class AdminUserStatus(str, Enum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
+class AdminUserPage(BaseModel):
+    items: list[AdminUserPublic]
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
 
 
 class AdminUserSessionsRevokeResponse(BaseModel):
