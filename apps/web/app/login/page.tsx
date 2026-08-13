@@ -1,7 +1,12 @@
 import Link from 'next/link';
 import { AuthForm } from '@/components/auth-form';
 
-export default function LoginPage() {
+export default function LoginPage({
+  searchParams,
+}: {
+  searchParams?: { 'password-reset'?: string };
+}) {
+  const passwordReset = searchParams?.['password-reset'] === 'success';
   return (
     <main
       className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12"
@@ -9,7 +14,23 @@ export default function LoginPage() {
     >
       <h1 className="font-display text-3xl">Welcome back</h1>
       <p className="mt-2 text-sm text-muted-foreground">Sign in to your Agrovix AgOS account.</p>
+      {passwordReset && (
+        <p
+          role="status"
+          data-testid="password-reset-success"
+          className="mt-4 rounded-md bg-primary/10 px-3 py-2 text-sm text-primary"
+        >
+          Password reset successful. Sign in with your new password.
+        </p>
+      )}
       <AuthForm mode="login" />
+      <Link
+        href="/forgot-password"
+        data-testid="login-forgot-password-link"
+        className="mt-4 self-start text-sm text-primary hover:underline"
+      >
+        Forgot password?
+      </Link>
       <p className="mt-6 text-sm text-muted-foreground">
         New to Agrovix?{' '}
         <Link
