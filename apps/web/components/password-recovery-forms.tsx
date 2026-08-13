@@ -55,7 +55,9 @@ export function ForgotPasswordForm() {
       setAccepted(true);
     } catch (requestError) {
       setError(operationalError(requestError));
-      setErrorTarget(requestError instanceof ApiError && requestError.status === 422 ? 'email' : 'summary');
+      setErrorTarget(
+        requestError instanceof ApiError && requestError.status === 422 ? 'email' : 'summary',
+      );
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
@@ -63,7 +65,11 @@ export function ForgotPasswordForm() {
   }
 
   return (
-    <form onSubmit={onSubmit} className="mt-8 flex flex-col gap-4" data-testid="forgot-password-form">
+    <form
+      onSubmit={onSubmit}
+      className="mt-8 flex flex-col gap-4"
+      data-testid="forgot-password-form"
+    >
       <label className="flex flex-col gap-1 text-sm">
         <span className="text-muted-foreground">Email</span>
         <input
@@ -81,12 +87,26 @@ export function ForgotPasswordForm() {
       </label>
 
       {accepted && (
-        <p ref={outcomeRef} tabIndex={-1} role="status" id="recovery-request-success" data-testid="recovery-request-success" className="rounded-md bg-primary/10 px-3 py-2 text-sm text-primary outline-none">
+        <p
+          ref={outcomeRef}
+          tabIndex={-1}
+          role="status"
+          id="recovery-request-success"
+          data-testid="recovery-request-success"
+          className="rounded-md bg-primary/10 px-3 py-2 text-sm text-primary outline-none"
+        >
           {GENERIC_REQUEST_MESSAGE}
         </p>
       )}
       {error && (
-        <p ref={outcomeRef} tabIndex={-1} role="alert" id="recovery-request-error" data-testid="recovery-request-error" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive outline-none">
+        <p
+          ref={outcomeRef}
+          tabIndex={-1}
+          role="alert"
+          id="recovery-request-error"
+          data-testid="recovery-request-error"
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive outline-none"
+        >
           {error}
         </p>
       )}
@@ -113,7 +133,9 @@ export function ResetPasswordForm({ initialToken }: { initialToken: string | nul
   const [token, setToken] = useState(initialToken ?? '');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [errorTarget, setErrorTarget] = useState<'password' | 'confirmation' | 'summary' | null>(null);
+  const [errorTarget, setErrorTarget] = useState<'password' | 'confirmation' | 'summary' | null>(
+    null,
+  );
   const [terminalState, setTerminalState] = useState<'invalid' | 'success' | null>(null);
 
   useEffect(() => {
@@ -178,7 +200,13 @@ export function ResetPasswordForm({ initialToken }: { initialToken: string | nul
 
   if (terminalState === 'success') {
     return (
-      <p ref={outcomeRef} tabIndex={-1} role="status" data-testid="reset-password-success" className="mt-6 rounded-md bg-primary/10 px-3 py-2 text-sm text-primary outline-none">
+      <p
+        ref={outcomeRef}
+        tabIndex={-1}
+        role="status"
+        data-testid="reset-password-success"
+        className="mt-6 rounded-md bg-primary/10 px-3 py-2 text-sm text-primary outline-none"
+      >
         Password reset successful. Redirecting to sign in.
       </p>
     );
@@ -187,7 +215,13 @@ export function ResetPasswordForm({ initialToken }: { initialToken: string | nul
   if (terminalState === 'invalid' || !token) {
     return (
       <div className="mt-6 flex flex-col gap-4" data-testid="reset-password-missing-token">
-        <p ref={outcomeRef} tabIndex={-1} role="alert" data-testid="reset-password-invalid-link" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive outline-none">
+        <p
+          ref={outcomeRef}
+          tabIndex={-1}
+          role="alert"
+          data-testid="reset-password-invalid-link"
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive outline-none"
+        >
           {terminalState === 'invalid'
             ? 'Invalid or expired recovery link.'
             : 'This recovery link is missing or no longer available.'}
@@ -200,7 +234,12 @@ export function ResetPasswordForm({ initialToken }: { initialToken: string | nul
   }
 
   return (
-    <form ref={formRef} onSubmit={onSubmit} className="mt-8 flex flex-col gap-4" data-testid="reset-password-form">
+    <form
+      ref={formRef}
+      onSubmit={onSubmit}
+      className="mt-8 flex flex-col gap-4"
+      data-testid="reset-password-form"
+    >
       <label className="flex flex-col gap-1 text-sm">
         <span className="text-muted-foreground">New password</span>
         <input
@@ -237,7 +276,14 @@ export function ResetPasswordForm({ initialToken }: { initialToken: string | nul
       </label>
 
       {error && (
-        <p ref={outcomeRef} tabIndex={-1} role="alert" id="reset-password-error" data-testid="reset-password-error" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive outline-none">
+        <p
+          ref={outcomeRef}
+          tabIndex={-1}
+          role="alert"
+          id="reset-password-error"
+          data-testid="reset-password-error"
+          className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive outline-none"
+        >
           {error}
         </p>
       )}
