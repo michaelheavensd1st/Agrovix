@@ -25,6 +25,7 @@ import LoginPage from '@/app/login/page';
 import { ForgotPasswordForm, ResetPasswordForm } from '@/components/password-recovery-forms';
 
 const mockedApiFetch = apiFetch as unknown as ReturnType<typeof vi.fn>;
+const VALID_RECOVERY_TOKEN = 'opaque-secret-token-with-at-least-32-characters';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -158,7 +159,7 @@ describe('web password recovery', () => {
   });
 
   it('blocks mismatched passwords before calling the API', () => {
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     fireEvent.change(screen.getByTestId('reset-password-input'), {
       target: { value: 'new-password-one' },
     });
@@ -181,7 +182,7 @@ describe('web password recovery', () => {
 
   it('replaces the token URL and clears sensitive form state after a successful reset', async () => {
     mockedApiFetch.mockResolvedValue({ message: 'ok' });
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     const password = screen.getByTestId('reset-password-input') as HTMLInputElement;
     const confirmation = screen.getByTestId('reset-password-confirmation') as HTMLInputElement;
     fireEvent.change(password, { target: { value: 'new-password-one' } });
@@ -191,17 +192,17 @@ describe('web password recovery', () => {
     await waitFor(() => expect(replaceMock).toHaveBeenCalledWith('/login?password-reset=success'));
     expect(mockedApiFetch).toHaveBeenCalledWith('/v1/auth/recovery/reset', {
       method: 'POST',
-      body: JSON.stringify({ token: 'opaque-secret-token', new_password: 'new-password-one' }),
+      body: JSON.stringify({ token: VALID_RECOVERY_TOKEN, new_password: 'new-password-one' }),
     });
     expect(password.value).toBe('');
     expect(confirmation.value).toBe('');
     expect(screen.getByTestId('reset-password-success')).toHaveFocus();
-    expect(document.body.textContent).not.toContain('opaque-secret-token');
+    expect(document.body.textContent).not.toContain(VALID_RECOVERY_TOKEN);
   });
 
   it('maps invalid tokens without rendering the token', async () => {
     mockedApiFetch.mockRejectedValue(new ApiError(400, { detail: 'secret backend reason' }));
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     fireEvent.change(screen.getByTestId('reset-password-input'), {
       target: { value: 'new-password-one' },
     });
@@ -216,12 +217,12 @@ describe('web password recovery', () => {
     );
     expect(screen.getByTestId('reset-password-invalid-link')).toHaveFocus();
     expect(replaceMock).toHaveBeenCalledWith('/reset-password');
-    expect(document.body.textContent).not.toContain('opaque-secret-token');
+    expect(document.body.textContent).not.toContain(VALID_RECOVERY_TOKEN);
   });
 
   it('clears terminal invalid-link credentials and cannot reuse the invalid token', async () => {
     mockedApiFetch.mockRejectedValue(new ApiError(400, { detail: 'hostile token detail' }));
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     const password = screen.getByTestId('reset-password-input') as HTMLInputElement;
     const confirmation = screen.getByTestId('reset-password-confirmation') as HTMLInputElement;
     const form = screen.getByTestId('reset-password-form');
@@ -233,16 +234,70 @@ describe('web password recovery', () => {
     expect(password.value).toBe('');
     expect(confirmation.value).toBe('');
     expect(replaceMock).toHaveBeenCalledWith('/reset-password');
-    expect(document.body.textContent).not.toContain('opaque-secret-token');
+    expect(document.body.textContent).not.toContain(VALID_RECOVERY_TOKEN);
     expect(document.body.textContent).not.toContain('hostile token detail');
     fireEvent.submit(form);
     expect(mockedApiFetch).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['short-token', 'x'.repeat(257)])(
+    'terminates malformed token recovery without submitting or retaining credentials',
+    async (malformedToken) => {
+      const hostile = 'SQLSTATE 23505 token=internal-secret stack /srv/app.py:99';
+      mockedApiFetch.mockRejectedValue(new ApiError(422, { detail: hostile }));
+      render(<ResetPasswordForm initialToken={malformedToken} />);
+      const password = screen.getByTestId('reset-password-input') as HTMLInputElement;
+      const confirmation = screen.getByTestId('reset-password-confirmation') as HTMLInputElement;
+      const form = screen.getByTestId('reset-password-form');
+      fireEvent.change(password, { target: { value: 'new-password-one' } });
+      fireEvent.change(confirmation, { target: { value: 'new-password-one' } });
+      fireEvent.submit(form);
+
+      await waitFor(() => expect(screen.getByTestId('reset-password-invalid-link')).toBeVisible());
+      expect(screen.getByTestId('reset-password-invalid-link')).toHaveTextContent(
+        'Invalid or expired recovery link.',
+      );
+      expect(password.value).toBe('');
+      expect(confirmation.value).toBe('');
+      expect(replaceMock).toHaveBeenCalledWith('/reset-password');
+      expect(document.body.textContent).not.toContain(malformedToken);
+      expect(document.body.textContent).not.toContain(hostile);
+      expect(mockedApiFetch).not.toHaveBeenCalled();
+      fireEvent.submit(form);
+      expect(mockedApiFetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([32, 256])(
+    'allows a %i-character token through to the backend authority',
+    async (tokenLength) => {
+      const boundaryToken = 'x'.repeat(tokenLength);
+      mockedApiFetch.mockRejectedValue(
+        new ApiError(503, { detail: 'backend remains authoritative' }),
+      );
+      render(<ResetPasswordForm initialToken={boundaryToken} />);
+      fireEvent.change(screen.getByTestId('reset-password-input'), {
+        target: { value: 'new-password-one' },
+      });
+      fireEvent.change(screen.getByTestId('reset-password-confirmation'), {
+        target: { value: 'new-password-one' },
+      });
+      fireEvent.submit(screen.getByTestId('reset-password-form'));
+
+      await waitFor(() =>
+        expect(mockedApiFetch).toHaveBeenCalledWith('/v1/auth/recovery/reset', {
+          method: 'POST',
+          body: JSON.stringify({ token: boundaryToken, new_password: 'new-password-one' }),
+        }),
+      );
+      expect(screen.queryByTestId('reset-password-invalid-link')).not.toBeInTheDocument();
+    },
+  );
+
   it('uses bounded 422 copy, rejects hostile detail, associates the field, and focuses it', async () => {
     const hostile = 'SQLSTATE 23505 token=opaque-secret-token stack /srv/app.py:99';
     mockedApiFetch.mockRejectedValue(new ApiError(422, { detail: hostile }));
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     fireEvent.change(screen.getByTestId('reset-password-input'), {
       target: { value: 'new-password-one' },
     });
@@ -261,14 +316,14 @@ describe('web password recovery', () => {
     );
     expect(screen.getByTestId('reset-password-input')).toHaveAttribute('aria-invalid', 'true');
     expect(document.body.textContent).not.toContain(hostile);
-    expect(document.body.textContent).not.toContain('opaque-secret-token');
+    expect(document.body.textContent).not.toContain(VALID_RECOVERY_TOKEN);
   });
 
   it('focuses bounded reset server errors and unlocks for retry', async () => {
     mockedApiFetch
       .mockRejectedValueOnce(new ApiError(503, { detail: 'internal stack' }))
       .mockResolvedValueOnce({ message: 'ok' });
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     fireEvent.change(screen.getByTestId('reset-password-input'), {
       target: { value: 'new-password-one' },
     });
@@ -288,7 +343,7 @@ describe('web password recovery', () => {
   it('allows one reset request per pending window across submit and button activation', async () => {
     const first = deferred<{ message: string }>();
     mockedApiFetch.mockReturnValueOnce(first.promise);
-    render(<ResetPasswordForm initialToken="opaque-secret-token" />);
+    render(<ResetPasswordForm initialToken={VALID_RECOVERY_TOKEN} />);
     fireEvent.change(screen.getByTestId('reset-password-input'), {
       target: { value: 'new-password-one' },
     });

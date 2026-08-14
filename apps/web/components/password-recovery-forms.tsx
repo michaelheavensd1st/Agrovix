@@ -11,6 +11,8 @@ interface MessageResponse {
 
 const GENERIC_REQUEST_MESSAGE =
   'If an eligible account exists, password recovery instructions will be sent.';
+const RECOVERY_TOKEN_MIN_LENGTH = 32;
+const RECOVERY_TOKEN_MAX_LENGTH = 256;
 
 function operationalError(error: unknown): string {
   if (error instanceof ApiError && error.status === 429) {
@@ -159,6 +161,17 @@ export function ResetPasswordForm({ initialToken }: { initialToken: string | nul
     const form = new FormData(event.currentTarget);
     const newPassword = String(form.get('new_password') ?? '');
     const confirmation = String(form.get('confirm_password') ?? '');
+    const normalizedTokenLength = token.trim().length;
+    if (
+      normalizedTokenLength < RECOVERY_TOKEN_MIN_LENGTH ||
+      normalizedTokenLength > RECOVERY_TOKEN_MAX_LENGTH
+    ) {
+      formRef.current?.reset();
+      setToken('');
+      setTerminalState('invalid');
+      router.replace('/reset-password');
+      return;
+    }
     if (newPassword !== confirmation) {
       setError('Passwords do not match.');
       setErrorTarget('confirmation');
