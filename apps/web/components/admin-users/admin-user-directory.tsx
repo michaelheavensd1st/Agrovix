@@ -58,6 +58,14 @@ export function AdminUserDirectory() {
     void apiFetch<AdminUserPage>(adminUserDirectoryPath(query))
       .then((result) => {
         if (!isCurrent()) return;
+        if (query.offset > 0 && result.items.length === 0 && result.total > 0) {
+          const nearestValidOffset =
+            Math.floor((result.total - 1) / ADMIN_USER_PAGE_LIMIT) * ADMIN_USER_PAGE_LIMIT;
+          if (nearestValidOffset !== query.offset) {
+            router.replace(directoryHref({ ...query, offset: nearestValidOffset }));
+            return;
+          }
+        }
         setPage(result);
       })
       .catch((requestError: unknown) => {

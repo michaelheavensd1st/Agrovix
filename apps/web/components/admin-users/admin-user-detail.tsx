@@ -70,9 +70,7 @@ export function AdminUserDetail({ userId }: { userId: string }) {
       setCurrentUser(null);
       setUser(null);
       if (requestError instanceof ApiError && requestError.status === 401) {
-        router.push(
-          `/login?returnTo=${encodeURIComponent(`/admin/users/${userId}?returnTo=${encodeURIComponent(returnTo)}`)}`,
-        );
+        router.push(`/login?returnTo=${encodeURIComponent(`/admin/users/${userId}`)}`);
       } else if (requestError instanceof ApiError && requestError.status === 403) {
         setForbidden(true);
       } else if (requestError instanceof ApiError && requestError.status === 404) {
@@ -83,7 +81,7 @@ export function AdminUserDetail({ userId }: { userId: string }) {
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [returnTo, router, userId]);
+  }, [router, userId]);
 
   useEffect(() => {
     void load();
@@ -157,7 +155,7 @@ export function AdminUserDetail({ userId }: { userId: string }) {
       return { ok: true };
     } catch (requestError) {
       if (requestError instanceof ApiError && requestError.status === 401) {
-        router.push('/login');
+        router.push(`/login?returnTo=${encodeURIComponent(`/admin/users/${capturedUserId}`)}`);
         return { ok: false, message: 'Your session has expired.' };
       }
       if (requestError instanceof ApiError && requestError.status === 404) {

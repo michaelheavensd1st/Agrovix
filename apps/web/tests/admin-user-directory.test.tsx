@@ -147,6 +147,47 @@ describe('Sprint 5.6 admin user directory', () => {
     );
   });
 
+  it('recovers an out-of-range page to the nearest valid offset with filters intact', async () => {
+    window.history.replaceState(
+      {},
+      '',
+      '/admin/users?search=Ada&status=disabled&verified=false&offset=150',
+    );
+    mockedApiFetch
+      .mockResolvedValueOnce(page([], 51, 150))
+      .mockResolvedValueOnce(page([user('last')], 51, 50));
+    render(<AdminUserDirectory />);
+    await waitFor(() =>
+      expect(routerReplace).toHaveBeenCalledWith(
+        '/admin/users?search=Ada&status=disabled&verified=false&offset=50',
+      ),
+    );
+    expect(await screen.findByText('last@example.test')).toBeVisible();
+  });
+
+  it('does not redirect an exact final valid page', async () => {
+    window.history.replaceState({}, '', '/admin/users?offset=50');
+    mockedApiFetch.mockResolvedValue(page([user('last')], 51, 50));
+    render(<AdminUserDirectory />);
+    expect(await screen.findByText('Showing 51–51 of 51')).toBeVisible();
+    expect(routerReplace).not.toHaveBeenCalled();
+  });
+
+  it('does not let a stale empty page trigger recovery navigation', async () => {
+    window.history.replaceState({}, '', '/admin/users?offset=100');
+    const stale = deferred<AdminUserPage>();
+    mockedApiFetch
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce(page([user('active')], 1, 0));
+    render(<AdminUserDirectory />);
+    fireEvent.change(screen.getByLabelText('Account status'), { target: { value: 'active' } });
+    expect(await screen.findByText('active@example.test')).toBeVisible();
+    routerReplace.mockClear();
+    await act(async () => stale.resolve(page([], 51, 100)));
+    expect(routerReplace).not.toHaveBeenCalled();
+    expect(screen.getByText('active@example.test')).toBeVisible();
+  });
+
   it('renders distinct no-results and authorization states without backend detail', async () => {
     window.history.replaceState({}, '', '/admin/users?search=missing');
     mockedApiFetch.mockResolvedValueOnce(page([]));

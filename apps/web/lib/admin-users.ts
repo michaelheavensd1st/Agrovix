@@ -87,3 +87,53 @@ export function directoryHref(query: AdminUserDirectoryQuery): string {
   const encoded = params.toString();
   return encoded ? `/admin/users?${encoded}` : '/admin/users';
 }
+
+const ADMIN_USER_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DIRECTORY_QUERY_KEYS = new Set(['search', 'status', 'verified', 'offset']);
+
+export function safeAdminReturnTo(raw: string | null | undefined): string | null {
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\')) return null;
+  try {
+    decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+
+  let destination: URL;
+  try {
+    destination = new URL(raw, 'https://agrovix.internal');
+  } catch {
+    return null;
+  }
+  if (destination.origin !== 'https://agrovix.internal' || destination.hash) return null;
+
+  if (destination.pathname === '/admin/users') {
+    const keys = Array.from(destination.searchParams.keys());
+    if (keys.some((key, index) => !DIRECTORY_QUERY_KEYS.has(key) || keys.indexOf(key) !== index)) {
+      return null;
+    }
+    const search = destination.searchParams.get('search') ?? '';
+    const status = destination.searchParams.get('status');
+    const verified = destination.searchParams.get('verified');
+    const offsetRaw = destination.searchParams.get('offset');
+    const offset = offsetRaw === null || /^\d+$/.test(offsetRaw) ? Number(offsetRaw ?? 0) : NaN;
+    if (search.length > 255) return null;
+    if (status !== null && status !== 'active' && status !== 'disabled') return null;
+    if (verified !== null && verified !== 'true' && verified !== 'false') return null;
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset % ADMIN_USER_PAGE_LIMIT !== 0) {
+      return null;
+    }
+    return directoryHref({
+      search,
+      status: status ?? '',
+      verified: verified ?? '',
+      offset,
+    });
+  }
+
+  const detailMatch = destination.pathname.match(/^\/admin\/users\/([^/]+)$/);
+  if (detailMatch && ADMIN_USER_ID_PATTERN.test(detailMatch[1]) && destination.search === '') {
+    return destination.pathname;
+  }
+  return null;
+}

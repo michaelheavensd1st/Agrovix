@@ -220,6 +220,36 @@ describe('Sprint 5.6 admin user detail and actions', () => {
     expect(document.body.textContent).not.toContain('SQLSTATE');
   });
 
+  it('terminates an unauthorized mutation without replay and returns only navigation context', async () => {
+    const targetId = '11111111-1111-4111-8111-111111111111';
+    const targetUser = target({ id: targetId });
+    mockedApiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (path === '/v1/auth/me') return Promise.resolve(VIEWER as never);
+      if (path === `/v1/admin/users/${targetId}` && !init?.method) {
+        return Promise.resolve(targetUser as never);
+      }
+      if (path === `/v1/admin/users/${targetId}/disable`) {
+        return Promise.reject(new ApiError(401, { detail: 'expired' }));
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    render(<AdminUserDetail userId={targetId} />);
+    fireEvent.click(await screen.findByTestId('admin-disable-user'));
+    fireEvent.change(screen.getByLabelText(/administrative reason/i), {
+      target: { value: 'Fresh confirmation only' },
+    });
+    fireEvent.click(screen.getByTestId('admin-user-action-confirm'));
+    expect(await screen.findByTestId('admin-action-error')).toHaveTextContent(
+      'Your session has expired.',
+    );
+    expect(
+      mockedApiFetch.mock.calls.filter(([path]) => path === `/v1/admin/users/${targetId}/disable`),
+    ).toHaveLength(1);
+    expect(routerPush).toHaveBeenCalledWith(
+      `/login?returnTo=${encodeURIComponent(`/admin/users/${targetId}`)}`,
+    );
+  });
+
   it('traps focus, closes with Escape, and restores focus to the action trigger', async () => {
     bootstrap();
     render(<AdminUserDetail userId="target-1" />);
