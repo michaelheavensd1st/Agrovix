@@ -4,9 +4,10 @@ import { AuthForm } from '@/components/auth-form';
 export default function LoginPage({
   searchParams,
 }: {
-  searchParams?: { 'password-reset'?: string };
+  searchParams?: { 'password-reset'?: string; returnTo?: string | string[] };
 }) {
   const passwordReset = searchParams?.['password-reset'] === 'success';
+  const returnTo = typeof searchParams?.returnTo === 'string' ? searchParams.returnTo : null;
   return (
     <main
       className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12"
@@ -23,7 +24,7 @@ export default function LoginPage({
           Password reset successful. Sign in with your new password.
         </p>
       )}
-      <AuthForm mode="login" />
+      <AuthForm mode="login" returnTo={returnTo} />
       <Link
         href="/forgot-password"
         data-testid="login-forgot-password-link"
