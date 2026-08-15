@@ -54,7 +54,7 @@ def _kernel(session) -> PasswordRecoveryKernel:
 async def _seed_user() -> UUID:
     async with db.AsyncSessionLocal() as session:
         user = User(
-            email=f"recovery-race-{uuid4().hex}@example.test",
+            email=f"recovery-race-{uuid4().hex}@agrovix.dev",
             hashed_password="not-used-in-sprint-5.1",
             is_active=True,
             is_verified=True,
