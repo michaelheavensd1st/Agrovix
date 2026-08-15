@@ -1,8 +1,13 @@
 import Link from 'next/link';
 import { ResetPasswordForm } from '@/components/password-recovery-forms';
 
-export default function ResetPasswordPage({ searchParams }: { searchParams: { token?: string } }) {
-  const token = typeof searchParams?.token === 'string' ? searchParams.token : null;
+export default async function ResetPasswordPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ token?: string }>;
+}) {
+  const resolvedSearchParams = await searchParams;
+  const token = typeof resolvedSearchParams?.token === 'string' ? resolvedSearchParams.token : null;
   return (
     <main
       className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12"

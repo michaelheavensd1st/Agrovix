@@ -1,13 +1,15 @@
 import Link from 'next/link';
 import { AuthForm } from '@/components/auth-form';
 
-export default function LoginPage({
+export default async function LoginPage({
   searchParams,
 }: {
-  searchParams?: { 'password-reset'?: string; returnTo?: string | string[] };
+  searchParams?: Promise<{ 'password-reset'?: string; returnTo?: string | string[] }>;
 }) {
-  const passwordReset = searchParams?.['password-reset'] === 'success';
-  const returnTo = typeof searchParams?.returnTo === 'string' ? searchParams.returnTo : null;
+  const resolvedSearchParams = await searchParams;
+  const passwordReset = resolvedSearchParams?.['password-reset'] === 'success';
+  const returnTo =
+    typeof resolvedSearchParams?.returnTo === 'string' ? resolvedSearchParams.returnTo : null;
   return (
     <main
       className="mx-auto flex min-h-screen max-w-md flex-col justify-center px-6 py-12"
