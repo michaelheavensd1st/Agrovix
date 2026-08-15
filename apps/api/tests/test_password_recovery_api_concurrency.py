@@ -70,7 +70,7 @@ async def _seed() -> tuple[UUID, str, str]:
     password = "Original-Password!2026"
     async with db.AsyncSessionLocal() as session:
         user = User(
-            email=f"recovery-race-api-{uuid4().hex}@example.test",
+            email=f"recovery-race-api-{uuid4().hex}@agrovix.dev",
             hashed_password=hash_password(password),
             is_active=True,
             is_verified=True,
