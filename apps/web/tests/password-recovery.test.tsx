@@ -43,16 +43,16 @@ describe('web password recovery', () => {
     replaceMock.mockReset();
   });
 
-  it('links the login page to public password recovery', () => {
-    render(<LoginPage searchParams={{}} />);
+  it('links the login page to public password recovery', async () => {
+    render(await LoginPage({ searchParams: Promise.resolve({}) }));
     expect(screen.getByTestId('login-forgot-password-link')).toHaveAttribute(
       'href',
       '/forgot-password',
     );
   });
 
-  it('confirms reset completion on the token-free login route', () => {
-    render(<LoginPage searchParams={{ 'password-reset': 'success' }} />);
+  it('confirms reset completion on the token-free login route', async () => {
+    render(await LoginPage({ searchParams: Promise.resolve({ 'password-reset': 'success' }) }));
     expect(screen.getByTestId('password-reset-success')).toHaveTextContent(
       'Password reset successful. Sign in with your new password.',
     );
