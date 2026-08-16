@@ -10,13 +10,15 @@ scripts/dev/status.sh
 # → http://localhost:3000
 ```
 
-Run these commands from the repository root. The browser calls `/api-proxy`, and the Next.js
-server forwards requests to `http://api:8000/api` over the Compose network. This preserves
-same-origin HTTP-only cookies and removes any normal browser dependency on port 8000.
+Run these commands from the repository root. The browser calls `/api-proxy/v1/...`, and the
+server-side Next.js Route Handler forwards requests to `${API_PROXY_TARGET}/api/v1/...`. Compose
+sets `API_PROXY_TARGET=http://api:8000`, so traffic reaches FastAPI over the Compose network. This
+preserves same-origin HTTP-only cookies and removes any normal browser dependency on port 8000.
 
 For optional host-only Next.js development, use `pnpm dev:web`. The default proxy target is
-`http://127.0.0.1:8000`; override it with `API_PROXY_TARGET` if the API is elsewhere. Do not add
-`/api` to the target—the rewrite supplies that path.
+`http://127.0.0.1:8000`; override it with the server-only `API_PROXY_TARGET` if the API is
+elsewhere. The target must be an absolute HTTP(S) origin only. Do not add `/api` or another path;
+the Route Handler supplies `/api`.
 
 Useful runtime commands:
 

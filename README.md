@@ -127,7 +127,8 @@ scripts/dev/status.sh
 Docker Compose supervises PostgreSQL, Redis, FastAPI, and Next.js. The commands are the same
 inside Codespaces; no custom Codespaces lifecycle hook or foreground terminal must remain open.
 Normal browser traffic uses <http://localhost:3000>. API requests stay on that origin under
-`/api-proxy` and are forwarded by Next.js to FastAPI over the Compose network.
+`/api-proxy/v1/...` and a server-side Next.js Route Handler forwards them to
+`${API_PROXY_TARGET}/api/v1/...` over the Compose network.
 
 On a new database, `start.sh` reports pending migrations without applying them. Apply them
 explicitly, then inspect readiness again:
@@ -292,9 +293,11 @@ CSS, and shadcn/ui. Sprint 0 ships the following pages:
 | `*`          | `app/not-found.tsx`             | Custom 404                      |
 
 State + API interaction is handled through a thin `lib/api.ts` client. Its default
-`NEXT_PUBLIC_API_URL=/api-proxy` keeps cookies and requests on the web origin. Host-only Next.js
-uses `API_PROXY_TARGET=http://127.0.0.1:8000`; Compose overrides the target to
-`http://api:8000`.
+`NEXT_PUBLIC_API_URL=/api-proxy` keeps cookies and requests on the web origin. The server-side
+Route Handler maps browser `/api-proxy/v1/...` requests to `${API_PROXY_TARGET}/api/v1/...`.
+Host-only Next.js uses `API_PROXY_TARGET=http://127.0.0.1:8000`; Compose overrides the target to
+`http://api:8000`. `API_PROXY_TARGET` is server-only and must contain only the HTTP(S) upstream
+origin, without `/api` or another path.
 
 ## Mobile (Expo / React Native) Details
 
