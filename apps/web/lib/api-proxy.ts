@@ -1,5 +1,3 @@
-const DEFAULT_PROXY_TARGET = 'http://127.0.0.1:8000';
-
 const REQUEST_HEADER_ALLOWLIST = new Set([
   'accept',
   'accept-encoding',
@@ -38,9 +36,132 @@ const ENCODED_PATH_SEPARATOR = /%(?:2f|5c)/i;
 
 type RouteContext = { params: Promise<{ path?: string[] }> };
 type HeadersWithSetCookie = Headers & { getSetCookie?: () => string[] };
+type DiagnosticCategory =
+  | 'dns_resolution'
+  | 'connection_refused'
+  | 'network_unreachable'
+  | 'tls_handshake'
+  | 'timeout'
+  | 'other';
+
+const SAFE_ERROR_NAMES = new Set(['AbortError', 'Error', 'TimeoutError', 'TypeError']);
+const SAFE_ERROR_CODES = new Set([
+  'CERT_HAS_EXPIRED',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENOTFOUND',
+  'ETIMEDOUT',
+  'ERR_TLS_CERT_ALTNAME_INVALID',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+type ErrorRecord = Record<string, unknown>;
+
+export type SafeFetchDiagnostic = {
+  event: 'api_proxy.fetch_failed';
+  targetConfigured: true;
+  category: DiagnosticCategory;
+  errorName: string;
+  errorCode?: string;
+  causeCode?: string;
+  syscallCategory?: 'dns' | 'connect' | 'read' | 'write' | 'other';
+};
+
+function record(value: unknown): ErrorRecord | undefined {
+  return typeof value === 'object' && value !== null ? (value as ErrorRecord) : undefined;
+}
+
+function safeProperty(value: unknown, property: string): unknown {
+  try {
+    return record(value)?.[property];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeCode(value: unknown): string | undefined {
+  const code = safeProperty(value, 'code');
+  return typeof code === 'string' && SAFE_ERROR_CODES.has(code) ? code : undefined;
+}
+
+function nestedErrors(value: unknown): unknown[] {
+  const errors = safeProperty(value, 'errors');
+  return Array.isArray(errors) ? errors.slice(0, 8) : [];
+}
+
+function categoryFor(codes: Array<string | undefined>, errorName: string): DiagnosticCategory {
+  if (codes.includes('ENOTFOUND')) return 'dns_resolution';
+  if (codes.includes('ECONNREFUSED')) return 'connection_refused';
+  if (codes.some((code) => code === 'ENETUNREACH' || code === 'EHOSTUNREACH')) {
+    return 'network_unreachable';
+  }
+  if (
+    codes.some(
+      (code) =>
+        code?.includes('CERT') ||
+        code?.includes('TLS') ||
+        code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+        code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+    )
+  ) {
+    return 'tls_handshake';
+  }
+  if (
+    errorName === 'AbortError' ||
+    errorName === 'TimeoutError' ||
+    codes.some((code) => code === 'ETIMEDOUT' || code?.includes('TIMEOUT'))
+  ) {
+    return 'timeout';
+  }
+  return 'other';
+}
+
+function safeSyscallCategory(value: unknown): SafeFetchDiagnostic['syscallCategory'] {
+  const syscall = safeProperty(value, 'syscall');
+  if (typeof syscall !== 'string') return undefined;
+  if (syscall === 'getaddrinfo' || syscall === 'getnameinfo') return 'dns';
+  if (syscall === 'connect') return 'connect';
+  if (syscall === 'read') return 'read';
+  if (syscall === 'write') return 'write';
+  return 'other';
+}
+
+export function safeFetchDiagnostic(error: unknown): SafeFetchDiagnostic {
+  const rawName = safeProperty(error, 'name');
+  const errorName =
+    typeof rawName === 'string' && SAFE_ERROR_NAMES.has(rawName) ? rawName : 'OtherError';
+  const cause = safeProperty(error, 'cause');
+  const candidates = [cause, ...nestedErrors(cause)];
+  const errorCode = safeCode(error);
+  const causeCode = candidates.map(safeCode).find((code) => code !== undefined);
+  const syscallCategory = candidates
+    .map(safeSyscallCategory)
+    .find((category) => category !== undefined);
+
+  return {
+    event: 'api_proxy.fetch_failed',
+    targetConfigured: true,
+    category: categoryFor(
+      [errorCode, ...candidates.map(safeCode)],
+      errorName,
+    ),
+    errorName,
+    ...(errorCode ? { errorCode } : {}),
+    ...(causeCode ? { causeCode } : {}),
+    ...(syscallCategory ? { syscallCategory } : {}),
+  };
+}
 
 export function normalizeProxyTarget(rawTarget: string | undefined): string {
-  const configured = rawTarget === undefined ? DEFAULT_PROXY_TARGET : rawTarget;
+  const configured = rawTarget;
   if (!configured || configured.trim() !== configured) {
     throw new Error(
       'API_PROXY_TARGET must be a non-empty absolute HTTP(S) origin without whitespace.',
@@ -139,11 +260,17 @@ function rewriteLocation(location: string, upstream: URL, targetOrigin: string):
 }
 
 export async function proxyApiRequest(request: Request, context: RouteContext): Promise<Response> {
+  const rawTarget = process.env.API_PROXY_TARGET;
+  if (rawTarget === undefined) {
+    console.error({ event: 'api_proxy.configuration_missing', targetConfigured: false });
+    return Response.json({ detail: 'Upstream API unavailable.' }, { status: 502 });
+  }
+
   let upstream: URL;
   let targetOrigin: string;
   try {
     const { path = [] } = await context.params;
-    targetOrigin = normalizeProxyTarget(process.env.API_PROXY_TARGET);
+    targetOrigin = normalizeProxyTarget(rawTarget);
     upstream = buildUpstreamUrl(request, path, targetOrigin);
   } catch {
     return Response.json({ detail: 'Invalid API proxy configuration or path.' }, { status: 400 });
@@ -161,7 +288,8 @@ export async function proxyApiRequest(request: Request, context: RouteContext): 
       redirect: 'manual',
       ...(hasBody ? { duplex: 'half' as const } : {}),
     });
-  } catch {
+  } catch (error) {
+    console.error(safeFetchDiagnostic(error));
     return Response.json({ detail: 'Upstream API unavailable.' }, { status: 502 });
   }
 

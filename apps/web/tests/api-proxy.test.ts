@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { buildUpstreamUrl, normalizeProxyTarget, proxyApiRequest } from '@/lib/api-proxy';
+import {
+  buildUpstreamUrl,
+  normalizeProxyTarget,
+  proxyApiRequest,
+  safeFetchDiagnostic,
+} from '@/lib/api-proxy';
 
 const TARGET = 'https://api.example.test';
 
@@ -29,7 +34,6 @@ function responseCookies(response: Response): string[] {
 
 describe('API proxy target and path validation', () => {
   it.each([
-    [undefined, 'http://127.0.0.1:8000'],
     ['http://api:8000/', 'http://api:8000'],
     ['http://api:8000///', 'http://api:8000'],
     [TARGET, TARGET],
@@ -39,6 +43,7 @@ describe('API proxy target and path validation', () => {
 
   it.each([
     '',
+    undefined,
     '   ',
     ' https://api.example.test',
     '/api',
@@ -82,6 +87,7 @@ describe('API proxy target and path validation', () => {
 
 describe('API proxy transport', () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     delete process.env.API_PROXY_TARGET;
   });
@@ -231,11 +237,68 @@ describe('API proxy transport', () => {
 
   it('returns a sanitized 502 when the upstream transport fails', async () => {
     process.env.API_PROXY_TARGET = TARGET;
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('getaddrinfo ENOTFOUND secret')));
+    const error = new TypeError('fetch failed for https://secret.example/token');
+    Object.defineProperty(error, 'cause', {
+      value: Object.assign(new Error('getaddrinfo exposed.example'), {
+        code: 'ENOTFOUND',
+        syscall: 'getaddrinfo',
+      }),
+    });
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(error));
     const response = await proxyApiRequest(request(), context(['v1', 'items']));
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({ detail: 'Upstream API unavailable.' });
+    expect(diagnostic).toHaveBeenCalledWith({
+      event: 'api_proxy.fetch_failed',
+      targetConfigured: true,
+      category: 'dns_resolution',
+      errorName: 'TypeError',
+      causeCode: 'ENOTFOUND',
+      syscallCategory: 'dns',
+    });
   });
+
+  it('fails closed when API_PROXY_TARGET is missing without attempting localhost', async () => {
+    const fetchMock = vi.fn();
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const response = await proxyApiRequest(request(), context(['v1', 'items']));
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ detail: 'Upstream API unavailable.' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(diagnostic).toHaveBeenCalledWith({
+      event: 'api_proxy.configuration_missing',
+      targetConfigured: false,
+    });
+  });
+
+  it.each([
+    ['ENOTFOUND', 'getaddrinfo', 'dns_resolution', 'dns'],
+    ['ECONNREFUSED', 'connect', 'connection_refused', 'connect'],
+    ['ENETUNREACH', 'connect', 'network_unreachable', 'connect'],
+    ['ERR_TLS_CERT_ALTNAME_INVALID', undefined, 'tls_handshake', undefined],
+    ['UND_ERR_CONNECT_TIMEOUT', 'connect', 'timeout', 'connect'],
+    ['UNSAFE_https://secret.example/token', 'unsafe-secret', 'other', 'other'],
+  ])(
+    'classifies %s without exposing messages or unsafe metadata',
+    (code, syscall, category, expectedSyscall) => {
+      const error = Object.assign(new TypeError('https://secret.example/token?credential=secret'), {
+        cause: Object.assign(new Error('secret upstream message'), { code, syscall }),
+      });
+      const diagnostic = safeFetchDiagnostic(error);
+      const serialized = JSON.stringify(diagnostic);
+
+      expect(diagnostic.category).toBe(category);
+      expect(diagnostic.syscallCategory).toBe(expectedSyscall);
+      expect(serialized).not.toContain('secret.example');
+      expect(serialized).not.toContain('credential');
+      expect(serialized).not.toContain('unsafe-secret');
+      expect(serialized).not.toContain('UNSAFE_');
+    },
+  );
 
   it('rejects malformed paths before making an upstream request', async () => {
     process.env.API_PROXY_TARGET = TARGET;
