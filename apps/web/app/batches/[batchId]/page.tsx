@@ -27,6 +27,7 @@ import {
   FeedingForm,
   MortalityForm,
   StockingForm,
+  TransferEventForm,
   useEventCatalog,
 } from '@/components/event-forms';
 
@@ -326,7 +327,18 @@ export default function BatchDetailPage() {
                 onUnauthenticated={() => router.push('/login')}
               />
             )}
-            {picker.kind === 'catalog' && (
+            {picker.kind === 'catalog' && picker.entry.code === 'TRANSFER' && unit && farm && (
+              <TransferEventForm
+                batchId={batchId}
+                entry={picker.entry}
+                farmId={farm.id}
+                sourceUnit={unit}
+                onCreated={onEventCreated}
+                onCancel={() => setPicker({ kind: 'idle' })}
+                onUnauthenticated={() => router.push('/login')}
+              />
+            )}
+            {picker.kind === 'catalog' && picker.entry.code !== 'TRANSFER' && (
               <CatalogEventForm
                 batchId={batchId}
                 entry={picker.entry}

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 
 vi.mock('next/navigation', () => ({
@@ -11,11 +11,25 @@ vi.mock('@/lib/api', async () => {
   return { ...actual, apiFetch: vi.fn() };
 });
 vi.mock('@/components/event-forms', () => ({
-  CatalogEventForm: () => null,
+  CatalogEventForm: () => <div data-testid="catalog-event-form-mock" />,
   FeedingForm: () => null,
   MortalityForm: () => null,
   StockingForm: () => null,
-  useEventCatalog: () => [],
+  TransferEventForm: ({ sourceUnit }: { sourceUnit: { code: string } }) => (
+    <div data-testid="transfer-event-form-mock">{sourceUnit.code}</div>
+  ),
+  useEventCatalog: () => [
+    {
+      code: 'TRANSFER',
+      display_name: 'Transfer',
+      category: 'operations',
+      version: 2,
+      triggers_transition_to: null,
+      schema: {},
+      metadata: {},
+      openapi_example: null,
+    },
+  ],
 }));
 
 import BatchDetailPage from '@/app/batches/[batchId]/page';
@@ -123,5 +137,9 @@ describe('Batch event timeline', () => {
     await waitFor(() => expect(row).toHaveTextContent('→ 125 ind.'));
     expect(row).not.toHaveTextContent(DESTINATION_UUID);
     expect(row).not.toHaveTextContent(DESTINATION_UUID.slice(0, 8));
+
+    fireEvent.click(screen.getByTestId('record-TRANSFER'));
+    expect(screen.getByTestId('transfer-event-form-mock')).toHaveTextContent('SRC-01');
+    expect(screen.queryByTestId('catalog-event-form-mock')).not.toBeInTheDocument();
   });
 });
