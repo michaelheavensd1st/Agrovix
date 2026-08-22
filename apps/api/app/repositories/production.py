@@ -22,7 +22,9 @@ from app.models.production import (
     ProductionBatchTransition,
     ProductionEvent,
     ProductionSite,
+    ProductionSiteStatus,
     ProductionUnit,
+    ProductionUnitStatus,
     ProductionUnitType,
 )
 
@@ -186,6 +188,49 @@ class ProductionUnitRepository:
             .order_by(ProductionUnit.name.asc())
         )
         return (await self.session.execute(stmt)).scalars().all()
+
+    async def list_eligible_transfer_destinations(
+        self, *, farm_id: uuid.UUID, exclude_unit_id: uuid.UUID
+    ) -> Sequence[tuple[ProductionUnit, ProductionSite]]:
+        """Return active transfer destinations inside an authoritative farm scope."""
+        stmt = (
+            select(ProductionUnit, ProductionSite)
+            .join(ProductionSite, ProductionSite.id == ProductionUnit.site_id)
+            .where(
+                ProductionSite.farm_id == farm_id,
+                ProductionSite.deleted_at.is_(None),
+                ProductionSite.status == ProductionSiteStatus.ACTIVE,
+                ProductionUnit.id != exclude_unit_id,
+                ProductionUnit.deleted_at.is_(None),
+                ProductionUnit.status == ProductionUnitStatus.ACTIVE,
+            )
+            .order_by(
+                ProductionSite.code.asc(),
+                ProductionUnit.code.asc(),
+                ProductionUnit.name.asc(),
+            )
+        )
+        return (await self.session.execute(stmt)).all()
+
+    async def get_eligible_transfer_destination(
+        self, *, unit_id: uuid.UUID, farm_id: uuid.UUID, exclude_unit_id: uuid.UUID
+    ) -> tuple[ProductionUnit, ProductionSite] | None:
+        """Resolve one destination without looking outside the authoritative farm."""
+        stmt = (
+            select(ProductionUnit, ProductionSite)
+            .join(ProductionSite, ProductionSite.id == ProductionUnit.site_id)
+            .where(
+                ProductionUnit.id == unit_id,
+                ProductionSite.farm_id == farm_id,
+                ProductionSite.deleted_at.is_(None),
+                ProductionSite.status == ProductionSiteStatus.ACTIVE,
+                ProductionUnit.id != exclude_unit_id,
+                ProductionUnit.deleted_at.is_(None),
+                ProductionUnit.status == ProductionUnitStatus.ACTIVE,
+            )
+        )
+        row = (await self.session.execute(stmt)).one_or_none()
+        return (row[0], row[1]) if row is not None else None
 
     async def soft_delete(self, unit: ProductionUnit) -> None:
         now = datetime.now(UTC)

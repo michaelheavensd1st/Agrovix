@@ -13,13 +13,7 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { ApiError, apiFetch, apiFetchResult } from '@/lib/api';
 import { parseApiErrors } from '@/lib/api-errors';
-import { mapWithConcurrency } from '@/lib/inventory-items';
-import type {
-  EventCatalogEntry,
-  ProductionEvent,
-  ProductionSite,
-  ProductionUnit,
-} from '@/lib/types';
+import type { EventCatalogEntry, ProductionEvent, ProductionUnit } from '@/lib/types';
 import type {
   DashboardInventoryItem,
   DashboardLot,
@@ -43,7 +37,6 @@ interface CatalogFormProps {
 }
 
 interface TransferFormProps extends CatalogFormProps {
-  farmId: string;
   sourceUnit: ProductionUnit;
 }
 
@@ -745,7 +738,6 @@ function safeTransferMessage(message: string): string {
 export function TransferEventForm({
   batchId,
   entry,
-  farmId,
   sourceUnit,
   onCreated,
   onCancel,
@@ -784,40 +776,25 @@ export function TransferEventForm({
       setDestinations([]);
       setDestinationId('');
       try {
-        const sites = await apiFetch<ProductionSite[]>(`/v1/farms/${farmId}/sites`);
-        const eligibleSites = sites.filter((site) => site.status === 'active' && !site.deleted_at);
-        const settled = await mapWithConcurrency(eligibleSites, 5, async (site) => ({
-          site,
-          units: await apiFetch<ProductionUnit[]>(`/v1/sites/${site.id}/units`),
-        }));
-        const failed = settled.find(
-          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        const options = await apiFetch<EligibleTransferUnit[]>(
+          `/v1/batches/${batchId}/transfer-destinations`,
         );
-        if (failed) throw failed.reason;
-        const options = settled
-          .flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []))
-          .flatMap(({ site, units }) =>
-            units.flatMap((unit) => {
-              if (unit.id === sourceUnit.id || unit.deleted_at || unit.status !== 'active') {
-                return [];
-              }
-              const unitLabel = unit.name ? `${unit.code} — ${unit.name}` : unit.code;
-              return [{ id: unit.id, label: `${unitLabel} · ${site.code}` }];
-            }),
-          )
-          .sort((a, b) => a.label.localeCompare(b.label));
         if (!cancelled) setDestinations(options);
       } catch (loadError) {
         if (!cancelled) {
           if (loadError instanceof ApiError && loadError.status === 401) {
             onUnauthenticatedRef.current?.();
           }
-          const parsed = parseApiErrors(loadError);
-          setDestinationsError(
-            safeTransferMessage(
-              parsed.generalErrors[0] ?? 'Eligible destination units could not be loaded.',
-            ),
-          );
+          if (loadError instanceof ApiError && loadError.status === 403) {
+            setDestinationsError('You do not have permission to record transfers.');
+          } else {
+            const parsed = parseApiErrors(loadError);
+            setDestinationsError(
+              safeTransferMessage(
+                parsed.generalErrors[0] ?? 'Eligible destination units could not be loaded.',
+              ),
+            );
+          }
           setDestinations([]);
         }
       } finally {
@@ -828,7 +805,7 @@ export function TransferEventForm({
     return () => {
       cancelled = true;
     };
-  }, [farmId, sourceUnit.id]);
+  }, [batchId]);
 
   function descriptionFor(key: string): string | undefined {
     return resolvedSchema(schema, properties[key] ?? {}).description;

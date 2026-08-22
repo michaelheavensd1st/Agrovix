@@ -331,7 +331,6 @@ export default function BatchDetailPage() {
               <TransferEventForm
                 batchId={batchId}
                 entry={picker.entry}
-                farmId={farm.id}
                 sourceUnit={unit}
                 onCreated={onEventCreated}
                 onCancel={() => setPicker({ kind: 'idle' })}
