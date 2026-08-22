@@ -15,7 +15,6 @@ const mockedApiFetch = vi.mocked(apiFetch);
 const mockedApiFetchResult = vi.mocked(apiFetchResult);
 const SOURCE_UUID = '11111111-1111-4111-8111-111111111111';
 const DESTINATION_UUID = '22222222-2222-4222-8222-222222222222';
-const OTHER_DESTINATION_UUID = '33333333-3333-4333-8333-333333333333';
 const CATALOG_SOURCE_UUID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CATALOG_DESTINATION_UUID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const ORIGINAL_TZ = process.env.TZ;
@@ -68,37 +67,10 @@ const TRANSFER: EventCatalogEntry = {
   },
 };
 
-const ACTIVE_SITES = [
-  { id: 'site-1', farm_id: 'farm-1', name: 'Main', code: 'MAIN', status: 'active' },
-  { id: 'site-2', farm_id: 'farm-1', name: 'Grow-out', code: 'GROW', status: 'active' },
-];
-
-function unit(
-  id: string,
-  siteId: string,
-  code: string,
-  name: string,
-  status: ProductionUnit['status'] = 'active',
-  deletedAt?: string,
-): ProductionUnit {
-  return {
-    id,
-    site_id: siteId,
-    unit_type_id: 'type-1',
-    code,
-    name,
-    status,
-    capacity: 1000,
-    deleted_at: deletedAt,
-  };
-}
-
 function mockSuccessfulDiscovery() {
   mockedApiFetch.mockImplementation(async (path) => {
-    if (path === '/v1/farms/farm-1/sites') return ACTIVE_SITES as never;
-    if (path === '/v1/sites/site-1/units') return [SOURCE_UNIT] as never;
-    if (path === '/v1/sites/site-2/units') {
-      return [unit(DESTINATION_UUID, 'site-2', 'P2', 'Grow-out Pond')] as never;
+    if (path === '/v1/batches/batch-1/transfer-destinations') {
+      return [{ id: DESTINATION_UUID, label: 'P2 — Grow-out Pond · GROW' }] as never;
     }
     throw new Error(`Unexpected request: ${path}`);
   });
@@ -109,7 +81,6 @@ function renderTransfer() {
     <TransferEventForm
       batchId="batch-1"
       entry={TRANSFER}
-      farmId="farm-1"
       sourceUnit={SOURCE_UNIT}
       onCreated={() => {}}
       onCancel={() => {}}
@@ -163,61 +134,8 @@ describe('TransferEventForm', () => {
     }
   });
 
-  it('discovers eligible cross-site units and excludes source and unavailable lifecycle states', async () => {
-    mockedApiFetch.mockImplementation(async (path) => {
-      if (path === '/v1/farms/farm-1/sites') {
-        return [
-          ...ACTIVE_SITES,
-          {
-            id: 'site-maintenance',
-            farm_id: 'farm-1',
-            name: 'Maintenance',
-            code: 'MAINT',
-            status: 'maintenance',
-          },
-          {
-            id: 'site-closed',
-            farm_id: 'farm-1',
-            name: 'Closed',
-            code: 'CLOSED',
-            status: 'closed',
-          },
-          {
-            id: 'site-deleted',
-            farm_id: 'farm-1',
-            name: 'Deleted',
-            code: 'DELETED',
-            status: 'active',
-            deleted_at: '2026-08-21T00:00:00Z',
-          },
-        ] as never;
-      }
-      if (path === '/v1/sites/site-1/units') {
-        return [
-          SOURCE_UNIT,
-          unit('44444444-4444-4444-8444-444444444444', 'site-1', 'P3', 'Closed', 'closed'),
-          unit(
-            '55555555-5555-4555-8555-555555555555',
-            'site-1',
-            'P4',
-            'Maintenance',
-            'maintenance',
-          ),
-          unit(
-            '66666666-6666-4666-8666-666666666666',
-            'site-1',
-            'P5',
-            'Deleted',
-            'active',
-            '2026-08-21T00:00:00Z',
-          ),
-        ] as never;
-      }
-      if (path === '/v1/sites/site-2/units') {
-        return [unit(DESTINATION_UUID, 'site-2', 'P2', 'Grow-out Pond')] as never;
-      }
-      throw new Error(`Unexpected request: ${path}`);
-    });
+  it('uses only the batch-scoped server-authoritative destination endpoint', async () => {
+    mockSuccessfulDiscovery();
     renderTransfer();
 
     const select = await screen.findByTestId('transfer-destination-unit');
@@ -226,11 +144,9 @@ describe('TransferEventForm', () => {
       (option) => option.value,
     );
     expect(optionValues).toContain(DESTINATION_UUID);
-    expect(optionValues).not.toContain(SOURCE_UUID);
     expect(optionValues).toHaveLength(2);
-    expect(mockedApiFetch).not.toHaveBeenCalledWith('/v1/sites/site-maintenance/units');
-    expect(mockedApiFetch).not.toHaveBeenCalledWith('/v1/sites/site-closed/units');
-    expect(mockedApiFetch).not.toHaveBeenCalledWith('/v1/sites/site-deleted/units');
+    expect(mockedApiFetch).toHaveBeenCalledTimes(1);
+    expect(mockedApiFetch).toHaveBeenCalledWith('/v1/batches/batch-1/transfer-destinations');
   });
 
   it('submits authoritative unit UUIDs and rejects arbitrary destination text', async () => {
@@ -322,34 +238,31 @@ describe('TransferEventForm', () => {
   });
 
   it('disables submission while loading and shows a safe empty state after successful discovery', async () => {
-    let resolveSites!: (sites: typeof ACTIVE_SITES) => void;
+    let resolveDestinations!: (destinations: []) => void;
     mockedApiFetch.mockImplementation((path) => {
-      if (path === '/v1/farms/farm-1/sites') {
+      if (path === '/v1/batches/batch-1/transfer-destinations') {
         return new Promise((resolve) => {
-          resolveSites = resolve;
+          resolveDestinations = resolve;
         }) as never;
       }
-      if (path.endsWith('/units')) return Promise.resolve([SOURCE_UNIT]) as never;
       return Promise.reject(new Error(`Unexpected request: ${path}`));
     });
     renderTransfer();
     expect(screen.getByTestId('transfer-destinations-loading')).toBeInTheDocument();
     expect(screen.getByTestId('transfer-submit')).toBeDisabled();
 
-    resolveSites(ACTIVE_SITES);
+    resolveDestinations([]);
     expect(await screen.findByTestId('transfer-destinations-empty')).toHaveTextContent(
       'No eligible destination units are available in this farm.',
     );
     expect(screen.getByTestId('transfer-submit')).toBeDisabled();
   });
 
-  it('fails destination discovery closed when any site request fails', async () => {
+  it('fails destination discovery closed when the authoritative request fails', async () => {
     mockedApiFetch.mockImplementation(async (path) => {
-      if (path === '/v1/farms/farm-1/sites') return ACTIVE_SITES as never;
-      if (path === '/v1/sites/site-1/units') {
-        return [unit(OTHER_DESTINATION_UUID, 'site-1', 'P6', 'Partial Result')] as never;
+      if (path === '/v1/batches/batch-1/transfer-destinations') {
+        throw new Error('Network unavailable');
       }
-      if (path === '/v1/sites/site-2/units') throw new Error('Network unavailable');
       throw new Error(`Unexpected request: ${path}`);
     });
     renderTransfer();
@@ -357,7 +270,22 @@ describe('TransferEventForm', () => {
     expect(await screen.findByTestId('transfer-destinations-error')).toHaveTextContent(
       'Network unavailable',
     );
-    expect(screen.queryByRole('option', { name: /Partial Result/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId('transfer-destination-unit')).toBeDisabled();
+    expect(screen.getByTestId('transfer-submit')).toBeDisabled();
+  });
+
+  it('hides internal permission codes when destination discovery is forbidden', async () => {
+    mockedApiFetch.mockRejectedValue(
+      new ApiError(403, {
+        detail: 'Missing required permission: production_event.create',
+      } as never),
+    );
+    renderTransfer();
+
+    const error = await screen.findByTestId('transfer-destinations-error');
+    expect(error).toHaveTextContent('You do not have permission to record transfers.');
+    expect(error).not.toHaveTextContent('production_event.create');
+    expect(error).not.toHaveTextContent('Missing required permission');
     expect(screen.getByTestId('transfer-destination-unit')).toBeDisabled();
     expect(screen.getByTestId('transfer-submit')).toBeDisabled();
   });

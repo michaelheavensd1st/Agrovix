@@ -1041,80 +1041,22 @@ class ProductionEventService:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
-                    "code": "transfer_source_mismatch",
-                    "message": ("TRANSFER source_unit_id must equal the batch's current unit."),
-                    "expected": str(unit.id),
-                    "received": str(src_id),
+                    "code": "transfer_source_changed",
+                    "message": "The batch's source unit changed. Refresh and try again.",
                 },
             )
 
-        dst_unit = await self.unit_repo.get_by_id(dst_id)
-        if dst_unit is None or dst_unit.deleted_at is not None:
+        destination = await self.unit_repo.get_eligible_transfer_destination(
+            unit_id=dst_id,
+            farm_id=farm.id,
+            exclude_unit_id=unit.id,
+        )
+        if destination is None:
             raise HTTPException(
-                status.HTTP_404_NOT_FOUND,
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
                 {
-                    "code": "transfer_destination_not_found",
-                    "message": "Destination unit not found or has been deleted.",
-                    "destination_unit_id": str(dst_id),
-                },
-            )
-
-        dst_site = await self.site_repo.get_by_id_including_deleted(dst_unit.site_id)
-        if dst_site is None or dst_site.deleted_at is not None:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {
-                    "code": "transfer_destination_site_unavailable",
-                    "message": "Destination unit's site is unavailable.",
-                },
-            )
-
-        # Destination lifecycle — Codex Review Gate 02: never transfer
-        # INTO a CLOSED or MAINTENANCE unit / site. Uses the central
-        # lifecycle helper so the exit codes match every other write
-        # gate (site_closed_no_writes / unit_closed_no_writes / etc.)
-        # but with the destination-specific "transferring-in" framing.
-        from app.production.lifecycle_policy import is_closed as _lp_closed
-        from app.production.lifecycle_policy import is_maintenance as _lp_maintenance
-
-        for label, resource in (("site", dst_site), ("unit", dst_unit)):
-            if _lp_closed(resource):
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_destination_closed",
-                        "message": (
-                            f"Destination {label} is CLOSED. TRANSFER is not " "permitted."
-                        ),
-                        "resource": label,
-                    },
-                )
-            if _lp_maintenance(resource):
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    {
-                        "code": "transfer_destination_under_maintenance",
-                        "message": (
-                            f"Destination {label} is under MAINTENANCE. Wait for "
-                            "the maintenance window to end before transferring in."
-                        ),
-                        "resource": label,
-                    },
-                )
-
-        # Cross-farm transfers are blocked in Sprint 3.
-        if dst_site.farm_id != farm.id:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                {
-                    "code": "transfer_cross_farm_blocked",
-                    "message": (
-                        "Cross-farm transfers are not permitted in Sprint 3. "
-                        "The destination unit must belong to the same farm as "
-                        "the source batch."
-                    ),
-                    "source_farm_id": str(farm.id),
-                    "destination_farm_id": str(dst_site.farm_id),
+                    "code": "transfer_destination_ineligible",
+                    "message": "The selected destination is not eligible for this transfer.",
                 },
             )
 
@@ -1137,3 +1079,22 @@ class ProductionEventService:
                     ),
                 },
             )
+
+    async def list_transfer_destinations(
+        self, *, unit: ProductionUnit, farm: Farm
+    ) -> list[dict[str, object]]:
+        rows = await self.unit_repo.list_eligible_transfer_destinations(
+            farm_id=farm.id,
+            exclude_unit_id=unit.id,
+        )
+        return [
+            {
+                "id": destination.id,
+                "label": (
+                    f"{destination.code} — {destination.name} · {site.code}"
+                    if destination.name
+                    else f"{destination.code} · {site.code}"
+                ),
+            }
+            for destination, site in rows
+        ]

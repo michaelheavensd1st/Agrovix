@@ -232,6 +232,13 @@ class ProductionEventCreate(BaseModel):
     notes: str | None = Field(default=None, max_length=2000)
 
 
+class TransferDestinationPublic(BaseModel):
+    """Operator-facing destination option resolved within the source batch's farm."""
+
+    id: UUID
+    label: str
+
+
 class ProductionEventPublic(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

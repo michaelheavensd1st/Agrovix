@@ -404,8 +404,8 @@ async def test_transfer_into_maintenance_destination_blocked(client: AsyncClient
             ),
         },
     )
-    assert r.status_code == 409, r.text
-    assert r.json()["detail"]["code"] == "transfer_destination_under_maintenance"
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"]["code"] == "transfer_destination_ineligible"
 
 
 # ===================================================================== #
