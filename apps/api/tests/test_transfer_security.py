@@ -22,7 +22,7 @@ from tests._helpers import (
     switch_user,
     transfer_payload,
 )
-from tests.test_codex_review_gate_02 import _prepare_active_batch
+from tests.test_codex_review_gate_02 import _prepare_active_batch, _prepare_receiving_batch
 from tests.test_production_engine import _create_unit
 
 pytestmark = pytest.mark.asyncio
@@ -42,7 +42,12 @@ async def _site(client: AsyncClient, farm_id: str, label: str) -> str:
 
 
 async def _post_transfer(
-    client: AsyncClient, *, batch_id: str, source_id: str, destination_id: str
+    client: AsyncClient,
+    *,
+    batch_id: str,
+    source_id: str,
+    destination_id: str,
+    destination_batch_id: str | None = None,
 ):
     return await client.post(
         f"/api/v1/batches/{batch_id}/events",
@@ -51,6 +56,7 @@ async def _post_transfer(
             "data": transfer_payload(
                 source_unit_id=source_id,
                 destination_unit_id=destination_id,
+                destination_batch_id=destination_batch_id,
                 quantity=1,
             ),
         },
@@ -98,6 +104,7 @@ async def _assign_event_create_only_role(email: str, org_id: str, farm_id: str) 
 async def test_event_create_only_caller_can_discover_and_transfer(client: AsyncClient) -> None:
     ctx = await _prepare_active_batch(client, quantity=10)
     destination_id = await _destination(client, ctx["site_id"], ctx["unit_type_id"])
+    destination_batch_id = await _prepare_receiving_batch(client, destination_id)
     operator = f"transfer-only-{uuid4().hex[:8]}@agrovix.dev"
     await create_verified_user(operator)
     await invite_and_accept(
@@ -111,7 +118,8 @@ async def test_event_create_only_caller_can_discover_and_transfer(client: AsyncC
 
     discovery = await client.get(f"/api/v1/batches/{ctx['batch_id']}/transfer-destinations")
     assert discovery.status_code == 200, discovery.text
-    assert [row["id"] for row in discovery.json()] == [destination_id]
+    assert [row["id"] for row in discovery.json()] == [destination_batch_id]
+    assert discovery.json()[0]["unit_id"] == destination_id
     assert discovery.json()[0]["label"]
 
     response = await _post_transfer(
@@ -119,6 +127,7 @@ async def test_event_create_only_caller_can_discover_and_transfer(client: AsyncC
         batch_id=ctx["batch_id"],
         source_id=ctx["unit_id"],
         destination_id=destination_id,
+        destination_batch_id=destination_batch_id,
     )
     assert response.status_code == 201, response.text
 

@@ -1112,7 +1112,7 @@ async def list_transfer_destinations(
         organization_id=farm.organization_id,
         farm_id=farm.id,
     )
-    destinations = await service.list_transfer_destinations(unit=unit, farm=farm)
+    destinations = await service.list_transfer_destinations(batch=batch, unit=unit, farm=farm)
     return [TransferDestinationPublic(**destination) for destination in destinations]
 
 
