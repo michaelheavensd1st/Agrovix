@@ -951,13 +951,24 @@ class ProductionEventService:
             idempotency_key=idempotency_key,
             payload_hash=payload_hash if idempotency_key else None,
         )
+        raw_performed_at = payload.get("performed_at") or data["transferred_at"]
+        effective_performed_at = (
+            raw_performed_at
+            if isinstance(raw_performed_at, datetime)
+            else datetime.fromisoformat(str(raw_performed_at))
+        )
+        effective_performed_at = (
+            effective_performed_at.replace(tzinfo=UTC)
+            if effective_performed_at.tzinfo is None
+            else effective_performed_at.astimezone(UTC)
+        )
         common = {
             "organization_id": farm.organization_id,
             "farm_id": farm.id,
             "event_type": "TRANSFER",
             "event_type_version": CATALOG.require("TRANSFER").version,
             "performed_by_id": actor.id,
-            "performed_at": payload.get("performed_at") or datetime.now(UTC),
+            "performed_at": effective_performed_at,
             "data": data,
             "attachments": payload.get("attachments"),
             "is_final": False,

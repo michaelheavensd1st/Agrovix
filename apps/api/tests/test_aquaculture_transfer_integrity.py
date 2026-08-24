@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -99,6 +99,105 @@ async def test_transfer_idempotency_replays_complete_pair(client: AsyncClient) -
         path, json=conflict_body, headers={"Idempotency-Key": "paired-replay"}
     )
     assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "idempotency_key_payload_conflict"
+
+
+async def test_transfer_uses_validated_chronology_for_both_pair_events(
+    client: AsyncClient,
+) -> None:
+    source, _unit, destination, body = await _pair(client, loss=0)
+    transferred_at = "2025-01-02T03:04:05-05:00"
+    body["data"]["transferred_at"] = transferred_at
+    response = await client.post(f"/api/v1/batches/{source['batch_id']}/events", json=body)
+    assert response.status_code == 201, response.text
+
+    source_events = (await client.get(f"/api/v1/batches/{source['batch_id']}/events")).json()[
+        "items"
+    ]
+    destination_events = (await client.get(f"/api/v1/batches/{destination}/events")).json()["items"]
+    outgoing = next(event for event in source_events if event["event_type"] == "TRANSFER")
+    incoming = next(event for event in destination_events if event["event_type"] == "TRANSFER")
+    expected = datetime.fromisoformat(transferred_at).astimezone(UTC)
+    outgoing_at = datetime.fromisoformat(outgoing["performed_at"])
+    incoming_at = datetime.fromisoformat(incoming["performed_at"])
+    if outgoing_at.tzinfo is None:
+        outgoing_at = outgoing_at.replace(tzinfo=UTC)
+    if incoming_at.tzinfo is None:
+        incoming_at = incoming_at.replace(tzinfo=UTC)
+    assert outgoing_at == expected
+    assert incoming_at == expected
+    assert outgoing["performed_at"] == incoming["performed_at"]
+
+
+async def test_explicit_top_level_transfer_chronology_takes_precedence(
+    client: AsyncClient,
+) -> None:
+    source, _unit, _destination, body = await _pair(client, loss=0)
+    body["data"]["transferred_at"] = "2025-01-01T00:00:00+00:00"
+    body["performed_at"] = "2025-02-01T00:00:00+02:00"
+    response = await client.post(f"/api/v1/batches/{source['batch_id']}/events", json=body)
+    assert response.status_code == 201, response.text
+    expected = datetime.fromisoformat(body["performed_at"]).astimezone(UTC)
+    assert datetime.fromisoformat(response.json()["performed_at"]) == expected
+
+
+async def test_backdated_transfer_before_sampling_does_not_fold_after_checkpoint(
+    client: AsyncClient,
+) -> None:
+    source, _unit, _destination, body = await _pair(client, loss=5)
+    sampling_at = datetime.now(UTC)
+    body["data"]["transferred_at"] = (sampling_at - timedelta(days=365)).isoformat()
+    sampling = await client.post(
+        f"/api/v1/batches/{source['batch_id']}/events",
+        json={
+            "event_type": "SAMPLING",
+            "performed_at": sampling_at.isoformat(),
+            "data": sampling_payload(estimated_population=700),
+        },
+    )
+    assert sampling.status_code == 201, sampling.text
+    transfer = await client.post(f"/api/v1/batches/{source['batch_id']}/events", json=body)
+    assert transfer.status_code == 201, transfer.text
+    projection = (await client.get(f"/api/v1/batches/{source['batch_id']}/projections")).json()
+    assert projection["estimated_remaining_population"] == 700
+
+
+async def test_transfer_after_sampling_folds_after_checkpoint(client: AsyncClient) -> None:
+    source, _unit, _destination, body = await _pair(client, loss=5)
+    sampling_at = datetime.now(UTC)
+    body["data"]["transferred_at"] = (sampling_at + timedelta(days=365)).isoformat()
+    sampling = await client.post(
+        f"/api/v1/batches/{source['batch_id']}/events",
+        json={
+            "event_type": "SAMPLING",
+            "performed_at": sampling_at.isoformat(),
+            "data": sampling_payload(estimated_population=700),
+        },
+    )
+    assert sampling.status_code == 201, sampling.text
+    transfer = await client.post(f"/api/v1/batches/{source['batch_id']}/events", json=body)
+    assert transfer.status_code == 201, transfer.text
+    projection = (await client.get(f"/api/v1/batches/{source['batch_id']}/projections")).json()
+    assert projection["estimated_remaining_population"] == 495
+
+
+async def test_transfer_idempotency_conflicts_when_transferred_at_changes(
+    client: AsyncClient,
+) -> None:
+    source, _unit, _destination, body = await _pair(client, loss=0)
+    path = f"/api/v1/batches/{source['batch_id']}/events"
+    first = await client.post(path, json=body, headers={"Idempotency-Key": "chronology-replay"})
+    assert first.status_code == 201, first.text
+    changed = {
+        **body,
+        "data": {**body["data"], "transferred_at": "2032-01-01T00:00:00+00:00"},
+    }
+    conflict = await client.post(
+        path,
+        json=changed,
+        headers={"Idempotency-Key": "chronology-replay"},
+    )
+    assert conflict.status_code == 409, conflict.text
     assert conflict.json()["detail"]["code"] == "idempotency_key_payload_conflict"
 
 
@@ -266,6 +365,7 @@ async def test_latest_sampling_checkpoint_folds_later_transfer_on_both_sides(
             },
         )
         assert response.status_code == 201
+    body["data"]["transferred_at"] = datetime.now(UTC).isoformat()
     transfer = await client.post(f"/api/v1/batches/{source['batch_id']}/events", json=body)
     assert transfer.status_code == 201, transfer.text
     source_projection = (
@@ -343,7 +443,7 @@ async def test_equal_time_transfer_pair_folds_after_both_sampling_checkpoints(
             },
         )
         assert response.status_code == 201
-    body["performed_at"] = performed_at
+    body["data"]["transferred_at"] = performed_at
     transfer = await client.post(f"/api/v1/batches/{source['batch_id']}/events", json=body)
     assert transfer.status_code == 201, transfer.text
     source_projection = (
