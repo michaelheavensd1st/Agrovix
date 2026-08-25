@@ -101,9 +101,30 @@ async def _wait_blocked(pids: set[int], *, timeout: float = 5) -> None:
     )
     deadline = asyncio.get_running_loop().time() + timeout
     last_rows: list[dict[str, object]] = []
+
+    def remaining(operation: str) -> float:
+        seconds = deadline - asyncio.get_running_loop().time()
+        if seconds <= 0:
+            pytest.fail(
+                "Timed out waiting for PostgreSQL user-row locks during "
+                f"{operation}; expected_pids={sorted(pids)!r}, last_rows={last_rows!r}"
+            )
+        return seconds
+
     async with db.AsyncSessionLocal() as observer:
         while True:
-            rows = (await observer.execute(statement, {"pids": list(pids)})).all()
+            try:
+                result = await asyncio.wait_for(
+                    observer.execute(statement, {"pids": list(pids)}),
+                    timeout=remaining("observer.execute"),
+                )
+            except TimeoutError:
+                pytest.fail(
+                    "Timed out waiting for PostgreSQL user-row locks during "
+                    "observer.execute; "
+                    f"expected_pids={sorted(pids)!r}, last_rows={last_rows!r}"
+                )
+            rows = result.all()
             last_rows = [dict(row._mapping) for row in rows]
             if len(rows) == len(pids) and all(
                 row.wait_event_type == "Lock"
@@ -113,15 +134,20 @@ async def _wait_blocked(pids: set[int], *, timeout: float = 5) -> None:
                 for row in rows
             ):
                 return
-            if asyncio.get_running_loop().time() >= deadline:
-                pytest.fail(
-                    "Timed out waiting for PostgreSQL user-row locks; "
-                    f"expected_pids={sorted(pids)!r}, last_rows={last_rows!r}"
-                )
             # PostgreSQL may cache cumulative-statistics values, including
             # pg_stat_activity query text, until the observer transaction ends.
-            await observer.rollback()
-            await asyncio.sleep(0.01)
+            try:
+                await asyncio.wait_for(
+                    observer.rollback(),
+                    timeout=remaining("observer.rollback"),
+                )
+            except TimeoutError:
+                pytest.fail(
+                    "Timed out waiting for PostgreSQL user-row locks during "
+                    "observer.rollback; "
+                    f"expected_pids={sorted(pids)!r}, last_rows={last_rows!r}"
+                )
+            await asyncio.sleep(min(0.01, remaining("poll delay")))
 
 
 async def _contender(
@@ -396,3 +422,117 @@ async def test_cleanup_closes_every_session_when_rollbacks_fail() -> None:
     assert len(errors) == 2
     assert controller.rollback_attempted and controller.close_attempted
     assert contender.rollback_attempted and contender.close_attempted
+
+
+async def test_wait_blocked_bounds_stalled_observer_execute(monkeypatch) -> None:
+    class StalledExecuteObserver:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(db, "AsyncSessionLocal", StalledExecuteObserver)
+
+    with pytest.raises(pytest.fail.Exception) as raised:
+        await asyncio.wait_for(_wait_blocked({4321}, timeout=0.02), timeout=0.5)
+
+    message = str(raised.value)
+    assert "observer.execute" in message
+    assert "expected_pids=[4321]" in message
+    assert "last_rows=[]" in message
+
+
+async def test_wait_blocked_bounds_stalled_observer_rollback(monkeypatch) -> None:
+    class DiagnosticRow:
+        def __init__(self) -> None:
+            self.pid = 4321
+            self.state = "active"
+            self.wait_event_type = None
+            self.wait_event = None
+            self.blocking_pids = []
+            self.query = "SELECT 1"
+            self.query_start = None
+            self.backend_xid = None
+            self.backend_xmin = None
+            self._mapping = vars(self)
+
+    class Result:
+        def all(self):
+            return [DiagnosticRow()]
+
+    class StalledRollbackObserver:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            return Result()
+
+        async def rollback(self) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(db, "AsyncSessionLocal", StalledRollbackObserver)
+
+    with pytest.raises(pytest.fail.Exception) as raised:
+        await asyncio.wait_for(_wait_blocked({4321}, timeout=0.02), timeout=0.5)
+
+    message = str(raised.value)
+    assert "observer.rollback" in message
+    assert "'pid': 4321" in message
+    assert "'query': 'SELECT 1'" in message
+
+
+async def test_wait_blocked_rolls_back_before_resampling(monkeypatch) -> None:
+    class DiagnosticRow:
+        def __init__(self, *, blocked: bool) -> None:
+            self.pid = 4321
+            self.state = "active"
+            self.wait_event_type = "Lock" if blocked else None
+            self.wait_event = "transactionid" if blocked else None
+            self.blocking_pids = [1234] if blocked else []
+            self.query = "SELECT users.id FROM users FOR UPDATE" if blocked else "SELECT 1"
+            self.query_start = None
+            self.backend_xid = None
+            self.backend_xmin = None
+            self._mapping = vars(self)
+
+    class Result:
+        def __init__(self, row) -> None:
+            self.row = row
+
+        def all(self):
+            return [self.row]
+
+    class SnapshotObserver:
+        def __init__(self) -> None:
+            self.samples = 0
+            self.rollbacks = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            if self.samples:
+                assert self.rollbacks == 1
+            self.samples += 1
+            return Result(DiagnosticRow(blocked=self.samples == 2))
+
+        async def rollback(self) -> None:
+            self.rollbacks += 1
+
+    observer = SnapshotObserver()
+    monkeypatch.setattr(db, "AsyncSessionLocal", lambda: observer)
+
+    await _wait_blocked({4321}, timeout=0.5)
+
+    assert observer.samples == 2
+    assert observer.rollbacks == 1
