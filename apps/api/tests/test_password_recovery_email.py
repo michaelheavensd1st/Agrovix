@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from app.core.logging import AgrovixLogHandler, JsonFormatter, configure_logging
 from app.email import factory
 from app.email.base import EmailDeliveryError, EmailMessage
 from app.email.factory import EmailSenderUnavailableError
@@ -33,6 +34,44 @@ async def test_log_sender_redacts_recovery_content(caplog) -> None:
     assert any(
         getattr(record, "sensitive_content", None) == "redacted" for record in caplog.records
     )
+
+
+async def test_logging_configuration_preserves_capture_and_is_idempotent(caplog, capsys) -> None:
+    raw = "raw-recovery-secret"
+    root = logging.getLogger()
+    external_handlers = tuple(
+        handler for handler in root.handlers if not isinstance(handler, AgrovixLogHandler)
+    )
+
+    configure_logging()
+    configure_logging()
+
+    assert all(handler in root.handlers for handler in external_handlers)
+    assert sum(isinstance(handler, AgrovixLogHandler) for handler in root.handlers) == 1
+
+    with caplog.at_level(logging.INFO):
+        await LogEmailSender().send(
+            EmailMessage(
+                to="person@example.test",
+                subject="reset",
+                text_body=f"https://example.test/reset?token={raw}",
+                template="auth.password_recovery",
+                context={"reset_url": f"https://example.test/reset?token={raw}"},
+            )
+        )
+
+    assert raw not in caplog.text
+    redaction_record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "sensitive_content", None) == "redacted"
+    )
+    formatted = JsonFormatter().format(redaction_record)
+    assert '"message":"email.dispatch"' in formatted
+    assert '"template":"auth.password_recovery"' in formatted
+    assert '"sensitive_content":"redacted"' in formatted
+    assert raw not in formatted
+    assert raw not in capsys.readouterr().out
 
 
 async def test_resend_adapter_uses_authorization_and_wraps_failures(monkeypatch) -> None:
