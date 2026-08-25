@@ -90,16 +90,21 @@ async def _pid(session) -> int:
     return int(value)
 
 
-async def _wait_blocked(pids: set[int]) -> None:
+async def _wait_blocked(pids: set[int], *, timeout: float = 5) -> None:
     statement = text(
         """
-        SELECT pid, wait_event_type, pg_blocking_pids(pid) blocking_pids, query
+        SELECT pid, state, wait_event_type, wait_event,
+               pg_blocking_pids(pid) blocking_pids, query, query_start,
+               backend_xid, backend_xmin
         FROM pg_stat_activity WHERE pid = ANY(CAST(:pids AS INTEGER[]))
         """
     )
+    deadline = asyncio.get_running_loop().time() + timeout
+    last_rows: list[dict[str, object]] = []
     async with db.AsyncSessionLocal() as observer:
         while True:
             rows = (await observer.execute(statement, {"pids": list(pids)})).all()
+            last_rows = [dict(row._mapping) for row in rows]
             if len(rows) == len(pids) and all(
                 row.wait_event_type == "Lock"
                 and row.blocking_pids
@@ -108,6 +113,14 @@ async def _wait_blocked(pids: set[int]) -> None:
                 for row in rows
             ):
                 return
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail(
+                    "Timed out waiting for PostgreSQL user-row locks; "
+                    f"expected_pids={sorted(pids)!r}, last_rows={last_rows!r}"
+                )
+            # PostgreSQL may cache cumulative-statistics values, including
+            # pg_stat_activity query text, until the observer transaction ends.
+            await observer.rollback()
             await asyncio.sleep(0.01)
 
 
@@ -192,7 +205,7 @@ async def _blocked_race(
         ]
         pids = set(await asyncio.wait_for(asyncio.gather(*pid_futures), timeout=5))
         assert len(pids) == len(operations)
-        await asyncio.wait_for(_wait_blocked(pids), timeout=5)
+        await _wait_blocked(pids)
         assert all(not task.done() for task in tasks)
         await controller.commit()
         return await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
@@ -250,7 +263,7 @@ async def test_reset_wins_against_refresh_and_login() -> None:
             asyncio.create_task(_contender(login, login_session, login_pid)),
         ]
         pids = set(await asyncio.wait_for(asyncio.gather(refresh_pid, login_pid), timeout=5))
-        await asyncio.wait_for(_wait_blocked(pids), timeout=5)
+        await _wait_blocked(pids)
         await controller.commit()
         outcomes = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
         assert [outcome for outcome, _ in outcomes] == ["http-401", "http-401"]
@@ -300,7 +313,7 @@ async def test_refresh_or_login_winner_is_revoked_by_following_reset(operation_n
 
         task = asyncio.create_task(_contender(reset, reset_session, ready))
         reset_pid = await asyncio.wait_for(ready, timeout=5)
-        await asyncio.wait_for(_wait_blocked({reset_pid}), timeout=5)
+        await _wait_blocked({reset_pid})
         await controller.commit()
         assert (await asyncio.wait_for(task, timeout=10))[0] == "success"
     finally:
