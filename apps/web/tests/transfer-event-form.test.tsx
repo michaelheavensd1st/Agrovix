@@ -15,6 +15,7 @@ const mockedApiFetch = vi.mocked(apiFetch);
 const mockedApiFetchResult = vi.mocked(apiFetchResult);
 const SOURCE_UUID = '11111111-1111-4111-8111-111111111111';
 const DESTINATION_UUID = '22222222-2222-4222-8222-222222222222';
+const DESTINATION_UNIT_UUID = '33333333-3333-4333-8333-333333333333';
 const CATALOG_SOURCE_UUID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CATALOG_DESTINATION_UUID = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const ORIGINAL_TZ = process.env.TZ;
@@ -38,11 +39,18 @@ const TRANSFER: EventCatalogEntry = {
   metadata: {},
   schema: {
     type: 'object',
-    required: ['source_unit_id', 'destination_unit_id', 'quantity', 'transferred_at'],
+    required: [
+      'source_unit_id',
+      'destination_unit_id',
+      'destination_batch_id',
+      'quantity',
+      'transferred_at',
+    ],
     $defs: { WeightUnit: { type: 'string', enum: ['g', 'kg'] } },
     properties: {
       source_unit_id: { type: 'string' },
       destination_unit_id: { type: 'string' },
+      destination_batch_id: { type: 'string' },
       quantity: { type: 'integer', minimum: 1, description: 'Individuals transferred (net).' },
       average_weight: { anyOf: [{ type: 'number', minimum: 0 }, { type: 'null' }] },
       weight_unit: { $ref: '#/$defs/WeightUnit', default: 'g' },
@@ -70,7 +78,13 @@ const TRANSFER: EventCatalogEntry = {
 function mockSuccessfulDiscovery() {
   mockedApiFetch.mockImplementation(async (path) => {
     if (path === '/v1/batches/batch-1/transfer-destinations') {
-      return [{ id: DESTINATION_UUID, label: 'P2 — Grow-out Pond · GROW' }] as never;
+      return [
+        {
+          id: DESTINATION_UUID,
+          unit_id: DESTINATION_UNIT_UUID,
+          label: 'P2 — Grow-out Pond · GROW',
+        },
+      ] as never;
     }
     throw new Error(`Unexpected request: ${path}`);
   });
@@ -122,7 +136,6 @@ describe('TransferEventForm', () => {
     expect(screen.queryByText(DESTINATION_UUID)).not.toBeInTheDocument();
     for (const label of [
       'Source unit',
-      'Destination unit',
       'Quantity (individuals)',
       'Average weight',
       'Weight unit',
@@ -132,6 +145,7 @@ describe('TransferEventForm', () => {
     ]) {
       expect(screen.getByText(label, { exact: false })).toBeInTheDocument();
     }
+    expect(screen.getByRole('combobox', { name: /Destination batch/ })).toBeInTheDocument();
   });
 
   it('uses only the batch-scoped server-authoritative destination endpoint', async () => {
@@ -157,7 +171,7 @@ describe('TransferEventForm', () => {
 
     fireEvent.change(select, { target: { value: 'P2' } });
     fireEvent.submit(screen.getByTestId('transfer-form'));
-    expect(await screen.findByText('Select an eligible destination unit.')).toBeInTheDocument();
+    expect(await screen.findByText('Select an eligible destination batch.')).toBeInTheDocument();
     expect(mockedApiFetchResult).not.toHaveBeenCalled();
 
     fireEvent.change(select, { target: { value: DESTINATION_UUID } });
@@ -176,7 +190,8 @@ describe('TransferEventForm', () => {
       event_type: 'TRANSFER',
       data: {
         source_unit_id: SOURCE_UUID,
-        destination_unit_id: DESTINATION_UUID,
+        destination_unit_id: DESTINATION_UNIT_UUID,
+        destination_batch_id: DESTINATION_UUID,
         quantity: 80,
         average_weight: 3.4,
         weight_unit: 'g',
@@ -253,7 +268,7 @@ describe('TransferEventForm', () => {
 
     resolveDestinations([]);
     expect(await screen.findByTestId('transfer-destinations-empty')).toHaveTextContent(
-      'No eligible destination units are available in this farm.',
+      'No eligible destination batches are available in this farm.',
     );
     expect(screen.getByTestId('transfer-submit')).toBeDisabled();
   });

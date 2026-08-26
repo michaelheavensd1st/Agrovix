@@ -57,6 +57,7 @@ interface EligibleFeedLot {
 
 interface EligibleTransferUnit {
   id: string;
+  unit_id: string;
   label: string;
 }
 
@@ -830,7 +831,7 @@ export function TransferEventForm({
     if (submittingRef.current) return;
     const selectedDestination = destinations.find((unit) => unit.id === destinationId);
     if (!selectedDestination) {
-      setFieldErrors({ destination_unit_id: 'Select an eligible destination unit.' });
+      setFieldErrors({ destination_batch_id: 'Select an eligible destination batch.' });
       return;
     }
     submittingRef.current = true;
@@ -840,7 +841,8 @@ export function TransferEventForm({
     try {
       const data: Record<string, unknown> = {
         source_unit_id: sourceUnit.id,
-        destination_unit_id: selectedDestination.id,
+        destination_unit_id: selectedDestination.unit_id,
+        destination_batch_id: selectedDestination.id,
         quantity: Number(quantity),
         weight_unit: weightUnit,
         transfer_loss: Number(transferLoss),
@@ -894,34 +896,34 @@ export function TransferEventForm({
       </div>
 
       <label className="block text-sm">
-        Destination unit <span className="text-destructive">*</span>
+        Destination batch <span className="text-destructive">*</span>
         <select
           data-testid="transfer-destination-unit"
           className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
           value={destinationId}
           onChange={(e) => {
             setDestinationId(e.target.value);
-            setFieldErrors((prev) => ({ ...prev, destination_unit_id: '' }));
+            setFieldErrors((prev) => ({ ...prev, destination_batch_id: '' }));
           }}
           disabled={destinationUnavailable || busy}
           required
-          aria-invalid={Boolean(fieldErrors.destination_unit_id)}
+          aria-invalid={Boolean(fieldErrors.destination_batch_id)}
           aria-describedby={
-            fieldErrors.destination_unit_id ? 'transfer-destination_unit_id-error' : undefined
+            fieldErrors.destination_batch_id ? 'transfer-destination_batch_id-error' : undefined
           }
         >
-          <option value="">Select an eligible destination…</option>
+          <option value="">Select an eligible destination batch…</option>
           {destinations.map((unit) => (
             <option key={unit.id} value={unit.id}>
               {unit.label}
             </option>
           ))}
         </select>
-        {fieldError('destination_unit_id')}
+        {fieldError('destination_batch_id')}
       </label>
       {destinationsLoading && (
         <p className="text-xs text-muted-foreground" data-testid="transfer-destinations-loading">
-          Loading eligible destination units…
+          Loading eligible destination batches…
         </p>
       )}
       {!destinationsLoading && !destinationsError && destinations.length === 0 && (
@@ -929,12 +931,12 @@ export function TransferEventForm({
           className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground"
           data-testid="transfer-destinations-empty"
         >
-          No eligible destination units are available in this farm.
+          No eligible destination batches are available in this farm.
         </p>
       )}
       {destinationsError && (
         <p className="text-xs text-destructive" data-testid="transfer-destinations-error">
-          Destination units could not be loaded: {destinationsError}
+          Destination batches could not be loaded: {destinationsError}
         </p>
       )}
 

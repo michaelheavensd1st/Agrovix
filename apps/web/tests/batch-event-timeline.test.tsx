@@ -100,7 +100,22 @@ describe('Batch event timeline', () => {
               event_type_version: 1,
               performed_by_id: 'user-1',
               performed_at: '2026-08-21T12:00:00.000Z',
+              transfer_id: 'transfer-1',
+              transfer_role: 'out',
               data: { destination_unit_id: DESTINATION_UUID, quantity: 125 },
+              is_final: false,
+              notes: null,
+            },
+            {
+              id: 'event-2',
+              batch_id: 'batch-1',
+              event_type: 'TRANSFER',
+              event_type_version: 2,
+              transfer_id: 'transfer-2',
+              transfer_role: 'in',
+              performed_by_id: 'user-1',
+              performed_at: '2026-08-21T11:00:00.000Z',
+              data: { source_unit_id: DESTINATION_UUID, quantity: 80 },
               is_final: false,
               notes: null,
             },
@@ -134,9 +149,12 @@ describe('Batch event timeline', () => {
     render(<BatchDetailPage />);
 
     const row = await screen.findByTestId('event-row-event-1');
-    await waitFor(() => expect(row).toHaveTextContent('→ 125 ind.'));
+    await waitFor(() => expect(row).toHaveTextContent('→ 125 ind. sent'));
     expect(row).not.toHaveTextContent(DESTINATION_UUID);
     expect(row).not.toHaveTextContent(DESTINATION_UUID.slice(0, 8));
+    const receipt = screen.getByTestId('event-row-event-2');
+    expect(receipt).toHaveTextContent('← 80 ind. received');
+    expect(receipt).not.toHaveTextContent(DESTINATION_UUID);
 
     fireEvent.click(screen.getByTestId('record-TRANSFER'));
     expect(screen.getByTestId('transfer-event-form-mock')).toHaveTextContent('SRC-01');

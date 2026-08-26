@@ -17,6 +17,7 @@ import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
+from typing import cast
 
 from fastapi import HTTPException, status
 from pydantic import ValidationError
@@ -28,6 +29,7 @@ from app.models.production import (
     ProductionBatchState,
     ProductionEvent,
     ProductionSite,
+    ProductionTransferRole,
     ProductionUnit,
     ProductionUnitType,
 )
@@ -318,14 +320,32 @@ _TERMINAL_STATES = {
 }
 
 
-def _compute_payload_hash(event_type: str, validated_data: dict) -> str:
-    """Deterministic SHA-256 hex over the event type + validated payload.
+def _compute_payload_hash(event_type: str, validated_data: dict, request_payload: dict) -> str:
+    """Deterministic SHA-256 hex over the complete semantic event request.
 
     Stable regardless of dict key order so two clients constructing the
-    same logical payload get the same hash. Used to detect
+    same logical request get the same hash. Generated identifiers and audit
+    timestamps are deliberately excluded. Used to detect
     Idempotency-Key replays that would otherwise silently overwrite a
     different payload (Codex Review Gate 01, finding CRG01-2).
     """
+    canonical = json.dumps(
+        {
+            "event_type": event_type,
+            "performed_at": request_payload.get("performed_at"),
+            "data": validated_data,
+            "attachments": request_payload.get("attachments"),
+            "notes": request_payload.get("notes"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _compute_legacy_payload_hash(event_type: str, validated_data: dict[str, object]) -> str:
+    """Recognize idempotency hashes persisted before semantic-request hashing."""
     canonical = json.dumps(
         {"event_type": event_type, "data": validated_data},
         sort_keys=True,
@@ -333,6 +353,18 @@ def _compute_payload_hash(event_type: str, validated_data: dict) -> str:
         default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _idempotency_hash_matches(
+    stored_hash: str | None,
+    current_hash: str,
+    event_type: str,
+    validated_data: dict[str, object],
+) -> bool:
+    return stored_hash in {
+        current_hash,
+        _compute_legacy_payload_hash(event_type, validated_data),
+    }
 
 
 class ProductionBatchService:
@@ -585,11 +617,13 @@ class ProductionEventService:
         # ---- Idempotency check (pre-lock, pre-insert) ------------ #
         # Cheap short-circuit for the common replay case so we don't
         # take out the batch lock unnecessarily.
-        payload_hash = _compute_payload_hash(entry.code, validated_data)
+        payload_hash = _compute_payload_hash(entry.code, validated_data, payload)
         if idempotency_key is not None:
             existing = await self.event_repo.get_by_batch_and_key(batch.id, idempotency_key)
             if existing is not None:
-                if existing.payload_hash != payload_hash:
+                if not _idempotency_hash_matches(
+                    existing.payload_hash, payload_hash, entry.code, validated_data
+                ):
                     raise HTTPException(
                         status.HTTP_409_CONFLICT,
                         {
@@ -609,7 +643,27 @@ class ProductionEventService:
         # Every subsequent read used for population validation must
         # go through ``self.event_repo`` on the same session so the
         # queries observe the same snapshot the lock is holding.
-        locked_batch = await self.batch_repo.get_by_id_for_update(batch.id)
+        destination_batch_id: uuid.UUID | None = None
+        if entry.code == "TRANSFER":
+            try:
+                destination_batch_id = uuid.UUID(str(validated_data["destination_batch_id"]))
+            except (KeyError, ValueError, TypeError) as exc:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    {"code": "transfer_invalid_destination_batch_id"},
+                ) from exc
+            if destination_batch_id == batch.id:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    {
+                        "code": "transfer_same_batch",
+                        "message": "Source and destination batches must differ.",
+                    },
+                )
+            locked = await self.batch_repo.lock_pair(batch.id, destination_batch_id)
+            locked_batch = locked.get(batch.id)
+        else:
+            locked_batch = await self.batch_repo.get_by_id_for_update(batch.id)
         if locked_batch is None:
             # Deleted between the endpoint's tenancy load and now.
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Batch not found.")
@@ -617,6 +671,21 @@ class ProductionEventService:
         # caller passed in so downstream code (transitions, audit
         # metadata) sees the truth.
         batch = locked_batch
+
+        # Re-check after acquiring the source lock. This closes the window
+        # where two identical transfer commands both miss the optimistic
+        # pre-lock lookup; the loser now observes and replays the complete pair.
+        if idempotency_key is not None:
+            existing = await self.event_repo.get_by_batch_and_key(batch.id, idempotency_key)
+            if existing is not None:
+                if not _idempotency_hash_matches(
+                    existing.payload_hash, payload_hash, entry.code, validated_data
+                ):
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        {"code": "idempotency_key_payload_conflict"},
+                    )
+                return existing, True
 
         if batch.state in _TERMINAL_STATES:
             raise HTTPException(
@@ -645,6 +714,31 @@ class ProductionEventService:
             farm=farm,
             is_final=is_final,
         )
+
+        if entry.code == "TRANSFER":
+            assert destination_batch_id is not None
+            event = await self._create_transfer_pair(
+                actor=actor,
+                source_batch=batch,
+                source_unit=unit,
+                source_site=site,
+                farm=farm,
+                data=validated_data,
+                payload=payload,
+                payload_hash=payload_hash,
+                idempotency_key=idempotency_key,
+            )
+            await self.audit_repo.record(
+                actor_id=actor.id,
+                action="production_transfer.create",
+                entity_type="production_transfer",
+                entity_id=str(event.transfer_id),
+                organization_id=farm.organization_id,
+                farm_id=farm.id,
+                metadata={"source_event_id": str(event.id)},
+                **request_ctx,
+            )
+            return event, False
 
         try:
             # Wrap the INSERT in a SAVEPOINT so that a concurrent-race
@@ -680,7 +774,9 @@ class ProductionEventService:
             existing = await self.event_repo.get_by_batch_and_key(batch.id, idempotency_key)
             if existing is None:  # defensive — should not happen
                 raise
-            if existing.payload_hash != payload_hash:
+            if not _idempotency_hash_matches(
+                existing.payload_hash, payload_hash, entry.code, validated_data
+            ):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     {
@@ -804,6 +900,100 @@ class ProductionEventService:
                     triggering_event=event,
                 )
         return event, False
+
+    async def _create_transfer_pair(
+        self,
+        *,
+        actor: User,
+        source_batch: ProductionBatch,
+        source_unit: ProductionUnit,
+        source_site: ProductionSite,
+        farm: Farm,
+        data: dict[str, object],
+        payload: dict[str, object],
+        payload_hash: str,
+        idempotency_key: str | None,
+    ) -> ProductionEvent:
+        destination_batch_id = uuid.UUID(str(data["destination_batch_id"]))
+        destination_unit_id = uuid.UUID(str(data["destination_unit_id"]))
+        resolved = await self.batch_repo.resolve_transfer_destination(
+            batch_id=destination_batch_id, unit_id=destination_unit_id, farm_id=farm.id
+        )
+        if resolved is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": "transfer_destination_batch_ineligible",
+                    "message": "Destination batch does not belong to the selected eligible unit.",
+                },
+            )
+        destination_batch, destination_unit, destination_site = resolved
+        if destination_batch.state not in {
+            ProductionBatchState.STOCKED,
+            ProductionBatchState.ACTIVE,
+        }:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_destination_batch_state",
+                    "message": "Destination batch cannot receive transfers in its current state.",
+                },
+            )
+        transfer = await self.event_repo.create_transfer(
+            organization_id=farm.organization_id,
+            farm_id=farm.id,
+            source_batch_id=source_batch.id,
+            destination_batch_id=destination_batch.id,
+            source_unit_id=source_unit.id,
+            destination_unit_id=destination_unit.id,
+            quantity=int(cast(int | str, data["quantity"])),
+            transfer_loss=int(cast(int | str, data.get("transfer_loss", 0))),
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash if idempotency_key else None,
+        )
+        raw_performed_at = payload.get("performed_at") or data["transferred_at"]
+        effective_performed_at = (
+            raw_performed_at
+            if isinstance(raw_performed_at, datetime)
+            else datetime.fromisoformat(str(raw_performed_at))
+        )
+        effective_performed_at = (
+            effective_performed_at.replace(tzinfo=UTC)
+            if effective_performed_at.tzinfo is None
+            else effective_performed_at.astimezone(UTC)
+        )
+        common = {
+            "organization_id": farm.organization_id,
+            "farm_id": farm.id,
+            "event_type": "TRANSFER",
+            "event_type_version": CATALOG.require("TRANSFER").version,
+            "performed_by_id": actor.id,
+            "performed_at": effective_performed_at,
+            "data": data,
+            "attachments": payload.get("attachments"),
+            "is_final": False,
+            "notes": payload.get("notes"),
+            "transfer_id": transfer.id,
+        }
+        source_event = await self.event_repo.create(
+            **common,
+            site_id=source_site.id,
+            unit_id=source_unit.id,
+            batch_id=source_batch.id,
+            transfer_role=ProductionTransferRole.OUT,
+            idempotency_key=idempotency_key,
+            payload_hash=payload_hash if idempotency_key else None,
+        )
+        await self.event_repo.create(
+            **common,
+            site_id=destination_site.id,
+            unit_id=destination_unit.id,
+            batch_id=destination_batch.id,
+            transfer_role=ProductionTransferRole.IN,
+            idempotency_key=None,
+            payload_hash=None,
+        )
+        return source_event
 
     async def list_for_batch(
         self, batch: ProductionBatch, *, limit: int, cursor: str | None, event_type: str | None
@@ -1025,9 +1215,11 @@ class ProductionEventService:
     ) -> None:
         raw_src = str(data.get("source_unit_id", "")).strip()
         raw_dst = str(data.get("destination_unit_id", "")).strip()
+        raw_dst_batch = str(data.get("destination_batch_id", "")).strip()
         try:
             src_id = uuid.UUID(raw_src)
             dst_id = uuid.UUID(raw_dst)
+            dst_batch_id = uuid.UUID(raw_dst_batch)
         except (ValueError, TypeError) as exc:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1060,6 +1252,30 @@ class ProductionEventService:
                 },
             )
 
+        resolved_batch = await self.batch_repo.resolve_transfer_destination(
+            batch_id=dst_batch_id, unit_id=dst_id, farm_id=farm.id
+        )
+        if resolved_batch is None or dst_batch_id == batch.id:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                {
+                    "code": "transfer_destination_batch_ineligible",
+                    "message": "The selected destination batch is not eligible for this transfer.",
+                },
+            )
+        destination_batch, _, _ = resolved_batch
+        if destination_batch.state not in {
+            ProductionBatchState.STOCKED,
+            ProductionBatchState.ACTIVE,
+        }:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "transfer_destination_batch_state",
+                    "message": "Destination batch cannot receive transfers in its current state.",
+                },
+            )
+
         # Population guard: quantity + transfer_loss ≤ remaining population.
         from app.services.projections import compute_batch_projections  # local: cycle-safe
 
@@ -1081,20 +1297,22 @@ class ProductionEventService:
             )
 
     async def list_transfer_destinations(
-        self, *, unit: ProductionUnit, farm: Farm
+        self, *, batch: ProductionBatch, unit: ProductionUnit, farm: Farm
     ) -> list[dict[str, object]]:
-        rows = await self.unit_repo.list_eligible_transfer_destinations(
+        rows = await self.batch_repo.list_eligible_transfer_batches(
             farm_id=farm.id,
+            exclude_batch_id=batch.id,
             exclude_unit_id=unit.id,
         )
         return [
             {
-                "id": destination.id,
+                "id": destination_batch.id,
+                "unit_id": destination.id,
                 "label": (
-                    f"{destination.code} — {destination.name} · {site.code}"
+                    f"{destination.code} — {destination.name} · {destination_batch.code} · {site.code}"
                     if destination.name
-                    else f"{destination.code} · {site.code}"
+                    else f"{destination.code} · {destination_batch.code} · {site.code}"
                 ),
             }
-            for destination, site in rows
+            for destination_batch, destination, site in rows
         ]

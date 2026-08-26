@@ -66,7 +66,9 @@ function payloadSummary(evt: ProductionEvent): string {
       return parts.join(' · ') || 'water quality';
     }
     case 'TRANSFER':
-      return `→ ${d.quantity} ind.`;
+      return evt.transfer_role === 'in'
+        ? `← ${d.quantity} ind. received`
+        : `→ ${d.quantity} ind. sent`;
     case 'HARVEST':
       return `${fmtNumber(Number(d.quantity))} ind · ${d.total_weight}${d.weight_unit ?? 'kg'}${d.is_final ? ' · FINAL' : ''}`;
     default:
