@@ -131,10 +131,20 @@ def _reset_and_migrate_postgres(database_url: str, database_url_sync: str) -> No
     finally:
         sync_engine.dispose()
 
+    _upgrade_postgres_to_head()
+
+
+def _programmatic_alembic_config() -> Config:
+    """Build Alembic config without applying ``alembic.ini`` logging state."""
     api_root = Path(__file__).resolve().parents[1]
-    alembic_config = Config(str(api_root / "alembic.ini"))
+    alembic_config = Config()
     alembic_config.set_main_option("script_location", str(api_root / "alembic"))
-    command.upgrade(alembic_config, "head")
+    return alembic_config
+
+
+def _upgrade_postgres_to_head() -> None:
+    """Run test-database migrations without reconfiguring host logging."""
+    command.upgrade(_programmatic_alembic_config(), "head")
 
 
 # NOTE — event-loop management is handled entirely by pytest-asyncio
