@@ -1,6 +1,7 @@
 # Runtime dependencies for the Agrovix AgOS API.
 
-fastapi==0.115.5
+fastapi==0.133.0
+starlette==1.3.1
 uvicorn[standard]==0.32.1
 
 # Data + persistence
