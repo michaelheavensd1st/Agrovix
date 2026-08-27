@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import timedelta
 
 import pytest
@@ -15,9 +16,17 @@ from app.core.security import TokenExpiredError, TokenInvalidError, create_token
 def test_jwt_rejects_invalid_signature_malformed_and_wrong_algorithm() -> None:
     settings = get_settings()
     valid, _ = create_token(subject="security-regression", token_type="access")
+    header, payload, encoded_signature = valid.split(".")
+    signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+    corrupted_signature = bytes([signature[0] ^ 1]) + signature[1:]
+    assert corrupted_signature != signature
+    encoded_corrupted_signature = (
+        base64.urlsafe_b64encode(corrupted_signature).rstrip(b"=").decode()
+    )
+    corrupted = ".".join((header, payload, encoded_corrupted_signature))
 
     with pytest.raises(TokenInvalidError):
-        decode_token(f"{valid[:-1]}{'a' if valid[-1] != 'a' else 'b'}")
+        decode_token(corrupted)
     with pytest.raises(TokenInvalidError):
         decode_token("not-a-jwt")
 
