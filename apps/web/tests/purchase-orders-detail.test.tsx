@@ -247,7 +247,11 @@ describe('PurchaseOrderDetailPage', () => {
     render(<PurchaseOrderDetailPage />);
     expect(await screen.findByTestId('po-detail')).toBeInTheDocument();
     expect(screen.getByTestId('po-transitions-loading')).toBeInTheDocument();
-    await act(() => historyRequest.reject(new Error('history unavailable')));
+    const observedRejection = historyRequest.promise.catch(() => undefined);
+    await act(async () => {
+      historyRequest.reject(new Error('history unavailable'));
+      await observedRejection;
+    });
     expect(await screen.findByTestId('po-transitions-error')).toBeInTheDocument();
     expect(screen.getByTestId('po-detail')).toBeInTheDocument();
   });

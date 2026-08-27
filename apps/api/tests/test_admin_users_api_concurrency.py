@@ -108,12 +108,10 @@ async def _pid(session) -> int:
 
 
 async def _wait_user_lock(contender_pid: int, controller_pid: int) -> tuple[int, ...]:
-    statement = text(
-        """
+    statement = text("""
         SELECT wait_event_type, pg_blocking_pids(pid) AS blocking_pids
         FROM pg_stat_activity WHERE pid = :pid
-        """
-    )
+        """)
     async with db.AsyncSessionLocal() as observer:
         while True:
             row = (await observer.execute(statement, {"pid": contender_pid})).one()

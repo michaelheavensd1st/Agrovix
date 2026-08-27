@@ -310,8 +310,7 @@ async def test_pre_0015_legacy_transfer_survives_upgrade(
         command.downgrade(config, "0014_password_recovery")
         with sync_engine.begin() as connection:
             connection.execute(
-                text(
-                    """
+                text("""
                     INSERT INTO production_events (
                       id, organization_id, farm_id, site_id, unit_id, batch_id,
                       event_type, event_type_version, performed_at, data, attachments,
@@ -321,8 +320,7 @@ async def test_pre_0015_legacy_transfer_survives_upgrade(
                       'TRANSFER', 2, :performed_at,
                       CAST(:data AS jsonb), NULL, false, NULL, NULL, NULL, :created_at
                     )
-                    """
-                ),
+                    """),
                 {
                     "id": legacy_id,
                     "organization_id": topology["organization_id"],
