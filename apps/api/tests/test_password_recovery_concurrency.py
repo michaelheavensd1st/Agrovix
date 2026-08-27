@@ -83,13 +83,11 @@ async def _wait_until_postgres_reports_lock_contention(
     contender_pids: set[int],
 ) -> None:
     """Return only after PostgreSQL reports every contender blocked on a lock."""
-    statement = text(
-        """
+    statement = text("""
         SELECT pid, wait_event_type, pg_blocking_pids(pid) AS blocking_pids, query
         FROM pg_stat_activity
         WHERE pid = ANY(CAST(:pids AS INTEGER[]))
-        """
-    )
+        """)
     async with db.AsyncSessionLocal() as observer:
         while True:
             rows = (await observer.execute(statement, {"pids": list(contender_pids)})).all()
@@ -294,14 +292,12 @@ async def test_issuance_timeout_cleans_tasks_transactions_and_controller_lock():
 
     async with db.AsyncSessionLocal() as observer:
         lingering = await observer.scalar(
-            text(
-                """
+            text("""
                 SELECT count(*)
                 FROM pg_stat_activity
                 WHERE pid = ANY(CAST(:pids AS INTEGER[]))
                   AND state = 'idle in transaction'
-                """
-            ),
+                """),
             {"pids": list(pids)},
         )
         assert lingering == 0

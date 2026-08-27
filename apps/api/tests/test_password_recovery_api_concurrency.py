@@ -91,14 +91,12 @@ async def _pid(session) -> int:
 
 
 async def _wait_blocked(pids: set[int], *, timeout: float = 5) -> None:
-    statement = text(
-        """
+    statement = text("""
         SELECT pid, state, wait_event_type, wait_event,
                pg_blocking_pids(pid) blocking_pids, query, query_start,
                backend_xid, backend_xmin
         FROM pg_stat_activity WHERE pid = ANY(CAST(:pids AS INTEGER[]))
-        """
-    )
+        """)
     deadline = asyncio.get_running_loop().time() + timeout
     last_rows: list[dict[str, object]] = []
 
