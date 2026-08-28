@@ -182,6 +182,15 @@ class ProductionUnitRepository:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def get_by_site_and_code(
+        self, *, site_id: uuid.UUID, code: str
+    ) -> ProductionUnit | None:
+        stmt = select(ProductionUnit).where(
+            ProductionUnit.site_id == site_id,
+            ProductionUnit.code == code,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
     async def list_for_site(self, site_id: uuid.UUID) -> Sequence[ProductionUnit]:
         stmt = (
             select(ProductionUnit)

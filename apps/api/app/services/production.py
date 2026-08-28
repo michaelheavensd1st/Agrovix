@@ -233,7 +233,31 @@ class ProductionUnitService:
                 status.HTTP_400_BAD_REQUEST,
                 "Unknown or inaccessible production unit type.",
             )
-        unit = await self.unit_repo.create(site_id=site.id, **data)
+        try:
+            # Keep an expected uniqueness race contained to a SAVEPOINT so
+            # the outer request transaction remains usable for a controlled
+            # conflict response.
+            async with self.unit_repo.session.begin_nested():
+                unit = await self.unit_repo.create(site_id=site.id, **data)
+        except IntegrityError as exc:
+            existing = await self.unit_repo.get_by_site_and_code(
+                site_id=site.id,
+                code=data["code"],
+            )
+            if existing is None:
+                raise
+
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "production_unit_code_conflict",
+                    "message": (
+                        "A production unit with this code already exists "
+                        "in this site."
+                    ),
+                },
+            ) from exc
+
         await self.audit_repo.record(
             actor_id=actor.id,
             action="production_unit.create",
