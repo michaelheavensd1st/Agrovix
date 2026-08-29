@@ -684,6 +684,13 @@ describe('PurchaseOrderDetailPage', () => {
       await waitFor(() =>
         expect([transitionLoads, receiptLoads, warehouseLoads]).toEqual([2, 2, 2]),
       );
+
+      const requestedPaths = mockedApiFetch.mock.calls.map(([path]) => path);
+      expect(
+        requestedPaths.filter((path) => path === '/v1/purchase-orders/po-1/receipt-warehouses'),
+      ).toHaveLength(2);
+      expect(requestedPaths).not.toContain('/v1/purchase-orders/org-1/receipt-warehouses');
+
       await waitFor(() => expect(screen.getByTestId('receive-po-action')).toHaveFocus());
     },
   );
