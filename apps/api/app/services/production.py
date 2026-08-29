@@ -251,10 +251,7 @@ class ProductionUnitService:
                 status.HTTP_409_CONFLICT,
                 {
                     "code": "production_unit_code_conflict",
-                    "message": (
-                        "A production unit with this code already exists "
-                        "in this site."
-                    ),
+                    "message": ("A production unit with this code already exists " "in this site."),
                 },
             ) from exc
 
