@@ -81,6 +81,62 @@ Fixture: `PO-2026-000004`.
 - A stale PATCH using `expected_version: 1` against current version `2` returned HTTP `409` with code `purchase_order_version_conflict` and context `current_version: 2`.
 - Final read proved the rejected stale write changed nothing: status remained `DRAFT`, version remained `2`, and supplier reference remained `UAT-EDIT-V2`.
 
+### Purchase receipt posting / inventory posting
+
+PASS.
+
+A controlled production-acceptance fixture was created against the Railway production API to validate the receiving flow end to end at API level.
+
+Controlled Purchase Order:
+
+- Purchase Order ID: `6a3a1d6e-8065-4ff7-b2ee-e7fc596b10b4`
+- Initial receivable state: `APPROVED`, version `3`
+- Purchase Order line ID: `e4e41ad5-3e24-464e-ab7d-77031758966a`
+- Ordered quantity: `100.000000 kg`
+- Eligible warehouse ID: `94e15351-d4b4-46bc-ac36-a304c675ba8f`
+- Warehouse code: `UAT_RECEIPT_WH_A`
+
+Independent approval was performed by a separate non-superuser organization-scoped approver account. Creator self-approval was therefore not used.
+
+First partial receipt:
+
+- HTTP `201`
+- Receipt ID: `27c2131f-cc97-404f-bc6b-cfe8753357e8`
+- GRN: `GRN-2026-000001`
+- Quantity: `40.000000 kg`
+- Inventory lot ID: `958208f1-dd3b-41cd-b860-51f43a3313ef`
+- Inventory transaction ID: `42462b62-b99e-4f3e-abf1-f6a5aba8902f`
+- Purchase Order transitioned from `APPROVED v3` to `PARTIALLY_RECEIVED v4`
+- Readback confirmed `40.000000 / 100.000000 kg` received.
+
+Idempotency validation:
+
+- Replaying the exact first receipt with the same `Idempotency-Key` returned HTTP `200`.
+- Response header `x-idempotent-replay: true` was present.
+- The replay returned the same receipt ID, GRN, inventory lot ID, and inventory transaction ID.
+- Reusing the same idempotency key with a changed quantity returned HTTP `409` with code `idempotency_key_payload_conflict`.
+- Readback after the rejected changed-payload request confirmed the Purchase Order remained `PARTIALLY_RECEIVED v4` with exactly `40.000000 kg` received.
+
+Final receipt:
+
+- HTTP `201`
+- Receipt ID: `f36cd2c2-25b2-4bb1-83be-e989560401a9`
+- GRN: `GRN-2026-000002`
+- Quantity: `60.000000 kg`
+- Inventory lot ID: `7d91e5a2-d289-4e9a-9ab7-35763751891f`
+- Inventory transaction ID: `94f0aba1-845b-48c8-aa80-18be9209aa9e`
+- Purchase Order transitioned from `PARTIALLY_RECEIVED v4` to `RECEIVED v5`
+- Final readback confirmed `100.000000 / 100.000000 kg` received and canonical quantities matched exactly.
+
+Post-completion protection:
+
+- A further receipt attempt against the fully received Purchase Order returned HTTP `409` with code `purchase_order_not_receivable`.
+- No additional receipt mutation was accepted after the Purchase Order reached `RECEIVED`.
+
+This closes the API-level Purchase Receipt posting gate, including inventory-lot creation, inventory-transaction creation, partial and full receipt transitions, replay safety, conflicting replay rejection, and terminal over-receipt protection.
+
+Browser qualification remains governed by Section 8: the dedicated production frontend/domain was not established by this closeout, so this receipt-posting evidence is specifically API-level production acceptance and is not represented as dedicated production-browser receipt-posting validation.
+
 ## 4. Release-UAT deployment verification
 
 Railway release-UAT API health returned HTTP `200` with Redis-backed rate limiting healthy.
@@ -173,7 +229,7 @@ The following items were not treated as release blockers for this closeout:
 2. Railway production Postgres has PITR disabled and no automatic backup schedule; production backup policy should be hardened separately.
 3. Transactional email provider failures can currently surface as generic HTTP `500`; graceful provider-failure handling should be hardened.
 4. A previously observed email-verification test login returned `401`; this was not reproduced as a verified product defect and may have been test-password input error.
-5. Receipt-posting UAT was not completed because the tested Purchase Order returned an empty eligible-warehouse list; a controlled warehouse fixture is required for that flow.
+5. Dedicated production-browser receipt-posting validation was not established because the validated Vercel `develop` Preview is not treated as proof of a distinct production frontend/database path; API-level receipt posting was completed successfully as recorded in Section 3.
 6. A timezone-sensitive web test has previously failed outside UTC while passing under `TZ=UTC`; this is test-environment debt.
 7. Broad API mypy debt remains outside the focused remediation scope.
 8. Repository dependency/security-alert debt should be handled as a dedicated security-maintenance stream rather than silently folded into this closeout.
