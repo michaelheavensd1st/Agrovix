@@ -135,6 +135,26 @@ Post-completion protection:
 
 This closes the API-level Purchase Receipt posting gate, including inventory-lot creation, inventory-transaction creation, partial and full receipt transitions, replay safety, conflicting replay rejection, and terminal over-receipt protection.
 
+### Production receipt-fixture inventory isolation
+
+PASS.
+
+Because Purchase Receipt posting creates immutable inventory-ledger history, a read-only production database audit was performed before authorizing fixture cleanup.
+
+The controlled receipt fixture is logically isolated from all other observed inventory activity:
+
+- Warehouse `94e15351-d4b4-46bc-ac36-a304c675ba8f` is explicitly named `UAT Receipt Warehouse A` with code `UAT_RECEIPT_WH_A`.
+- Inventory item `3ee95b24-b3c4-4d56-9dcc-141ccd755f84` is explicitly named `UAT Receipt Feed` with code `UAT-RECEIPT-FEED`.
+- The UAT warehouse contains exactly `2` inventory transactions, `2` active lots, and `1` distinct inventory item.
+- The two transactions total exactly `100.000000 kg`, matching the controlled `40 kg` and `60 kg` Purchase Receipt scenarios.
+- The UAT inventory item has no transaction activity or active lots in any other warehouse.
+- The only transaction type recorded for the UAT item is `receipt`.
+- Read-only schema discovery returned `inventory_items`, `inventory_lots`, and `inventory_transactions` as the inventory-related tables relevant to this fixture; no separately named stock/balance table was identified.
+- Receipt transaction IDs are `42462b62-b99e-4f3e-abf1-f6a5aba8902f` and `94f0aba1-845b-48c8-aa80-18be9209aa9e`.
+- Receipt lot IDs are `958208f1-dd3b-41cd-b860-51f43a3313ef` and `7d91e5a2-d289-4e9a-9ab7-35763751891f`.
+
+Accordingly, the synthetic `100 kg` balance is quarantined inside a dedicated, clearly identified UAT warehouse/item ledger namespace and is not commingled with another observed warehouse or inventory-item ledger. The immutable Purchase Receipt and inventory transaction history must not be deleted, rewritten, or offset merely for UAT cleanup. No compensating inventory adjustment is authorized or required for this closeout because the fixture remains quarantined as acceptance evidence and is not being converted into operational stock.
+
 Browser qualification remains governed by Section 8: the dedicated production frontend/domain was not established by this closeout, so this receipt-posting evidence is specifically API-level production acceptance and is not represented as dedicated production-browser receipt-posting validation.
 
 ## 4. Release-UAT deployment verification
@@ -160,7 +180,7 @@ Railway production target:
 - Project: `talented-fulfillment`
 - Environment: `production`
 - Application service: `Agrovix`
-- Production application deployment ID at closeout: `b45ed9ca-33db-4dfa-a3f3-36cb85e3f18e`
+- Production application deployment ID at closeout: `19028a58-3e26-4e11-95c4-1c44a142c610`
 
 Production health verification:
 
@@ -196,12 +216,12 @@ At closeout:
 
 Application rollback anchor:
 
-- Deployment ID: `b45ed9ca-33db-4dfa-a3f3-36cb85e3f18e`
+- Deployment ID: `19028a58-3e26-4e11-95c4-1c44a142c610`
 - Git SHA: `48c236ac2e625f0ca18c0e7e7f9940327c2197e4`
 - Git branch: `develop`
 - Repository: `michaelheavensd1st/Agrovix`
 
-The production application was already running the exact UAT-approved SHA, so no redundant redeployment was performed.
+The production application code remained on the exact UAT-approved SHA. A subsequent configuration-only redeployment was performed to apply the corrected transactional-email sender configuration; in-container verification after that redeployment confirmed `RAILWAY_GIT_COMMIT_SHA=48c236ac2e625f0ca18c0e7e7f9940327c2197e4` and `RAILWAY_GIT_BRANCH=develop`. No application-code change was introduced by that configuration redeployment.
 
 ## 7. Railway platform stability gate
 
@@ -236,9 +256,11 @@ The following items were not treated as release blockers for this closeout:
 
 ## 10. Data preservation and cleanup rule
 
-UAT fixtures must not be deleted until this closeout evidence is committed and reviewed. Cleanup should be controlled and limited to disposable UAT data. Production data must not be modified as part of UAT fixture cleanup.
+UAT fixtures must not be deleted until this closeout evidence is committed and reviewed. Cleanup should be controlled and limited to genuinely disposable UAT data. Production data must not be modified merely to remove acceptance evidence.
 
-Aquaculture and Purchase Order fixtures used to establish the acceptance evidence should remain available until the closeout commit/PR is safely merged and the evidence is no longer dependent on live fixture inspection.
+The Release 6.0.6 Purchase Receipt fixture is specifically excluded from destructive cleanup: its Purchase Receipt records, inventory lots, and inventory transactions form immutable acceptance/audit evidence and must not be deleted, rewritten, or neutralized by a compensating adjustment solely for cleanup purposes. Its synthetic `100 kg` balance remains quarantined in the dedicated `UAT_RECEIPT_WH_A` / `UAT-RECEIPT-FEED` ledger namespace documented in Section 3.
+
+Aquaculture and other Purchase Order fixtures used to establish the acceptance evidence should remain available until the closeout commit/PR is safely merged and the evidence is no longer dependent on live fixture inspection.
 
 ## 11. Final acceptance statement
 
@@ -248,4 +270,4 @@ Release 6.0.6 is accepted at Git SHA:
 
 The functional UAT gate is closed and the Railway production API is accepted on that exact SHA with a healthy application, Redis, PostgreSQL, aligned Alembic state, and a fresh pre-acceptance database backup.
 
-No further deployment is required merely to reproduce the accepted release SHA. Follow-up work should proceed as separately controlled hardening/cleanup work, beginning with preservation of this report, then UAT fixture cleanup, production frontend/domain hardening, and production backup-policy hardening.
+The current production deployment remains on the accepted release SHA; no further application-code deployment is required merely to reproduce that SHA. Follow-up work should proceed as separately controlled hardening/cleanup work, beginning with preservation of this report, then UAT fixture cleanup, production frontend/domain hardening, and production backup-policy hardening.
