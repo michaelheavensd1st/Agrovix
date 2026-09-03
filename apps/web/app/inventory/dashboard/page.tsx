@@ -42,6 +42,7 @@ import { ErrorBanner, ForbiddenBanner, Loading } from '@/components/ape-ui';
 import { EmptyStateCard, friendlyError } from '@/components/ui-polish';
 import {
   buildDashboardProjection,
+  isQuarantinedReceiptFixtureWarehouse,
   resolveOrganizationId,
   type DashboardInventoryItem,
   type DashboardLot,
@@ -205,17 +206,20 @@ export default function InventoryDashboardPage() {
 
       try {
         const [warehouses, items] = await Promise.all([
-          apiFetch<DashboardWarehouse[]>(
-            `/v1/organizations/${organizationId}/warehouses?operational_only=true`,
-          ),
-          apiFetch<DashboardInventoryItem[]>(
-            `/v1/organizations/${organizationId}/inventory-items?operational_only=true`,
-          ),
+          apiFetch<DashboardWarehouse[]>(`/v1/organizations/${organizationId}/warehouses`),
+          apiFetch<DashboardInventoryItem[]>(`/v1/organizations/${organizationId}/inventory-items`),
         ]);
         if (isStale()) return;
 
+        // Reporting intentionally retains closed warehouses and inactive item
+        // metadata. Only the documented Release 6.0.6 receipt fixture is
+        // excluded from this operational projection and lot fan-out.
+        const reportingWarehouses = warehouses.filter(
+          (warehouse) => !isQuarantinedReceiptFixtureWarehouse(warehouse),
+        );
+
         const lotResults = await Promise.allSettled(
-          warehouses.map((wh) => apiFetch<DashboardLot[]>(`/v1/warehouses/${wh.id}/lots`)),
+          reportingWarehouses.map((wh) => apiFetch<DashboardLot[]>(`/v1/warehouses/${wh.id}/lots`)),
         );
         if (isStale()) return;
 
@@ -231,7 +235,7 @@ export default function InventoryDashboardPage() {
 
         const nowIso = new Date().toISOString();
         const projection = buildDashboardProjection({
-          warehouses,
+          warehouses: reportingWarehouses,
           items,
           lots: outcome.lots,
           nowIso,
@@ -245,7 +249,7 @@ export default function InventoryDashboardPage() {
               ? 'One or more warehouses could not be loaded. Some totals may be understated.'
               : null,
           projection,
-          warehouses,
+          warehouses: reportingWarehouses,
           items,
           lots: outcome.lots,
           nowIso,

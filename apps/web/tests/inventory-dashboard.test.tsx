@@ -26,6 +26,7 @@ import {
   EXPIRING_SOON_DAYS,
   isItemInCurrentOrg,
   isLotInCurrentOrg,
+  QUARANTINED_RECEIPT_FIXTURE_WAREHOUSE_ID,
   isWarehouseInCurrentOrg,
   parseBalance,
   resolveOrganizationId,
@@ -46,6 +47,8 @@ import {
 // --------------------------------------------------------------------- //
 
 const NOW = '2026-02-15T12:00:00.000Z';
+const CANONICAL_RELEASE_606_RECEIPT_FIXTURE_WAREHOUSE_ID =
+  '94e15351-d4b4-46bc-ac36-a304c675ba8f';
 
 const WH_MAIN: DashboardWarehouse = {
   id: 'wh-1',
@@ -118,6 +121,12 @@ function makeLot(overrides: Partial<DashboardLot>): DashboardLot {
 // --------------------------------------------------------------------- //
 
 describe('inventory-dashboard aggregation', () => {
+  it('anchors the quarantine to the canonical Release 6.0.6 fixture warehouse', () => {
+    expect(QUARANTINED_RECEIPT_FIXTURE_WAREHOUSE_ID).toBe(
+      CANONICAL_RELEASE_606_RECEIPT_FIXTURE_WAREHOUSE_ID,
+    );
+  });
+
   it('parseBalance handles strings, numbers and garbage', () => {
     expect(parseBalance('12.5')).toBe(12.5);
     expect(parseBalance(0)).toBe(0);
@@ -473,13 +482,11 @@ function primeApi(config: {
       if (config.throwOnOrgs) return Promise.reject(config.throwOnOrgs);
       return Promise.resolve(config.orgs ?? []);
     }
-    const whMatch = path.match(/^\/v1\/organizations\/([^/]+)\/warehouses\?operational_only=true$/);
+    const whMatch = path.match(/^\/v1\/organizations\/([^/]+)\/warehouses$/);
     if (whMatch) {
       return Promise.resolve(config.warehousesByOrg?.[whMatch[1]] ?? []);
     }
-    const itemMatch = path.match(
-      /^\/v1\/organizations\/([^/]+)\/inventory-items\?operational_only=true$/,
-    );
+    const itemMatch = path.match(/^\/v1\/organizations\/([^/]+)\/inventory-items$/);
     if (itemMatch) {
       return Promise.resolve(config.itemsByOrg?.[itemMatch[1]] ?? []);
     }
@@ -578,17 +585,32 @@ describe('InventoryDashboardPage', () => {
     );
   });
 
-  it('requests operational catalogs and never fetches closed-quarantine warehouse lots', async () => {
+  it('preserves legitimate closed stock and inactive metadata while excluding the receipt fixture', async () => {
+    const receiptFixtureWarehouse: DashboardWarehouse = {
+      ...WH_CLOSED,
+      id: CANONICAL_RELEASE_606_RECEIPT_FIXTURE_WAREHOUSE_ID,
+      code: 'UAT_RECEIPT_WH_A',
+      name: 'UAT Receipt Warehouse A',
+    };
     primeApi({
       orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
-      warehousesByOrg: { 'org-1': [WH_MAIN] },
-      itemsByOrg: { 'org-1': [ITEM_FEED] },
+      warehousesByOrg: { 'org-1': [WH_MAIN, WH_CLOSED, receiptFixtureWarehouse] },
+      itemsByOrg: { 'org-1': [ITEM_FEED, ITEM_INACTIVE] },
       lotsByWh: {
         [WH_MAIN.id]: [makeLot({ id: 'operational-lot', balance: '5' })],
         [WH_CLOSED.id]: [
           makeLot({
-            id: 'quarantined-receipt-lot',
+            id: 'legitimate-closed-lot',
+            item_id: ITEM_INACTIVE.id,
             warehouse_id: WH_CLOSED.id,
+            lot_code: 'LEGIT-CLOSED-LOT',
+            balance: '0',
+          }),
+        ],
+        [receiptFixtureWarehouse.id]: [
+          makeLot({
+            id: 'quarantined-receipt-lot',
+            warehouse_id: receiptFixtureWarehouse.id,
             balance: '100',
           }),
         ],
@@ -598,13 +620,27 @@ describe('InventoryDashboardPage', () => {
     render(<InventoryDashboardPage />);
     await screen.findByTestId('inventory-dashboard-summary');
 
-    expect(mockedApiFetch).toHaveBeenCalledWith(
-      '/v1/organizations/org-1/warehouses?operational_only=true',
+    expect(mockedApiFetch).toHaveBeenCalledWith('/v1/organizations/org-1/warehouses');
+    expect(mockedApiFetch).toHaveBeenCalledWith('/v1/organizations/org-1/inventory-items');
+    expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/warehouses/${WH_CLOSED.id}/lots`);
+    expect(mockedApiFetch).not.toHaveBeenCalledWith(
+      `/v1/warehouses/${receiptFixtureWarehouse.id}/lots`,
     );
-    expect(mockedApiFetch).toHaveBeenCalledWith(
-      '/v1/organizations/org-1/inventory-items?operational_only=true',
+    expect(
+      screen.getByTestId('inventory-dashboard-metric-total_warehouses-value'),
+    ).toHaveTextContent('2');
+    expect(screen.getByTestId('inventory-dashboard-metric-total_lots-value')).toHaveTextContent(
+      '2',
     );
-    expect(mockedApiFetch).not.toHaveBeenCalledWith(`/v1/warehouses/${WH_CLOSED.id}/lots`);
+    expect(
+      screen.getByTestId('inventory-dashboard-metric-total_active_items-value'),
+    ).toHaveTextContent('1');
+    expect(
+      screen.getByTestId('inventory-dashboard-attention-row-legitimate-closed-lot'),
+    ).toHaveTextContent('Old bags');
+    expect(
+      screen.getByTestId('inventory-dashboard-attention-row-legitimate-closed-lot'),
+    ).toHaveTextContent('Archived');
     expect(screen.queryByText('100')).not.toBeInTheDocument();
   });
 
@@ -724,14 +760,10 @@ describe('InventoryDashboardPage', () => {
           { id: 'org-2', name: 'Delta', slug: 'delta' },
         ]);
       }
-      if (path === '/v1/organizations/org-1/warehouses?operational_only=true')
-        return dAWarehouses.promise;
-      if (path === '/v1/organizations/org-1/inventory-items?operational_only=true')
-        return dAItems.promise;
-      if (path === '/v1/organizations/org-2/warehouses?operational_only=true')
-        return Promise.resolve([WH_COLD]);
-      if (path === '/v1/organizations/org-2/inventory-items?operational_only=true')
-        return Promise.resolve([ITEM_MED]);
+      if (path === '/v1/organizations/org-1/warehouses') return dAWarehouses.promise;
+      if (path === '/v1/organizations/org-1/inventory-items') return dAItems.promise;
+      if (path === '/v1/organizations/org-2/warehouses') return Promise.resolve([WH_COLD]);
+      if (path === '/v1/organizations/org-2/inventory-items') return Promise.resolve([ITEM_MED]);
       if (path === `/v1/warehouses/${WH_MAIN.id}/lots`) return dALots.promise;
       if (path === `/v1/warehouses/${WH_COLD.id}/lots`) {
         return Promise.resolve([
