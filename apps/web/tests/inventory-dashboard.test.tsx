@@ -473,11 +473,13 @@ function primeApi(config: {
       if (config.throwOnOrgs) return Promise.reject(config.throwOnOrgs);
       return Promise.resolve(config.orgs ?? []);
     }
-    const whMatch = path.match(/^\/v1\/organizations\/([^/]+)\/warehouses$/);
+    const whMatch = path.match(/^\/v1\/organizations\/([^/]+)\/warehouses\?operational_only=true$/);
     if (whMatch) {
       return Promise.resolve(config.warehousesByOrg?.[whMatch[1]] ?? []);
     }
-    const itemMatch = path.match(/^\/v1\/organizations\/([^/]+)\/inventory-items$/);
+    const itemMatch = path.match(
+      /^\/v1\/organizations\/([^/]+)\/inventory-items\?operational_only=true$/,
+    );
     if (itemMatch) {
       return Promise.resolve(config.itemsByOrg?.[itemMatch[1]] ?? []);
     }
@@ -574,6 +576,36 @@ describe('InventoryDashboardPage', () => {
       'href',
       '/inventory?organization_id=org-1&tab=history',
     );
+  });
+
+  it('requests operational catalogs and never fetches closed-quarantine warehouse lots', async () => {
+    primeApi({
+      orgs: [{ id: 'org-1', name: 'Aegis', slug: 'aegis' }],
+      warehousesByOrg: { 'org-1': [WH_MAIN] },
+      itemsByOrg: { 'org-1': [ITEM_FEED] },
+      lotsByWh: {
+        [WH_MAIN.id]: [makeLot({ id: 'operational-lot', balance: '5' })],
+        [WH_CLOSED.id]: [
+          makeLot({
+            id: 'quarantined-receipt-lot',
+            warehouse_id: WH_CLOSED.id,
+            balance: '100',
+          }),
+        ],
+      },
+    });
+
+    render(<InventoryDashboardPage />);
+    await screen.findByTestId('inventory-dashboard-summary');
+
+    expect(mockedApiFetch).toHaveBeenCalledWith(
+      '/v1/organizations/org-1/warehouses?operational_only=true',
+    );
+    expect(mockedApiFetch).toHaveBeenCalledWith(
+      '/v1/organizations/org-1/inventory-items?operational_only=true',
+    );
+    expect(mockedApiFetch).not.toHaveBeenCalledWith(`/v1/warehouses/${WH_CLOSED.id}/lots`);
+    expect(screen.queryByText('100')).not.toBeInTheDocument();
   });
 
   // ------------------------------------------------------------------- //
@@ -692,10 +724,14 @@ describe('InventoryDashboardPage', () => {
           { id: 'org-2', name: 'Delta', slug: 'delta' },
         ]);
       }
-      if (path === '/v1/organizations/org-1/warehouses') return dAWarehouses.promise;
-      if (path === '/v1/organizations/org-1/inventory-items') return dAItems.promise;
-      if (path === '/v1/organizations/org-2/warehouses') return Promise.resolve([WH_COLD]);
-      if (path === '/v1/organizations/org-2/inventory-items') return Promise.resolve([ITEM_MED]);
+      if (path === '/v1/organizations/org-1/warehouses?operational_only=true')
+        return dAWarehouses.promise;
+      if (path === '/v1/organizations/org-1/inventory-items?operational_only=true')
+        return dAItems.promise;
+      if (path === '/v1/organizations/org-2/warehouses?operational_only=true')
+        return Promise.resolve([WH_COLD]);
+      if (path === '/v1/organizations/org-2/inventory-items?operational_only=true')
+        return Promise.resolve([ITEM_MED]);
       if (path === `/v1/warehouses/${WH_MAIN.id}/lots`) return dALots.promise;
       if (path === `/v1/warehouses/${WH_COLD.id}/lots`) {
         return Promise.resolve([

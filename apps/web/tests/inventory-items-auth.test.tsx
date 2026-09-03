@@ -363,7 +363,8 @@ describe('InventoryItemDetailPage — cross-tenant + stale + auth', () => {
       // The URL item is not in org A's list — this is either a
       // cross-tenant attempt or a stale link. Either way, no swap.
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -386,7 +387,8 @@ describe('InventoryItemDetailPage — cross-tenant + stale + auth', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return dOrgA.promise;
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     const { unmount } = render(<InventoryItemDetailPage />);
@@ -443,7 +445,8 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
     mockedApiFetch.mockImplementation(async (path: string) => {
       if (path === '/v1/organizations') return [ORG_A];
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return [item];
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return warehouses;
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return warehouses;
       if (path.startsWith('/v1/warehouses/') && path.endsWith('/lots')) {
         inFlight += 1;
         peak = Math.max(peak, inFlight);
@@ -463,7 +466,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
         ]);
@@ -482,7 +485,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
         ]);
@@ -498,7 +501,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           {
             id: 'wh-1',
@@ -549,7 +552,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
         ]);
@@ -586,7 +589,7 @@ describe('InventoryItemDetailPage — availability + activity fan-out', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
         return Promise.resolve([makeItem({ id: 'item-1' })]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
         ]);
@@ -645,7 +648,7 @@ describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
         ]);
@@ -687,7 +690,7 @@ describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([item]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
         return Promise.resolve([
           { id: 'wh-1', organization_id: ORG_A.id, code: 'W1', name: 'W1', status: 'active' },
         ]);
@@ -747,7 +750,8 @@ describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) {
         return allowB ? dItemsB.promise : Promise.resolve([itemA, itemB]);
       }
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     const { rerender } = render(<InventoryItemDetailPage />);
@@ -782,7 +786,8 @@ describe('InventoryItemDetailPage — Sprint 5.3 review findings', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
         return Promise.resolve([itemA, itemB]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       if (path === `/v1/inventory-items/item-A` && init?.method === 'PATCH') return dPatch.promise;
       return Promise.resolve([]);
     });
@@ -843,12 +848,14 @@ describe('InventoryItemDetailPage — reactive URL organization sync', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
         return Promise.resolve([itemInA]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) {
         bServed = true;
         return dItemsB.promise;
       }
-      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -898,8 +905,10 @@ describe('InventoryItemDetailPage — reactive URL organization sync', () => {
       }
       if (path === `/v1/organizations/${ORG_B.id}/inventory-items`)
         return Promise.resolve([itemInB]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
-      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -930,7 +939,8 @@ describe('InventoryItemDetailPage — reactive URL organization sync', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
         return Promise.resolve([itemInA]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -952,7 +962,8 @@ describe('InventoryItemDetailPage — reactive URL organization sync', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
         return Promise.resolve([itemInA]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);
@@ -977,7 +988,8 @@ describe('InventoryItemDetailPage — reactive URL organization sync', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_B.id}/inventory-items`)
         return Promise.resolve([itemInB]);
-      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       return Promise.resolve([]);
     });
     render(<InventoryItemDetailPage />);

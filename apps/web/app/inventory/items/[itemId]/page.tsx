@@ -258,7 +258,9 @@ function InventoryItemDetailInner() {
     try {
       const [orgItems, orgWarehouses] = await Promise.all([
         apiFetch<InventoryItem[]>(`/v1/organizations/${capturedOrgId}/inventory-items`),
-        apiFetch<ItemWarehouse[]>(`/v1/organizations/${capturedOrgId}/warehouses`),
+        apiFetch<ItemWarehouse[]>(
+          `/v1/organizations/${capturedOrgId}/warehouses?operational_only=true`,
+        ),
       ]);
       if (!isCurrent()) return;
       const match = orgItems.find((i) => i.id === capturedItemId);

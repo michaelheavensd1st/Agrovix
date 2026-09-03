@@ -157,9 +157,9 @@ describe('/inventory workspace — authorization error handling', () => {
   it('Test 1 — warehouse/item load 401 redirects to /login and clears org data', async () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`))
         return Promise.reject(new ApiError(401, { detail: 'session expired' }));
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`))
         return Promise.reject(new ApiError(401, { detail: 'session expired' }));
       return Promise.resolve([]);
     });
@@ -182,9 +182,9 @@ describe('/inventory workspace — authorization error handling', () => {
   it('Test 2 — warehouse/item load 403 clears data and surfaces a permission banner', async () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`))
         return Promise.reject(new ApiError(403, { detail: 'forbidden' }));
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`))
         return Promise.reject(new ApiError(403, { detail: 'forbidden' }));
       return Promise.resolve([]);
     });
@@ -210,8 +210,9 @@ describe('/inventory workspace — authorization error handling', () => {
   it('Test 3a — lot load 401 redirects to /login', async () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`))
+        return Promise.resolve([WH_A]);
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`))
         return Promise.resolve([ITEM_A]);
       if (path === `/v1/warehouses/${WH_A.id}/lots`)
         return Promise.reject(new ApiError(401, { detail: 'session expired' }));
@@ -226,8 +227,9 @@ describe('/inventory workspace — authorization error handling', () => {
   it('Test 3b — first-load lot 403 clears lots and shows the lot-scope banner', async () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`))
+        return Promise.resolve([WH_A]);
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`))
         return Promise.resolve([ITEM_A]);
       if (path === `/v1/warehouses/${WH_A.id}/lots`)
         return Promise.reject(new ApiError(403, { detail: 'forbidden' }));
@@ -255,8 +257,9 @@ describe('/inventory workspace — authorization error handling', () => {
   it('Test 4a — history load 401 redirects to /login', async () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`))
+        return Promise.resolve([WH_A]);
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`))
         return Promise.resolve([ITEM_A]);
       if (path === `/v1/warehouses/${WH_A.id}/lots`) return Promise.resolve([LOT_A]);
       if (path === `/v1/lots/${LOT_A.id}/transactions`)
@@ -276,8 +279,9 @@ describe('/inventory workspace — authorization error handling', () => {
   it('Test 4b — history load 403 clears history rows and shows history-scope banner', async () => {
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_A]);
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`))
+        return Promise.resolve([WH_A]);
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`))
         return Promise.resolve([ITEM_A]);
       if (path === `/v1/warehouses/${WH_A.id}/lots`) return Promise.resolve([LOT_A]);
       if (path === `/v1/lots/${LOT_A.id}/transactions`)
@@ -309,10 +313,11 @@ describe('/inventory workspace — authorization error handling', () => {
 
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return dAWarehouses.promise;
-      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return dAItems.promise;
-      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([WH_B]);
-      if (path === `/v1/organizations/${ORG_B.id}/inventory-items`)
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/warehouses`)) return dAWarehouses.promise;
+      if (path.startsWith(`/v1/organizations/${ORG_A.id}/inventory-items`)) return dAItems.promise;
+      if (path.startsWith(`/v1/organizations/${ORG_B.id}/warehouses`))
+        return Promise.resolve([WH_B]);
+      if (path.startsWith(`/v1/organizations/${ORG_B.id}/inventory-items`))
         return Promise.resolve([ITEM_B]);
       if (path === `/v1/warehouses/${WH_B.id}/lots`) return Promise.resolve([LOT_B]);
       if (/^\/v1\/lots\/[^/]+\/transactions/.test(path)) return Promise.resolve({ items: [] });
@@ -344,5 +349,54 @@ describe('/inventory workspace — authorization error handling', () => {
     expect(routerPush).not.toHaveBeenCalledWith('/login');
     // No toast either — the 403 was recognised as auth and dropped.
     expect(toastSpy).not.toHaveBeenCalled();
+  });
+
+  it('keeps quarantine resources in admin catalogs but out of operational flows', async () => {
+    const closedWarehouse = {
+      ...WH_A,
+      id: 'wh-quarantine',
+      code: 'UAT_RECEIPT_WH_A',
+      name: 'UAT Receipt Warehouse A',
+      status: 'closed',
+    };
+    const inactiveItem = {
+      ...ITEM_A,
+      id: 'item-quarantine',
+      code: 'UAT-RECEIPT-FEED',
+      name: 'UAT Receipt Feed',
+      is_active: false,
+    };
+
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+        return Promise.resolve([WH_A, closedWarehouse]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([ITEM_A, inactiveItem]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([WH_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items?operational_only=true`)
+        return Promise.resolve([ITEM_A]);
+      if (path === `/v1/warehouses/${WH_A.id}/lots`) return Promise.resolve([LOT_A]);
+      if (path === `/v1/warehouses/${closedWarehouse.id}/lots`)
+        return Promise.resolve([{ ...LOT_A, id: 'uat-100kg', balance: '100' }]);
+      return Promise.resolve([]);
+    });
+
+    render(<InventoryPage />);
+
+    await switchTab('warehouses');
+    expect(await screen.findByText(closedWarehouse.name)).toBeInTheDocument();
+    await switchTab('items');
+    expect(await screen.findByText(inactiveItem.name)).toBeInTheDocument();
+
+    await switchTab('receive');
+    const warehouseSelector = await screen.findByTestId('inv-receive-warehouse');
+    const itemSelector = screen.getByTestId('inv-receive-item');
+    expect(warehouseSelector).toHaveTextContent(WH_A.name);
+    expect(warehouseSelector).not.toHaveTextContent(closedWarehouse.name);
+    expect(itemSelector).toHaveTextContent(ITEM_A.name);
+    expect(itemSelector).not.toHaveTextContent(inactiveItem.name);
+    expect(mockedApiFetch).not.toHaveBeenCalledWith(`/v1/warehouses/${closedWarehouse.id}/lots`);
   });
 });

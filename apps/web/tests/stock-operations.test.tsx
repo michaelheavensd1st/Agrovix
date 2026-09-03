@@ -134,7 +134,8 @@ async function primeDetailPage(opts?: {
     // Read paths.
     if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
     if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve(items);
-    if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve(warehouses);
+    if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+      return Promise.resolve(warehouses);
     if (path === '/v1/warehouses/wh-1/lots')
       return Promise.resolve(lots.filter((l) => l.warehouse_id === 'wh-1'));
     if (path === '/v1/warehouses/wh-2/lots')
@@ -151,6 +152,16 @@ async function primeDetailPage(opts?: {
   render(<InventoryItemDetailPage />);
   await waitFor(() => expect(screen.getByTestId('item-detail-stock-actions')).toBeInTheDocument());
 }
+
+it('item availability requests operational warehouses and never loads quarantine lots', async () => {
+  const closedWarehouseId = 'wh-quarantine';
+  await primeDetailPage({ warehouses: [WH_1], lots: [LOT_1] });
+
+  expect(mockedApiFetch).toHaveBeenCalledWith(
+    `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`,
+  );
+  expect(mockedApiFetch).not.toHaveBeenCalledWith(`/v1/warehouses/${closedWarehouseId}/lots`);
+});
 
 function rejectNextPostWithValidation(detail: Array<{ loc: string[]; msg: string }>) {
   mockedApiFetch.mockImplementation((_path: string, init?: RequestInit) => {
@@ -264,7 +275,8 @@ describe('StockOperationDialog — receive', () => {
       if (init?.method === 'POST') return dPost.promise;
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([WH_1, WH_2]);
       if (path.startsWith('/v1/warehouses/')) return Promise.resolve([LOT_1]);
       if (path.startsWith('/v1/lots/')) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.resolve([]);
@@ -936,8 +948,10 @@ describe('StockOperationDialog — route/generation guards', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
       if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
-      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses?operational_only=true`)
+        return Promise.resolve([]);
       if (path.startsWith('/v1/warehouses/')) return Promise.resolve([LOT_1]);
       if (path.startsWith('/v1/lots/')) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.resolve([]);
@@ -1294,7 +1308,8 @@ describe('InventoryItemActivity — atomic transfer reversal (Sprint 5.4.2)', ()
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([WH_1, WH_2]);
       if (path === '/v1/warehouses/wh-1/lots') return Promise.resolve([LOT_1]);
       if (path === '/v1/warehouses/wh-2/lots') return Promise.resolve([LOT_2]);
       if (path.startsWith(`/v1/lots/${LOT_1.id}/transactions`)) {
