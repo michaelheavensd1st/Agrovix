@@ -399,4 +399,84 @@ describe('/inventory workspace — authorization error handling', () => {
     expect(itemSelector).not.toHaveTextContent(inactiveItem.name);
     expect(mockedApiFetch).not.toHaveBeenCalledWith(`/v1/warehouses/${closedWarehouse.id}/lots`);
   });
+
+  it('keeps inactive-item lots identifiable in reporting but out of stock operations', async () => {
+    const destinationWarehouse = {
+      ...WH_A,
+      id: 'wh-A2',
+      code: 'A-SECONDARY',
+      name: 'Aegis secondary store',
+    };
+    const inactiveItem = {
+      ...ITEM_A,
+      id: 'item-inactive',
+      code: 'F-A-ARCHIVED',
+      name: 'Archived Aegis feed',
+      is_active: false,
+    };
+    const inactiveItemLot = {
+      ...LOT_A,
+      id: 'lot-inactive-item',
+      item_id: inactiveItem.id,
+      lot_code: 'LOT-ARCHIVED-FEED',
+      balance: '25',
+    };
+    const inactiveItemTransaction = {
+      id: 'tx-inactive-item',
+      transaction_type: 'receipt',
+      quantity: '25',
+      unit: 'kg',
+      reason: 'Historical archived feed receipt',
+      reference_type: 'purchase',
+      performed_at: '2026-02-01T10:00:00.000Z',
+    };
+
+    mockedApiFetch.mockImplementation((path: string) => {
+      if (path === '/v1/organizations') return Promise.resolve([ORG_A]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`)
+        return Promise.resolve([WH_A, destinationWarehouse]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items`)
+        return Promise.resolve([ITEM_A, inactiveItem]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
+        return Promise.resolve([WH_A, destinationWarehouse]);
+      if (path === `/v1/organizations/${ORG_A.id}/inventory-items?operational_only=true`)
+        return Promise.resolve([ITEM_A]);
+      if (path === `/v1/warehouses/${WH_A.id}/lots`)
+        return Promise.resolve([LOT_A, inactiveItemLot]);
+      if (path === `/v1/lots/${inactiveItemLot.id}/transactions`)
+        return Promise.resolve({ items: [inactiveItemTransaction] });
+      return Promise.resolve([]);
+    });
+
+    render(<InventoryPage />);
+
+    await waitFor(() => expect(screen.getByText('Lots').nextElementSibling).toHaveTextContent('1'));
+    const overview = screen.getByTestId('inv-overview');
+    expect(overview).toHaveTextContent(ITEM_A.name);
+    expect(overview).not.toHaveTextContent(inactiveItem.name);
+
+    await switchTab('lots');
+    expect(await screen.findByText(inactiveItemLot.lot_code)).toBeInTheDocument();
+    expect(screen.getByText(inactiveItem.name)).toBeInTheDocument();
+    expect(screen.queryByText(inactiveItem.id)).not.toBeInTheDocument();
+
+    for (const operation of ['issue', 'transfer', 'adjust']) {
+      await switchTab(operation);
+      const lotSelector = (await screen.findByTestId(`inv-${operation}-lot`)) as HTMLSelectElement;
+      const optionValues = Array.from(lotSelector.options, (option) => option.value);
+      expect(lotSelector).toHaveTextContent(LOT_A.lot_code);
+      expect(lotSelector).not.toHaveTextContent(inactiveItemLot.lot_code);
+      expect(optionValues).toContain(LOT_A.id);
+      expect(optionValues).not.toContain(inactiveItemLot.id);
+    }
+
+    await switchTab('history');
+    const historyLotSelector = await screen.findByTestId('inv-history-lot');
+    expect(historyLotSelector).toHaveTextContent(inactiveItemLot.lot_code);
+    fireEvent.change(historyLotSelector, { target: { value: inactiveItemLot.id } });
+    await waitFor(() =>
+      expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/lots/${inactiveItemLot.id}/transactions`),
+    );
+    expect(await screen.findByText(inactiveItemTransaction.reason)).toBeInTheDocument();
+  });
 });

@@ -431,17 +431,27 @@ function InventoryInner() {
       });
   }, [selectedLot, selectedWh, orgId, handleLoadError]);
 
+  const operationalItemIds = useMemo(
+    () => new Set(operationalItems.map((item) => item.id)),
+    [operationalItems],
+  );
+
+  const operationalLots = useMemo(
+    () => lots.filter((lot) => operationalItemIds.has(lot.item_id)),
+    [lots, operationalItemIds],
+  );
+
   const totalBalanceByItem = useMemo(() => {
     const acc = new Map<string, { balance: number; unit: string; name: string }>();
-    for (const lot of lots) {
-      const item = items.find((i) => i.id === lot.item_id);
+    for (const lot of operationalLots) {
+      const item = operationalItems.find((i) => i.id === lot.item_id);
       const name = item?.name ?? lot.item_id;
       const prev = acc.get(name) ?? { balance: 0, unit: lot.balance_unit, name };
       prev.balance += Number(lot.balance);
       acc.set(name, prev);
     }
     return Array.from(acc.values());
-  }, [items, lots]);
+  }, [operationalItems, operationalLots]);
 
   const currentWh = operationalWarehouses.find((w) => w.id === selectedWh) ?? null;
 
@@ -521,7 +531,7 @@ function InventoryInner() {
               loading={loadingOrg}
               warehouses={operationalWarehouses}
               items={operationalItems}
-              lots={lots}
+              lots={operationalLots}
               balances={totalBalanceByItem}
               onCreateWarehouse={() => setTab('warehouses')}
               onCreateItem={() => setTab('items')}
@@ -561,7 +571,7 @@ function InventoryInner() {
                 selectedWh={selectedWh}
                 onSelectWh={setSelectedWh}
                 lots={lots}
-                items={operationalItems}
+                items={items}
                 onOpenLot={(id) => {
                   setSelectedLot(id);
                   setTab('history');
@@ -586,7 +596,7 @@ function InventoryInner() {
               key={orgId || 'no-org'}
               mode="issue"
               warehouse={currentWh}
-              lots={lots}
+              lots={operationalLots}
               items={operationalItems}
               warehouses={operationalWarehouses}
               onDone={reloadLots}
@@ -598,7 +608,7 @@ function InventoryInner() {
               key={orgId || 'no-org'}
               warehouses={operationalWarehouses}
               warehouse={currentWh}
-              lots={lots}
+              lots={operationalLots}
               items={operationalItems}
               onDone={reloadLots}
             />
@@ -609,7 +619,7 @@ function InventoryInner() {
               key={orgId || 'no-org'}
               mode="adjust"
               warehouse={currentWh}
-              lots={lots}
+              lots={operationalLots}
               items={operationalItems}
               warehouses={operationalWarehouses}
               onDone={reloadLots}
