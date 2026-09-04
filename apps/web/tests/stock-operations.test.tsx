@@ -125,6 +125,7 @@ async function primeDetailPage(opts?: {
   warehouses?: ItemWarehouse[];
   lots?: ItemLot[];
   transactions?: unknown[];
+  transactionsByLot?: Record<string, unknown[]>;
 }) {
   const items = opts?.items ?? [ITEM];
   const warehouses = opts?.warehouses ?? [WH_1, WH_2];
@@ -134,14 +135,17 @@ async function primeDetailPage(opts?: {
     // Read paths.
     if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
     if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve(items);
-    if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
-      return Promise.resolve(warehouses);
-    if (path === '/v1/warehouses/wh-1/lots')
-      return Promise.resolve(lots.filter((l) => l.warehouse_id === 'wh-1'));
-    if (path === '/v1/warehouses/wh-2/lots')
-      return Promise.resolve(lots.filter((l) => l.warehouse_id === 'wh-2'));
-    if (path.startsWith('/v1/lots/') && path.includes('/transactions'))
-      return Promise.resolve(txPage);
+    if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve(warehouses);
+    const warehouseLotsMatch = path.match(/^\/v1\/warehouses\/([^/]+)\/lots$/);
+    if (warehouseLotsMatch)
+      return Promise.resolve(lots.filter((l) => l.warehouse_id === warehouseLotsMatch[1]));
+    const lotTransactionsMatch = path.match(/^\/v1\/lots\/([^/]+)\/transactions/);
+    if (lotTransactionsMatch) {
+      return Promise.resolve({
+        ...txPage,
+        items: opts?.transactionsByLot?.[lotTransactionsMatch[1]] ?? txPage.items,
+      });
+    }
     // Write paths are intercepted by individual tests via a
     // secondary layer set up on top of this base.
     if (init?.method === 'POST') return Promise.resolve({ id: 'tx-new' });
@@ -153,14 +157,50 @@ async function primeDetailPage(opts?: {
   await waitFor(() => expect(screen.getByTestId('item-detail-stock-actions')).toBeInTheDocument());
 }
 
-it('item availability requests operational warehouses and never loads quarantine lots', async () => {
-  const closedWarehouseId = 'wh-quarantine';
-  await primeDetailPage({ warehouses: [WH_1], lots: [LOT_1] });
+it('retains closed-warehouse availability and history without offering it for new operations', async () => {
+  const closedWarehouse: ItemWarehouse = {
+    id: 'wh-closed',
+    organization_id: ORG_A.id,
+    code: 'ARCH',
+    name: 'Closed Archive',
+    status: 'closed',
+  };
+  const closedLot: ItemLot = {
+    ...LOT_1,
+    id: 'lot-closed',
+    warehouse_id: closedWarehouse.id,
+    lot_code: 'ARCHIVE-LOT',
+  };
+  const closedLotTransaction = {
+    id: 'tx-closed-lot',
+    transaction_type: 'receipt',
+    quantity: '10',
+    unit: 'kg',
+    performed_at: '2026-01-02T00:00:00.000Z',
+    reason: 'Historical receipt',
+    reference_type: null,
+  };
 
-  expect(mockedApiFetch).toHaveBeenCalledWith(
-    `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`,
+  await primeDetailPage({
+    warehouses: [WH_1, closedWarehouse],
+    lots: [LOT_1, closedLot],
+    transactionsByLot: { [closedLot.id]: [closedLotTransaction], [LOT_1.id]: [] },
+  });
+
+  expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/organizations/${ORG_A.id}/warehouses`);
+  expect(await screen.findByTestId('item-availability-row-ARCH')).toHaveTextContent(
+    'Closed Archive',
   );
-  expect(mockedApiFetch).not.toHaveBeenCalledWith(`/v1/warehouses/${closedWarehouseId}/lots`);
+  expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/warehouses/${closedWarehouse.id}/lots`);
+  expect(screen.getByTestId('item-lot-row-ARCHIVE-LOT')).toHaveTextContent('Closed Archive');
+  expect(
+    await screen.findByTestId(`item-activity-row-${closedLotTransaction.id}`),
+  ).toHaveTextContent('Historical receipt');
+  expect(mockedApiFetch).toHaveBeenCalledWith(`/v1/lots/${closedLot.id}/transactions?limit=100`);
+
+  fireEvent.click(screen.getByTestId('item-detail-stock-receive'));
+  expect(screen.getByRole('option', { name: WH_1.name })).toBeInTheDocument();
+  expect(screen.queryByRole('option', { name: closedWarehouse.name })).not.toBeInTheDocument();
 });
 
 function rejectNextPostWithValidation(detail: Array<{ loc: string[]; msg: string }>) {
@@ -275,8 +315,7 @@ describe('StockOperationDialog — receive', () => {
       if (init?.method === 'POST') return dPost.promise;
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
-        return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
       if (path.startsWith('/v1/warehouses/')) return Promise.resolve([LOT_1]);
       if (path.startsWith('/v1/lots/')) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.resolve([]);
@@ -948,10 +987,8 @@ describe('StockOperationDialog — route/generation guards', () => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
       if (path === `/v1/organizations/${ORG_B.id}/inventory-items`) return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
-        return Promise.resolve([WH_1, WH_2]);
-      if (path === `/v1/organizations/${ORG_B.id}/warehouses?operational_only=true`)
-        return Promise.resolve([]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_B.id}/warehouses`) return Promise.resolve([]);
       if (path.startsWith('/v1/warehouses/')) return Promise.resolve([LOT_1]);
       if (path.startsWith('/v1/lots/')) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.resolve([]);
@@ -1308,8 +1345,7 @@ describe('InventoryItemActivity — atomic transfer reversal (Sprint 5.4.2)', ()
     mockedApiFetch.mockImplementation((path: string) => {
       if (path === '/v1/organizations') return Promise.resolve([ORG_A, ORG_B]);
       if (path === `/v1/organizations/${ORG_A.id}/inventory-items`) return Promise.resolve([ITEM]);
-      if (path === `/v1/organizations/${ORG_A.id}/warehouses?operational_only=true`)
-        return Promise.resolve([WH_1, WH_2]);
+      if (path === `/v1/organizations/${ORG_A.id}/warehouses`) return Promise.resolve([WH_1, WH_2]);
       if (path === '/v1/warehouses/wh-1/lots') return Promise.resolve([LOT_1]);
       if (path === '/v1/warehouses/wh-2/lots') return Promise.resolve([LOT_2]);
       if (path.startsWith(`/v1/lots/${LOT_1.id}/transactions`)) {

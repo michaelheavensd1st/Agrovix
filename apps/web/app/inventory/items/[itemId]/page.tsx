@@ -258,9 +258,7 @@ function InventoryItemDetailInner() {
     try {
       const [orgItems, orgWarehouses] = await Promise.all([
         apiFetch<InventoryItem[]>(`/v1/organizations/${capturedOrgId}/inventory-items`),
-        apiFetch<ItemWarehouse[]>(
-          `/v1/organizations/${capturedOrgId}/warehouses?operational_only=true`,
-        ),
+        apiFetch<ItemWarehouse[]>(`/v1/organizations/${capturedOrgId}/warehouses`),
       ]);
       if (!isCurrent()) return;
       const match = orgItems.find((i) => i.id === capturedItemId);
@@ -431,6 +429,11 @@ function InventoryItemDetailInner() {
   }, [item, warehouses, lots]);
 
   const warehousesById = useMemo(() => new Map(warehouses.map((w) => [w.id, w])), [warehouses]);
+
+  const operationalWarehouses = useMemo(
+    () => warehouses.filter((warehouse) => warehouse.status !== 'closed'),
+    [warehouses],
+  );
 
   const activeOrg = useMemo(() => orgs?.find((o) => o.id === orgId) ?? null, [orgs, orgId]);
 
@@ -676,7 +679,7 @@ function InventoryItemDetailInner() {
               type={activeStockOp}
               organizationId={orgId}
               item={item}
-              warehouses={warehouses}
+              warehouses={operationalWarehouses}
               lots={lots}
               reversalTx={
                 activeStockOp === 'reverse' && reversalTx
