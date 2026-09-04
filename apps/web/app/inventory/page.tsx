@@ -124,6 +124,8 @@ function InventoryInner() {
   const [orgId, setOrgId] = useState<string>('');
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [items, setItems] = useState<InventoryItem[]>([]);
+  const [operationalWarehouses, setOperationalWarehouses] = useState<Warehouse[]>([]);
+  const [operationalItems, setOperationalItems] = useState<InventoryItem[]>([]);
   const [selectedWh, setSelectedWh] = useState<string>('');
   const [lots, setLots] = useState<Lot[]>([]);
   const [history, setHistory] = useState<LedgerTx[]>([]);
@@ -218,6 +220,8 @@ function InventoryInner() {
           historyGenerationRef.current += 1;
           setWarehouses([]);
           setItems([]);
+          setOperationalWarehouses([]);
+          setOperationalItems([]);
           setLots([]);
           setHistory([]);
           setSelectedWh('');
@@ -289,13 +293,21 @@ function InventoryInner() {
     const isCurrent = () => orgGenerationRef.current === generation && capturedOrgId === orgId;
     setLoadingOrg(true);
     try {
-      const [wh, it] = await Promise.all([
+      const [wh, it, operationalWh, operationalIt] = await Promise.all([
         apiFetch<Warehouse[]>(`/v1/organizations/${capturedOrgId}/warehouses`),
         apiFetch<InventoryItem[]>(`/v1/organizations/${capturedOrgId}/inventory-items`),
+        apiFetch<Warehouse[]>(
+          `/v1/organizations/${capturedOrgId}/warehouses?operational_only=true`,
+        ),
+        apiFetch<InventoryItem[]>(
+          `/v1/organizations/${capturedOrgId}/inventory-items?operational_only=true`,
+        ),
       ]);
       if (!isCurrent()) return;
       setWarehouses(wh);
       setItems(it);
+      setOperationalWarehouses(operationalWh);
+      setOperationalItems(operationalIt);
       // A successful org reload clears any stale org-scope 403 banner.
       setForbidden((f) => (f?.scope === 'org' ? null : f));
       // Sprint 5.1 review round #2 — after an organization switch we
@@ -304,7 +316,11 @@ function InventoryInner() {
       // the initial load; the org-reset effect below clears
       // selectedWh right before reloadOrg runs, so this branch now
       // covers both first-load AND org-switch.
-      if (wh.length > 0) setSelectedWh((current) => (current ? current : wh[0].id));
+      setSelectedWh((current) =>
+        operationalWh.some((warehouse) => warehouse.id === current)
+          ? current
+          : (operationalWh[0]?.id ?? ''),
+      );
     } catch (e) {
       if (handleLoadError(e, 'org', isCurrent) === 'auth') return;
       if (!isCurrent()) return;
@@ -367,6 +383,8 @@ function InventoryInner() {
     historyGenerationRef.current += 1;
     setWarehouses([]);
     setItems([]);
+    setOperationalWarehouses([]);
+    setOperationalItems([]);
     setSelectedWh('');
     setLots([]);
     setSelectedLot('');
@@ -413,19 +431,29 @@ function InventoryInner() {
       });
   }, [selectedLot, selectedWh, orgId, handleLoadError]);
 
+  const operationalItemIds = useMemo(
+    () => new Set(operationalItems.map((item) => item.id)),
+    [operationalItems],
+  );
+
+  const operationalLots = useMemo(
+    () => lots.filter((lot) => operationalItemIds.has(lot.item_id)),
+    [lots, operationalItemIds],
+  );
+
   const totalBalanceByItem = useMemo(() => {
     const acc = new Map<string, { balance: number; unit: string; name: string }>();
-    for (const lot of lots) {
-      const item = items.find((i) => i.id === lot.item_id);
+    for (const lot of operationalLots) {
+      const item = operationalItems.find((i) => i.id === lot.item_id);
       const name = item?.name ?? lot.item_id;
       const prev = acc.get(name) ?? { balance: 0, unit: lot.balance_unit, name };
       prev.balance += Number(lot.balance);
       acc.set(name, prev);
     }
     return Array.from(acc.values());
-  }, [items, lots]);
+  }, [operationalItems, operationalLots]);
 
-  const currentWh = warehouses.find((w) => w.id === selectedWh) ?? null;
+  const currentWh = operationalWarehouses.find((w) => w.id === selectedWh) ?? null;
 
   const tabs: { key: Tab; label: string }[] = [
     { key: 'overview', label: 'Overview' },
@@ -501,9 +529,9 @@ function InventoryInner() {
           {tab === 'overview' && (
             <OverviewPanel
               loading={loadingOrg}
-              warehouses={warehouses}
-              items={items}
-              lots={lots}
+              warehouses={operationalWarehouses}
+              items={operationalItems}
+              lots={operationalLots}
               balances={totalBalanceByItem}
               onCreateWarehouse={() => setTab('warehouses')}
               onCreateItem={() => setTab('items')}
@@ -517,8 +545,14 @@ function InventoryInner() {
               warehouses={warehouses}
               onChange={reloadOrg}
               onSelect={(id) => {
-                setSelectedWh(id);
-                setTab('lots');
+                if (operationalWarehouses.some((warehouse) => warehouse.id === id)) {
+                  setSelectedWh(id);
+                  setTab('lots');
+                  return;
+                }
+                router.push(
+                  `/inventory/warehouses/${id}?organization_id=${encodeURIComponent(orgId)}`,
+                );
               }}
             />
           )}
@@ -533,7 +567,7 @@ function InventoryInner() {
             ) : (
               <LotsPanel
                 loading={loadingLots}
-                warehouses={warehouses}
+                warehouses={operationalWarehouses}
                 selectedWh={selectedWh}
                 onSelectWh={setSelectedWh}
                 lots={lots}
@@ -549,8 +583,8 @@ function InventoryInner() {
           {tab === 'receive' && (
             <ReceivePanel
               key={orgId || 'no-org'}
-              warehouses={warehouses}
-              items={items}
+              warehouses={operationalWarehouses}
+              items={operationalItems}
               selectedWh={selectedWh}
               onSelectWh={setSelectedWh}
               onDone={reloadLots}
@@ -562,9 +596,9 @@ function InventoryInner() {
               key={orgId || 'no-org'}
               mode="issue"
               warehouse={currentWh}
-              lots={lots}
-              items={items}
-              warehouses={warehouses}
+              lots={operationalLots}
+              items={operationalItems}
+              warehouses={operationalWarehouses}
               onDone={reloadLots}
             />
           )}
@@ -572,10 +606,10 @@ function InventoryInner() {
           {tab === 'transfer' && (
             <TransferPanel
               key={orgId || 'no-org'}
-              warehouses={warehouses}
+              warehouses={operationalWarehouses}
               warehouse={currentWh}
-              lots={lots}
-              items={items}
+              lots={operationalLots}
+              items={operationalItems}
               onDone={reloadLots}
             />
           )}
@@ -585,9 +619,9 @@ function InventoryInner() {
               key={orgId || 'no-org'}
               mode="adjust"
               warehouse={currentWh}
-              lots={lots}
-              items={items}
-              warehouses={warehouses}
+              lots={operationalLots}
+              items={operationalItems}
+              warehouses={operationalWarehouses}
               onDone={reloadLots}
             />
           )}

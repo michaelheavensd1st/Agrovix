@@ -307,8 +307,12 @@ export function FeedingForm({
       setLotsError(null);
       try {
         const [warehouses, items] = await Promise.all([
-          apiFetch<DashboardWarehouse[]>(`/v1/organizations/${organizationId}/warehouses`),
-          apiFetch<DashboardInventoryItem[]>(`/v1/organizations/${organizationId}/inventory-items`),
+          apiFetch<DashboardWarehouse[]>(
+            `/v1/organizations/${organizationId}/warehouses?operational_only=true`,
+          ),
+          apiFetch<DashboardInventoryItem[]>(
+            `/v1/organizations/${organizationId}/inventory-items?operational_only=true`,
+          ),
         ]);
         const itemById = new Map(
           items
