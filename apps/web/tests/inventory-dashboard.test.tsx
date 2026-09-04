@@ -47,8 +47,7 @@ import {
 // --------------------------------------------------------------------- //
 
 const NOW = '2026-02-15T12:00:00.000Z';
-const CANONICAL_RELEASE_606_RECEIPT_FIXTURE_WAREHOUSE_ID =
-  '94e15351-d4b4-46bc-ac36-a304c675ba8f';
+const CANONICAL_RELEASE_606_RECEIPT_FIXTURE_WAREHOUSE_ID = '94e15351-d4b4-46bc-ac36-a304c675ba8f';
 
 const WH_MAIN: DashboardWarehouse = {
   id: 'wh-1',
