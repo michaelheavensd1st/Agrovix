@@ -3,20 +3,23 @@
 **Closeout date:** 2026-09-01 (WAT)  
 **Repository:** `michaelheavensd1st/Agrovix`  
 **Release branch:** `develop`  
-**Accepted release SHA:** `48c236ac2e625f0ca18c0e7e7f9940327c2197e4`  
+**Current accepted production SHA:** `66bac60667df190c4cc2f704ed3d572d8828c90f`
 **Alembic head:** `0015_aqua_transfer_integrity`
+
+**Production runtime verification:** 2026-09-05 (UTC)
+**Documentation closeout:** PR #39 pending review
 
 ## 1. Decision
 
 **PRODUCTION ACCEPTED / FUNCTIONAL UAT CLOSED.**
 
-Release 6.0.6 passed the functional UAT and production-acceptance gates described below. No additional application redeployment was required during closeout because the Railway production service was already running the exact UAT-approved Git SHA.
+Release 6.0.6 passed the functional UAT and production-acceptance gates described below. The initial 2026-09-01 acceptance used Git SHA `48c236ac2e625f0ca18c0e7e7f9940327c2197e4`. Production runtime verification now passes on the PR #41 source commit `66bac60667df190c4cc2f704ed3d572d8828c90f` after the receipt-fixture dashboard quarantine was merged, the fixture was operationally retired, and the canonical production frontend was rebuilt with its Production-only API proxy target corrected.
 
-This acceptance is subject to the frontend-environment qualification in Section 8 and does not waive the non-blocking technical debt recorded in Section 9.
+Production acceptance and quarantine runtime verification are complete and PASS. Documentation closeout in PR #39 remains pending review; this report does not resolve or represent resolution of any PR #39 review thread. Production frontend validation is established as recorded in Section 8. This acceptance does not waive the remaining non-blocking technical debt recorded in Section 9.
 
 ## 2. Canonical release baseline
 
-At closeout the repository baseline was verified as:
+At initial acceptance on 2026-09-01 the repository baseline was verified as:
 
 - Branch: `develop`
 - Local HEAD: `48c236ac2e625f0ca18c0e7e7f9940327c2197e4`
@@ -30,7 +33,16 @@ Recent remediation lineage included:
 - PR #36 — `fix(production): return conflict for duplicate unit codes`
 - PR #37 — `fix(receipts): scope warehouse lookup to purchase order`
 - PR #38 — `fix(web): expose purchase orders from organization hub`
-- PR #38 merge commit is the accepted release SHA.
+- PR #38 merge commit was the initial accepted release SHA.
+
+The canonical accepted and deployed production baseline subsequently became:
+
+- Branch: `develop`
+- Git SHA: `66bac60667df190c4cc2f704ed3d572d8828c90f`
+- Lineage: accepted PR #41 source — `fix(inventory): enforce receipt fixture quarantine`
+- Railway production deployment: `SUCCESS` with a `RUNNING` instance
+- Canonical Vercel production frontend: `https://agrovix-web.vercel.app`
+- Alembic: exactly one head, `0015_aqua_transfer_integrity`
 
 ## 3. UAT remediation and acceptance evidence
 
@@ -139,7 +151,7 @@ This closes the API-level Purchase Receipt posting gate, including inventory-lot
 
 PASS.
 
-Because Purchase Receipt posting creates immutable inventory-ledger history, a read-only production database audit was performed before authorizing fixture cleanup.
+Because Purchase Receipt posting creates immutable inventory-ledger history, a read-only production database audit was performed before authorizing fixture retirement.
 
 The controlled receipt fixture is logically isolated from all other observed inventory activity:
 
@@ -155,7 +167,45 @@ The controlled receipt fixture is logically isolated from all other observed inv
 
 Accordingly, the synthetic `100 kg` balance is quarantined inside a dedicated, clearly identified UAT warehouse/item ledger namespace and is not commingled with another observed warehouse or inventory-item ledger. The immutable Purchase Receipt and inventory transaction history must not be deleted, rewritten, or offset merely for UAT cleanup. No compensating inventory adjustment is authorized or required for this closeout because the fixture remains quarantined as acceptance evidence and is not being converted into operational stock.
 
-Browser qualification remains governed by Section 8: the dedicated production frontend/domain was not established by this closeout, so this receipt-posting evidence is specifically API-level production acceptance and is not represented as dedicated production-browser receipt-posting validation.
+#### Operational retirement and preservation verification — 2026-09-04
+
+After a final `REPEATABLE READ`, `READ ONLY` preflight ended with `ROLLBACK`, the fixture was retired only through supported, audited application lifecycle operations:
+
+- Warehouse `94e15351-d4b4-46bc-ac36-a304c675ba8f` / `UAT_RECEIPT_WH_A`: `status = closed`; `deleted_at IS NULL`.
+- Inventory item `3ee95b24-b3c4-4d56-9dcc-141ccd755f84` / `UAT-RECEIPT-FEED`: `is_active = false`; `deleted_at IS NULL`.
+- Supplier `8f09ddc1-9597-4b4c-a43a-19789c54ba77` / `UAT-RECEIPT-SUPPLIER`: inactive/deactivated and not deleted. Its deactivation timestamp is populated and its reason is `Release 6.0.6 production acceptance fixture retired after verified isolation audit`.
+
+Final read-only verification confirmed that operational retirement did not delete, rewrite, or offset acceptance evidence:
+
+- Purchase Order `6a3a1d6e-8065-4ff7-b2ee-e7fc596b10b4` remains `RECEIVED` and retains its supplier relationship.
+- The chain contains exactly `1` PO line, `2` Purchase Receipts, `2` receipt lines, `2` inventory lots, `2` receipt ledger transactions, and `5` PO transitions.
+- Historical receipt quantity remains exactly `100.000000 kg`; the two lot balances remain exactly `40.000000 kg` and `60.000000 kg`.
+- No compensating adjustment was created.
+- Isolation re-verification found no transfers, issues, adjustments, reversals, consumption, production-event references, new fixture inventory activity, cross-warehouse/item contamination, or unexpected fixture dependencies.
+
+The six original fixture audit events remain present, and their recorded integrity digests were verified unchanged:
+
+- `0f91c3eb-6fb6-414d-8ab2-ac0ebdff26f8`
+- `2cf3145c-aec8-4bf8-8e38-a240acaf8e8a`
+- `39037252-7e56-4939-8945-2288fd4fe78f`
+- `366a809a-de29-4e84-a1e5-6c689cd593a9`
+- `73bdc136-02f5-4033-9c0b-7d1f885f18c8`
+- `a70e30eb-919e-4afe-85f7-7365121f4f50`
+
+Normal warehouse-retirement, item-retirement, and supplier-deactivation audit events were created. No prior audit event was deleted or rewritten.
+
+The exact dashboard quarantine for warehouse UUID `94e15351-d4b4-46bc-ac36-a304c675ba8f` remains required and present in the deployed source. Closing the warehouse does not make the quarantine obsolete: the dashboard projection can otherwise include closed warehouses and historical lots, while the intentionally preserved fixture ledger still contains the synthetic `100 kg` balance. The quarantine must remain until that projection contract changes through separately reviewed application work.
+
+#### Authenticated production API and dashboard projection verification — 2026-09-05
+
+Authenticated requests to `https://api-staging.aegisfarm.com` established the administrative-record and operational-projection boundary at runtime:
+
+- Administrative warehouses returned HTTP `200`; `UAT_RECEIPT_WH_A` remained present with `status = closed`.
+- Warehouses requested with `operational_only=true` returned HTTP `200`; `UAT_RECEIPT_WH_A` was absent.
+- Administrative inventory items returned HTTP `200`; `UAT-RECEIPT-FEED` remained present with `is_active = false`.
+- Inventory items requested with `operational_only=true` returned HTTP `200`; `UAT-RECEIPT-FEED` was absent.
+
+This proves the historical administrative records remain preserved while the retired fixture is excluded from operational API projections.
 
 ## 4. Release-UAT deployment verification
 
@@ -178,9 +228,15 @@ Final browser smoke validation on the canonical Vercel `develop` Preview confirm
 Railway production target:
 
 - Project: `talented-fulfillment`
+- Project ID: `9112a2e7-1f4b-4bce-8ddb-5a243c43cf29`
 - Environment: `production`
+- Environment ID: `15d44ea0-e6f5-4c08-bfeb-474ac38b57ce`
 - Application service: `Agrovix`
-- Production application deployment ID at closeout: `19028a58-3e26-4e11-95c4-1c44a142c610`
+- Application service ID: `0a247ad0-6129-445c-b259-4c64b3fe714d`
+- Current production deployment ID: `2944aba2-bf9b-4e04-b9f0-b9ea944b83c4`
+- Deployment status: `SUCCESS`
+- Running instance ID: `8b244f17-4b24-43b2-9255-5007a8acd3f2`
+- Deployed Git SHA: `66bac60667df190c4cc2f704ed3d572d8828c90f`
 
 Production health verification:
 
@@ -196,6 +252,13 @@ Inside the production Railway application container:
 - `alembic heads`: `0015_aqua_transfer_integrity (head)`
 
 Therefore no pending Alembic migration was required for this acceptance event.
+
+Final production database verification on 2026-09-04 reconfirmed:
+
+- `alembic current`: `0015_aqua_transfer_integrity (head)`
+- `alembic heads`: `0015_aqua_transfer_integrity (head)`
+- no migration was performed;
+- the closeout database transaction used `REPEATABLE READ`, was `READ ONLY`, and ended with `ROLLBACK`.
 
 ## 6. Backup and rollback evidence
 
@@ -214,7 +277,7 @@ At closeout:
 - No automatic volume-backup schedule was configured.
 - PITR was deliberately not enabled during closeout because enabling it would introduce an unrelated service redeployment.
 
-Application rollback anchor:
+Historical application rollback anchor from the initial acceptance stage:
 
 - Deployment ID: `19028a58-3e26-4e11-95c4-1c44a142c610`
 - Git SHA: `48c236ac2e625f0ca18c0e7e7f9940327c2197e4`
@@ -223,51 +286,70 @@ Application rollback anchor:
 
 The production application code remained on the exact UAT-approved SHA. A subsequent configuration-only redeployment was performed to apply the corrected transactional-email sender configuration; in-container verification after that redeployment confirmed `RAILWAY_GIT_COMMIT_SHA=48c236ac2e625f0ca18c0e7e7f9940327c2197e4` and `RAILWAY_GIT_BRANCH=develop`. No application-code change was introduced by that configuration redeployment.
 
+Deployment `19028a58-3e26-4e11-95c4-1c44a142c610` is retained here only as historical rollback evidence; it is no longer the active production deployment. The current active deployment is recorded in Section 5.
+
 ## 7. Railway platform stability gate
 
 During preflight the Railway dashboard displayed an incident banner concerning delayed deployment initialization. Promotion was held while the incident was considered active.
 
 Railway's status report subsequently marked the incident **Resolved**, stating that the deployment pipeline had stabilized, the queued-deployment backlog had cleared, and throughput had returned to normal. Only after this status was established was the infrastructure-stability gate treated as passed.
 
-## 8. Frontend environment qualification
+## 8. Frontend production verification
 
-The final browser validation used the canonical Vercel `develop` Preview rather than a separately identified production frontend/domain.
+At initial acceptance on 2026-09-01, browser validation used the canonical Vercel `develop` Preview and did not establish a separately identified production frontend/domain. That historical qualification is superseded by the final production verification below.
 
-Therefore this report records:
+The canonical production frontend is `https://agrovix-web.vercel.app`. It was rebuilt from the same accepted PR #41 source commit after correcting the Production-only `API_PROXY_TARGET` to `https://api-staging.aegisfarm.com`:
 
-- production Railway API acceptance: PASS;
-- accepted frontend build browser smoke: PASS;
-- dedicated production frontend/domain validation: **not established by this closeout**.
+- Project: `agrovix-web`
+- Project ID: `prj_SKigjKdu1pdn3AqJmHuRz55ppPZV`
+- Git branch: `develop`
+- Source commit: `66bac60667df190c4cc2f704ed3d572d8828c90f`
+- Production API proxy target: `https://api-staging.aegisfarm.com`
 
-A dedicated production frontend/domain should be treated as a follow-up deployment-hardening objective. This qualification prevents the closeout evidence from being interpreted as proof that a distinct production web deployment was validated when it was not.
+The repaired `/api-proxy` reaches Railway, and authenticated browser login succeeds. Authenticated production Inventory Dashboard verification returned:
+
+- Active items: `0`
+- Warehouses: `0`
+- Tracked lots: `0`
+- Out of stock: `0`
+- Needs attention: `0 lots`
+
+These runtime results establish that the closed UAT warehouse, inactive UAT item, two historical receipt lots, and synthetic `100 kg` are excluded from the operational dashboard projection while their historical and administrative records remain preserved. Production acceptance and quarantine runtime verification therefore PASS on the accepted PR #41 source commit.
+
+Slash normalization remains a separate nonblocking finding: `/api-proxy/v1/version` returned HTTP `307` with `Location: http://api-staging.aegisfarm.com/api/v1/version/`. This did not prevent the repaired proxy, authenticated login, or dashboard verification from succeeding, but redirect scheme/forwarded-header handling should be hardened separately.
 
 ## 9. Accepted non-blocking technical debt / follow-up
 
 The following items were not treated as release blockers for this closeout:
 
-1. Dedicated production frontend/domain deployment and validation remains to be established.
-2. Railway production Postgres has PITR disabled and no automatic backup schedule; production backup policy should be hardened separately.
-3. Transactional email provider failures can currently surface as generic HTTP `500`; graceful provider-failure handling should be hardened.
-4. A previously observed email-verification test login returned `401`; this was not reproduced as a verified product defect and may have been test-password input error.
-5. Dedicated production-browser receipt-posting validation was not established because the validated Vercel `develop` Preview is not treated as proof of a distinct production frontend/database path; API-level receipt posting was completed successfully as recorded in Section 3.
-6. A timezone-sensitive web test has previously failed outside UTC while passing under `TZ=UTC`; this is test-environment debt.
-7. Broad API mypy debt remains outside the focused remediation scope.
-8. Repository dependency/security-alert debt should be handled as a dedicated security-maintenance stream rather than silently folded into this closeout.
+1. Railway production Postgres has PITR disabled and no automatic backup schedule; production backup policy should be hardened separately.
+2. Transactional email provider failures can currently surface as generic HTTP `500`; graceful provider-failure handling should be hardened.
+3. A previously observed email-verification test login returned `401`; this was not reproduced as a verified product defect and may have been test-password input error.
+4. A timezone-sensitive web test has previously failed outside UTC while passing under `TZ=UTC`; this is test-environment debt.
+5. Broad API mypy debt remains outside the focused remediation scope.
+6. Repository dependency/security-alert debt should be handled as a dedicated security-maintenance stream rather than silently folded into this closeout.
+7. Slash normalization through the production proxy can emit an HTTP `Location` for an HTTPS upstream request; proxy forwarded-header or redirect-scheme handling should be hardened separately.
+
+Receipt-fixture operational retirement was completed on 2026-09-04, and production frontend/runtime verification was completed on 2026-09-05; neither is an outstanding technical-debt item.
+
+PR #39 documentation closeout remains pending review. That review status is separate from the completed production acceptance/quarantine runtime PASS, and no PR #39 review thread is resolved by this report revision.
 
 ## 10. Data preservation and cleanup rule
 
-UAT fixtures must not be deleted until this closeout evidence is committed and reviewed. Cleanup should be controlled and limited to genuinely disposable UAT data. Production data must not be modified merely to remove acceptance evidence.
+UAT fixtures must not be destructively deleted merely to remove acceptance evidence. Cleanup must remain controlled and limited to genuinely disposable UAT data.
 
-The Release 6.0.6 Purchase Receipt fixture is specifically excluded from destructive cleanup: its Purchase Receipt records, inventory lots, and inventory transactions form immutable acceptance/audit evidence and must not be deleted, rewritten, or neutralized by a compensating adjustment solely for cleanup purposes. Its synthetic `100 kg` balance remains quarantined in the dedicated `UAT_RECEIPT_WH_A` / `UAT-RECEIPT-FEED` ledger namespace documented in Section 3.
+The Release 6.0.6 Purchase Receipt fixture has completed supported operational retirement. Its warehouse is closed, item is inactive, and supplier is deactivated without deleting any of them. Its Purchase Receipt records, inventory lots, inventory transactions, PO transitions, and audit events remain immutable acceptance evidence and were not deleted, rewritten, or neutralized by a compensating adjustment. Its synthetic `100 kg` balance remains quarantined in the dedicated `UAT_RECEIPT_WH_A` / `UAT-RECEIPT-FEED` ledger namespace documented in Section 3.
 
 Aquaculture and other Purchase Order fixtures used to establish the acceptance evidence should remain available until the closeout commit/PR is safely merged and the evidence is no longer dependent on live fixture inspection.
 
 ## 11. Final acceptance statement
 
-Release 6.0.6 is accepted at Git SHA:
+**RELEASE 6.0.6 PRODUCTION ACCEPTANCE: PASS**
 
-`48c236ac2e625f0ca18c0e7e7f9940327c2197e4`
+The current canonical production Git SHA is:
 
-The functional UAT gate is closed and the Railway production API is accepted on that exact SHA with a healthy application, Redis, PostgreSQL, aligned Alembic state, and a fresh pre-acceptance database backup.
+`66bac60667df190c4cc2f704ed3d572d8828c90f`
 
-The current production deployment remains on the accepted release SHA; no further application-code deployment is required merely to reproduce that SHA. Follow-up work should proceed as separately controlled hardening/cleanup work, beginning with preservation of this report, then UAT fixture cleanup, production frontend/domain hardening, and production backup-policy hardening.
+Railway production runs that exact SHA with Alembic aligned at `0015_aqua_transfer_integrity`. The canonical production frontend was rebuilt from the same accepted source commit with the corrected Production-only API proxy target. Authenticated production API and browser verification proves the retired fixture remains available administratively and historically while being excluded from operational API and Inventory Dashboard projections. Production acceptance and quarantine runtime verification are therefore complete and PASS.
+
+No additional deployment or migration is required for production acceptance. Documentation/PR #39 closeout remains pending review, independently of the runtime PASS; no review thread has been resolved by this revision. Remaining follow-up is limited to that review and the still-valid technical debt in Section 9.
