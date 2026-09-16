@@ -211,6 +211,35 @@ describe('mobile API configuration and native auth transport', () => {
     expect(message).not.toMatch(/access_token|refresh_token|authorization|cookie/i);
   });
 
+  test('diagnostics enabled sanitize unclassified errors without using the generic fallback', () => {
+    const failure = new Error(
+      'Bearer access-secret password=private cookie=session authorization=credential',
+    );
+    failure.name = 'Unsafe Error\nBearer name-secret password=name-password';
+    failure.stack = 'SECRET STACK TRACE';
+
+    const message = authErrorMessage(failure, true, '/v1/auth/register');
+
+    expect(message).toContain('phase=unclassified');
+    expect(message).toContain('base=[unavailable]');
+    expect(message).toContain('path=/v1/auth/register');
+    expect(message).toContain('error=Unclassified.UnsafeErrorBearerredactedpasswordredacted');
+    expect(message).not.toBe('Unable to reach the API.');
+    expect(message).not.toContain('access-secret');
+    expect(message).not.toContain('private');
+    expect(message).not.toContain('session');
+    expect(message).not.toContain('credential');
+    expect(message).not.toContain('name-secret');
+    expect(message).not.toContain('name-password');
+    expect(message).not.toContain('SECRET STACK TRACE');
+  });
+
+  test('diagnostics disabled retain the generic fallback for unclassified errors', () => {
+    expect(authErrorMessage(new Error('unexpected failure'), false)).toBe(
+      'Unable to reach the API.',
+    );
+  });
+
   test.each(['android', 'ios'])(
     '%s login selects bearer transport and stores tokens',
     async (os) => {

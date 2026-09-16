@@ -1,5 +1,14 @@
 import { createContext, useContext, useState, ReactNode } from 'react';
-import { ApiError, ApiFailure, login, logout, register, RegisterPayload } from './api';
+import {
+  ApiError,
+  ApiFailure,
+  ApiFailureMetadata,
+  describeUnknownApiError,
+  login,
+  logout,
+  register,
+  RegisterPayload,
+} from './api';
 
 interface AuthContextValue {
   submitting: boolean;
@@ -11,17 +20,32 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-export function authErrorMessage(
-  error: unknown,
-  diagnosticsEnabled = process.env.EXPO_PUBLIC_API_DIAGNOSTICS === 'true',
-): string {
-  if (!(error instanceof ApiFailure)) return 'Unable to reach the API.';
-  if (!diagnosticsEnabled) {
-    if (error instanceof ApiError) return error.detail;
-    if (error.phase === 'configuration') return 'The API configuration is invalid.';
-    if (error.phase === 'network') return 'Unable to reach the API.';
-    return 'The API returned an invalid response.';
-  }
+const API_FAILURE_PHASES = new Set<ApiFailureMetadata['phase']>([
+  'configuration',
+  'network',
+  'http',
+  'parse',
+  'application',
+]);
+
+function hasApiFailureMetadata(error: unknown): error is ApiFailureMetadata {
+  if (typeof error !== 'object' || error === null) return false;
+  const failure = error as Partial<ApiFailureMetadata>;
+  return (
+    API_FAILURE_PHASES.has(failure.phase as ApiFailureMetadata['phase']) &&
+    typeof failure.apiBase === 'string' &&
+    typeof failure.path === 'string' &&
+    (failure.status === undefined || typeof failure.status === 'number') &&
+    typeof failure.errorName === 'string' &&
+    typeof failure.safeMessage === 'string'
+  );
+}
+
+type DiagnosticMetadata = Omit<ApiFailureMetadata, 'phase'> & {
+  phase: ApiFailureMetadata['phase'] | 'unclassified';
+};
+
+function diagnosticMessage(error: DiagnosticMetadata): string {
   return [
     `phase=${error.phase}`,
     `base=${error.apiBase}`,
@@ -32,17 +56,59 @@ export function authErrorMessage(
   ].join(' ');
 }
 
+function structuralDiagnosticMessage(error: ApiFailureMetadata): string {
+  const candidate = new Error(error.safeMessage);
+  candidate.name = error.errorName;
+  const sanitized = describeUnknownApiError(candidate);
+  const path = /^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{1,200}$/.test(error.path)
+    ? error.path
+    : '[unavailable]';
+  return diagnosticMessage({
+    phase: error.phase,
+    apiBase: '[unavailable]',
+    path,
+    status: error.status,
+    errorName: sanitized.errorName,
+    safeMessage: sanitized.safeMessage,
+  });
+}
+
+export function authErrorMessage(
+  error: unknown,
+  diagnosticsEnabled = process.env.EXPO_PUBLIC_API_DIAGNOSTICS === 'true',
+  knownPath = '[unavailable]',
+): string {
+  if (!diagnosticsEnabled) {
+    if (!(error instanceof ApiFailure)) return 'Unable to reach the API.';
+    if (error instanceof ApiError) return error.detail;
+    if (error.phase === 'configuration') return 'The API configuration is invalid.';
+    if (error.phase === 'network') return 'Unable to reach the API.';
+    return 'The API returned an invalid response.';
+  }
+  if (error instanceof ApiFailure) return diagnosticMessage(error);
+  if (hasApiFailureMetadata(error)) return structuralDiagnosticMessage(error);
+  const unknown = describeUnknownApiError(error);
+  return diagnosticMessage({
+    phase: 'unclassified',
+    apiBase: '[unavailable]',
+    path: knownPath,
+    status: undefined,
+    errorName: `Unclassified.${unknown.errorName}`,
+    safeMessage: unknown.safeMessage,
+  });
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function run<T>(op: () => Promise<T>): Promise<T | null> {
+  async function run<T>(op: () => Promise<T>, knownPath?: string): Promise<T | null> {
     setSubmitting(true);
     setError(null);
     try {
       return await op();
     } catch (err) {
-      setError(authErrorMessage(err));
+      setError(authErrorMessage(err, undefined, knownPath));
       return null;
     } finally {
       setSubmitting(false);
@@ -53,7 +119,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     submitting,
     error,
     signIn: async (email, password) => (await run(() => login(email, password))) !== null,
-    register: async (payload) => (await run(() => register(payload))) !== null,
+    register: async (payload) => (await run(() => register(payload), '/v1/auth/register')) !== null,
     signOut: async () => {
       await run(() => logout());
     },

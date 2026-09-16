@@ -99,6 +99,20 @@ function errorName(error: unknown): string {
   return name || 'Error';
 }
 
+export function describeUnknownApiError(
+  error: unknown,
+): Pick<ApiFailureMetadata, 'errorName' | 'safeMessage'> {
+  const namedError = new Error();
+  namedError.name = sanitizeMessage(error instanceof Error ? error.name : '', 'Error');
+  return {
+    errorName: errorName(namedError),
+    safeMessage: sanitizeMessage(
+      error instanceof Error ? error.message : '',
+      'An unclassified error occurred.',
+    ),
+  };
+}
+
 function diagnosticPath(path: string): string {
   const withoutQueryOrFragment = path.split(/[?#]/, 1)[0];
   return sanitizeMessage(withoutQueryOrFragment, '[unavailable]');
