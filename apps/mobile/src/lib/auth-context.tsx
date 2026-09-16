@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, ReactNode } from 'react';
-import { ApiError, login, logout, register, RegisterPayload } from './api';
+import { ApiError, ApiFailure, login, logout, register, RegisterPayload } from './api';
 
 interface AuthContextValue {
   submitting: boolean;
@@ -11,6 +11,27 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+export function authErrorMessage(
+  error: unknown,
+  diagnosticsEnabled = process.env.EXPO_PUBLIC_API_DIAGNOSTICS === 'true',
+): string {
+  if (!(error instanceof ApiFailure)) return 'Unable to reach the API.';
+  if (!diagnosticsEnabled) {
+    if (error instanceof ApiError) return error.detail;
+    if (error.phase === 'configuration') return 'The API configuration is invalid.';
+    if (error.phase === 'network') return 'Unable to reach the API.';
+    return 'The API returned an invalid response.';
+  }
+  return [
+    `phase=${error.phase}`,
+    `base=${error.apiBase}`,
+    `path=${error.path}`,
+    ...(error.status === undefined ? [] : [`status=${error.status}`]),
+    `error=${error.errorName}`,
+    `message=${error.safeMessage}`,
+  ].join(' ');
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,7 +42,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       return await op();
     } catch (err) {
-      setError(err instanceof ApiError ? err.detail : 'Unable to reach the API.');
+      setError(authErrorMessage(err));
       return null;
     } finally {
       setSubmitting(false);

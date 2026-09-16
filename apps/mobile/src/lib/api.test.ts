@@ -19,7 +19,17 @@ jest.mock('./secure-storage', () => ({
 }));
 
 import easConfig from '../../eas.json';
-import { authenticatedRequest, login, logout, refreshTokens, resolveApiUrl } from './api';
+import {
+  ApiError,
+  ApiFailure,
+  authenticatedRequest,
+  login,
+  logout,
+  refreshTokens,
+  register,
+  resolveApiUrl,
+} from './api';
+import { authErrorMessage } from './auth-context';
 import * as secureStorage from './secure-storage';
 
 const mockSetTokens = jest.mocked(secureStorage.setTokens);
@@ -41,6 +51,10 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function textResponse(body: string, status: number, contentType = 'text/plain'): Response {
+  return new Response(body, { status, headers: { 'Content-Type': contentType } });
+}
+
 describe('mobile API configuration and native auth transport', () => {
   let fetchMock: ReturnType<typeof jest.fn>;
 
@@ -55,6 +69,146 @@ describe('mobile API configuration and native auth transport', () => {
     const validationUrl = easConfig.build['sdk56-validation'].env.EXPO_PUBLIC_API_URL;
     expect(resolveApiUrl(validationUrl, 'http://localhost:8000/api')).toBe(validationUrl);
     expect(resolveApiUrl(undefined, 'http://localhost:8000/api')).toBe('http://localhost:8000/api');
+  });
+
+  test('fetch rejection is classified as a sanitized network failure', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Network request failed') as never);
+
+    await expect(
+      register({ email: 'private@example.com', password: 'Secret123!', full_name: null }),
+    ).rejects.toMatchObject({
+      phase: 'network',
+      path: '/v1/auth/register',
+      status: undefined,
+      errorName: 'TypeError',
+      safeMessage: 'Network request failed',
+    });
+  });
+
+  test('201 valid JSON registration succeeds', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ id: 'user-id' }, 201) as never);
+
+    await expect(
+      register({ email: 'new@example.com', password: 'Secret123!', full_name: 'New User' }),
+    ).resolves.toBeUndefined();
+  });
+
+  test.each([
+    ['', 'empty'],
+    ['{"id":', 'malformed'],
+  ])('201 %s application/json registration is a parse failure', async (body) => {
+    fetchMock.mockResolvedValue(textResponse(body, 201, 'application/json') as never);
+
+    await expect(
+      register({ email: 'new@example.com', password: 'Secret123!', full_name: null }),
+    ).rejects.toMatchObject({ phase: 'parse', status: 201, path: '/v1/auth/register' });
+  });
+
+  test.each(['Application/JSON; Charset=UTF-8', 'application/problem+json'])(
+    'registration parses JSON content type %s',
+    async (contentType) => {
+      fetchMock.mockResolvedValue(textResponse('{"id":"user-id"}', 201, contentType) as never);
+
+      await expect(
+        register({ email: 'new@example.com', password: 'Secret123!', full_name: null }),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  test('non-JSON 2xx registration is an application contract failure', async () => {
+    fetchMock.mockResolvedValue(textResponse('created', 201) as never);
+
+    await expect(
+      register({ email: 'new@example.com', password: 'Secret123!', full_name: null }),
+    ).rejects.toMatchObject({ phase: 'application', status: 201 });
+  });
+
+  test('non-JSON HTTP error is a safe HTTP failure', async () => {
+    fetchMock.mockResolvedValue(
+      textResponse('<html>proxy error</html>', 502, 'text/html') as never,
+    );
+
+    await expect(
+      register({ email: 'new@example.com', password: 'Secret123!', full_name: null }),
+    ).rejects.toMatchObject({ phase: 'http', status: 502, detail: 'Request failed' });
+  });
+
+  test('string API detail remains usable and sensitive values are redacted', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ detail: 'Account private@example.com password: Secret123!' }, 409) as never,
+    );
+
+    await expect(
+      register({ email: 'private@example.com', password: 'Secret123!', full_name: null }),
+    ).rejects.toMatchObject({
+      detail: 'Account [redacted-email] password=[redacted]',
+    });
+  });
+
+  test('FastAPI structured validation detail is normalized without rendering objects', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ detail: [{ loc: ['body', 'email'], msg: 'invalid' }] }, 422) as never,
+    );
+
+    await expect(
+      register({ email: 'invalid', password: 'Secret123!', full_name: null }),
+    ).rejects.toMatchObject({ detail: 'Request validation failed.' });
+  });
+
+  test.each([null, [], 'created'])(
+    'unexpected successful registration shape %p is an application failure',
+    async (body) => {
+      fetchMock.mockResolvedValue(jsonResponse(body, 201) as never);
+
+      await expect(
+        register({ email: 'new@example.com', password: 'Secret123!', full_name: null }),
+      ).rejects.toMatchObject({ phase: 'application', status: 201 });
+    },
+  );
+
+  test('diagnostics disabled retain concise safe UI errors', () => {
+    const failure = new ApiFailure(
+      'network',
+      'https://api.example.test/api',
+      '/v1/auth/register',
+      undefined,
+      'TypeError',
+      'Network request failed',
+    );
+    expect(authErrorMessage(failure, false)).toBe('Unable to reach the API.');
+    expect(
+      authErrorMessage(
+        new ApiError(
+          409,
+          'An account with that email already exists.',
+          'https://api.test/api',
+          '/v1',
+        ),
+        false,
+      ),
+    ).toBe('An account with that email already exists.');
+  });
+
+  test('diagnostics enabled show only sanitized classification metadata', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ detail: 'Account private@example.com password: Secret123!' }, 409) as never,
+    );
+    let failure: unknown;
+    try {
+      await register({ email: 'private@example.com', password: 'Secret123!', full_name: null });
+    } catch (error) {
+      failure = error;
+    }
+
+    const message = authErrorMessage(failure, true);
+    expect(message).toContain('phase=http');
+    expect(message).toContain('base=http://localhost:8000/api');
+    expect(message).toContain('path=/v1/auth/register');
+    expect(message).toContain('status=409');
+    expect(message).toContain('error=ApiError');
+    expect(message).not.toContain('private@example.com');
+    expect(message).not.toContain('Secret123!');
+    expect(message).not.toMatch(/access_token|refresh_token|authorization|cookie/i);
   });
 
   test.each(['android', 'ios'])(
