@@ -30,6 +30,21 @@ export interface TokenPair {
   expires_in: number;
 }
 
+function isTokenPair(body: unknown): body is TokenPair {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
+  const candidate = body as Partial<Record<keyof TokenPair, unknown>>;
+  return (
+    typeof candidate.access_token === 'string' &&
+    candidate.access_token.trim().length > 0 &&
+    typeof candidate.refresh_token === 'string' &&
+    candidate.refresh_token.trim().length > 0 &&
+    candidate.token_type === 'bearer' &&
+    typeof candidate.expires_in === 'number' &&
+    Number.isFinite(candidate.expires_in) &&
+    candidate.expires_in > 0
+  );
+}
+
 interface MessageResponse {
   message: string;
 }
@@ -315,12 +330,19 @@ export async function resendVerification(email: string): Promise<string> {
 
 export async function login(email: string, password: string): Promise<void> {
   const native = isNativePlatform();
-  const response = await request<TokenPair>('/v1/auth/login', {
+  const init: RequestInit = {
     method: 'POST',
     ...(native ? { headers: NATIVE_AUTH_HEADERS } : {}),
     body: JSON.stringify({ email, password }),
+  };
+  if (!native) {
+    await request('/v1/auth/login', init);
+    return;
+  }
+  const response = await request<TokenPair>('/v1/auth/login', init, false, true, {
+    validate: isTokenPair,
   });
-  if (native) await setTokens(response.access_token, response.refresh_token);
+  await setTokens(response.access_token, response.refresh_token);
 }
 
 async function performRefresh(): Promise<void> {
@@ -330,11 +352,17 @@ async function performRefresh(): Promise<void> {
   }
   const refreshToken = await getRefreshToken();
   if (!refreshToken) throw new ApiError(401, 'Missing refresh token.');
-  const tokens = await request<TokenPair>('/v1/auth/refresh', {
-    method: 'POST',
-    headers: NATIVE_AUTH_HEADERS,
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  });
+  const tokens = await request<TokenPair>(
+    '/v1/auth/refresh',
+    {
+      method: 'POST',
+      headers: NATIVE_AUTH_HEADERS,
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    },
+    false,
+    true,
+    { validate: isTokenPair },
+  );
   await setTokens(tokens.access_token, tokens.refresh_token);
 }
 

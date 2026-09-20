@@ -349,8 +349,37 @@ describe('mobile API configuration and native auth transport', () => {
       const init = fetchMock.mock.calls[0][1] as RequestInit;
       expect(init.headers).toMatchObject({ 'X-Agrovix-Auth-Transport': 'bearer' });
       expect(mockSetTokens).toHaveBeenCalledWith('access-1', 'refresh-1');
+      expect(mockSetTokens).toHaveBeenCalledTimes(1);
     },
   );
+
+  test.each([
+    ['cookie-only response', { token_type: 'bearer', expires_in: 900 }],
+    ['missing access token', { refresh_token: 'refresh-1', token_type: 'bearer', expires_in: 900 }],
+    ['missing refresh token', { access_token: 'access-1', token_type: 'bearer', expires_in: 900 }],
+    ['null access token', tokenPair(null as unknown as string, 'refresh-1')],
+    ['null refresh token', tokenPair('access-1', null as unknown as string)],
+    ['empty access token', tokenPair('', 'refresh-1')],
+    ['whitespace refresh token', tokenPair('access-1', '   ')],
+    ['numeric access token', tokenPair(123 as unknown as string, 'refresh-1')],
+    ['object refresh token', tokenPair('access-1', {} as unknown as string)],
+    ['wrong token type', { ...tokenPair('access-1', 'refresh-1'), token_type: 'mac' }],
+    ['zero expiry', { ...tokenPair('access-1', 'refresh-1'), expires_in: 0 }],
+    ['negative expiry', { ...tokenPair('access-1', 'refresh-1'), expires_in: -1 }],
+    ['string expiry', { ...tokenPair('access-1', 'refresh-1'), expires_in: '900' }],
+    ['null expiry', { ...tokenPair('access-1', 'refresh-1'), expires_in: null }],
+  ])('native login rejects HTTP 200 with %s', async (_description, body) => {
+    fetchMock.mockResolvedValue(jsonResponse(body) as never);
+
+    await expect(login('native@example.com', 'password')).rejects.toMatchObject({
+      phase: 'application',
+      status: 200,
+      errorName: 'ApiContractError',
+      safeMessage: 'The API response did not match the expected contract.',
+    });
+
+    expect(mockSetTokens).not.toHaveBeenCalled();
+  });
 
   test.each(['android', 'ios'])(
     '%s refresh selects bearer transport and atomically replaces the pair',
@@ -365,8 +394,22 @@ describe('mobile API configuration and native auth transport', () => {
       expect(init.headers).toMatchObject({ 'X-Agrovix-Auth-Transport': 'bearer' });
       expect(JSON.parse(init.body as string)).toEqual({ refresh_token: 'refresh-1' });
       expect(mockSetTokens).toHaveBeenCalledWith('access-2', 'refresh-2');
+      expect(mockSetTokens).toHaveBeenCalledTimes(1);
     },
   );
+
+  test('native refresh rejects a cookie-only HTTP 200 without replacing stored tokens', async () => {
+    mockGetRefreshToken.mockResolvedValue('refresh-1');
+    fetchMock.mockResolvedValue(jsonResponse({ token_type: 'bearer', expires_in: 900 }) as never);
+
+    await expect(refreshTokens()).rejects.toMatchObject({
+      phase: 'application',
+      status: 200,
+      errorName: 'ApiContractError',
+    });
+
+    expect(mockSetTokens).not.toHaveBeenCalled();
+  });
 
   test('Expo web login and refresh use cookies without entering bearer storage', async () => {
     mockPlatformOs = 'web';
