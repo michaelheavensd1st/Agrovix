@@ -30,6 +30,10 @@ export interface TokenPair {
   expires_in: number;
 }
 
+interface MessageResponse {
+  message: string;
+}
+
 export type ApiFailurePhase = 'configuration' | 'network' | 'http' | 'parse' | 'application';
 
 export interface ApiFailureMetadata {
@@ -289,6 +293,24 @@ export async function register(payload: RegisterPayload): Promise<void> {
         typeof body === 'object' && body !== null && !Array.isArray(body),
     },
   );
+}
+
+export async function resendVerification(email: string): Promise<string> {
+  const response = await request<MessageResponse>(
+    '/v1/auth/resend-verification',
+    { method: 'POST', body: JSON.stringify({ email }) },
+    false,
+    true,
+    {
+      expectedStatus: 200,
+      validate: (body): body is MessageResponse =>
+        typeof body === 'object' &&
+        body !== null &&
+        !Array.isArray(body) &&
+        typeof (body as { message?: unknown }).message === 'string',
+    },
+  );
+  return response.message;
 }
 
 export async function login(email: string, password: string): Promise<void> {

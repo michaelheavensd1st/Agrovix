@@ -12,13 +12,28 @@ import { Link, router } from 'expo-router';
 import { useAuth } from '../src/lib/auth-context';
 
 export default function Login() {
-  const { signIn, submitting, error } = useAuth();
+  const {
+    signIn,
+    submitting,
+    error,
+    emailUnverified,
+    resendVerification,
+    resendPending,
+    resendError,
+    resendSuccess,
+    clearVerificationState,
+  } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
   async function handleSubmit() {
     const ok = await signIn(email, password);
     if (ok) router.replace('/dashboard');
+  }
+
+  function handleEmailChange(value: string) {
+    setEmail(value);
+    clearVerificationState();
   }
 
   return (
@@ -33,9 +48,10 @@ export default function Login() {
       <Field
         label="Email"
         value={email}
-        onChange={setEmail}
+        onChange={handleEmailChange}
         keyboardType="email-address"
         testID="login-email-input"
+        editable={!resendPending}
       />
       <Field
         label="Password"
@@ -51,10 +67,35 @@ export default function Login() {
         </Text>
       )}
 
+      {emailUnverified && (
+        <View>
+          {resendError && (
+            <Text style={styles.error} testID="login-resend-error">
+              {resendError}
+            </Text>
+          )}
+          {resendSuccess && (
+            <Text style={styles.success} testID="login-resend-success">
+              {resendSuccess}
+            </Text>
+          )}
+          <Pressable
+            disabled={submitting || resendPending}
+            testID="login-resend-verification-button"
+            style={[styles.resendButton, (submitting || resendPending) && { opacity: 0.6 }]}
+            onPress={() => resendVerification(email)}
+          >
+            <Text style={styles.resendButtonLabel}>
+              {resendPending ? 'Sending verification email…' : 'Resend verification email'}
+            </Text>
+          </Pressable>
+        </View>
+      )}
+
       <Pressable
-        disabled={submitting}
+        disabled={submitting || resendPending}
         testID="login-submit-button"
-        style={[styles.primaryButton, submitting && { opacity: 0.6 }]}
+        style={[styles.primaryButton, (submitting || resendPending) && { opacity: 0.6 }]}
         onPress={handleSubmit}
       >
         <Text style={styles.primaryButtonLabel}>{submitting ? 'Signing in…' : 'Sign in'}</Text>
@@ -76,6 +117,7 @@ interface FieldProps {
   testID: string;
   secureTextEntry?: boolean;
   keyboardType?: 'default' | 'email-address';
+  editable?: boolean;
 }
 
 function Field({
@@ -85,6 +127,7 @@ function Field({
   testID,
   secureTextEntry,
   keyboardType = 'default',
+  editable = true,
 }: FieldProps) {
   return (
     <View style={styles.field}>
@@ -96,7 +139,8 @@ function Field({
         secureTextEntry={secureTextEntry}
         keyboardType={keyboardType}
         autoCapitalize={keyboardType === 'email-address' ? 'none' : 'sentences'}
-        style={styles.input}
+        editable={editable}
+        style={[styles.input, !editable && { opacity: 0.6 }]}
       />
     </View>
   );
@@ -133,4 +177,7 @@ const styles = StyleSheet.create({
   primaryButtonLabel: { color: '#f5f2e8', fontWeight: '600' },
   linkText: { color: '#0f2e1e', marginTop: 24, textAlign: 'center' },
   error: { color: '#b23a1f', marginTop: 4, marginBottom: 8 },
+  success: { color: '#2d6a4f', marginTop: 4, marginBottom: 8 },
+  resendButton: { alignItems: 'center', paddingVertical: 10 },
+  resendButtonLabel: { color: '#0f2e1e', fontWeight: '600' },
 });

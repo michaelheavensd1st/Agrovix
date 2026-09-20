@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, ReactNode } from 'react';
+import { createContext, useContext, useRef, useState, ReactNode } from 'react';
 import {
   ApiError,
   ApiFailure,
@@ -7,15 +7,31 @@ import {
   login,
   logout,
   register,
+  resendVerification as requestVerificationEmail,
   RegisterPayload,
 } from './api';
+
+const EMAIL_UNVERIFIED_DETAIL = 'Please verify your email before signing in.';
+const RESEND_SUCCESS_MESSAGE = 'If the account is eligible, a verification email has been sent.';
 
 interface AuthContextValue {
   submitting: boolean;
   error: string | null;
+  emailUnverified: boolean;
+  resendPending: boolean;
+  resendError: string | null;
+  resendSuccess: string | null;
   signIn: (email: string, password: string) => Promise<boolean>;
+  resendVerification: (email: string) => Promise<boolean>;
+  clearVerificationState: () => void;
   register: (payload: RegisterPayload) => Promise<boolean>;
   signOut: () => Promise<void>;
+}
+
+export function isEmailUnverifiedError(error: unknown): boolean {
+  return (
+    error instanceof ApiError && error.status === 403 && error.detail === EMAIL_UNVERIFIED_DETAIL
+  );
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -101,6 +117,22 @@ export function authErrorMessage(
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [emailUnverified, setEmailUnverified] = useState(false);
+  const [resendPending, setResendPending] = useState(false);
+  const [resendError, setResendError] = useState<string | null>(null);
+  const [resendSuccess, setResendSuccess] = useState<string | null>(null);
+  const signInPendingRef = useRef(false);
+  const resendPendingRef = useRef(false);
+  const eligibleVerificationEmailRef = useRef<string | null>(null);
+  const resendRequestVersionRef = useRef(0);
+
+  function clearVerificationState() {
+    resendRequestVersionRef.current += 1;
+    eligibleVerificationEmailRef.current = null;
+    setEmailUnverified(false);
+    setResendError(null);
+    setResendSuccess(null);
+  }
 
   async function run<T>(op: () => Promise<T>, knownPath?: string): Promise<T | null> {
     setSubmitting(true);
@@ -118,7 +150,72 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const value: AuthContextValue = {
     submitting,
     error,
-    signIn: async (email, password) => (await run(() => login(email, password))) !== null,
+    emailUnverified,
+    resendPending,
+    resendError,
+    resendSuccess,
+    signIn: async (email, password) => {
+      if (signInPendingRef.current || resendPendingRef.current) return false;
+      signInPendingRef.current = true;
+      clearVerificationState();
+      const verificationStateVersion = resendRequestVersionRef.current;
+      setSubmitting(true);
+      setError(null);
+      try {
+        await login(email, password);
+        setEmailUnverified(false);
+        return true;
+      } catch (err) {
+        const unverified = isEmailUnverifiedError(err);
+        const verificationStateIsCurrent =
+          resendRequestVersionRef.current === verificationStateVersion;
+        eligibleVerificationEmailRef.current =
+          unverified && verificationStateIsCurrent ? email.trim().toLowerCase() : null;
+        setEmailUnverified(unverified && verificationStateIsCurrent);
+        setError(authErrorMessage(err));
+        return false;
+      } finally {
+        signInPendingRef.current = false;
+        setSubmitting(false);
+      }
+    },
+    resendVerification: async (email) => {
+      const emailIdentity = email.trim().toLowerCase();
+      if (
+        resendPendingRef.current ||
+        signInPendingRef.current ||
+        eligibleVerificationEmailRef.current !== emailIdentity
+      ) {
+        return false;
+      }
+      resendPendingRef.current = true;
+      const requestVersion = ++resendRequestVersionRef.current;
+      setResendPending(true);
+      setResendError(null);
+      setResendSuccess(null);
+      try {
+        await requestVerificationEmail(email);
+        if (
+          resendRequestVersionRef.current === requestVersion &&
+          eligibleVerificationEmailRef.current === emailIdentity
+        ) {
+          setResendSuccess(RESEND_SUCCESS_MESSAGE);
+        }
+        return true;
+      } catch (err) {
+        if (
+          resendRequestVersionRef.current === requestVersion &&
+          eligibleVerificationEmailRef.current === emailIdentity
+        ) {
+          setResendError(authErrorMessage(err, undefined, '/v1/auth/resend-verification'));
+        }
+        return false;
+      } finally {
+        resendPendingRef.current = false;
+        setResendPending(false);
+      }
+    },
+    clearVerificationState,
     register: async (payload) => (await run(() => register(payload), '/v1/auth/register')) !== null,
     signOut: async () => {
       await run(() => logout());

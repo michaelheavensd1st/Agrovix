@@ -27,9 +27,10 @@ import {
   logout,
   refreshTokens,
   register,
+  resendVerification,
   resolveApiUrl,
 } from './api';
-import { authErrorMessage } from './auth-context';
+import { authErrorMessage, isEmailUnverifiedError } from './auth-context';
 import * as secureStorage from './secure-storage';
 
 const mockSetTokens = jest.mocked(secureStorage.setTokens);
@@ -187,6 +188,103 @@ describe('mobile API configuration and native auth transport', () => {
         false,
       ),
     ).toBe('An account with that email already exists.');
+  });
+
+  test('only the exact unverified-email 403 is classified for resend eligibility', () => {
+    expect(
+      isEmailUnverifiedError(new ApiError(403, 'Please verify your email before signing in.')),
+    ).toBe(true);
+    expect(isEmailUnverifiedError(new ApiError(403, 'This account is disabled.'))).toBe(false);
+    expect(
+      isEmailUnverifiedError(new ApiError(401, 'Please verify your email before signing in.')),
+    ).toBe(false);
+  });
+
+  test('resend verification posts only the email without auth or token storage', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ message: 'If the account exists, a verification email was sent.' }) as never,
+    );
+
+    await expect(resendVerification('pending@example.com')).resolves.toBe(
+      'If the account exists, a verification email was sent.',
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:8000/api/v1/auth/resend-verification');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ email: 'pending@example.com' });
+    expect(init.headers).not.toHaveProperty('Authorization');
+    expect(mockGetAccessToken).not.toHaveBeenCalled();
+    expect(mockGetRefreshToken).not.toHaveBeenCalled();
+    expect(mockSetTokens).not.toHaveBeenCalled();
+    expect(mockClearTokens).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['', 'application/json', 'parse'],
+    ['{"message":', 'application/json', 'parse'],
+    ['accepted', 'text/plain', 'application'],
+    ['{"unexpected":true}', 'application/json', 'application'],
+  ])('resend rejects malformed successful response %#', async (body, contentType, phase) => {
+    fetchMock.mockResolvedValue(textResponse(body, 200, contentType) as never);
+
+    await expect(resendVerification('pending@example.com')).rejects.toMatchObject({
+      phase,
+      status: 200,
+      path: '/v1/auth/resend-verification',
+    });
+  });
+
+  test('resend rejects a valid response body returned with status 202', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(
+        { message: 'If the account exists, a verification email was sent.' },
+        202,
+      ) as never,
+    );
+
+    await expect(resendVerification('pending@example.com')).rejects.toMatchObject({
+      phase: 'application',
+      status: 202,
+      path: '/v1/auth/resend-verification',
+    });
+  });
+
+  test.each([null, 123, [], {}])(
+    'resend rejects a non-string message value %p',
+    async (message) => {
+      fetchMock.mockResolvedValue(jsonResponse({ message }) as never);
+
+      await expect(resendVerification('pending@example.com')).rejects.toMatchObject({
+        phase: 'application',
+        status: 200,
+        path: '/v1/auth/resend-verification',
+      });
+    },
+  );
+
+  test.each([429, 500])('resend preserves HTTP failure status %s', async (status) => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ detail: 'Request could not be completed.' }, status) as never,
+    );
+
+    await expect(resendVerification('pending@example.com')).rejects.toMatchObject({
+      phase: 'http',
+      status,
+      detail: 'Request could not be completed.',
+    });
+  });
+
+  test('resend classifies a rejected fetch as a network failure', async () => {
+    fetchMock.mockRejectedValue(new TypeError('Network request failed') as never);
+
+    await expect(resendVerification('pending@example.com')).rejects.toMatchObject({
+      phase: 'network',
+      path: '/v1/auth/resend-verification',
+      status: undefined,
+      safeMessage: 'Network request failed',
+    });
   });
 
   test('diagnostics enabled show only sanitized classification metadata', async () => {
