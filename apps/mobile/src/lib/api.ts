@@ -22,7 +22,7 @@ const CONFIGURED_API_URL = resolveApiUrl(
 const NATIVE_AUTH_HEADERS = { 'X-Agrovix-Auth-Transport': 'bearer' } as const;
 const refreshFlights = new Map<number, Promise<void>>();
 
-function isNativePlatform(): boolean {
+export function usesNativeBearerAuth(): boolean {
   return Platform.OS === 'android' || Platform.OS === 'ios';
 }
 
@@ -302,7 +302,7 @@ async function request<T>(
     'Content-Type': 'application/json',
     ...((init.headers as Record<string, string>) ?? {}),
   };
-  if (auth && isNativePlatform()) {
+  if (auth && usesNativeBearerAuth()) {
     if (!ownsAuthOperation(operation)) throw new StaleAuthOperationError();
     const token = await getAccessToken();
     if (!ownsAuthOperation(operation)) throw new StaleAuthOperationError();
@@ -326,7 +326,7 @@ async function request<T>(
     );
   }
   const status = res.status;
-  if (res.status === 401 && auth && mayRefresh && isNativePlatform()) {
+  if (res.status === 401 && auth && mayRefresh && usesNativeBearerAuth()) {
     await refreshTokens(operation);
     return request<T>(path, init, true, false, contract, operation);
   }
@@ -422,7 +422,7 @@ export async function login(
   password: string,
   operation: AuthOperation = beginAuthOperation(),
 ): Promise<string | null> {
-  const native = isNativePlatform();
+  const native = usesNativeBearerAuth();
   const init: RequestInit = {
     method: 'POST',
     ...(native ? { headers: NATIVE_AUTH_HEADERS } : {}),
@@ -449,7 +449,7 @@ export async function login(
 }
 
 async function performRefresh(operation: AuthOperation): Promise<void> {
-  if (!isNativePlatform()) {
+  if (!usesNativeBearerAuth()) {
     await request('/v1/auth/refresh', { method: 'POST', body: '{}' });
     return;
   }
@@ -530,7 +530,7 @@ export async function logout(operation: AuthOperation = beginAuthOperation()): P
   let originalError: unknown;
   let expectedRefreshToken: string | undefined;
   try {
-    const refreshToken = isNativePlatform() ? (await readCredentialPair())?.refreshToken : null;
+    const refreshToken = usesNativeBearerAuth() ? (await readCredentialPair())?.refreshToken : null;
     expectedRefreshToken = refreshToken ?? undefined;
     await request('/v1/auth/logout', {
       method: 'POST',

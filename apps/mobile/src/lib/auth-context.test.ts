@@ -1,7 +1,14 @@
 /// <reference types="jest" />
 
 jest.mock('expo-constants', () => ({ expoConfig: { extra: { apiUrl: 'http://localhost/api' } } }));
-jest.mock('react-native', () => ({ Platform: { OS: 'android' } }));
+let mockPlatformOs = 'android';
+jest.mock('react-native', () => ({
+  Platform: {
+    get OS() {
+      return mockPlatformOs;
+    },
+  },
+}));
 jest.mock('./api', () => {
   const actual = jest.requireActual('./api');
   return {
@@ -55,7 +62,28 @@ const user: CurrentUser = {
 describe('authenticated session policy', () => {
   beforeEach(() => {
     jest.resetAllMocks();
+    mockPlatformOs = 'android';
     mockGetRefreshToken.mockResolvedValue('stored-refresh');
+  });
+
+  test('web bootstrap validates the cookie session without reading native storage', async () => {
+    mockPlatformOs = 'web';
+    mockGetCurrentUser.mockResolvedValue(user);
+
+    await expect(restoreStoredSession()).resolves.toEqual({ status: 'authenticated', user });
+
+    expect(mockGetCurrentUser).toHaveBeenCalledTimes(1);
+    expect(mockGetAccessToken).not.toHaveBeenCalled();
+    expect(mockGetRefreshToken).not.toHaveBeenCalled();
+  });
+
+  test('web bootstrap treats a rejected cookie session as unauthenticated', async () => {
+    mockPlatformOs = 'web';
+    mockGetCurrentUser.mockRejectedValue(new ApiError(401, 'Could not validate credentials.'));
+
+    await expect(restoreStoredSession()).resolves.toEqual({ status: 'unauthenticated' });
+
+    expect(mockClearTokens).toHaveBeenCalledTimes(1);
   });
 
   test('no stored pair becomes unauthenticated without /me', async () => {

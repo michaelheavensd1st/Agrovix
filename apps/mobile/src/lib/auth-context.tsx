@@ -22,6 +22,7 @@ import {
   resendVerification as requestVerificationEmail,
   RegisterPayload,
   StaleAuthOperationError,
+  usesNativeBearerAuth,
 } from './api';
 import {
   AuthOperation,
@@ -190,6 +191,7 @@ export async function restoreStoredSession(
   operation: AuthOperation = beginAuthOperation(),
 ): Promise<SessionState> {
   try {
+    if (!usesNativeBearerAuth()) return validateCurrentSession(operation);
     const pair = await readCredentialPair();
     if (!pair) return { status: 'unauthenticated' };
     return validateCurrentSession(operation, pair.refreshToken);
