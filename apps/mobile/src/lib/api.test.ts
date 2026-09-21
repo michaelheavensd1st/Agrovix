@@ -23,13 +23,18 @@ import {
   ApiError,
   ApiFailure,
   authenticatedRequest,
+  CredentialStorageError,
+  getCurrentUser,
   login,
+  LogoutError,
   logout,
   refreshTokens,
   register,
   resendVerification,
   resolveApiUrl,
+  StaleAuthOperationError,
 } from './api';
+import { beginAuthOperation, clearCredentialPair, replaceCredentialPair } from './auth-operations';
 import { authErrorMessage, isEmailUnverifiedError } from './auth-context';
 import * as secureStorage from './secure-storage';
 
@@ -44,6 +49,25 @@ const tokenPair = (access: string, refresh: string) => ({
   token_type: 'bearer',
   expires_in: 900,
 });
+
+const currentUser = {
+  id: '123e4567-e89b-42d3-a456-426614174000',
+  email: 'native@example.com',
+  full_name: 'Native User',
+  is_active: true,
+  is_verified: true,
+  is_superuser: false,
+  created_at: '2026-09-21T12:00:00Z',
+  updated_at: '2026-09-21T12:00:00Z',
+  permissions: ['farm.read'],
+  permission_scopes: [
+    {
+      organization_id: '123e4567-e89b-42d3-a456-426614174001',
+      farm_id: null,
+      permissions: ['farm.read'],
+    },
+  ],
+};
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -381,10 +405,26 @@ describe('mobile API configuration and native auth transport', () => {
     expect(mockSetTokens).not.toHaveBeenCalled();
   });
 
+  test('native login persistence failure preserves the previously readable pair', async () => {
+    mockGetAccessToken.mockResolvedValue('previous-access');
+    mockGetRefreshToken.mockResolvedValue('previous-refresh');
+    mockSetTokens.mockRejectedValue(new Error('secure write failed'));
+    fetchMock.mockResolvedValue(jsonResponse(tokenPair('new-access', 'new-refresh')) as never);
+
+    await expect(login('native@example.com', 'password')).rejects.toBeInstanceOf(
+      CredentialStorageError,
+    );
+
+    await expect(mockGetAccessToken()).resolves.toBe('previous-access');
+    await expect(mockGetRefreshToken()).resolves.toBe('previous-refresh');
+    expect(mockClearTokens).not.toHaveBeenCalled();
+  });
+
   test.each(['android', 'ios'])(
     '%s refresh selects bearer transport and atomically replaces the pair',
     async (os) => {
       mockPlatformOs = os;
+      mockGetAccessToken.mockResolvedValue('access-1');
       mockGetRefreshToken.mockResolvedValue('refresh-1');
       fetchMock.mockResolvedValue(jsonResponse(tokenPair('access-2', 'refresh-2')) as never);
 
@@ -399,6 +439,7 @@ describe('mobile API configuration and native auth transport', () => {
   );
 
   test('native refresh rejects a cookie-only HTTP 200 without replacing stored tokens', async () => {
+    mockGetAccessToken.mockResolvedValue('access-1');
     mockGetRefreshToken.mockResolvedValue('refresh-1');
     fetchMock.mockResolvedValue(jsonResponse({ token_type: 'bearer', expires_in: 900 }) as never);
 
@@ -411,15 +452,123 @@ describe('mobile API configuration and native auth transport', () => {
     expect(mockSetTokens).not.toHaveBeenCalled();
   });
 
+  test('valid /me response is runtime validated and returned', async () => {
+    mockGetAccessToken.mockResolvedValue('access-1');
+    fetchMock.mockResolvedValue(jsonResponse(currentUser) as never);
+
+    await expect(getCurrentUser()).resolves.toEqual(currentUser);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:8000/api/v1/auth/me');
+    expect(init.method).toBe('GET');
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer access-1' });
+  });
+
+  test.each([
+    null,
+    {},
+    { ...currentUser, id: 'not-a-uuid' },
+    { ...currentUser, is_active: 'true' },
+    { ...currentUser, permissions: [null] },
+    { ...currentUser, permission_scopes: [{ organization_id: null }] },
+  ])('malformed /me HTTP 200 response %p is a contract failure', async (body) => {
+    mockGetAccessToken.mockResolvedValue('access-1');
+    fetchMock.mockResolvedValue(jsonResponse(body) as never);
+
+    await expect(getCurrentUser()).rejects.toMatchObject({
+      phase: 'application',
+      status: 200,
+      path: '/v1/auth/me',
+      errorName: 'ApiContractError',
+    });
+  });
+
+  test('expired /me refreshes once, persists one replacement pair, and retries with it', async () => {
+    let accessToken = 'access-1';
+    mockGetAccessToken.mockImplementation(async () => accessToken);
+    mockGetRefreshToken.mockResolvedValue('refresh-1');
+    mockSetTokens.mockImplementation(async (access) => {
+      accessToken = access;
+    });
+    fetchMock.mockImplementation(async (url, init) => {
+      if ((url as string).endsWith('/v1/auth/refresh')) {
+        return jsonResponse(tokenPair('access-2', 'refresh-2')) as never;
+      }
+      const headers = (init as RequestInit).headers as Record<string, string>;
+      return headers.Authorization === 'Bearer access-1'
+        ? (jsonResponse({ detail: 'Access token has expired.' }, 401) as never)
+        : (jsonResponse(currentUser) as never);
+    });
+
+    await expect(getCurrentUser()).resolves.toEqual(currentUser);
+
+    expect(mockSetTokens).toHaveBeenCalledWith('access-2', 'refresh-2');
+    expect(mockSetTokens).toHaveBeenCalledTimes(1);
+    const meCalls = fetchMock.mock.calls.filter(([url]) => (url as string).endsWith('/v1/auth/me'));
+    expect(meCalls).toHaveLength(2);
+    expect((meCalls[1][1].headers as Record<string, string>).Authorization).toBe('Bearer access-2');
+  });
+
+  test('refresh 401 is surfaced as definitive authentication failure', async () => {
+    mockGetAccessToken.mockResolvedValue('access-1');
+    mockGetRefreshToken.mockResolvedValue('refresh-1');
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ detail: 'Access token has expired.' }, 401) as never)
+      .mockResolvedValueOnce(jsonResponse({ detail: 'Invalid refresh token.' }, 401) as never);
+
+    await expect(getCurrentUser()).rejects.toMatchObject({ status: 401 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockSetTokens).not.toHaveBeenCalled();
+  });
+
+  test('malformed refresh HTTP 200 does not replace tokens', async () => {
+    mockGetAccessToken.mockResolvedValue('access-1');
+    mockGetRefreshToken.mockResolvedValue('refresh-1');
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ detail: 'Access token has expired.' }, 401) as never)
+      .mockResolvedValueOnce(jsonResponse({ token_type: 'bearer', expires_in: 900 }) as never);
+
+    await expect(getCurrentUser()).rejects.toMatchObject({
+      phase: 'application',
+      path: '/v1/auth/refresh',
+    });
+    expect(mockSetTokens).not.toHaveBeenCalled();
+  });
+
+  test('successful refresh followed by retry 401 does not refresh twice', async () => {
+    let accessToken = 'access-1';
+    mockGetAccessToken.mockImplementation(async () => accessToken);
+    mockGetRefreshToken.mockResolvedValue('refresh-1');
+    mockSetTokens.mockImplementation(async (access) => {
+      accessToken = access;
+    });
+    fetchMock.mockImplementation(async (url) => {
+      if ((url as string).endsWith('/v1/auth/refresh')) {
+        return jsonResponse(tokenPair('access-2', 'refresh-2')) as never;
+      }
+      return jsonResponse({ detail: 'Could not validate credentials.' }, 401) as never;
+    });
+
+    await expect(getCurrentUser()).rejects.toMatchObject({ status: 401 });
+
+    expect(
+      fetchMock.mock.calls.filter(([url]) => (url as string).endsWith('/v1/auth/refresh')),
+    ).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   test('Expo web login and refresh use cookies without entering bearer storage', async () => {
     mockPlatformOs = 'web';
-    fetchMock.mockImplementation(
-      async () => jsonResponse({ token_type: 'bearer', expires_in: 900 }) as never,
+    fetchMock.mockImplementation(async (url) =>
+      (url as string).endsWith('/v1/auth/me')
+        ? (jsonResponse(currentUser) as never)
+        : (jsonResponse({ token_type: 'bearer', expires_in: 900 }) as never),
     );
 
     await login('browser@example.com', 'password');
     await refreshTokens();
     await authenticatedRequest('/v1/protected');
+    await getCurrentUser();
 
     for (const [, init] of fetchMock.mock.calls) {
       expect(init).toMatchObject({ credentials: 'include' });
@@ -473,7 +622,94 @@ describe('mobile API configuration and native auth transport', () => {
     ).toEqual(['Bearer access-2', 'Bearer access-2']);
   });
 
+  test('a delayed stale refresh cannot overwrite a newer login pair', async () => {
+    let storedAccess: string | null = 'old-access';
+    let storedRefresh: string | null = 'old-refresh';
+    let releaseRefresh!: () => void;
+    let refreshStarted!: () => void;
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      refreshStarted = resolve;
+    });
+    mockGetAccessToken.mockImplementation(async () => storedAccess);
+    mockGetRefreshToken.mockImplementation(async () => storedRefresh);
+    mockSetTokens.mockImplementation(async (access, refresh) => {
+      storedAccess = access;
+      storedRefresh = refresh;
+    });
+    fetchMock.mockImplementation(async (url) => {
+      if ((url as string).endsWith('/v1/auth/refresh')) {
+        refreshStarted();
+        await refreshGate;
+        return jsonResponse(tokenPair('stale-access', 'stale-refresh')) as never;
+      }
+      return jsonResponse({ detail: 'Access token has expired.' }, 401) as never;
+    });
+    const staleOperation = beginAuthOperation();
+    const staleRequest = getCurrentUser(staleOperation);
+    await started;
+    const newerLogin = beginAuthOperation();
+    await replaceCredentialPair(newerLogin, {
+      accessToken: 'login-access',
+      refreshToken: 'login-refresh',
+    });
+
+    releaseRefresh();
+    await expect(staleRequest).rejects.toBeInstanceOf(StaleAuthOperationError);
+
+    expect(storedAccess).toBe('login-access');
+    expect(storedRefresh).toBe('login-refresh');
+    expect(mockSetTokens).toHaveBeenCalledTimes(1);
+  });
+
+  test('a delayed stale refresh cannot recreate credentials after a newer logout', async () => {
+    let storedAccess: string | null = 'old-access';
+    let storedRefresh: string | null = 'old-refresh';
+    let releaseRefresh!: () => void;
+    let refreshStarted!: () => void;
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      refreshStarted = resolve;
+    });
+    mockGetAccessToken.mockImplementation(async () => storedAccess);
+    mockGetRefreshToken.mockImplementation(async () => storedRefresh);
+    mockSetTokens.mockImplementation(async (access, refresh) => {
+      storedAccess = access;
+      storedRefresh = refresh;
+    });
+    mockClearTokens.mockImplementation(async () => {
+      storedAccess = null;
+      storedRefresh = null;
+    });
+    fetchMock.mockImplementation(async (url) => {
+      if ((url as string).endsWith('/v1/auth/refresh')) {
+        refreshStarted();
+        await refreshGate;
+        return jsonResponse(tokenPair('stale-access', 'stale-refresh')) as never;
+      }
+      return jsonResponse({ detail: 'Access token has expired.' }, 401) as never;
+    });
+    const staleOperation = beginAuthOperation();
+    const staleRequest = getCurrentUser(staleOperation);
+    await started;
+    const newerLogout = beginAuthOperation();
+    await clearCredentialPair(newerLogout, 'old-refresh');
+
+    releaseRefresh();
+    await expect(staleRequest).rejects.toBeInstanceOf(StaleAuthOperationError);
+
+    expect(storedAccess).toBeNull();
+    expect(storedRefresh).toBeNull();
+    expect(mockSetTokens).not.toHaveBeenCalled();
+    expect(mockClearTokens).toHaveBeenCalledTimes(1);
+  });
+
   test('logout uses the refresh-token body contract and always clears local tokens', async () => {
+    mockGetAccessToken.mockResolvedValue('access-2');
     mockGetRefreshToken.mockResolvedValue('refresh-2');
     fetchMock.mockResolvedValue(jsonResponse({ message: 'Logged out' }) as never);
 
@@ -488,19 +724,49 @@ describe('mobile API configuration and native auth transport', () => {
     const readFailure = new Error('secure read failed');
     mockGetRefreshToken.mockRejectedValue(readFailure);
 
-    await expect(logout()).rejects.toBe(readFailure);
+    await expect(logout()).rejects.toEqual(
+      expect.objectContaining({
+        failure: readFailure,
+        localCredentialsCleared: true,
+      }),
+    );
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(mockClearTokens).toHaveBeenCalledTimes(1);
   });
 
   test('logout clears tokens and reports the original server failure', async () => {
+    mockGetAccessToken.mockResolvedValue('access-2');
     mockGetRefreshToken.mockResolvedValue('refresh-2');
     fetchMock.mockResolvedValue(jsonResponse({ detail: 'server failed' }, 500) as never);
     mockClearTokens.mockRejectedValue(new Error('secure clear failed'));
 
-    await expect(logout()).rejects.toMatchObject({ status: 500, detail: 'server failed' });
+    await expect(logout()).rejects.toEqual(
+      expect.objectContaining({
+        failure: expect.objectContaining({ status: 500, detail: 'server failed' }),
+        localCredentialsCleared: false,
+      }),
+    );
 
+    expect(mockClearTokens).toHaveBeenCalledTimes(1);
+  });
+
+  test('logout reports server failure with successful local clearing', async () => {
+    mockGetAccessToken.mockResolvedValue('access-2');
+    mockGetRefreshToken.mockResolvedValue('refresh-2');
+    fetchMock.mockResolvedValue(jsonResponse({ detail: 'server failed' }, 500) as never);
+
+    let failure: unknown;
+    try {
+      await logout();
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(LogoutError);
+    expect(failure).toMatchObject({
+      localCredentialsCleared: true,
+      failure: expect.objectContaining({ status: 500, detail: 'server failed' }),
+    });
     expect(mockClearTokens).toHaveBeenCalledTimes(1);
   });
 });

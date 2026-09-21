@@ -1,6 +1,15 @@
 import Constants from 'expo-constants';
 import { Platform } from 'react-native';
-import { clearTokens, getAccessToken, getRefreshToken, setTokens } from './secure-storage';
+import {
+  AuthOperation,
+  beginAuthOperation,
+  clearCredentialPair,
+  currentAuthOperation,
+  ownsAuthOperation,
+  readCredentialPair,
+  replaceCredentialPair,
+} from './auth-operations';
+import { getAccessToken } from './secure-storage';
 
 export function resolveApiUrl(publicUrl?: string, configuredUrl?: string): string {
   return publicUrl || configuredUrl || 'http://localhost:8000/api';
@@ -11,7 +20,7 @@ const CONFIGURED_API_URL = resolveApiUrl(
   Constants.expoConfig?.extra?.apiUrl as string | undefined,
 );
 const NATIVE_AUTH_HEADERS = { 'X-Agrovix-Auth-Transport': 'bearer' } as const;
-let refreshPromise: Promise<void> | null = null;
+const refreshFlights = new Map<number, Promise<void>>();
 
 function isNativePlatform(): boolean {
   return Platform.OS === 'android' || Platform.OS === 'ios';
@@ -30,6 +39,25 @@ export interface TokenPair {
   expires_in: number;
 }
 
+export interface PermissionScope {
+  organization_id: string | null;
+  farm_id: string | null;
+  permissions: string[];
+}
+
+export interface CurrentUser {
+  id: string;
+  email: string;
+  full_name: string | null;
+  is_active: boolean;
+  is_verified: boolean;
+  is_superuser: boolean;
+  created_at: string;
+  updated_at: string;
+  permissions: string[];
+  permission_scopes: PermissionScope[];
+}
+
 function isTokenPair(body: unknown): body is TokenPair {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
   const candidate = body as Partial<Record<keyof TokenPair, unknown>>;
@@ -42,6 +70,50 @@ function isTokenPair(body: unknown): body is TokenPair {
     typeof candidate.expires_in === 'number' &&
     Number.isFinite(candidate.expires_in) &&
     candidate.expires_in > 0
+  );
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+function isDateTime(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && Number.isFinite(Date.parse(value));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function isPermissionScope(body: unknown): body is PermissionScope {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
+  const candidate = body as Partial<Record<keyof PermissionScope, unknown>>;
+  return (
+    (candidate.organization_id === null || isUuid(candidate.organization_id)) &&
+    (candidate.farm_id === null || isUuid(candidate.farm_id)) &&
+    isStringArray(candidate.permissions)
+  );
+}
+
+function isCurrentUser(body: unknown): body is CurrentUser {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return false;
+  const candidate = body as Partial<Record<keyof CurrentUser, unknown>>;
+  return (
+    isUuid(candidate.id) &&
+    typeof candidate.email === 'string' &&
+    EMAIL_PATTERN.test(candidate.email) &&
+    (candidate.full_name === null || typeof candidate.full_name === 'string') &&
+    typeof candidate.is_active === 'boolean' &&
+    typeof candidate.is_verified === 'boolean' &&
+    typeof candidate.is_superuser === 'boolean' &&
+    isDateTime(candidate.created_at) &&
+    isDateTime(candidate.updated_at) &&
+    isStringArray(candidate.permissions) &&
+    Array.isArray(candidate.permission_scopes) &&
+    candidate.permission_scopes.every(isPermissionScope)
   );
 }
 
@@ -82,6 +154,20 @@ export class ApiError extends ApiFailure {
     path = '[unavailable]',
   ) {
     super('http', apiBase, path, status, 'ApiError', detail);
+  }
+}
+
+export class CredentialStorageError extends Error {
+  constructor(public readonly failure: unknown) {
+    super('Credentials could not be stored securely.');
+    this.name = 'CredentialStorageError';
+  }
+}
+
+export class StaleAuthOperationError extends Error {
+  constructor() {
+    super('Authentication operation was superseded.');
+    this.name = 'StaleAuthOperationError';
   }
 }
 
@@ -209,6 +295,7 @@ async function request<T>(
   auth = false,
   mayRefresh = true,
   contract: RequestContract<T> = {},
+  operation: AuthOperation = currentAuthOperation(),
 ): Promise<T> {
   const location = resolveApiLocation(path);
   const headers: Record<string, string> = {
@@ -216,7 +303,9 @@ async function request<T>(
     ...((init.headers as Record<string, string>) ?? {}),
   };
   if (auth && isNativePlatform()) {
+    if (!ownsAuthOperation(operation)) throw new StaleAuthOperationError();
     const token = await getAccessToken();
+    if (!ownsAuthOperation(operation)) throw new StaleAuthOperationError();
     if (token) headers.Authorization = `Bearer ${token}`;
   }
   let res: Response;
@@ -238,8 +327,8 @@ async function request<T>(
   }
   const status = res.status;
   if (res.status === 401 && auth && mayRefresh && isNativePlatform()) {
-    await refreshTokens();
-    return request<T>(path, init, true, false, contract);
+    await refreshTokens(operation);
+    return request<T>(path, init, true, false, contract, operation);
   }
   const isJson = isJsonContentType(res.headers.get('content-type'));
   let responseText: string;
@@ -328,7 +417,11 @@ export async function resendVerification(email: string): Promise<string> {
   return response.message;
 }
 
-export async function login(email: string, password: string): Promise<void> {
+export async function login(
+  email: string,
+  password: string,
+  operation: AuthOperation = beginAuthOperation(),
+): Promise<string | null> {
   const native = isNativePlatform();
   const init: RequestInit = {
     method: 'POST',
@@ -337,20 +430,32 @@ export async function login(email: string, password: string): Promise<void> {
   };
   if (!native) {
     await request('/v1/auth/login', init);
-    return;
+    return null;
   }
   const response = await request<TokenPair>('/v1/auth/login', init, false, true, {
     validate: isTokenPair,
   });
-  await setTokens(response.access_token, response.refresh_token);
+  try {
+    const replaced = await replaceCredentialPair(operation, {
+      accessToken: response.access_token,
+      refreshToken: response.refresh_token,
+    });
+    if (!replaced) throw new StaleAuthOperationError();
+  } catch (error) {
+    if (error instanceof StaleAuthOperationError) throw error;
+    throw new CredentialStorageError(error);
+  }
+  return response.refresh_token;
 }
 
-async function performRefresh(): Promise<void> {
+async function performRefresh(operation: AuthOperation): Promise<void> {
   if (!isNativePlatform()) {
     await request('/v1/auth/refresh', { method: 'POST', body: '{}' });
     return;
   }
-  const refreshToken = await getRefreshToken();
+  if (!ownsAuthOperation(operation)) throw new StaleAuthOperationError();
+  const pair = await readCredentialPair();
+  const refreshToken = pair?.refreshToken;
   if (!refreshToken) throw new ApiError(401, 'Missing refresh token.');
   const tokens = await request<TokenPair>(
     '/v1/auth/refresh',
@@ -363,28 +468,70 @@ async function performRefresh(): Promise<void> {
     true,
     { validate: isTokenPair },
   );
-  await setTokens(tokens.access_token, tokens.refresh_token);
+  const replaced = await replaceCredentialPair(
+    operation,
+    { accessToken: tokens.access_token, refreshToken: tokens.refresh_token },
+    refreshToken,
+  );
+  if (!replaced) throw new StaleAuthOperationError();
 }
 
-export async function refreshTokens(): Promise<void> {
-  if (refreshPromise) return refreshPromise;
-  const pending = performRefresh();
-  refreshPromise = pending;
+export async function refreshTokens(
+  operation: AuthOperation = currentAuthOperation(),
+): Promise<void> {
+  const existing = refreshFlights.get(operation.epoch);
+  if (existing) return existing;
+  const pending = performRefresh(operation);
+  refreshFlights.set(operation.epoch, pending);
   try {
     await pending;
   } finally {
-    if (refreshPromise === pending) refreshPromise = null;
+    if (refreshFlights.get(operation.epoch) === pending) {
+      refreshFlights.delete(operation.epoch);
+    }
   }
 }
 
-export async function authenticatedRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  return request<T>(path, init, true);
+export async function authenticatedRequest<T>(
+  path: string,
+  init: RequestInit = {},
+  operation: AuthOperation = currentAuthOperation(),
+): Promise<T> {
+  return request<T>(path, init, true, true, {}, operation);
 }
 
-export async function logout(): Promise<void> {
+export async function getCurrentUser(
+  operation: AuthOperation = currentAuthOperation(),
+): Promise<CurrentUser> {
+  return request<CurrentUser>(
+    '/v1/auth/me',
+    { method: 'GET' },
+    true,
+    true,
+    {
+      expectedStatus: 200,
+      validate: isCurrentUser,
+    },
+    operation,
+  );
+}
+
+export class LogoutError extends Error {
+  constructor(
+    public readonly failure: unknown,
+    public readonly localCredentialsCleared: boolean,
+  ) {
+    super('Sign out could not be completed.');
+    this.name = 'LogoutError';
+  }
+}
+
+export async function logout(operation: AuthOperation = beginAuthOperation()): Promise<void> {
   let originalError: unknown;
+  let expectedRefreshToken: string | undefined;
   try {
-    const refreshToken = isNativePlatform() ? await getRefreshToken() : null;
+    const refreshToken = isNativePlatform() ? (await readCredentialPair())?.refreshToken : null;
+    expectedRefreshToken = refreshToken ?? undefined;
     await request('/v1/auth/logout', {
       method: 'POST',
       body: JSON.stringify(refreshToken ? { refresh_token: refreshToken } : {}),
@@ -393,9 +540,10 @@ export async function logout(): Promise<void> {
     originalError = error;
   }
   try {
-    await clearTokens();
+    const cleared = await clearCredentialPair(operation, expectedRefreshToken);
+    if (!cleared) throw new StaleAuthOperationError();
   } catch (error) {
-    if (originalError === undefined) originalError = error;
+    throw new LogoutError(originalError ?? error, false);
   }
-  if (originalError !== undefined) throw originalError;
+  if (originalError !== undefined) throw new LogoutError(originalError, true);
 }

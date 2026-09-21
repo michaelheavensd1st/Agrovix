@@ -1,20 +1,50 @@
-import { createContext, useContext, useRef, useState, ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  ReactNode,
+} from 'react';
 import {
   ApiError,
   ApiFailure,
   ApiFailureMetadata,
+  CredentialStorageError,
+  CurrentUser,
   describeUnknownApiError,
+  getCurrentUser,
   login,
+  LogoutError,
   logout,
   register,
   resendVerification as requestVerificationEmail,
   RegisterPayload,
+  StaleAuthOperationError,
 } from './api';
+import {
+  AuthOperation,
+  AuthOperationOwner,
+  beginAuthOperation,
+  clearCredentialPair,
+  ownsAuthOperation,
+  readCredentialPair,
+  SingleFlight,
+} from './auth-operations';
 
 const EMAIL_UNVERIFIED_DETAIL = 'Please verify your email before signing in.';
 const RESEND_SUCCESS_MESSAGE = 'If the account is eligible, a verification email has been sent.';
 
+export type SessionState =
+  | { status: 'initializing' }
+  | { status: 'authenticated'; user: CurrentUser }
+  | { status: 'unauthenticated' }
+  | { status: 'recoverable-error'; message: string };
+
 interface AuthContextValue {
+  session: SessionState;
+  retrySessionBootstrap: () => Promise<void>;
   submitting: boolean;
   error: string | null;
   emailUnverified: boolean;
@@ -114,7 +144,101 @@ export function authErrorMessage(
   });
 }
 
+function sessionErrorMessage(error: unknown): string {
+  return authErrorMessage(error, undefined, '/v1/auth/me');
+}
+
+async function sessionAfterLoginFailure(error: unknown): Promise<SessionState> {
+  if (error instanceof CredentialStorageError) {
+    return { status: 'recoverable-error', message: sessionErrorMessage(error.failure) };
+  }
+  try {
+    const existingPair = await readCredentialPair();
+    return existingPair
+      ? { status: 'recoverable-error', message: authErrorMessage(error) }
+      : { status: 'unauthenticated' };
+  } catch (storageError) {
+    return { status: 'recoverable-error', message: sessionErrorMessage(storageError) };
+  }
+}
+
+async function validateCurrentSession(
+  operation: AuthOperation,
+  expectedRefreshToken?: string,
+): Promise<SessionState> {
+  try {
+    return { status: 'authenticated', user: await getCurrentUser(operation) };
+  } catch (error) {
+    if (error instanceof StaleAuthOperationError) {
+      return { status: 'recoverable-error', message: sessionErrorMessage(error) };
+    }
+    if (!(error instanceof ApiError) || error.status !== 401) {
+      return { status: 'recoverable-error', message: sessionErrorMessage(error) };
+    }
+    try {
+      const cleared = await clearCredentialPair(operation, expectedRefreshToken);
+      return cleared
+        ? { status: 'unauthenticated' }
+        : { status: 'recoverable-error', message: 'Authentication state changed. Please retry.' };
+    } catch (clearError) {
+      return { status: 'recoverable-error', message: sessionErrorMessage(clearError) };
+    }
+  }
+}
+
+export async function restoreStoredSession(
+  operation: AuthOperation = beginAuthOperation(),
+): Promise<SessionState> {
+  try {
+    const pair = await readCredentialPair();
+    if (!pair) return { status: 'unauthenticated' };
+    return validateCurrentSession(operation, pair.refreshToken);
+  } catch (error) {
+    return { status: 'recoverable-error', message: sessionErrorMessage(error) };
+  }
+}
+
+export async function establishLoginSession(
+  email: string,
+  password: string,
+  operation: AuthOperation = beginAuthOperation(),
+): Promise<SessionState> {
+  try {
+    const refreshToken = await login(email, password, operation);
+    return validateCurrentSession(operation, refreshToken ?? undefined);
+  } catch (error) {
+    if (error instanceof CredentialStorageError) {
+      return { status: 'recoverable-error', message: sessionErrorMessage(error.failure) };
+    }
+    throw error;
+  }
+}
+
+export interface LogoutSessionResult {
+  session: SessionState;
+  failure?: unknown;
+}
+
+export async function endSession(
+  operation: AuthOperation = beginAuthOperation(),
+): Promise<LogoutSessionResult> {
+  try {
+    await logout(operation);
+    return { session: { status: 'unauthenticated' } };
+  } catch (error) {
+    if (error instanceof LogoutError && error.localCredentialsCleared) {
+      return { session: { status: 'unauthenticated' } };
+    }
+    const failure = error instanceof LogoutError ? error.failure : error;
+    return {
+      session: { status: 'recoverable-error', message: authErrorMessage(failure) },
+      failure,
+    };
+  }
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<SessionState>({ status: 'initializing' });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [emailUnverified, setEmailUnverified] = useState(false);
@@ -123,8 +247,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [resendSuccess, setResendSuccess] = useState<string | null>(null);
   const signInPendingRef = useRef(false);
   const resendPendingRef = useRef(false);
+  const signOutFlightRef = useRef(new SingleFlight());
   const eligibleVerificationEmailRef = useRef<string | null>(null);
   const resendRequestVersionRef = useRef(0);
+  const bootstrapPendingRef = useRef<Promise<void> | null>(null);
+  const mountedRef = useRef(true);
+  const operationOwnerRef = useRef<AuthOperationOwner | null>(null);
+  if (!operationOwnerRef.current) operationOwnerRef.current = new AuthOperationOwner();
+
+  const commitSession = useCallback((operation: AuthOperation, next: SessionState): boolean => {
+    if (!mountedRef.current || !ownsAuthOperation(operation)) return false;
+    setSession(next);
+    return true;
+  }, []);
+
+  const commitUi = useCallback((operation: AuthOperation, update: () => void): boolean => {
+    if (!mountedRef.current || !ownsAuthOperation(operation)) return false;
+    update();
+    return true;
+  }, []);
+
+  const retrySessionBootstrap = useCallback((): Promise<void> => {
+    if (bootstrapPendingRef.current) return bootstrapPendingRef.current;
+    const operation = operationOwnerRef.current!.begin();
+    setSession({ status: 'initializing' });
+    const pending = restoreStoredSession(operation)
+      .then((next) => {
+        commitSession(operation, next);
+      })
+      .finally(() => {
+        if (bootstrapPendingRef.current === pending) bootstrapPendingRef.current = null;
+      });
+    bootstrapPendingRef.current = pending;
+    return pending;
+  }, [commitSession]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void retrySessionBootstrap();
+    return () => {
+      mountedRef.current = false;
+      operationOwnerRef.current?.invalidate();
+    };
+  }, [retrySessionBootstrap]);
 
   function clearVerificationState() {
     resendRequestVersionRef.current += 1;
@@ -148,6 +313,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   const value: AuthContextValue = {
+    session,
+    retrySessionBootstrap,
     submitting,
     error,
     emailUnverified,
@@ -161,22 +328,38 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const verificationStateVersion = resendRequestVersionRef.current;
       setSubmitting(true);
       setError(null);
+      const operation = operationOwnerRef.current!.begin();
       try {
-        await login(email, password);
-        setEmailUnverified(false);
+        const nextSession = await establishLoginSession(email, password, operation);
+        if (!commitSession(operation, nextSession)) return false;
+        if (nextSession.status !== 'authenticated') {
+          commitUi(operation, () => {
+            setError(
+              nextSession.status === 'recoverable-error'
+                ? nextSession.message
+                : 'Could not validate credentials.',
+            );
+          });
+          return false;
+        }
+        commitUi(operation, () => setEmailUnverified(false));
         return true;
       } catch (err) {
+        const nextSession = await sessionAfterLoginFailure(err);
+        if (!commitSession(operation, nextSession)) return false;
         const unverified = isEmailUnverifiedError(err);
         const verificationStateIsCurrent =
           resendRequestVersionRef.current === verificationStateVersion;
-        eligibleVerificationEmailRef.current =
-          unverified && verificationStateIsCurrent ? email.trim().toLowerCase() : null;
-        setEmailUnverified(unverified && verificationStateIsCurrent);
-        setError(authErrorMessage(err));
+        commitUi(operation, () => {
+          eligibleVerificationEmailRef.current =
+            unverified && verificationStateIsCurrent ? email.trim().toLowerCase() : null;
+          setEmailUnverified(unverified && verificationStateIsCurrent);
+          setError(authErrorMessage(err));
+        });
         return false;
       } finally {
         signInPendingRef.current = false;
-        setSubmitting(false);
+        commitUi(operation, () => setSubmitting(false));
       }
     },
     resendVerification: async (email) => {
@@ -217,9 +400,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     },
     clearVerificationState,
     register: async (payload) => (await run(() => register(payload), '/v1/auth/register')) !== null,
-    signOut: async () => {
-      await run(() => logout());
-    },
+    signOut: () =>
+      signOutFlightRef.current.run(async () => {
+        const operation = operationOwnerRef.current!.begin();
+        setSubmitting(true);
+        setError(null);
+        try {
+          const result = await endSession(operation);
+          commitSession(operation, result.session);
+          if (result.failure !== undefined) {
+            commitUi(operation, () => setError(authErrorMessage(result.failure)));
+          }
+        } finally {
+          commitUi(operation, () => setSubmitting(false));
+        }
+      }),
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

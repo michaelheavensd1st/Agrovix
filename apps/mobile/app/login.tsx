@@ -8,7 +8,7 @@ import {
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
-import { Link, router } from 'expo-router';
+import { Link } from 'expo-router';
 import { useAuth } from '../src/lib/auth-context';
 
 export default function Login() {
@@ -27,8 +27,7 @@ export default function Login() {
   const [password, setPassword] = useState('');
 
   async function handleSubmit() {
-    const ok = await signIn(email, password);
-    if (ok) router.replace('/dashboard');
+    await signIn(email, password);
   }
 
   function handleEmailChange(value: string) {
