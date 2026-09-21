@@ -1,13 +1,11 @@
 import { View, Text, StyleSheet, ScrollView, Pressable } from 'react-native';
-import { router } from 'expo-router';
 import { useAuth } from '../src/lib/auth-context';
 
 export default function Dashboard() {
-  const { signOut } = useAuth();
+  const { error, signOut, submitting } = useAuth();
 
   async function handleSignOut() {
     await signOut();
-    router.replace('/login');
   }
 
   return (
@@ -22,9 +20,16 @@ export default function Dashboard() {
         </Text>
       </View>
 
+      {error ? (
+        <Text style={styles.error} testID="dashboard-auth-error">
+          {error}
+        </Text>
+      ) : null}
+
       <Pressable
+        disabled={submitting}
         testID="dashboard-signout-button"
-        style={styles.signOutButton}
+        style={[styles.signOutButton, submitting && { opacity: 0.6 }]}
         onPress={handleSignOut}
       >
         <Text style={styles.signOutLabel}>Sign out</Text>
@@ -47,6 +52,7 @@ const styles = StyleSheet.create({
   },
   cardTitle: { fontSize: 18, fontWeight: '600', color: '#0f2e1e', textAlign: 'center' },
   cardBody: { fontSize: 14, color: '#4a5c50', textAlign: 'center', marginTop: 8 },
+  error: { color: '#b23a1f', marginTop: 16, textAlign: 'center' },
   signOutButton: {
     marginTop: 32,
     paddingVertical: 12,
