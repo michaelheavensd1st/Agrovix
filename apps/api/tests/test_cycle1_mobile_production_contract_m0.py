@@ -67,6 +67,7 @@ async def test_mobile_bearer_auth_and_context_contract(client: AsyncClient) -> N
     access_token = body["access_token"]
     assert access_token
 
+    client.cookies.clear()
     me = await client.get(
         "/api/v1/auth/me",
         headers={"Authorization": f"Bearer {access_token}"},
