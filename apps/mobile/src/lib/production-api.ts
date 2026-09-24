@@ -78,6 +78,22 @@ function isTransferDestination(value: unknown): value is Record<string, unknown>
   );
 }
 
+const PRODUCTION_SITE_STATUSES = new Set(['active', 'maintenance', 'closed']);
+const PRODUCTION_UNIT_STATUSES = new Set(['active', 'maintenance', 'closed']);
+const PRODUCTION_BATCH_STATES = new Set([
+  'planned',
+  'stocked',
+  'active',
+  'harvested',
+  'closed',
+  'suspended',
+  'cancelled',
+  'failed',
+]);
+
+const isCanonicalEnumValue = (value: unknown, allowed: ReadonlySet<string>): value is string =>
+  typeof value === 'string' && allowed.has(value);
+
 function isProductionSite(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
   return isOpaqueId(value.id);
@@ -94,10 +110,10 @@ function isProductionSiteDetail(value: unknown): value is Record<string, unknown
     (value.address === null || typeof value.address === 'string') &&
     (value.latitude === null || isFiniteNumber(value.latitude)) &&
     (value.longitude === null || isFiniteNumber(value.longitude)) &&
-    (value.timezone === null || isNonEmptyString(value.timezone)) &&
+    (value.timezone === null || typeof value.timezone === 'string') &&
     (value.manager_id === null || isOpaqueId(value.manager_id)) &&
     (value.capacity === null || isFiniteNumber(value.capacity)) &&
-    isNonEmptyString(value.status) &&
+    isCanonicalEnumValue(value.status, PRODUCTION_SITE_STATUSES) &&
     (value.metadata_json === null || isRecord(value.metadata_json)) &&
     typeof value.is_default === 'boolean' &&
     typeof value.is_active === 'boolean' &&
@@ -114,7 +130,7 @@ function isFarm(value: unknown): value is Record<string, unknown> {
     isNonEmptyString(value.name) &&
     isNonEmptyString(value.code) &&
     (value.address === null || typeof value.address === 'string') &&
-    (value.timezone === null || isNonEmptyString(value.timezone)) &&
+    (value.timezone === null || typeof value.timezone === 'string') &&
     typeof value.is_active === 'boolean' &&
     isNonEmptyString(value.created_at) &&
     isNonEmptyString(value.updated_at)
@@ -148,7 +164,7 @@ function isProductionUnit(value: unknown): value is Record<string, unknown> {
     isNonEmptyString(value.name) &&
     isNonEmptyString(value.code) &&
     (value.capacity === null || isFiniteNumber(value.capacity)) &&
-    isNonEmptyString(value.status) &&
+    isCanonicalEnumValue(value.status, PRODUCTION_UNIT_STATUSES) &&
     (value.metadata_json === null || isRecord(value.metadata_json)) &&
     isNonEmptyString(value.created_at) &&
     isNonEmptyString(value.updated_at)
@@ -161,7 +177,7 @@ function isProductionBatch(value: unknown): value is Record<string, unknown> {
     isOpaqueId(value.id) &&
     isOpaqueId(value.unit_id) &&
     isNonEmptyString(value.code) &&
-    isNonEmptyString(value.state) &&
+    isCanonicalEnumValue(value.state, PRODUCTION_BATCH_STATES) &&
     (value.species === null || typeof value.species === 'string') &&
     (value.planned_at === null || isNonEmptyString(value.planned_at)) &&
     (value.stocked_at === null || isNonEmptyString(value.stocked_at)) &&

@@ -521,6 +521,186 @@ describe('production-api client contract', () => {
     });
   });
 
+  test('accepts backend-valid empty timezone strings and canonical enums while rejecting malformed values', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'farm-empty-timezone',
+            organization_id: 'org-1',
+            name: 'Main Farm',
+            code: 'FARM-1',
+            address: null,
+            timezone: '',
+            is_active: true,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const farms = await listFarms('org-1');
+    expect(farms[0]).toMatchObject({ timezone: '' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'site-empty-timezone',
+            farm_id: 'farm-1',
+            name: 'Pond Site',
+            code: 'SITE-1',
+            description: null,
+            address: null,
+            latitude: null,
+            longitude: null,
+            timezone: '',
+            manager_id: null,
+            capacity: null,
+            status: 'maintenance',
+            metadata_json: null,
+            is_default: true,
+            is_active: true,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const sites = await listProductionSites('farm-1');
+    expect(sites[0]).toMatchObject({ timezone: '', status: 'maintenance' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'unit-valid-status',
+            site_id: 'site-1',
+            unit_type_id: 'type-1',
+            name: 'Pond 1',
+            code: 'P1',
+            capacity: 100,
+            status: 'closed',
+            metadata_json: null,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const units = await listProductionUnits('site-1');
+    expect(units[0]).toMatchObject({ status: 'closed' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: 'batch-valid-state',
+          unit_id: 'unit-1',
+          code: 'B-002',
+          state: 'stocked',
+          species: 'Catfish',
+          planned_at: '2026-09-24T00:00:00Z',
+          stocked_at: '2026-09-24T12:00:00Z',
+          harvested_at: null,
+          closed_at: null,
+          expected_quantity: 200,
+          actual_quantity: 180,
+          notes: null,
+          metadata_json: null,
+          created_at: '2026-09-24T00:00:00Z',
+          updated_at: '2026-09-24T12:00:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const batch = await getProductionBatch('batch-valid-state');
+    expect(batch).toMatchObject({ state: 'stocked' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'farm-bad-timezone',
+            organization_id: 'org-1',
+            name: 'Main Farm',
+            code: 'FARM-1',
+            address: null,
+            timezone: 123,
+            is_active: true,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    await expect(listFarms('org-1')).rejects.toMatchObject({
+      phase: 'application',
+      errorName: 'ApiContractError',
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'site-bad-status',
+            farm_id: 'farm-1',
+            name: 'Pond Site',
+            code: 'SITE-1',
+            description: null,
+            address: null,
+            latitude: null,
+            longitude: null,
+            timezone: null,
+            manager_id: null,
+            capacity: null,
+            status: 'bogus',
+            metadata_json: null,
+            is_default: true,
+            is_active: true,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    await expect(listProductionSites('farm-1')).rejects.toMatchObject({
+      phase: 'application',
+      errorName: 'ApiContractError',
+    });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: 'batch-bad-state',
+          unit_id: 'unit-1',
+          code: 'B-003',
+          state: 'bogus',
+          species: 'Catfish',
+          planned_at: '2026-09-24T00:00:00Z',
+          stocked_at: null,
+          harvested_at: null,
+          closed_at: null,
+          expected_quantity: 200,
+          actual_quantity: null,
+          notes: null,
+          metadata_json: null,
+          created_at: '2026-09-24T00:00:00Z',
+          updated_at: '2026-09-24T00:00:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    await expect(getProductionBatch('batch-bad-state')).rejects.toMatchObject({
+      phase: 'application',
+      errorName: 'ApiContractError',
+    });
+  });
+
   test('captures contract and application errors from upstream payloads', async () => {
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ detail: 'Forbidden' }), {
