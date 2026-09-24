@@ -1,7 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useLocalSearchParams } from 'expo-router';
-import { getProductionBatch, getBatchProjections, listBatchEvents } from '../../../src/lib/production-api';
+import {
+  getProductionBatch,
+  getBatchProjections,
+  listBatchEvents,
+} from '../../../src/lib/production-api';
 
 export default function ProductionBatchDetailScreen() {
   const params = useLocalSearchParams<{
@@ -91,7 +95,9 @@ export default function ProductionBatchDetailScreen() {
               projections.map((projection, index) => (
                 <View key={`${projection.id ?? 'projection'}-${index}`} style={styles.listItem}>
                   <Text style={styles.listItemTitle}>{projection.name ?? 'Projection'}</Text>
-                  <Text style={styles.listItemMeta}>{projection.period ?? '—'} • {projection.value ?? '—'}</Text>
+                  <Text style={styles.listItemMeta}>
+                    {projection.period ?? '—'} • {projection.value ?? '—'}
+                  </Text>
                 </View>
               ))
             )}
@@ -123,13 +129,33 @@ const styles = StyleSheet.create({
   title: { fontSize: 28, fontWeight: '600', color: '#0f2e1e', marginTop: 4 },
   meta: { color: '#4a5c50', marginTop: 12 },
   error: { color: '#8b1d1d', marginTop: 12, fontWeight: '600' },
-  card: { backgroundColor: '#fff', borderRadius: 16, borderWidth: 1, borderColor: '#d6d1c1', marginTop: 20, padding: 16 },
-  row: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#efe9db' },
+  card: {
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#d6d1c1',
+    marginTop: 20,
+    padding: 16,
+  },
+  row: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#efe9db',
+  },
   rowLabel: { color: '#4a5c50', fontSize: 14 },
   rowValue: { color: '#0f2e1e', fontWeight: '600', maxWidth: '60%' },
   section: { marginTop: 28 },
   sectionTitle: { fontSize: 18, fontWeight: '700', color: '#0f2e1e', marginBottom: 12 },
-  listItem: { backgroundColor: '#fff', borderRadius: 12, borderWidth: 1, borderColor: '#d6d1c1', padding: 14, marginBottom: 10 },
+  listItem: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#d6d1c1',
+    padding: 14,
+    marginBottom: 10,
+  },
   listItemTitle: { color: '#0f2e1e', fontWeight: '600' },
   listItemMeta: { marginTop: 4, color: '#4a5c50' },
 });
