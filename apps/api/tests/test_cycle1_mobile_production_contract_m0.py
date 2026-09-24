@@ -77,7 +77,10 @@ async def test_mobile_bearer_auth_and_context_contract(client: AsyncClient) -> N
     assert me_body["is_active"] is True
     assert any(scope["organization_id"] == org_id for scope in me_body["permission_scopes"])
     assert any(scope["permissions"] for scope in me_body["permission_scopes"])
-    assert any(scope["organization_id"] == org_id and scope["farm_id"] is None for scope in me_body["permission_scopes"]) or any(
+    assert any(
+        scope["organization_id"] == org_id and scope["farm_id"] is None
+        for scope in me_body["permission_scopes"]
+    ) or any(
         scope["organization_id"] == org_id and scope["farm_id"] == farm_id
         for scope in me_body["permission_scopes"]
     )
@@ -101,7 +104,15 @@ async def test_mobile_batch_contract_event_catalog_and_timeline_are_stable(
     catalog = await client.get("/api/v1/production-events/catalog")
     assert catalog.status_code == 200, catalog.text
     codes = {entry["code"] for entry in catalog.json()["entries"]}
-    assert {"STOCKING", "FEEDING", "MORTALITY", "SAMPLING", "WATER_QUALITY", "TRANSFER", "HARVEST"}.issubset(codes)
+    assert {
+        "STOCKING",
+        "FEEDING",
+        "MORTALITY",
+        "SAMPLING",
+        "WATER_QUALITY",
+        "TRANSFER",
+        "HARVEST",
+    }.issubset(codes)
 
     stocking = await client.post(
         f"/api/v1/batches/{ctx['batch_id']}/events",
