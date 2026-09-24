@@ -90,7 +90,7 @@ describe('production-api client contract', () => {
           performed_by_id: null,
           performed_at: '2026-09-24T10:00:00Z',
           data: { quantity: 1250 },
-          attachments: [],
+          attachments: null,
           is_final: false,
           notes: null,
           idempotency_key: 'idem-123',
@@ -107,8 +107,79 @@ describe('production-api client contract', () => {
     );
 
     expect(event.idempotency_key).toBe('idem-123');
+    expect(event.attachments).toBeNull();
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect((init.headers as Record<string, string>)['Idempotency-Key']).toBe('idem-123');
+  });
+
+  test('accepts nullable event attachments and rejects malformed attachment payloads', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: 'event-null-attachments',
+          organization_id: '11111111-1111-4111-8111-111111111111',
+          farm_id: '22222222-2222-4222-8222-222222222222',
+          site_id: '33333333-3333-4333-8333-333333333333',
+          unit_id: '44444444-4444-4444-8444-444444444444',
+          batch_id: 'batch-123',
+          event_type: 'STOCKING',
+          event_type_version: 1,
+          transfer_id: null,
+          transfer_role: null,
+          performed_by_id: null,
+          performed_at: '2026-09-24T10:00:00Z',
+          data: { quantity: 1250 },
+          attachments: null,
+          is_final: false,
+          notes: null,
+          idempotency_key: 'idem-null-attachments',
+          created_at: '2026-09-24T10:00:00Z',
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await expect(
+      createBatchEvent(
+        'batch-123',
+        { event_type: 'STOCKING', data: { quantity: 1250 } },
+        'idem-null-attachments',
+      ),
+    ).resolves.toMatchObject({ attachments: null });
+
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: 'event-bad-attachments',
+          organization_id: '11111111-1111-4111-8111-111111111111',
+          farm_id: '22222222-2222-4222-8222-222222222222',
+          site_id: '33333333-3333-4333-8333-333333333333',
+          unit_id: '44444444-4444-4444-8444-444444444444',
+          batch_id: 'batch-123',
+          event_type: 'STOCKING',
+          event_type_version: 1,
+          transfer_id: null,
+          transfer_role: null,
+          performed_by_id: null,
+          performed_at: '2026-09-24T10:00:00Z',
+          data: { quantity: 1250 },
+          attachments: 'not-an-array',
+          is_final: false,
+          notes: null,
+          idempotency_key: 'idem-bad-attachments',
+          created_at: '2026-09-24T10:00:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await expect(
+      createBatchEvent(
+        'batch-123',
+        { event_type: 'STOCKING', data: { quantity: 1250 } },
+        'idem-bad-attachments',
+      ),
+    ).rejects.toMatchObject({ phase: 'application', errorName: 'ApiContractError' });
   });
 
   test('accepts 201 creation responses and rejects conflicting replay errors', async () => {
@@ -193,6 +264,66 @@ describe('production-api client contract', () => {
 
     const transfers = await listTransferDestinations('batch-123');
     expect(transfers[0]).toMatchObject({ id: 'dest-batch-1', label: 'Destination Unit' });
+  });
+
+  test('accepts nullable survival rates for empty planned batches and rejects malformed values', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          batch_id: 'batch-empty',
+          initial_stocked_quantity: 0,
+          cumulative_mortality: 0,
+          cumulative_harvest: 0,
+          cumulative_transfer_out: 0,
+          cumulative_transfer_in: 0,
+          estimated_remaining_population: 0,
+          latest_average_weight: null,
+          weight_unit: 'kg',
+          estimated_biomass_kg: 0,
+          total_feed_kg: 0,
+          survival_rate: null,
+          batch_age_days: 0,
+          latest_water_quality: null,
+          latest_sampling_at: null,
+          computed_at: '2026-09-24T00:00:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await expect(getBatchProjections('batch-empty')).resolves.toMatchObject({
+      survival_rate: null,
+      batch_id: 'batch-empty',
+    });
+
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          batch_id: 'batch-bad-survival',
+          initial_stocked_quantity: 0,
+          cumulative_mortality: 0,
+          cumulative_harvest: 0,
+          cumulative_transfer_out: 0,
+          cumulative_transfer_in: 0,
+          estimated_remaining_population: 0,
+          latest_average_weight: null,
+          weight_unit: 'kg',
+          estimated_biomass_kg: 0,
+          total_feed_kg: 0,
+          survival_rate: 'not-a-number',
+          batch_age_days: 0,
+          latest_water_quality: null,
+          latest_sampling_at: null,
+          computed_at: '2026-09-24T00:00:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    await expect(getBatchProjections('batch-bad-survival')).rejects.toMatchObject({
+      phase: 'application',
+      errorName: 'ApiContractError',
+    });
   });
 
   test('validates site creation and organization listing payloads at runtime', async () => {

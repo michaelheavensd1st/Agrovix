@@ -56,7 +56,7 @@ function isBatchEvent(value: unknown): value is Record<string, unknown> {
   if (!isFiniteNumber(value.event_type_version)) return false;
   if (!isNonEmptyString(value.performed_at)) return false;
   if (!isNonEmptyString(value.created_at)) return false;
-  if (!Array.isArray(value.attachments)) return false;
+  if (value.attachments !== null && !Array.isArray(value.attachments)) return false;
   if (!isRecord(value.data)) return false;
   return true;
 }
@@ -67,7 +67,7 @@ function isProjection(value: unknown): value is Record<string, unknown> {
     isNonEmptyString(value.batch_id) &&
     isFiniteNumber(value.initial_stocked_quantity) &&
     isFiniteNumber(value.estimated_remaining_population) &&
-    isFiniteNumber(value.survival_rate)
+    (value.survival_rate === null || isFiniteNumber(value.survival_rate))
   );
 }
 
