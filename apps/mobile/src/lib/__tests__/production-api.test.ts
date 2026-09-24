@@ -20,8 +20,14 @@ import {
   createBatchEvent,
   createProductionSite,
   getBatchProjections,
+  getProductionBatch,
   listBatchEvents,
+  listFarms,
   listOrganizations,
+  listProductionBatches,
+  listProductionSites,
+  listProductionUnitTypes,
+  listProductionUnits,
   listTransferDestinations,
 } from '../production-api';
 
@@ -350,6 +356,169 @@ describe('production-api client contract', () => {
         status: 'active',
       } as any),
     ).resolves.toMatchObject({ id: 'site-1' });
+  });
+
+  test('reads canonical production org/farm/site/unit/batch contracts and rejects malformed 2xx payloads', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'farm-1',
+            organization_id: 'org-1',
+            name: 'Main Farm',
+            code: 'FARM-1',
+            address: null,
+            timezone: 'UTC',
+            is_active: true,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const farms = await listFarms('org-1');
+    expect(farms[0]).toMatchObject({ id: 'farm-1', code: 'FARM-1' });
+    expect(fetchMock.mock.calls[0][0]).toContain('/v1/organizations/org-1/farms');
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'site-1',
+            farm_id: 'farm-1',
+            name: 'Pond Site',
+            code: 'SITE-1',
+            description: null,
+            address: null,
+            latitude: null,
+            longitude: null,
+            timezone: 'UTC',
+            manager_id: null,
+            capacity: null,
+            status: 'active',
+            metadata_json: null,
+            is_default: true,
+            is_active: true,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const sites = await listProductionSites('farm-1');
+    expect(sites[0]).toMatchObject({ id: 'site-1', status: 'active' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'type-1',
+            organization_id: 'org-1',
+            code: 'CATFISH',
+            name: 'Catfish',
+            display_name: 'Catfish',
+            plural_name: 'Catfish',
+            vertical: 'AQUACULTURE',
+            description: null,
+            category: null,
+            is_system: true,
+            metadata_json: null,
+            created_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const unitTypes = await listProductionUnitTypes('org-1');
+    expect(unitTypes[0]).toMatchObject({ id: 'type-1', code: 'CATFISH' });
+    expect(fetchMock.mock.calls[2][0]).toContain('/v1/production-unit-types?organization_id=org-1');
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'unit-1',
+            site_id: 'site-1',
+            unit_type_id: 'type-1',
+            name: 'Pond 1',
+            code: 'P1',
+            capacity: 100,
+            status: 'active',
+            metadata_json: null,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const units = await listProductionUnits('site-1');
+    expect(units[0]).toMatchObject({ id: 'unit-1', name: 'Pond 1' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 'batch-1',
+            unit_id: 'unit-1',
+            code: 'B-001',
+            state: 'planned',
+            species: 'Catfish',
+            planned_at: '2026-09-24T00:00:00Z',
+            stocked_at: null,
+            harvested_at: null,
+            closed_at: null,
+            expected_quantity: 200,
+            actual_quantity: null,
+            notes: null,
+            metadata_json: null,
+            created_at: '2026-09-24T00:00:00Z',
+            updated_at: '2026-09-24T00:00:00Z',
+          },
+        ]),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const batches = await listProductionBatches('unit-1');
+    expect(batches[0]).toMatchObject({ id: 'batch-1', state: 'planned' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: 'batch-1',
+          unit_id: 'unit-1',
+          code: 'B-001',
+          state: 'planned',
+          species: 'Catfish',
+          planned_at: '2026-09-24T00:00:00Z',
+          stocked_at: null,
+          harvested_at: null,
+          closed_at: null,
+          expected_quantity: 200,
+          actual_quantity: null,
+          notes: null,
+          metadata_json: null,
+          created_at: '2026-09-24T00:00:00Z',
+          updated_at: '2026-09-24T00:00:00Z',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const batch = await getProductionBatch('batch-1');
+    expect(batch).toMatchObject({ id: 'batch-1', code: 'B-001' });
+
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ bad: 'payload' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await expect(listProductionUnits('site-bad')).rejects.toMatchObject({
+      phase: 'application',
+      errorName: 'ApiContractError',
+    });
   });
 
   test('captures contract and application errors from upstream payloads', async () => {

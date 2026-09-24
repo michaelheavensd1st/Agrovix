@@ -83,6 +83,99 @@ function isProductionSite(value: unknown): value is Record<string, unknown> {
   return isOpaqueId(value.id);
 }
 
+function isProductionSiteDetail(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return (
+    isOpaqueId(value.id) &&
+    isOpaqueId(value.farm_id) &&
+    isNonEmptyString(value.name) &&
+    isNonEmptyString(value.code) &&
+    (value.description === null || typeof value.description === 'string') &&
+    (value.address === null || typeof value.address === 'string') &&
+    (value.latitude === null || isFiniteNumber(value.latitude)) &&
+    (value.longitude === null || isFiniteNumber(value.longitude)) &&
+    (value.timezone === null || isNonEmptyString(value.timezone)) &&
+    (value.manager_id === null || isOpaqueId(value.manager_id)) &&
+    (value.capacity === null || isFiniteNumber(value.capacity)) &&
+    isNonEmptyString(value.status) &&
+    (value.metadata_json === null || isRecord(value.metadata_json)) &&
+    typeof value.is_default === 'boolean' &&
+    typeof value.is_active === 'boolean' &&
+    isNonEmptyString(value.created_at) &&
+    isNonEmptyString(value.updated_at)
+  );
+}
+
+function isFarm(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return (
+    isOpaqueId(value.id) &&
+    isOpaqueId(value.organization_id) &&
+    isNonEmptyString(value.name) &&
+    isNonEmptyString(value.code) &&
+    (value.address === null || typeof value.address === 'string') &&
+    (value.timezone === null || isNonEmptyString(value.timezone)) &&
+    typeof value.is_active === 'boolean' &&
+    isNonEmptyString(value.created_at) &&
+    isNonEmptyString(value.updated_at)
+  );
+}
+
+function isProductionUnitType(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return (
+    isOpaqueId(value.id) &&
+    (value.organization_id === null || isOpaqueId(value.organization_id)) &&
+    isNonEmptyString(value.code) &&
+    isNonEmptyString(value.name) &&
+    isNonEmptyString(value.display_name) &&
+    (value.plural_name === null || typeof value.plural_name === 'string') &&
+    (value.vertical === null || typeof value.vertical === 'string') &&
+    (value.description === null || typeof value.description === 'string') &&
+    (value.category === null || typeof value.category === 'string') &&
+    typeof value.is_system === 'boolean' &&
+    (value.metadata_json === null || isRecord(value.metadata_json)) &&
+    isNonEmptyString(value.created_at)
+  );
+}
+
+function isProductionUnit(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return (
+    isOpaqueId(value.id) &&
+    isOpaqueId(value.site_id) &&
+    isOpaqueId(value.unit_type_id) &&
+    isNonEmptyString(value.name) &&
+    isNonEmptyString(value.code) &&
+    (value.capacity === null || isFiniteNumber(value.capacity)) &&
+    isNonEmptyString(value.status) &&
+    (value.metadata_json === null || isRecord(value.metadata_json)) &&
+    isNonEmptyString(value.created_at) &&
+    isNonEmptyString(value.updated_at)
+  );
+}
+
+function isProductionBatch(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  return (
+    isOpaqueId(value.id) &&
+    isOpaqueId(value.unit_id) &&
+    isNonEmptyString(value.code) &&
+    isNonEmptyString(value.state) &&
+    (value.species === null || typeof value.species === 'string') &&
+    (value.planned_at === null || isNonEmptyString(value.planned_at)) &&
+    (value.stocked_at === null || isNonEmptyString(value.stocked_at)) &&
+    (value.harvested_at === null || isNonEmptyString(value.harvested_at)) &&
+    (value.closed_at === null || isNonEmptyString(value.closed_at)) &&
+    (value.expected_quantity === null || isFiniteNumber(value.expected_quantity)) &&
+    (value.actual_quantity === null || isFiniteNumber(value.actual_quantity)) &&
+    (value.notes === null || typeof value.notes === 'string') &&
+    (value.metadata_json === null || isRecord(value.metadata_json)) &&
+    isNonEmptyString(value.created_at) &&
+    isNonEmptyString(value.updated_at)
+  );
+}
+
 function isBatchEventListResponse(
   value: unknown,
 ): value is { items: unknown[]; next_cursor: string | null; limit: number } {
@@ -116,6 +209,103 @@ export async function listOrganizations(): Promise<
     return record;
   });
   return items as Array<{ id: string; slug: string; name: string }>;
+}
+
+export async function listFarms(organizationId: string): Promise<Array<Record<string, unknown>>> {
+  const path = `/v1/organizations/${encodeURIComponent(organizationId)}/farms`;
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const farms = assertArray(body, path);
+  return farms.map((entry) => {
+    const record = assertRecord(entry, path);
+    if (!isFarm(record)) {
+      contractFailure(
+        path,
+        `The API response for ${path} did not match the expected farm contract.`,
+      );
+    }
+    return record;
+  });
+}
+
+export async function listProductionSites(farmId: string): Promise<Array<Record<string, unknown>>> {
+  const path = `/v1/farms/${encodeURIComponent(farmId)}/sites`;
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const sites = assertArray(body, path);
+  return sites.map((entry) => {
+    const record = assertRecord(entry, path);
+    if (!isProductionSiteDetail(record)) {
+      contractFailure(
+        path,
+        `The API response for ${path} did not match the expected site contract.`,
+      );
+    }
+    return record;
+  });
+}
+
+export async function listProductionUnitTypes(
+  organizationId: string,
+): Promise<Array<Record<string, unknown>>> {
+  const path = `/v1/production-unit-types?organization_id=${encodeURIComponent(organizationId)}`;
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const types = assertArray(body, path);
+  return types.map((entry) => {
+    const record = assertRecord(entry, path);
+    if (!isProductionUnitType(record)) {
+      contractFailure(
+        path,
+        `The API response for ${path} did not match the expected production-unit-type contract.`,
+      );
+    }
+    return record;
+  });
+}
+
+export async function listProductionUnits(siteId: string): Promise<Array<Record<string, unknown>>> {
+  const path = `/v1/sites/${encodeURIComponent(siteId)}/units`;
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const units = assertArray(body, path);
+  return units.map((entry) => {
+    const record = assertRecord(entry, path);
+    if (!isProductionUnit(record)) {
+      contractFailure(
+        path,
+        `The API response for ${path} did not match the expected unit contract.`,
+      );
+    }
+    return record;
+  });
+}
+
+export async function listProductionBatches(
+  unitId: string,
+): Promise<Array<Record<string, unknown>>> {
+  const path = `/v1/units/${encodeURIComponent(unitId)}/batches`;
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const batches = assertArray(body, path);
+  return batches.map((entry) => {
+    const record = assertRecord(entry, path);
+    if (!isProductionBatch(record)) {
+      contractFailure(
+        path,
+        `The API response for ${path} did not match the expected batch contract.`,
+      );
+    }
+    return record;
+  });
+}
+
+export async function getProductionBatch(batchId: string): Promise<Record<string, unknown>> {
+  const path = `/v1/batches/${encodeURIComponent(batchId)}`;
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const record = assertRecord(body, path);
+  if (!isProductionBatch(record)) {
+    contractFailure(
+      path,
+      `The API response for ${path} did not match the expected batch contract.`,
+    );
+  }
+  return record;
 }
 
 export async function createProductionSite(
