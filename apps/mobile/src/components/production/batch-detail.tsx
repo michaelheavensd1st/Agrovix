@@ -43,7 +43,8 @@ export function BatchDetailPanel({ batch, projection, events }: BatchDetailData)
           </View>
         </View>
         <Text style={styles.meta}>Species: {String(batch.species ?? 'Unknown')}</Text>
-        <Text style={styles.meta}>Unit: {String(batch.unit_id ?? '-')}</Text>
+        <Text style={styles.meta}>Farm: {String(batch.farm_name ?? '-')}</Text>
+        <Text style={styles.meta}>Unit: {String(batch.unit_name ?? batch.unit_id ?? '-')}</Text>
       </View>
 
       {projection ? (

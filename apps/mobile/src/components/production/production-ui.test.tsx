@@ -149,6 +149,8 @@ describe('M2 shared production UI boundary', () => {
         state: 'active',
         species: 'Tilapia',
         unit_id: 'unit-42',
+        unit_name: 'North Tank 2',
+        farm_name: 'North Farm',
       },
       projection: {
         initial_stocked_quantity: 120,
@@ -166,6 +168,10 @@ describe('M2 shared production UI boundary', () => {
 
     expect(values).toContain('B-001');
     expect(values).toContain('Active');
+    expect(values.some((value) => value.includes('Farm:'))).toBe(true);
+    expect(values).toContain('North Farm');
+    expect(values.some((value) => value.includes('Unit:'))).toBe(true);
+    expect(values).toContain('North Tank 2');
     expect(values).toContain('Initial stocked: ');
     expect(values).toContain('120');
     expect(values).toContain('Estimated remaining: ');
