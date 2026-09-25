@@ -35,13 +35,30 @@ describe('session route boundary', () => {
     expect(routeForSession('unauthenticated', 'index')).toBeNull();
   });
 
+  test('slash-prefixed and empty route names normalize to the same auth guard decisions', () => {
+    expect(routeForSession('authenticated', '/login')).toBe('/dashboard');
+    expect(routeForSession('authenticated', '/register')).toBe('/dashboard');
+    expect(routeForSession('unauthenticated', '/dashboard')).toBe('/login');
+    expect(routeForSession('unauthenticated', 'production')).toBe('/login');
+    expect(routeForSession('unauthenticated', '/production')).toBe('/login');
+    expect(routeForSession('authenticated', '/dashboard')).toBeNull();
+    expect(routeForSession('authenticated', '/production')).toBeNull();
+    expect(routeForSession('authenticated', '/')).toBeNull();
+    expect(routeForSession('authenticated', undefined)).toBeNull();
+  });
+
   test('unresolved and redirecting direct routes withhold their screen content', () => {
     expect(shouldHoldSessionRoute('initializing', 'dashboard')).toBe(true);
     expect(shouldHoldSessionRoute('recoverable-error', 'dashboard')).toBe(true);
     expect(shouldHoldSessionRoute('unauthenticated', 'dashboard')).toBe(true);
+    expect(shouldHoldSessionRoute('unauthenticated', 'production')).toBe(true);
+    expect(shouldHoldSessionRoute('unauthenticated', '/production')).toBe(true);
     expect(shouldHoldSessionRoute('authenticated', 'login')).toBe(true);
     expect(shouldHoldSessionRoute('authenticated', 'dashboard')).toBe(false);
+    expect(shouldHoldSessionRoute('authenticated', 'production')).toBe(false);
     expect(shouldHoldSessionRoute('unauthenticated', 'login')).toBe(false);
     expect(shouldHoldSessionRoute('initializing', 'index')).toBe(false);
+    expect(shouldHoldSessionRoute('authenticated', '/login')).toBe(true);
+    expect(shouldHoldSessionRoute('authenticated', undefined)).toBe(false);
   });
 });

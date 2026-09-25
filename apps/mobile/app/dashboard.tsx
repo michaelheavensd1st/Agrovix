@@ -1,4 +1,5 @@
 import { View, Text, StyleSheet, ScrollView, Pressable } from 'react-native';
+import { router } from 'expo-router';
 import { useAuth } from '../src/lib/auth-context';
 
 export default function Dashboard() {
@@ -10,14 +11,21 @@ export default function Dashboard() {
 
   return (
     <ScrollView contentContainerStyle={styles.container} testID="dashboard-screen">
-      <Text style={styles.eyebrow}>Sprint 1</Text>
+      <Text style={styles.eyebrow}>Production</Text>
       <Text style={styles.title}>Dashboard</Text>
 
       <View style={styles.card} testID="dashboard-empty-state">
-        <Text style={styles.cardTitle}>Shell only</Text>
+        <Text style={styles.cardTitle}>Production foundation</Text>
         <Text style={styles.cardBody}>
-          Mobile remains a shell during Sprint 1. Full aquaculture-first workflows land in Sprint 2.
+          Read-only production navigation is now available from organization to batch detail.
         </Text>
+        <Pressable
+          style={styles.primaryButton}
+          onPress={() => router.push('/production')}
+          accessibilityRole="button"
+        >
+          <Text style={styles.primaryButtonText}>Open production scope</Text>
+        </Pressable>
       </View>
 
       {error ? (
@@ -52,6 +60,14 @@ const styles = StyleSheet.create({
   },
   cardTitle: { fontSize: 18, fontWeight: '600', color: '#0f2e1e', textAlign: 'center' },
   cardBody: { fontSize: 14, color: '#4a5c50', textAlign: 'center', marginTop: 8 },
+  primaryButton: {
+    marginTop: 20,
+    borderRadius: 10,
+    backgroundColor: '#0f2e1e',
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  primaryButtonText: { color: '#f5f2e8', fontWeight: '700' },
   error: { color: '#b23a1f', marginTop: 16, textAlign: 'center' },
   signOutButton: {
     marginTop: 32,

@@ -2,6 +2,13 @@ import type { SessionState } from './auth-context';
 
 export type SessionDestination = '/dashboard' | '/login' | null;
 
+function normalizeRoute(route: string | undefined): string | null {
+  if (!route) return null;
+  const trimmed = route.trim();
+  if (!trimmed || trimmed === '/') return null;
+  return trimmed.replace(/^\/+/, '');
+}
+
 export function startupDestination(status: SessionState['status']): SessionDestination {
   if (status === 'authenticated') return '/dashboard';
   if (status === 'unauthenticated') return '/login';
@@ -12,11 +19,26 @@ export function routeForSession(
   status: SessionState['status'],
   route: string | undefined,
 ): SessionDestination {
-  if (status === 'initializing' || status === 'recoverable-error' || route === 'index') return null;
-  if (status === 'unauthenticated' && route === 'dashboard') return '/login';
-  if (status === 'authenticated' && (route === 'login' || route === 'register')) {
+  const normalizedRoute = normalizeRoute(route);
+
+  if (status === 'initializing' || status === 'recoverable-error' || normalizedRoute === 'index') {
+    return null;
+  }
+
+  if (status === 'unauthenticated') {
+    if (normalizedRoute === null || normalizedRoute === 'login' || normalizedRoute === 'register') {
+      return null;
+    }
+    return '/login';
+  }
+
+  if (
+    status === 'authenticated' &&
+    (normalizedRoute === 'login' || normalizedRoute === 'register')
+  ) {
     return '/dashboard';
   }
+
   return null;
 }
 
@@ -24,10 +46,12 @@ export function shouldHoldSessionRoute(
   status: SessionState['status'],
   route: string | undefined,
 ): boolean {
-  if (route === 'index') return false;
+  const normalizedRoute = normalizeRoute(route);
+
+  if (normalizedRoute === 'index') return false;
   return (
     status === 'initializing' ||
     status === 'recoverable-error' ||
-    routeForSession(status, route) !== null
+    routeForSession(status, normalizedRoute ?? undefined) !== null
   );
 }
