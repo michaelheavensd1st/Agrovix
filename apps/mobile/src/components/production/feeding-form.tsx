@@ -105,15 +105,25 @@ export function FeedingForm({ batchId, batchName, farmName, unitName, onSaved }:
       retrySubmission.current =
         draftRevision.current === submissionRevision ? result.retrySubmission : null;
       if (result.outcome === 'accepted') {
+        setConfirmed(false);
+        setConfirmedSnapshot(null);
         setStatusMessage('Feeding has been recorded and reconciled.');
         if (result.reconciliation) onSaved?.(result.submission, result.reconciliation);
       } else if (result.outcome === 'rejected') {
         setError(
           'The server rejected this feeding record. Review the values and submit a fresh record.',
         );
+      } else if (result.outcome === 'reconciliation_failed') {
+        setError(
+          'The feeding was accepted but reconciliation failed. The immutable submission remains preserved for a read-only retry.',
+        );
+      } else if (result.outcome === 'outcome_unknown') {
+        setError(
+          'The feeding write outcome is uncertain. The immutable submission has been preserved for retry with the same key.',
+        );
       } else {
         setError(
-          'The feeding write outcome is uncertain. The submission has been preserved for retry.',
+          'The feeding write failed. No retry submission was preserved; review the record before starting a new submission.',
         );
       }
     } catch (caught) {
@@ -156,9 +166,16 @@ export function FeedingForm({ batchId, batchName, farmName, unitName, onSaved }:
           <Pressable
             key={unit}
             onPress={() => updateField('unit', unit)}
-            style={styles.secondaryButton}
+            style={[styles.secondaryButton, values.unit === unit && styles.optionSelected]}
           >
-            <Text style={styles.secondaryButtonText}>{unit}</Text>
+            <Text
+              style={[
+                styles.secondaryButtonText,
+                values.unit === unit && styles.optionSelectedText,
+              ]}
+            >
+              {unit}
+            </Text>
           </Pressable>
         ))}
       </View>
@@ -168,9 +185,19 @@ export function FeedingForm({ batchId, batchName, farmName, unitName, onSaved }:
           <Pressable
             key={method}
             onPress={() => updateField('feeding_method', method)}
-            style={styles.secondaryButton}
+            style={[
+              styles.secondaryButton,
+              values.feeding_method === method && styles.optionSelected,
+            ]}
           >
-            <Text style={styles.secondaryButtonText}>{method}</Text>
+            <Text
+              style={[
+                styles.secondaryButtonText,
+                values.feeding_method === method && styles.optionSelectedText,
+              ]}
+            >
+              {method}
+            </Text>
           </Pressable>
         ))}
       </View>
@@ -263,4 +290,6 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
   },
   secondaryButtonText: { color: '#0f2e1e' },
+  optionSelected: { backgroundColor: '#dfeecf', borderColor: '#1f5d40', borderWidth: 1 },
+  optionSelectedText: { color: '#1f5d40', fontWeight: '700' },
 });

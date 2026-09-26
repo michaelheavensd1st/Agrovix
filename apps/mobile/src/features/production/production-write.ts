@@ -672,7 +672,11 @@ export function reconcileWaterQualityWrite({
   const submission =
     preservedSubmission ??
     createWaterQualitySubmission(context.batchId, payload, idempotencyKey, context);
-  if (JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)) {
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
     throw new Error('The preserved water-quality submission does not match the current intent.');
   }
   return reconcileProductionWrite({
@@ -708,7 +712,11 @@ export function reconcileFeedingWrite({
   const submission =
     preservedSubmission ??
     createFeedingSubmission(context.batchId, payload, idempotencyKey, context);
-  if (JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)) {
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
     throw new Error('The preserved feeding submission does not match the current intent.');
   }
   return reconcileProductionWrite({
