@@ -41,6 +41,7 @@ jest.mock('expo-router', () => ({
 
 import { Pressable } from 'react-native';
 import ProductionBatchDetailScreen from '../../../app/production/batches/[batchId]';
+import { FeedingForm } from './feeding-form';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
@@ -293,5 +294,19 @@ describe('M2 shared production UI boundary', () => {
     } finally {
       jest.restoreAllMocks();
     }
+  });
+
+  test('renders the non-inventory feeding write form from batch detail', () => {
+    const tree = BatchDetailPanel({
+      batch: { code: 'B-FEED', state: 'active', species: 'Shrimp' },
+      projection: { initial_stocked_quantity: 100, estimated_remaining_population: 100 },
+      events: [],
+      feedingContext: { batchId: 'batch-feed', batchName: 'B-FEED' },
+    });
+
+    const feedingElement = flattenNodes(tree).find(
+      (node) => React.isValidElement(node) && node.type === FeedingForm,
+    ) as React.ReactElement<any>;
+    expect(feedingElement).toBeTruthy();
   });
 });
