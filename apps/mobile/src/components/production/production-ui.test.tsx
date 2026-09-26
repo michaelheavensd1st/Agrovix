@@ -1,9 +1,22 @@
 import React from 'react';
 
+jest.mock('react', () => {
+  const React = jest.requireActual('react');
+  return {
+    ...React,
+    useEffect: jest.fn(),
+    useMemo: jest.fn(),
+    useState: jest.fn(),
+  };
+});
+jest.mock('expo-constants', () => ({
+  expoConfig: { extra: { apiUrl: 'http://localhost:8000/api' } },
+}));
 jest.mock('react-native', () => {
   const React = jest.requireActual('react');
 
   return {
+    Platform: { OS: 'android' },
     Pressable: ({ children, ...props }: any) => React.createElement('Pressable', props, children),
     ScrollView: ({ children, ...props }: any) => React.createElement('ScrollView', props, children),
     StyleSheet: { create: (styles: Record<string, unknown>) => styles },
@@ -11,8 +24,24 @@ jest.mock('react-native', () => {
     View: ({ children, ...props }: any) => React.createElement('View', props, children),
   };
 });
+jest.mock('../../lib/secure-storage', () => ({
+  setTokens: jest.fn(),
+  clearTokens: jest.fn(),
+  getAccessToken: jest.fn(),
+  getRefreshToken: jest.fn(),
+}));
+jest.mock('expo-router', () => ({
+  useLocalSearchParams: () => ({
+    batchId: 'batch-refresh',
+    batchName: 'B-009',
+    farmName: 'North Farm',
+    unitName: 'Pond 09',
+  }),
+}));
 
 import { Pressable } from 'react-native';
+import ProductionBatchDetailScreen from '../../../app/production/batches/[batchId]';
+import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
 
@@ -205,5 +234,64 @@ describe('M2 shared production UI boundary', () => {
     expect(
       flattenNodes(tree).filter((node) => React.isValidElement(node) && node.type === Pressable),
     ).toHaveLength(0);
+  });
+
+  test('displays authoritative batch state returned by water-quality reconciliation', () => {
+    const routeState: { value: unknown }[] = [
+      { value: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' } },
+      { value: { initial_stocked_quantity: 100, survival_rate: 0.8 } },
+      { value: [{ event_type: 'FEEDING', performed_at: '2026-09-24T10:00:00Z' }] },
+      { value: false },
+      { value: null },
+    ];
+    let stateIndex = 0;
+    const useStateSpy = React.useState as unknown as jest.Mock;
+    const useEffectSpy = React.useEffect as unknown as jest.Mock;
+    const useMemoSpy = React.useMemo as unknown as jest.Mock;
+    useStateSpy.mockReset();
+    useEffectSpy.mockReset();
+    useMemoSpy.mockReset();
+    useStateSpy.mockImplementation(() => {
+      const slot = routeState[stateIndex++];
+      return [
+        slot.value,
+        (next: unknown) => {
+          slot.value =
+            typeof next === 'function' ? (next as (value: unknown) => unknown)(slot.value) : next;
+        },
+      ];
+    });
+    useEffectSpy.mockImplementation(() => undefined);
+    useMemoSpy.mockImplementation((factory: () => unknown) => factory());
+
+    const renderBatchDetail = () => {
+      stateIndex = 0;
+      const panel = ProductionBatchDetailScreen() as React.ReactElement<any>;
+      return BatchDetailPanel(panel.props);
+    };
+
+    try {
+      const beforeReconciliation = renderBatchDetail();
+      const form = flattenNodes(beforeReconciliation).find(
+        (node) => React.isValidElement(node) && node.type === WaterQualityForm,
+      ) as React.ReactElement<any>;
+      form.props.onSaved(
+        { idempotencyKey: 'water-quality-key-refresh' },
+        {
+          batch: { id: 'batch-refresh', code: 'B-009', state: 'stocked', species: 'Shrimp' },
+          projection: { initial_stocked_quantity: 250, survival_rate: 0.91 },
+          events: [{ event_type: 'WATER_QUALITY', performed_at: '2026-09-25T14:30:00Z' }],
+        },
+      );
+
+      const refreshedValues = textValues(renderBatchDetail());
+      expect(refreshedValues).toContain('Stocked');
+      expect(refreshedValues).toContain('250');
+      expect(refreshedValues).toContain('0.91');
+      expect(refreshedValues).toContain('WATER_QUALITY');
+      expect(refreshedValues).not.toContain('100');
+    } finally {
+      jest.restoreAllMocks();
+    }
   });
 });
