@@ -101,7 +101,22 @@ export default function ProductionBatchDetailScreen() {
         setProjection(reconciliation.projection);
         setEvents(reconciliation.events);
       }}
+      onFeedingSaved={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
       waterQualityContext={
+        batchId
+          ? {
+              batchId,
+              batchName,
+              farmName: farmName ?? undefined,
+              unitName: unitName ?? undefined,
+            }
+          : undefined
+      }
+      feedingContext={
         batchId
           ? {
               batchId,

@@ -45,20 +45,27 @@ jest.mock('../../lib/production-api', () => ({
 
 import React from 'react';
 import { Pressable, TextInput } from 'react-native';
+import { FeedingForm } from '../../components/production/feeding-form';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
 import { ApiFailure } from '../../lib/api';
 import * as productionApi from '../../lib/production-api';
 import {
   buildWaterQualityPayload,
+  buildFeedingPayload,
+  createFeedingDraftSignature,
   createWaterQualityDraftSignature,
   createWaterQualityIdempotencyKey,
   createWaterQualitySubmission,
+  createFeedingSubmission,
   hasActualWaterQualityMeasurement,
   isSameLogicalSubmission,
   reconcileWaterQualityWrite,
+  reconcileFeedingWrite,
   resolveWriteOutcome,
   type WaterQualityWriteContext,
   type WaterQualitySubmission,
+  type FeedingInput,
+  type FeedingSubmission,
 } from './production-write';
 import * as productionWrite from './production-write';
 
@@ -633,5 +640,296 @@ describe('water-quality write workflow', () => {
     expect(() =>
       buildWaterQualityPayload({ ph: 18, measured_at: nowIso }, { batchId: 'batch-42' }),
     ).toThrow(/ph.*between/);
+  });
+});
+
+describe('feeding write workflow', () => {
+  const feedContext = { batchId: 'batch-feed', batchName: 'B-FEED' };
+  const reconciliation = {
+    batch: { id: 'batch-feed', code: 'B-FEED', state: 'active' },
+    projection: { batch_id: 'batch-feed', total_feed_kg: 2.5 },
+    events: [{ event_type: 'FEEDING', performed_at: '2026-09-26T08:00:00Z' }],
+  };
+
+  test('validates feed identity, quantity, units, method, and optional round', () => {
+    expect(buildFeedingPayload({ feed_description: 'Grower crumble', quantity: '2.5' })).toEqual({
+      feed_description: 'Grower crumble',
+      quantity: 2.5,
+      unit: 'kg',
+      feeding_method: 'broadcast',
+    });
+    expect(
+      buildFeedingPayload({
+        feed_item_ref: 'FEED-01',
+        quantity: 500,
+        unit: 'g',
+        feeding_method: 'tray',
+        feeding_round: '2',
+      }),
+    ).toMatchObject({
+      feed_item_ref: 'FEED-01',
+      quantity: 500,
+      unit: 'g',
+      feeding_method: 'tray',
+      feeding_round: 2,
+    });
+    expect(() => buildFeedingPayload({ quantity: 0 })).toThrow(/feed item reference|description/);
+    expect(() => buildFeedingPayload({ feed_description: 'x', quantity: 0 })).toThrow(
+      /greater than zero/,
+    );
+    expect(() => buildFeedingPayload({ feed_description: 'x', quantity: 1, unit: 'lb' })).toThrow(
+      /unit/,
+    );
+    expect(() =>
+      buildFeedingPayload({ feed_description: 'x', quantity: 1, feeding_round: 0 }),
+    ).toThrow(/feeding_round/);
+  });
+
+  test('accepts a resolved event, reconciles authoritative state, and stays within key limit', async () => {
+    const submission = createFeedingSubmission(
+      'batch-feed',
+      { feed_description: 'Grower crumble', quantity: 2.5 },
+      'feeding-key-1',
+      feedContext,
+    );
+    const result = await reconcileFeedingWrite({
+      context: feedContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post: jest.fn().mockResolvedValue({ id: 'event-feed', event_type: 'FEEDING' }),
+      readAll: jest.fn().mockResolvedValue(reconciliation),
+    });
+    expect(submission.idempotencyKey.length).toBeLessThanOrEqual(128);
+    expect(result.outcome).toBe('accepted');
+    expect(result.reconciliation).toEqual(reconciliation);
+  });
+
+  test('generates a compact feeding key and classifies a real 409 as rejected', async () => {
+    const generated = createFeedingSubmission('batch-feed', {
+      feed_description: 'Grower crumble',
+      quantity: 2.5,
+    });
+    expect(generated.idempotencyKey.length).toBeLessThanOrEqual(128);
+
+    const result = await reconcileFeedingWrite({
+      context: feedContext,
+      payload: generated.payload,
+      idempotencyKey: generated.idempotencyKey,
+      submission: generated,
+      post: jest
+        .fn()
+        .mockRejectedValue(
+          new ApiFailure(
+            'http',
+            'http://localhost:8000/api',
+            '/v1/batches/batch-feed/events',
+            409,
+            'ApiError',
+            'Conflict',
+          ),
+        ),
+      readAll: jest.fn(),
+    });
+    expect(result.outcome).toBe('rejected');
+    expect(result.retrySubmission).toBeNull();
+  });
+
+  test('coalesces concurrent feeding submissions with one POST and one result', async () => {
+    const submission = createFeedingSubmission(
+      'batch-feed',
+      { feed_description: 'Grower crumble', quantity: 2.5 },
+      'feeding-key-concurrent',
+      feedContext,
+    );
+    const post = jest.fn().mockResolvedValue({ id: 'event-feed', event_type: 'FEEDING' });
+    const first = reconcileFeedingWrite({
+      context: feedContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll: jest.fn().mockResolvedValue(reconciliation),
+    });
+    const second = reconcileFeedingWrite({
+      context: feedContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll: jest.fn().mockResolvedValue(reconciliation),
+    });
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(secondResult).toBe(firstResult);
+  });
+
+  test('feeding form reuses K1 for unchanged retry and creates K2 after edit', async () => {
+    let values: Record<string, string> = {
+      feed_description: 'Grower crumble',
+      feed_item_ref: '',
+      quantity: '2.5',
+      unit: 'kg',
+      feeding_method: 'broadcast',
+      feeding_round: '',
+    };
+    let confirmed = true;
+    let confirmedSnapshot = createFeedingDraftSignature(
+      'batch-feed',
+      values as unknown as FeedingInput,
+    );
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const retryRef = { current: null as FeedingSubmission | null };
+    const guard = { current: false };
+    const revision = { current: 0 };
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post
+      .mockReset()
+      .mockRejectedValueOnce(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-feed/events',
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      )
+      .mockRejectedValueOnce(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-feed/events',
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      )
+      .mockResolvedValue({ id: 'event-feed', event_type: 'FEEDING' } as never);
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue({ id: 'batch-feed' });
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue({ batch_id: 'batch-feed' });
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: [],
+      next_cursor: null,
+      limit: 25,
+    });
+    const onSaved = jest.fn();
+
+    const renderForm = () => {
+      const setters = [
+        (update: (current: Record<string, string>) => Record<string, string>) => {
+          values = update(values);
+        },
+        (value: boolean) => {
+          confirmed = value;
+        },
+        (value: string | null) => {
+          confirmedSnapshot = value ?? '';
+        },
+        jest.fn(),
+        jest.fn(),
+        jest.fn(),
+      ];
+      stateSpy.mockReset();
+      [
+        [values, setters[0]],
+        [confirmed, setters[1]],
+        [confirmedSnapshot, setters[2]],
+        [false, setters[3]],
+        [null, setters[4]],
+        [null, setters[5]],
+      ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
+      refSpy
+        .mockReset()
+        .mockReturnValueOnce(guard)
+        .mockReturnValueOnce(retryRef)
+        .mockReturnValueOnce(revision);
+      const form = FeedingForm({ batchId: 'batch-feed', onSaved });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(form);
+      return elements;
+    };
+    const pressablesFor = (elements: React.ReactElement[]) =>
+      elements.filter((element) => element.type === Pressable);
+    const inputsFor = (elements: React.ReactElement[]) =>
+      elements.filter((element) => element.type === TextInput);
+
+    const first = pressablesFor(renderForm());
+    (first[first.length - 1].props as { onPress: () => void }).onPress();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const key1 = post.mock.calls[0][2];
+    expect(key1).toBeTruthy();
+    expect(retryRef.current?.idempotencyKey).toBe(key1);
+
+    const second = pressablesFor(renderForm());
+    (second[second.length - 1].props as { onPress: () => void }).onPress();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(post.mock.calls[1][2]).toBe(key1);
+    expect((post.mock.calls[1][1] as { data: Record<string, unknown> }).data).toMatchObject({
+      feed_description: 'Grower crumble',
+      quantity: 2.5,
+    });
+
+    const edited = renderForm();
+    const editedInputs = inputsFor(edited);
+    (editedInputs[2].props as { onChangeText: (value: string) => void }).onChangeText('3.5');
+    expect(retryRef.current).toBeNull();
+
+    const reconfirm = pressablesFor(renderForm());
+    (reconfirm[reconfirm.length - 2].props as { onPress: () => void }).onPress();
+    const final = pressablesFor(renderForm());
+    (final[final.length - 1].props as { onPress: () => void }).onPress();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const key2 = post.mock.calls[2][2];
+    expect(key2).not.toBe(key1);
+    expect((post.mock.calls[2][1] as { data: Record<string, unknown> }).data).toMatchObject({
+      feed_description: 'Grower crumble',
+      quantity: 3.5,
+    });
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  test('coalesces same-key writes and reuses ambiguous submission without reposting after reads fail', async () => {
+    const submission = createFeedingSubmission(
+      'batch-feed',
+      { feed_description: 'Grower crumble', quantity: 2.5 },
+      'feeding-key-retry',
+      feedContext,
+    );
+    const post = jest.fn().mockResolvedValue({ id: 'event-feed', event_type: 'FEEDING' });
+    const readAll = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('read failed'))
+      .mockResolvedValue(reconciliation);
+    const first = await reconcileFeedingWrite({
+      context: feedContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('reconciliation_failed');
+    const second = await reconcileFeedingWrite({
+      context: feedContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission: first.retrySubmission ?? undefined,
+      post,
+      readAll,
+    });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(second.outcome).toBe('accepted');
+    expect(second.submission).toBe(first.retrySubmission);
   });
 });
