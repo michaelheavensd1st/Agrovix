@@ -67,8 +67,15 @@ export interface WaterQualityWriteResult {
   retrySubmission: WaterQualitySubmission | null;
   posted: boolean;
   reconciled: boolean;
+  reconciliation?: WaterQualityReconciliationData;
   response?: { status?: number; detail?: unknown } | null;
   error?: Error | null;
+}
+
+export interface WaterQualityReconciliationData {
+  batch: Record<string, unknown>;
+  projection: Record<string, unknown>;
+  events: Record<string, unknown>[];
 }
 
 const WATER_QUALITY_FIELDS: readonly WaterQualityMeasurementKey[] = [
@@ -198,11 +205,10 @@ export function buildWaterQualityPayload(
 }
 
 export function createWaterQualityIdempotencyKey(
-  batchId: string,
-  payload: WaterQualityPayload,
+  _batchId: string,
+  _payload: WaterQualityPayload,
 ): string {
-  const stable = JSON.stringify({ batchId, payload });
-  return `water-quality:${batchId}:${makeOpaqueId(stable)}`;
+  return makeOpaqueId('water-quality');
 }
 
 export function createWaterQualitySubmission(
@@ -374,25 +380,22 @@ async function performWaterQualityWrite(
       eventType: 'WATER_QUALITY',
       data: Record<string, unknown>,
       key: string,
-    ) => Promise<{
-      accepted?: boolean;
-      status?: number;
-      detail?: unknown;
-    }>;
-    readAll: (batchId: string) => Promise<unknown>;
+    ) => Promise<Record<string, unknown>>;
+    readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
   },
   submission: WaterQualitySubmission,
 ): Promise<WaterQualityWriteResult> {
   const prior = WATER_QUALITY_WRITE_LEDGER.get(submission.idempotencyKey);
   if (prior && prior.posted && prior.outcome !== 'rejected' && prior.outcome !== 'write_failed') {
     try {
-      await readAll(context.batchId);
+      const reconciliation = await readAll(context.batchId);
       const replay = {
         ...prior,
         outcome: 'accepted',
         retrySubmission: null,
         posted: true,
         reconciled: true,
+        reconciliation,
         response: prior.response ?? null,
         error: null,
       } satisfies WaterQualityWriteResult;
@@ -420,56 +423,51 @@ async function performWaterQualityWrite(
       submission.payload as unknown as Record<string, unknown>,
       submission.idempotencyKey,
     );
+    const status = typeof writeResponse.status === 'number' ? writeResponse.status : undefined;
+    const response = {
+      ...(status === undefined ? {} : { status }),
+      ...('detail' in writeResponse ? { detail: writeResponse.detail } : {}),
+    };
 
-    if (writeResponse?.status === 409 || writeResponse?.status === 422) {
+    if (status === 409 || status === 422) {
       const result: WaterQualityWriteResult = {
         outcome: 'rejected',
         submission,
         retrySubmission: null,
         posted: false,
         reconciled: false,
-        response: writeResponse,
+        response,
       };
       WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
       return result;
     }
 
-    if (writeResponse?.status === 200 || writeResponse?.status === 201 || writeResponse?.accepted) {
-      try {
-        await readAll(context.batchId);
-        const result: WaterQualityWriteResult = {
-          outcome: 'accepted',
-          submission,
-          retrySubmission: null,
-          posted: true,
-          reconciled: true,
-          response: writeResponse,
-        };
-        WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
-        return result;
-      } catch (error) {
-        const result: WaterQualityWriteResult = {
-          outcome: 'reconciliation_failed',
-          submission,
-          retrySubmission: submission,
-          posted: true,
-          reconciled: false,
-          response: writeResponse,
-          error: error instanceof Error ? error : new Error('Reconciliation failed.'),
-        };
-        WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
-        return result;
-      }
+    try {
+      const reconciliation = await readAll(context.batchId);
+      const result: WaterQualityWriteResult = {
+        outcome: 'accepted',
+        submission,
+        retrySubmission: null,
+        posted: true,
+        reconciled: true,
+        reconciliation,
+        response,
+      };
+      WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
+      return result;
+    } catch (error) {
+      const result: WaterQualityWriteResult = {
+        outcome: 'reconciliation_failed',
+        submission,
+        retrySubmission: submission,
+        posted: true,
+        reconciled: false,
+        response,
+        error: error instanceof Error ? error : new Error('Reconciliation failed.'),
+      };
+      WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
+      return result;
     }
-
-    const result = resolveWriteOutcome({
-      submission,
-      status: undefined,
-      accepted: writeResponse?.accepted,
-      response: writeResponse,
-    });
-    WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
-    return result;
   } catch (error) {
     const result = classifyWriteFailure(error, submission);
     WATER_QUALITY_WRITE_LEDGER.set(submission.idempotencyKey, result);
@@ -481,30 +479,34 @@ export function reconcileWaterQualityWrite({
   context,
   payload,
   idempotencyKey,
+  submission: preservedSubmission,
   post,
   readAll,
 }: {
   context: WaterQualityWriteContext;
   payload: WaterQualityMeasurementInput;
   idempotencyKey: string;
+  submission?: WaterQualitySubmission;
   post: (
     batchId: string,
     eventType: 'WATER_QUALITY',
     data: Record<string, unknown>,
     key: string,
-  ) => Promise<{
-    accepted?: boolean;
-    status?: number;
-    detail?: unknown;
-  }>;
-  readAll: (batchId: string) => Promise<unknown>;
+  ) => Promise<Record<string, unknown>>;
+  readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
 }): Promise<WaterQualityWriteResult> {
-  const submission = createWaterQualitySubmission(
-    context.batchId,
-    payload,
-    idempotencyKey,
-    context,
-  );
+  const normalizedPayload = buildWaterQualityPayload(payload, { batchId: context.batchId });
+  const submission =
+    preservedSubmission ??
+    createWaterQualitySubmission(context.batchId, payload, idempotencyKey, context);
+
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
+    throw new Error('The preserved water-quality submission does not match the current intent.');
+  }
   const pending = WATER_QUALITY_WRITE_IN_FLIGHT.get(submission.idempotencyKey);
 
   if (pending) {

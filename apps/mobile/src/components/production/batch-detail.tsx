@@ -6,13 +6,17 @@ import {
   sortBatchEvents,
 } from '../../features/production/production-state';
 import { WaterQualityForm } from './water-quality-form';
-import type { WaterQualityWriteContext } from '../../features/production/production-write';
+import type {
+  WaterQualityReconciliationData,
+  WaterQualityWriteContext,
+} from '../../features/production/production-write';
 
 export interface BatchDetailData {
   batch: Record<string, unknown>;
   projection: Record<string, unknown> | null;
   events: Array<Record<string, unknown>>;
   waterQualityContext?: WaterQualityWriteContext;
+  onWaterQualitySaved?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
 export function BatchDetailPanel({
@@ -20,6 +24,7 @@ export function BatchDetailPanel({
   projection,
   events,
   waterQualityContext,
+  onWaterQualitySaved,
 }: BatchDetailData) {
   const state = typeof batch.state === 'string' ? batch.state : 'unknown';
   const tone = getStatusTone(state);
@@ -97,6 +102,7 @@ export function BatchDetailPanel({
           batchName={waterQualityContext.batchName}
           farmName={waterQualityContext.farmName}
           unitName={waterQualityContext.unitName}
+          onSaved={(_submission, reconciliation) => onWaterQualitySaved?.(reconciliation)}
         />
       ) : null}
     </ScrollView>

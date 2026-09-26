@@ -44,20 +44,23 @@ jest.mock('../../lib/production-api', () => ({
 }));
 
 import React from 'react';
-import { Pressable } from 'react-native';
+import { Pressable, TextInput } from 'react-native';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
 import { ApiFailure } from '../../lib/api';
 import * as productionApi from '../../lib/production-api';
 import {
   buildWaterQualityPayload,
   createWaterQualityDraftSignature,
+  createWaterQualityIdempotencyKey,
   createWaterQualitySubmission,
   hasActualWaterQualityMeasurement,
   isSameLogicalSubmission,
   reconcileWaterQualityWrite,
   resolveWriteOutcome,
   type WaterQualityWriteContext,
+  type WaterQualitySubmission,
 } from './production-write';
+import * as productionWrite from './production-write';
 
 describe('water-quality write workflow', () => {
   const nowIso = '2026-09-25T14:30:00Z';
@@ -106,7 +109,27 @@ describe('water-quality write workflow', () => {
     });
 
     expect(first.idempotencyKey).not.toBe(second.idempotencyKey);
+    expect(first.idempotencyKey.length).toBeLessThanOrEqual(128);
     expect(first.payload).toEqual(second.payload);
+  });
+
+  test('generated idempotency keys stay within the backend column limit', () => {
+    const payload = buildWaterQualityPayload(
+      {
+        temperature: 29.4,
+        ph: 7.9,
+        dissolved_oxygen: 5.6,
+        ammonia: 0.15,
+        nitrite: 0.02,
+        turbidity: 42,
+        measured_at: nowIso,
+      },
+      { batchId: '123e4567-e89b-42d3-a456-426614174000' },
+    );
+
+    expect(
+      createWaterQualityIdempotencyKey('123e4567-e89b-42d3-a456-426614174000', payload).length,
+    ).toBeLessThanOrEqual(128);
   });
 
   test('reuses the same logical submission for same payload and idempotency key', () => {
@@ -311,8 +334,14 @@ describe('water-quality write workflow', () => {
     ];
     states.forEach((state) => stateSpy.mockImplementationOnce(() => state));
     const guard = { current: false };
+    const retryIntent = { current: null as WaterQualitySubmission | null };
+    const draftRevision = { current: 0 };
     const refSpy = React.useRef as unknown as jest.Mock;
-    refSpy.mockReset().mockReturnValue(guard);
+    refSpy
+      .mockReset()
+      .mockReturnValueOnce(guard)
+      .mockReturnValueOnce(retryIntent)
+      .mockReturnValueOnce(draftRevision);
 
     const post = jest.mocked(productionApi.createBatchEvent);
     post.mockResolvedValue({ status: 201, accepted: true } as never);
@@ -351,6 +380,132 @@ describe('water-quality write workflow', () => {
     }
   });
 
+  test('form retries the exact ambiguous submission and edits start a fresh intent', async () => {
+    let currentValues: Record<string, string> = {
+      temperature: '29.4',
+      ph: '',
+      dissolved_oxygen: '',
+      ammonia: '',
+      nitrite: '',
+      turbidity: '',
+      measured_at: nowIso,
+    };
+    let confirmed = true;
+    let confirmedSnapshot: string | null = createWaterQualityDraftSignature(
+      'batch-retry',
+      currentValues,
+    );
+    const guard = { current: false };
+    const retryIntent = { current: null as WaterQualitySubmission | null };
+    const draftRevision = { current: 0 };
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const onSaved = jest.fn();
+    const setError = jest.fn();
+    const post = jest.mocked(productionApi.createBatchEvent);
+    const networkFailure = new ApiFailure(
+      'network',
+      'http://localhost:8000/api',
+      '/v1/batches/batch-retry/events',
+      undefined,
+      'TypeError',
+      'Network request failed',
+    );
+    const eventRecord = {
+      id: 'event-retry',
+      event_type: 'WATER_QUALITY',
+      batch_id: 'batch-retry',
+    };
+    post
+      .mockReset()
+      .mockRejectedValueOnce(networkFailure)
+      .mockRejectedValueOnce(networkFailure)
+      .mockResolvedValue(eventRecord as never);
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue({ id: 'batch-retry' });
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue({ batch_id: 'batch-retry' });
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: [],
+      next_cursor: null,
+      limit: 25,
+    });
+
+    const configureHooks = () => {
+      stateSpy.mockReset();
+      const hooks = [
+        [
+          currentValues,
+          (update: (current: Record<string, string>) => Record<string, string>) => {
+            currentValues = update(currentValues);
+          },
+        ],
+        [confirmed, (value: boolean) => (confirmed = value)],
+        [confirmedSnapshot, (value: string | null) => (confirmedSnapshot = value)],
+        [false, jest.fn()],
+        [null, setError],
+        [null, jest.fn()],
+      ];
+      hooks.forEach((hook) => stateSpy.mockImplementationOnce(() => hook));
+      refSpy
+        .mockReset()
+        .mockReturnValueOnce(guard)
+        .mockReturnValueOnce(retryIntent)
+        .mockReturnValueOnce(draftRevision);
+    };
+    const renderForm = () => {
+      configureHooks();
+      const tree = WaterQualityForm({ batchId: 'batch-retry', onSaved });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) {
+          node.forEach(visit);
+        } else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const submitForm = (elements: React.ReactElement[]) => {
+      const pressables = elements.filter((element) => element.type === Pressable);
+      (pressables[1].props as { onPress: () => void }).onPress();
+    };
+    const reconcileSpy = jest.spyOn(productionWrite, 'reconcileWaterQualityWrite');
+
+    try {
+      submitForm(renderForm());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(retryIntent.current).not.toBeNull();
+      const preservedSubmission = retryIntent.current;
+      const originalKey = post.mock.calls[0][2];
+
+      submitForm(renderForm());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reconcileSpy.mock.calls[1][0].submission).toBe(preservedSubmission);
+      expect(post.mock.calls[1][2]).toBe(originalKey);
+      expect(retryIntent.current).toBe(preservedSubmission);
+
+      const editedElements = renderForm();
+      const textInputs = editedElements.filter((element) => element.type === TextInput);
+      (textInputs[1].props as { onChangeText: (value: string) => void }).onChangeText('30.1');
+      expect(retryIntent.current).toBeNull();
+
+      const confirmationElements = renderForm();
+      const pressables = confirmationElements.filter((element) => element.type === Pressable);
+      (pressables[0].props as { onPress: () => void }).onPress();
+      submitForm(renderForm());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(3);
+      expect(post.mock.calls[2][2]).not.toBe(originalKey);
+      expect(onSaved).toHaveBeenCalledTimes(1);
+      expect(onSaved.mock.calls[0][0].idempotencyKey).toBe(post.mock.calls[2][2]);
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
   test('lost-response first attempt plus same-key replay succeeds upon read-only refresh', async () => {
     const payload = { temperature: 29.4, measured_at: nowIso };
     const post = jest.fn().mockResolvedValue({ status: 201, accepted: true });
@@ -373,6 +528,7 @@ describe('water-quality write workflow', () => {
       context: { batchId: 'batch-42' },
       payload,
       idempotencyKey: 'water-quality-key-replay',
+      submission: first.retrySubmission ?? undefined,
       post,
       readAll,
     });
@@ -381,6 +537,7 @@ describe('water-quality write workflow', () => {
     expect(readAll).toHaveBeenCalledTimes(2);
     expect(second.outcome).toBe('accepted');
     expect(second.reconciled).toBe(true);
+    expect(second.submission).toBe(first.retrySubmission);
   });
 
   test('definitive rejection creates a fresh logical submission after material edit', () => {
@@ -412,7 +569,7 @@ describe('water-quality write workflow', () => {
     expect(edited.payload.temperature).toBe(30.1);
   });
 
-  test('successful write performs the authoritative reads and exposes the correct batch target', async () => {
+  test('accepts a resolved event record and returns authoritative reconciliation data', async () => {
     const context: WaterQualityWriteContext = {
       batchId: 'batch-42',
       farmName: 'North Farm',
@@ -420,12 +577,14 @@ describe('water-quality write workflow', () => {
       batchName: 'B-001',
     };
 
-    const post = jest.fn().mockResolvedValue({ status: 201, accepted: true });
-    const readAll = jest.fn().mockResolvedValue({
+    const eventRecord = { id: 'event-42', event_type: 'WATER_QUALITY', batch_id: 'batch-42' };
+    const post = jest.fn().mockResolvedValue(eventRecord);
+    const reconciliation = {
       batch: { id: 'batch-42', code: 'B-001', state: 'active' },
       projection: { batch_id: 'batch-42', initial_stocked_quantity: 100 },
       events: [{ event_type: 'WATER_QUALITY', performed_at: nowIso }],
-    });
+    };
+    const readAll = jest.fn().mockResolvedValue(reconciliation);
 
     const result = await reconcileWaterQualityWrite({
       context,
@@ -441,6 +600,7 @@ describe('water-quality write workflow', () => {
     expect(result.reconciled).toBe(true);
     expect(result.posted).toBe(true);
     expect(result.submission.batchId).toBe('batch-42');
+    expect(result.reconciliation).toEqual(reconciliation);
   });
 
   test('edits after confirmation invalidate the prior confirmation snapshot', () => {

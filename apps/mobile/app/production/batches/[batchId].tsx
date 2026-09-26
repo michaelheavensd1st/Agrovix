@@ -7,6 +7,7 @@ import {
   getBatchProjections,
   listBatchEvents,
 } from '../../../src/lib/production-api';
+import type { WaterQualityReconciliationData } from '../../../src/features/production/production-write';
 
 export default function ProductionBatchDetailScreen() {
   const params = useLocalSearchParams<{
@@ -95,6 +96,11 @@ export default function ProductionBatchDetailScreen() {
       }
       projection={projection}
       events={events}
+      onWaterQualitySaved={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
       waterQualityContext={
         batchId
           ? {

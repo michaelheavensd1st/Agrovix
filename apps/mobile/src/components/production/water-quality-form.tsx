@@ -12,6 +12,8 @@ import {
   hasActualWaterQualityMeasurement,
   reconcileWaterQualityWrite,
   type WaterQualityWriteContext,
+  type WaterQualityReconciliationData,
+  type WaterQualitySubmission,
 } from '../../features/production/production-write';
 
 export interface WaterQualityFormProps {
@@ -19,7 +21,10 @@ export interface WaterQualityFormProps {
   batchName?: string;
   farmName?: string;
   unitName?: string;
-  onSaved?: (submission: ReturnType<typeof createWaterQualitySubmission>) => void;
+  onSaved?: (
+    submission: ReturnType<typeof createWaterQualitySubmission>,
+    reconciliation: WaterQualityReconciliationData,
+  ) => void;
   onCancel?: () => void;
 }
 
@@ -47,8 +52,12 @@ export function WaterQualityForm({
   const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const submissionInFlight = useRef(false);
+  const retrySubmission = useRef<WaterQualitySubmission | null>(null);
+  const draftRevision = useRef(0);
 
   const updateField = (key: string, nextValue: string) => {
+    draftRevision.current += 1;
+    retrySubmission.current = null;
     setValues((current) => ({ ...current, [key]: nextValue }));
     if (confirmed) {
       setConfirmed(false);
@@ -123,37 +132,47 @@ export function WaterQualityForm({
       setStatusMessage(null);
 
       try {
+        const submissionRevision = draftRevision.current;
         const context: WaterQualityWriteContext = {
           batchId,
           batchName,
           farmName,
           unitName,
         };
-        const submission = createWaterQualitySubmission(
-          batchId,
-          measurementSet,
-          undefined,
-          context,
-        );
+        const submission =
+          retrySubmission.current?.batchId === batchId
+            ? retrySubmission.current
+            : createWaterQualitySubmission(batchId, measurementSet, undefined, context);
 
         const result = await reconcileWaterQualityWrite({
           context,
           payload: submission.payload,
           idempotencyKey: submission.idempotencyKey,
+          submission,
           post: async (targetBatchId, eventType, data, key) =>
             createBatchEvent(targetBatchId, { event_type: eventType, data }, key),
           readAll: async (targetBatchId) => {
-            await Promise.all([
+            const [batch, projection, eventData] = await Promise.all([
               getProductionBatch(targetBatchId),
               getBatchProjections(targetBatchId),
               listBatchEvents(targetBatchId),
             ]);
+            return {
+              batch,
+              projection,
+              events: Array.isArray(eventData.items) ? eventData.items : [],
+            };
           },
         });
 
+        retrySubmission.current =
+          draftRevision.current === submissionRevision ? result.retrySubmission : null;
+
         if (result.outcome === 'accepted') {
           setStatusMessage('Water quality has been recorded and reconciled.');
-          onSaved?.(result.submission);
+          if (result.reconciliation) {
+            onSaved?.(result.submission, result.reconciliation);
+          }
           return;
         }
 
