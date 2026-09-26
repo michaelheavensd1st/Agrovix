@@ -95,6 +95,16 @@ export default function ProductionBatchDetailScreen() {
       }
       projection={projection}
       events={events}
+      waterQualityContext={
+        batchId
+          ? {
+              batchId,
+              batchName,
+              farmName: farmName ?? undefined,
+              unitName: unitName ?? undefined,
+            }
+          : undefined
+      }
     />
   );
 }

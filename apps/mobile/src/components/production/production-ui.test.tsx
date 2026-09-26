@@ -1,9 +1,13 @@
 import React from 'react';
 
+jest.mock('expo-constants', () => ({
+  expoConfig: { extra: { apiUrl: 'http://localhost:8000/api' } },
+}));
 jest.mock('react-native', () => {
   const React = jest.requireActual('react');
 
   return {
+    Platform: { OS: 'android' },
     Pressable: ({ children, ...props }: any) => React.createElement('Pressable', props, children),
     ScrollView: ({ children, ...props }: any) => React.createElement('ScrollView', props, children),
     StyleSheet: { create: (styles: Record<string, unknown>) => styles },
@@ -11,6 +15,12 @@ jest.mock('react-native', () => {
     View: ({ children, ...props }: any) => React.createElement('View', props, children),
   };
 });
+jest.mock('../../lib/secure-storage', () => ({
+  setTokens: jest.fn(),
+  clearTokens: jest.fn(),
+  getAccessToken: jest.fn(),
+  getRefreshToken: jest.fn(),
+}));
 
 import { Pressable } from 'react-native';
 import { BatchDetailPanel } from './batch-detail';
