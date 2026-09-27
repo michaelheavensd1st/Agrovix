@@ -6,6 +6,7 @@ import {
   sortBatchEvents,
 } from '../../features/production/production-state';
 import { FeedingForm } from './feeding-form';
+import { MortalityForm } from './mortality-form';
 import { WaterQualityForm } from './water-quality-form';
 import type {
   WaterQualityReconciliationData,
@@ -20,6 +21,8 @@ export interface BatchDetailData {
   onWaterQualitySaved?: (reconciliation: WaterQualityReconciliationData) => void;
   feedingContext?: WaterQualityWriteContext;
   onFeedingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  mortalityContext?: WaterQualityWriteContext;
+  onMortalitySaved?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
 export function BatchDetailPanel({
@@ -30,6 +33,8 @@ export function BatchDetailPanel({
   onWaterQualitySaved,
   feedingContext,
   onFeedingSaved,
+  mortalityContext,
+  onMortalitySaved,
 }: BatchDetailData) {
   const state = typeof batch.state === 'string' ? batch.state : 'unknown';
   const tone = getStatusTone(state);
@@ -117,6 +122,16 @@ export function BatchDetailPanel({
           farmName={feedingContext.farmName}
           unitName={feedingContext.unitName}
           onSaved={(_submission, reconciliation) => onFeedingSaved?.(reconciliation)}
+        />
+      ) : null}
+      {mortalityContext ? (
+        <MortalityForm
+          batchId={mortalityContext.batchId}
+          batchName={mortalityContext.batchName}
+          farmName={mortalityContext.farmName}
+          siteName={mortalityContext.siteName}
+          unitName={mortalityContext.unitName}
+          onSaved={(_submission, reconciliation) => onMortalitySaved?.(reconciliation)}
         />
       ) : null}
     </ScrollView>

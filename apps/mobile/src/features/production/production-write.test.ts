@@ -46,23 +46,30 @@ jest.mock('../../lib/production-api', () => ({
 import React from 'react';
 import { Pressable, TextInput } from 'react-native';
 import { FeedingForm } from '../../components/production/feeding-form';
+import { MortalityForm } from '../../components/production/mortality-form';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
 import { ApiFailure } from '../../lib/api';
 import * as productionApi from '../../lib/production-api';
 import {
   buildWaterQualityPayload,
   buildFeedingPayload,
+  buildMortalityPayload,
   createFeedingDraftSignature,
+  createMortalityDraftSignature,
   createWaterQualityDraftSignature,
   createWaterQualityIdempotencyKey,
   createWaterQualitySubmission,
+  createMortalitySubmission,
   createFeedingSubmission,
   hasActualWaterQualityMeasurement,
   isSameLogicalSubmission,
+  reconcileMortalityWrite,
   reconcileWaterQualityWrite,
   reconcileFeedingWrite,
   resolveWriteOutcome,
   type WaterQualityWriteContext,
+  type MortalityInput,
+  type MortalitySubmission,
   type WaterQualitySubmission,
   type FeedingInput,
   type FeedingSubmission,
@@ -1198,5 +1205,627 @@ describe('feeding write workflow', () => {
     expect(post).toHaveBeenCalledTimes(1);
     expect(second.outcome).toBe('accepted');
     expect(second.submission).toBe(first.retrySubmission);
+  });
+});
+
+describe('mortality write workflow', () => {
+  const mortalityContext: WaterQualityWriteContext = {
+    batchId: 'batch-mortality',
+    batchName: 'B-MORT',
+    farmName: 'North Farm',
+    unitName: 'Pond 3',
+  };
+  const mortalityInput: MortalityInput = {
+    count: '3',
+    observed_at: '2026-09-26T08:30',
+    suspected_cause: 'Low dissolved oxygen',
+    disposal_method: 'compost',
+    evidence: {
+      photos: ['photo://evidence-1'],
+      lab_report_ref: 'LAB-17',
+      veterinarian_id: 'VET-4',
+      notes: 'Sample retained for review',
+    },
+  };
+  const mortalityReconciliation = {
+    batch: { id: 'batch-mortality', code: 'B-MORT', state: 'active' },
+    projection: {
+      batch_id: 'batch-mortality',
+      initial_stocked_quantity: 100,
+      cumulative_mortality: 3,
+      estimated_remaining_population: 97,
+    },
+    events: [{ event_type: 'MORTALITY', performed_at: '2026-09-26T08:30:00.000Z' }],
+  };
+
+  test('builds exact canonical MORTALITY data and binds intent to batch and payload', () => {
+    const payload = buildMortalityPayload(mortalityInput);
+    expect(payload).toEqual({
+      count: 3,
+      observed_at: '2026-09-26T08:30:00.000Z',
+      suspected_cause: 'Low dissolved oxygen',
+      disposal_method: 'compost',
+      evidence: {
+        photos: ['photo://evidence-1'],
+        lab_report_ref: 'LAB-17',
+        veterinarian_id: 'VET-4',
+        notes: 'Sample retained for review',
+      },
+    });
+    const signature = createMortalityDraftSignature('batch-mortality', mortalityInput);
+    expect(signature).toContain('batch-mortality');
+    expect(signature).toContain('Low dissolved oxygen');
+    expect(
+      createMortalityDraftSignature('batch-mortality', {
+        ...mortalityInput,
+        count: 4,
+      }),
+    ).not.toBe(signature);
+  });
+
+  test('rejects nonpositive/noninteger counts, invalid timestamps, enum values, and overlong fields', () => {
+    for (const count of [0, -1, 1.5, '2.2']) {
+      expect(() => buildMortalityPayload({ ...mortalityInput, count })).toThrow(/positive integer/);
+    }
+    expect(() => buildMortalityPayload({ ...mortalityInput, observed_at: 'not-a-time' })).toThrow(
+      /observed_at/,
+    );
+    expect(() =>
+      buildMortalityPayload({ ...mortalityInput, observed_at: '2026-02-30T08:30' }),
+    ).toThrow(/observed_at/);
+    expect(
+      buildMortalityPayload({ ...mortalityInput, observed_at: '2024-02-29T08:30' }).observed_at,
+    ).toBe('2024-02-29T08:30:00.000Z');
+    expect(() => buildMortalityPayload({ ...mortalityInput, disposal_method: 'dumping' })).toThrow(
+      /disposal_method/,
+    );
+    expect(() =>
+      buildMortalityPayload({ ...mortalityInput, suspected_cause: 'x'.repeat(256) }),
+    ).toThrow(/suspected_cause/);
+    expect(() =>
+      buildMortalityPayload({
+        ...mortalityInput,
+        evidence: { notes: 'x'.repeat(1001) },
+      }),
+    ).toThrow(/evidence.notes/);
+  });
+
+  test('keeps a compact immutable submission and rejects batch/key identity mismatches', () => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      undefined,
+      mortalityContext,
+    );
+    expect(submission.idempotencyKey.length).toBeLessThanOrEqual(128);
+    expect(submission.context.batchId).toBe(mortalityContext.batchId);
+
+    const post = jest.fn();
+    const readAll = jest.fn();
+    expect(() =>
+      reconcileMortalityWrite({
+        context: { ...mortalityContext, batchId: 'another-batch' },
+        payload: submission.payload,
+        idempotencyKey: submission.idempotencyKey,
+        submission,
+        post,
+        readAll,
+      }),
+    ).toThrow(/current intent/);
+    expect(() =>
+      reconcileMortalityWrite({
+        context: mortalityContext,
+        payload: submission.payload,
+        idempotencyKey: 'different-key',
+        submission,
+        post,
+        readAll,
+      }),
+    ).toThrow(/current intent/);
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  test('accepts a resolved/replayed event and uses only authoritative reconciliation projections', async () => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      'mortality-accepted-key',
+      mortalityContext,
+    );
+    const eventRecord = {
+      id: 'event-mortality',
+      event_type: 'MORTALITY',
+      batch_id: mortalityContext.batchId,
+      performed_by_id: 'server-actor',
+      data: submission.payload,
+    };
+    const post = jest.fn().mockResolvedValue(eventRecord);
+    const readAll = jest.fn().mockResolvedValue(mortalityReconciliation);
+    const result = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+
+    expect(post).toHaveBeenCalledWith(
+      mortalityContext.batchId,
+      'MORTALITY',
+      submission.payload,
+      submission.idempotencyKey,
+    );
+    expect(result.outcome).toBe('accepted');
+    expect(result.reconciliation).toEqual(mortalityReconciliation);
+    expect(result.reconciliation?.projection.estimated_remaining_population).toBe(97);
+    expect(result.submission.payload.count).toBe(3);
+    expect(result.submission.payload).not.toHaveProperty('performed_by_id');
+
+    const replay = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(replay.outcome).toBe('accepted');
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(readAll).toHaveBeenCalledTimes(2);
+  });
+
+  test('does not reuse a settled mortality result for a different payload under the same key', async () => {
+    const post = jest.fn().mockResolvedValue({ id: 'event-mortality', event_type: 'MORTALITY' });
+    const readAll = jest.fn().mockResolvedValue(mortalityReconciliation);
+    const first = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: mortalityInput,
+      idempotencyKey: 'mortality-settled-identity-key',
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('accepted');
+
+    const differentIntent = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: { ...mortalityInput, count: 4 },
+      idempotencyKey: 'mortality-settled-identity-key',
+      post,
+      readAll,
+    });
+    expect(differentIntent.outcome).toBe('write_failed');
+    expect(differentIntent.posted).toBe(false);
+    expect(readAll).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('ambiguous retry preserves the exact submission and key', async () => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      'mortality-ambiguous-key',
+      mortalityContext,
+    );
+    const post = jest
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-mortality/events',
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      )
+      .mockResolvedValue({ id: 'event-mortality', event_type: 'MORTALITY' });
+    const readAll = jest.fn().mockResolvedValue(mortalityReconciliation);
+    const first = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('outcome_unknown');
+    expect(first.retrySubmission).toBe(submission);
+
+    const retry = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission: first.retrySubmission ?? undefined,
+      post,
+      readAll,
+    });
+    expect(retry.outcome).toBe('accepted');
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[0][3]).toBe(submission.idempotencyKey);
+    expect(post.mock.calls[1][3]).toBe(submission.idempotencyKey);
+    expect(retry.submission).toBe(submission);
+  });
+
+  test.each([409, 422])('does not retry a definitive HTTP %s rejection', async (status) => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      `mortality-definitive-${status}`,
+      mortalityContext,
+    );
+    const post = jest
+      .fn()
+      .mockRejectedValue(
+        new ApiFailure(
+          'http',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-mortality/events',
+          status,
+          'ApiError',
+          'Rejected',
+        ),
+      );
+    const result = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll: jest.fn(),
+    });
+    expect(result.outcome).toBe('rejected');
+    expect(result.retrySubmission).toBeNull();
+  });
+
+  test('coalesces concurrent same-key mortality calls into one POST', async () => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      'mortality-concurrent-key',
+      mortalityContext,
+    );
+    const post = jest.fn().mockResolvedValue({ id: 'event-mortality', event_type: 'MORTALITY' });
+    const readAll = jest.fn().mockResolvedValue(mortalityReconciliation);
+    const args = {
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    };
+    const [first, second] = await Promise.all([
+      reconcileMortalityWrite(args),
+      reconcileMortalityWrite(args),
+    ]);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(second).toBe(first);
+  });
+
+  test('reconciliation failure retries reads only and never reposts mortality', async () => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      'mortality-readonly-retry-key',
+      mortalityContext,
+    );
+    const post = jest.fn().mockResolvedValue({ id: 'event-mortality', event_type: 'MORTALITY' });
+    const readAll = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('projection unavailable'))
+      .mockResolvedValue(mortalityReconciliation);
+    const first = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('reconciliation_failed');
+    expect(first.posted).toBe(true);
+    expect(first.retrySubmission).toBe(submission);
+
+    const retry = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission: first.retrySubmission ?? undefined,
+      post,
+      readAll,
+    });
+    expect(retry.outcome).toBe('accepted');
+    expect(retry.reconciled).toBe(true);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(readAll).toHaveBeenCalledTimes(2);
+  });
+
+  test('mortality form requires explicit batch-specific confirmation and blocks stale duplicate submit', async () => {
+    let values: Record<string, string> = {
+      count: '3',
+      observed_at: '2026-09-26T08:30Z',
+      suspected_cause: 'Low dissolved oxygen',
+      disposal_method: 'compost',
+      photos: 'photo://evidence-1',
+      lab_report_ref: 'LAB-17',
+      veterinarian_id: 'VET-4',
+      evidence_notes: 'Sample retained',
+    };
+    let confirmed = false;
+    let confirmedSnapshot: string | null = null;
+    let busy = false;
+    let error: string | null = null;
+    let statusMessage: string | null = null;
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const submissionInFlight = { current: false };
+    const retrySubmission = { current: null as MortalitySubmission | null };
+    const draftRevision = { current: 0 };
+    const setters = [
+      (update: (current: Record<string, string>) => Record<string, string>) => {
+        values = update(values);
+      },
+      (next: boolean) => {
+        confirmed = next;
+      },
+      (next: string | null) => {
+        confirmedSnapshot = next;
+      },
+      (next: boolean) => {
+        busy = next;
+      },
+      (next: string | null) => {
+        error = next;
+      },
+      (next: string | null) => {
+        statusMessage = next;
+      },
+    ];
+    let lastTree: React.ReactElement | null = null;
+    const eventRecord = {
+      id: 'mortality-event-1',
+      event_type: 'MORTALITY',
+      batch_id: 'batch-mortality',
+      performed_by_id: 'server-actor',
+      data: buildMortalityPayload(mortalityInput),
+    };
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockResolvedValue(eventRecord);
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue({ id: 'batch-mortality' });
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue({
+      ...mortalityReconciliation.projection,
+      estimated_remaining_population: 97,
+    });
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: mortalityReconciliation.events,
+      next_cursor: null,
+      limit: 25,
+    });
+    const onSaved = jest.fn();
+
+    const renderForm = () => {
+      stateSpy.mockReset();
+      [values, confirmed, confirmedSnapshot, busy, error, statusMessage].forEach((value, index) =>
+        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      );
+      refSpy
+        .mockReset()
+        .mockReturnValueOnce(submissionInFlight)
+        .mockReturnValueOnce(retrySubmission)
+        .mockReturnValueOnce(draftRevision);
+      const tree = MortalityForm({
+        batchId: 'batch-mortality',
+        batchName: 'B-MORT',
+        farmName: 'North Farm',
+        siteName: 'Site 3',
+        unitName: 'Pond 3',
+        onSaved,
+      });
+      lastTree = tree;
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string[] => {
+      if (Array.isArray(node)) return node.flatMap(textContent);
+      if (typeof node === 'string' || typeof node === 'number') return [String(node)];
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return [];
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent((element as React.ReactElement<{ children?: unknown }>).props.children)
+            .join(' ')
+            .includes(text),
+      ) as React.ReactElement<{ onPress: () => void }>;
+
+    try {
+      const initial = renderForm();
+      await buttonWithText(initial, 'Submit mortality').props.onPress();
+      expect(post).not.toHaveBeenCalled();
+      expect(error).toContain('confirm');
+
+      const observedAtInput = initial.filter((element) => element.type === TextInput)[1];
+      (observedAtInput.props as { onChangeText: (value: string) => void }).onChangeText(
+        '2026-02-30T08:30',
+      );
+      const invalidDateElements = renderForm();
+      await buttonWithText(invalidDateElements, 'I confirm this mortality record').props.onPress();
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+      expect(error).toContain('valid observed-at date');
+      expect(post).not.toHaveBeenCalled();
+
+      const correctedDateElements = renderForm();
+      (
+        correctedDateElements.filter((element) => element.type === TextInput)[1].props as {
+          onChangeText: (value: string) => void;
+        }
+      ).onChangeText('2026-09-26T08:30Z');
+
+      const confirmation = buttonWithText(renderForm(), 'I confirm this mortality record');
+      confirmation.props.onPress();
+      expect(confirmed).toBe(true);
+      const confirmedElements = renderForm();
+      const preview = textContent(lastTree).join('');
+      expect(preview).toContain('Mortality count: 3');
+      expect(preview).toContain('Observed at: 2026-09-26T08:30Z');
+      expect(preview).toContain('Cause: Low dissolved oxygen');
+      expect(preview).toContain('Disposal: compost');
+
+      const submit = buttonWithText(confirmedElements, 'Submit mortality');
+      void submit.props.onPress();
+      void submit.props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0][0]).toBe('batch-mortality');
+      expect(post.mock.calls[0][1]).toMatchObject({
+        event_type: 'MORTALITY',
+        data: {
+          count: 3,
+          observed_at: '2026-09-26T08:30:00.000Z',
+          suspected_cause: 'Low dissolved oxygen',
+          disposal_method: 'compost',
+        },
+      });
+      expect(post.mock.calls[0][1].data).not.toHaveProperty('performed_by_id');
+      expect(onSaved).toHaveBeenCalledWith(
+        expect.objectContaining({
+          context: expect.objectContaining({
+            batchId: 'batch-mortality',
+            farmName: 'North Farm',
+            siteName: 'Site 3',
+            unitName: 'Pond 3',
+          }),
+        }),
+        expect.objectContaining({
+          projection: expect.objectContaining({ estimated_remaining_population: 97 }),
+        }),
+      );
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+
+      await buttonWithText(renderForm(), 'Submit mortality').props.onPress();
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(error).toContain('confirm');
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('mortality form clears confirmation after definitive rejection before a fresh-key attempt', async () => {
+    const values: Record<string, string> = {
+      count: '3',
+      observed_at: '2026-09-26T08:30Z',
+      suspected_cause: '',
+      disposal_method: '',
+      photos: '',
+      lab_report_ref: '',
+      veterinarian_id: '',
+      evidence_notes: '',
+    };
+    let confirmed = true;
+    let confirmedSnapshot: string | null = createMortalityDraftSignature('batch-mortality', {
+      count: '3',
+      observed_at: '2026-09-26T08:30Z',
+      suspected_cause: '',
+      disposal_method: null,
+      evidence: {
+        photos: [],
+        lab_report_ref: '',
+        veterinarian_id: '',
+        notes: '',
+      },
+    });
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const inFlight = { current: false };
+    const retryRef = { current: null as MortalitySubmission | null };
+    const revision = { current: 0 };
+    const setError = jest.fn();
+    const setConfirmed = (value: boolean) => {
+      confirmed = value;
+    };
+    const setSnapshot = (value: string | null) => {
+      confirmedSnapshot = value;
+    };
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post
+      .mockReset()
+      .mockRejectedValue(
+        new ApiFailure(
+          'http',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-mortality/events',
+          409,
+          'ApiError',
+          'mortality_exceeds_population',
+        ),
+      );
+
+    const renderForm = () => {
+      stateSpy.mockReset();
+      [
+        [values, jest.fn()],
+        [confirmed, setConfirmed],
+        [confirmedSnapshot, setSnapshot],
+        [false, jest.fn()],
+        [null, setError],
+        [null, jest.fn()],
+      ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
+      refSpy
+        .mockReset()
+        .mockReturnValueOnce(inFlight)
+        .mockReturnValueOnce(retryRef)
+        .mockReturnValueOnce(revision);
+      const tree = MortalityForm({ batchId: 'batch-mortality', batchName: 'B-MORT' });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+
+    try {
+      const initial = renderForm();
+      const buttons = initial.filter((element) => element.type === Pressable);
+      (buttons[buttons.length - 1].props as { onPress: () => void }).onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+      expect(retryRef.current).toBeNull();
+
+      const afterRejection = renderForm();
+      const retryButtons = afterRejection.filter((element) => element.type === Pressable);
+      (retryButtons[retryButtons.length - 1].props as { onPress: () => void }).onPress();
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(setError).toHaveBeenLastCalledWith(
+        'Please confirm this mortality record before submission.',
+      );
+    } finally {
+      jest.restoreAllMocks();
+    }
   });
 });

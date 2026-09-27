@@ -35,6 +35,7 @@ jest.mock('expo-router', () => ({
     batchId: 'batch-refresh',
     batchName: 'B-009',
     farmName: 'North Farm',
+    siteName: 'Site 09',
     unitName: 'Pond 09',
   }),
 }));
@@ -42,6 +43,7 @@ jest.mock('expo-router', () => ({
 import { Pressable } from 'react-native';
 import ProductionBatchDetailScreen from '../../../app/production/batches/[batchId]';
 import { FeedingForm } from './feeding-form';
+import { MortalityForm } from './mortality-form';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
@@ -291,6 +293,26 @@ describe('M2 shared production UI boundary', () => {
       expect(refreshedValues).toContain('0.91');
       expect(refreshedValues).toContain('WATER_QUALITY');
       expect(refreshedValues).not.toContain('100');
+
+      const mortalityForm = flattenNodes(renderBatchDetail()).find(
+        (node) => React.isValidElement(node) && node.type === MortalityForm,
+      ) as React.ReactElement<any>;
+      mortalityForm.props.onSaved(
+        { idempotencyKey: 'mortality-key-route' },
+        {
+          batch: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' },
+          projection: {
+            initial_stocked_quantity: 250,
+            cumulative_mortality: 4,
+            estimated_remaining_population: 246,
+            survival_rate: 0.984,
+          },
+          events: [{ event_type: 'MORTALITY', performed_at: '2026-09-26T08:30:00Z' }],
+        },
+      );
+      const mortalityRefreshedValues = textValues(renderBatchDetail());
+      expect(mortalityRefreshedValues).toContain('246');
+      expect(mortalityRefreshedValues).toContain('MORTALITY');
     } finally {
       jest.restoreAllMocks();
     }
