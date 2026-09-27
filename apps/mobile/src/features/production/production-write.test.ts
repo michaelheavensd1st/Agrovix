@@ -60,6 +60,7 @@ import {
   createWaterQualityIdempotencyKey,
   createWaterQualitySubmission,
   createMortalitySubmission,
+  normalizeMortalityObservedAt,
   createFeedingSubmission,
   hasActualWaterQualityMeasurement,
   isSameLogicalSubmission,
@@ -872,7 +873,7 @@ describe('feeding write workflow', () => {
     expect(result.retrySubmission).toBeNull();
   });
 
-  test('feeding form does not claim a write_failed intent was preserved', async () => {
+  test('feeding form preserves submission after a post-response contract failure', async () => {
     const values = {
       feed_description: 'Grower crumble',
       feed_item_ref: '',
@@ -929,9 +930,18 @@ describe('feeding write workflow', () => {
       (pressables[pressables.length - 1].props as { onPress: () => void }).onPress();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(retryRef.current).toBeNull();
+      expect(retryRef.current).toMatchObject({
+        batchId: 'batch-feed',
+        payload: {
+          feed_description: 'Grower crumble',
+          quantity: 2.5,
+          unit: 'kg',
+          feeding_method: 'broadcast',
+        },
+      });
+      expect(retryRef.current?.idempotencyKey).toMatch(/^feeding:/);
       expect(errorSetter).toHaveBeenCalledWith(
-        'The feeding write failed. No retry submission was preserved; review the record before starting a new submission.',
+        'The feeding write outcome is uncertain. The immutable submission has been preserved for retry with the same key.',
       );
     } finally {
       jest.restoreAllMocks();
@@ -1242,7 +1252,7 @@ describe('mortality write workflow', () => {
     const payload = buildMortalityPayload(mortalityInput);
     expect(payload).toEqual({
       count: 3,
-      observed_at: '2026-09-26T08:30:00.000Z',
+      observed_at: normalizeMortalityObservedAt(mortalityInput.observed_at),
       suspected_cause: 'Low dissolved oxygen',
       disposal_method: 'compost',
       evidence: {
@@ -1275,7 +1285,7 @@ describe('mortality write workflow', () => {
     ).toThrow(/observed_at/);
     expect(
       buildMortalityPayload({ ...mortalityInput, observed_at: '2024-02-29T08:30' }).observed_at,
-    ).toBe('2024-02-29T08:30:00.000Z');
+    ).toBe(new Date('2024-02-29T08:30').toISOString());
     expect(() => buildMortalityPayload({ ...mortalityInput, disposal_method: 'dumping' })).toThrow(
       /disposal_method/,
     );
@@ -1288,6 +1298,22 @@ describe('mortality write workflow', () => {
         evidence: { notes: 'x'.repeat(1001) },
       }),
     ).toThrow(/evidence.notes/);
+  });
+
+  test('interprets timezone-free observed_at as local time and preserves explicit instants', () => {
+    const localObservedAt = new Date('2026-09-26T08:30');
+    const localLeapDay = new Date('2024-02-29T08:30');
+    expect(normalizeMortalityObservedAt('2026-09-26T08:30')).toBe(localObservedAt.toISOString());
+    expect(normalizeMortalityObservedAt('2026-09-26T08:30:45.123')).toBe(
+      new Date('2026-09-26T08:30:45.123').toISOString(),
+    );
+    expect(normalizeMortalityObservedAt('2026-09-26T08:30Z')).toBe('2026-09-26T08:30:00.000Z');
+    expect(normalizeMortalityObservedAt('2026-09-26T08:30+02:30')).toBe('2026-09-26T06:00:00.000Z');
+    expect(normalizeMortalityObservedAt('2024-02-29T08:30')).toBe(localLeapDay.toISOString());
+    if (new Date('2026-03-08T02:30').getHours() !== 2) {
+      expect(normalizeMortalityObservedAt('2026-03-08T02:30')).toBeNull();
+    }
+    expect(normalizeMortalityObservedAt('0000-02-29T08:30')).toBeNull();
   });
 
   test('keeps a compact immutable submission and rejects batch/key identity mismatches', () => {
@@ -1447,6 +1473,68 @@ describe('mortality write workflow', () => {
     expect(retry.submission).toBe(submission);
   });
 
+  test.each([
+    [
+      'HTTP 503',
+      new ApiFailure(
+        'http',
+        'http://localhost:8000/api',
+        '/v1/batches/batch-mortality/events',
+        503,
+        'ApiError',
+        'Service unavailable',
+      ),
+      'mortality-http-503-key',
+    ],
+    [
+      'post-response contract failure',
+      new ApiFailure(
+        'application',
+        'http://localhost:8000/api',
+        '/v1/batches/batch-mortality/events',
+        undefined,
+        'ApiContractError',
+        'Invalid event response contract',
+      ),
+      'mortality-contract-failure-key',
+    ],
+  ])('%s preserves the immutable submission for same-key retry', async (_name, failure, key) => {
+    const submission = createMortalitySubmission(
+      mortalityContext.batchId,
+      mortalityInput,
+      key,
+      mortalityContext,
+    );
+    const post = jest
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValue({ id: 'event-mortality', event_type: 'MORTALITY' });
+    const readAll = jest.fn().mockResolvedValue(mortalityReconciliation);
+
+    const first = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('outcome_unknown');
+    expect(first.retrySubmission).toBe(submission);
+
+    const retry = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission: first.retrySubmission ?? undefined,
+      post,
+      readAll,
+    });
+    expect(retry.outcome).toBe('accepted');
+    expect(retry.submission).toBe(submission);
+    expect(post.mock.calls.map((call) => call[3])).toEqual([key, key]);
+  });
+
   test.each([409, 422])('does not retry a definitive HTTP %s rejection', async (status) => {
     const submission = createMortalitySubmission(
       mortalityContext.batchId,
@@ -1541,6 +1629,26 @@ describe('mortality write workflow', () => {
     expect(readAll).toHaveBeenCalledTimes(2);
   });
 
+  test('mortality form initializes observed_at from the device-local clock', () => {
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-09-26T15:30:00.000Z'));
+    stateSpy.mockReset().mockImplementation((initial: unknown) => [initial, jest.fn()]);
+    refSpy.mockReset().mockImplementation((initial: unknown) => ({ current: initial }));
+
+    try {
+      const now = new Date();
+      const pad = (value: number) => String(value).padStart(2, '0');
+      const expectedLocalTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      expect(MortalityForm({ batchId: 'batch-mortality' })).toBeTruthy();
+      expect(stateSpy.mock.calls[0][0]).toMatchObject({ observed_at: expectedLocalTime });
+    } finally {
+      jest.useRealTimers();
+      jest.restoreAllMocks();
+    }
+  });
+
   test('mortality form requires explicit batch-specific confirmation and blocks stale duplicate submit', async () => {
     let values: Record<string, string> = {
       count: '3',
@@ -1591,7 +1699,29 @@ describe('mortality write workflow', () => {
       data: buildMortalityPayload(mortalityInput),
     };
     const post = jest.mocked(productionApi.createBatchEvent);
-    post.mockReset().mockResolvedValue(eventRecord);
+    post
+      .mockReset()
+      .mockRejectedValueOnce(
+        new ApiFailure(
+          'http',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-mortality/events',
+          503,
+          'ApiError',
+          'Service unavailable',
+        ),
+      )
+      .mockRejectedValueOnce(
+        new ApiFailure(
+          'application',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-mortality/events',
+          undefined,
+          'ApiContractError',
+          'Invalid event response contract',
+        ),
+      )
+      .mockResolvedValue(eventRecord);
     jest.mocked(productionApi.getProductionBatch).mockResolvedValue({ id: 'batch-mortality' });
     jest.mocked(productionApi.getBatchProjections).mockResolvedValue({
       ...mortalityReconciliation.projection,
@@ -1674,7 +1804,7 @@ describe('mortality write workflow', () => {
         correctedDateElements.filter((element) => element.type === TextInput)[1].props as {
           onChangeText: (value: string) => void;
         }
-      ).onChangeText('2026-09-26T08:30Z');
+      ).onChangeText('2026-09-26T08:30');
 
       const confirmation = buttonWithText(renderForm(), 'I confirm this mortality record');
       confirmation.props.onPress();
@@ -1682,27 +1812,82 @@ describe('mortality write workflow', () => {
       const confirmedElements = renderForm();
       const preview = textContent(lastTree).join('');
       expect(preview).toContain('Mortality count: 3');
-      expect(preview).toContain('Observed at: 2026-09-26T08:30Z');
+      expect(preview).toContain('Observed at: 2026-09-26T08:30');
       expect(preview).toContain('Cause: Low dissolved oxygen');
       expect(preview).toContain('Disposal: compost');
 
-      const submit = buttonWithText(confirmedElements, 'Submit mortality');
-      void submit.props.onPress();
-      void submit.props.onPress();
+      const signatureSpy = jest.spyOn(productionWrite, 'createMortalityDraftSignature');
+      signatureSpy.mockReturnValueOnce('changed-normalized-observed-instant');
+      await buttonWithText(confirmedElements, 'Submit mortality').props.onPress();
+      signatureSpy.mockRestore();
+      expect(post).not.toHaveBeenCalled();
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+      expect(retrySubmission.current).toBeNull();
+      expect(error).toContain('changed after confirmation');
+
+      buttonWithText(renderForm(), 'I confirm this mortality record').props.onPress();
+      const submitAfterReconfirm = buttonWithText(renderForm(), 'Submit mortality');
+      submitAfterReconfirm.props.onPress();
+      submitAfterReconfirm.props.onPress();
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       expect(post).toHaveBeenCalledTimes(1);
       expect(post.mock.calls[0][0]).toBe('batch-mortality');
-      expect(post.mock.calls[0][1]).toMatchObject({
+      const firstKey = retrySubmission.current?.idempotencyKey;
+      expect(firstKey).toBeTruthy();
+      expect(retrySubmission.current?.payload).toEqual(
+        buildMortalityPayload({
+          count: '3',
+          observed_at: '2026-09-26T08:30',
+          suspected_cause: 'Low dissolved oxygen',
+          disposal_method: 'compost',
+          evidence: {
+            photos: ['photo://evidence-1'],
+            lab_report_ref: 'LAB-17',
+            veterinarian_id: 'VET-4',
+            notes: 'Sample retained',
+          },
+        }),
+      );
+      expect(error).toContain('outcome is uncertain');
+
+      buttonWithText(renderForm(), 'Submit mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([firstKey, firstKey]);
+      expect(retrySubmission.current?.idempotencyKey).toBe(firstKey);
+      expect(error).toContain('outcome is uncertain');
+
+      const editableElements = renderForm();
+      (
+        editableElements.filter((element) => element.type === TextInput)[0].props as {
+          onChangeText: (value: string) => void;
+        }
+      ).onChangeText('4');
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+      expect(retrySubmission.current).toBeNull();
+      await buttonWithText(renderForm(), 'Submit mortality').props.onPress();
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(error).toContain('confirm');
+
+      buttonWithText(renderForm(), 'I confirm this mortality record').props.onPress();
+      await buttonWithText(renderForm(), 'Submit mortality').props.onPress();
+      expect(post).toHaveBeenCalledTimes(3);
+      const secondKey = post.mock.calls[2][2];
+      expect(secondKey).not.toBe(firstKey);
+      expect(post.mock.calls[2][1]).toMatchObject({
         event_type: 'MORTALITY',
         data: {
-          count: 3,
-          observed_at: '2026-09-26T08:30:00.000Z',
+          count: 4,
+          observed_at: normalizeMortalityObservedAt('2026-09-26T08:30'),
           suspected_cause: 'Low dissolved oxygen',
           disposal_method: 'compost',
         },
       });
-      expect(post.mock.calls[0][1].data).not.toHaveProperty('performed_by_id');
+      expect(post.mock.calls[2][1].data).not.toHaveProperty('performed_by_id');
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(onSaved).toHaveBeenCalledWith(
         expect.objectContaining({
           context: expect.objectContaining({
@@ -1720,7 +1905,7 @@ describe('mortality write workflow', () => {
       expect(confirmedSnapshot).toBeNull();
 
       await buttonWithText(renderForm(), 'Submit mortality').props.onPress();
-      expect(post).toHaveBeenCalledTimes(1);
+      expect(post).toHaveBeenCalledTimes(3);
       expect(error).toContain('confirm');
     } finally {
       jest.restoreAllMocks();

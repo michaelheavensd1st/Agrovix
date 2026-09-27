@@ -203,27 +203,50 @@ function normalizeMeasuredAt(value: string | null | undefined): string | null {
 export function normalizeMortalityObservedAt(value: string | null): string | null {
   if (typeof value !== 'string' || value.trim().length === 0) return null;
   const trimmed = value.trim();
-  const withTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(trimmed)
-    ? trimmed
-    : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(trimmed)
-      ? `${trimmed}:00Z`
-      : `${trimmed}Z`;
+  const timestamp =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      trimmed,
+    );
+  if (!timestamp) return null;
+
+  const year = Number(timestamp[1]);
+  const month = Number(timestamp[2]);
+  const day = Number(timestamp[3]);
+  const hour = Number(timestamp[4]);
+  const minute = Number(timestamp[5]);
+  const second = Number(timestamp[6] ?? 0);
+  const fraction = timestamp[7] ?? '';
+  const millisecond = Number(`${fraction}000`.slice(0, 3));
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   if (
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/.test(withTimezone)
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth[month - 1] ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
   ) {
     return null;
   }
-  const dateParts = /^(\d{4})-(\d{2})-(\d{2})T/.exec(withTimezone);
-  if (!dateParts) return null;
-  const year = Number(dateParts[1]);
-  const month = Number(dateParts[2]);
-  const day = Number(dateParts[3]);
-  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]) return null;
 
-  const parsed = new Date(withTimezone);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  if (
+    !timestamp[8] &&
+    (parsed.getFullYear() !== year ||
+      parsed.getMonth() !== month - 1 ||
+      parsed.getDate() !== day ||
+      parsed.getHours() !== hour ||
+      parsed.getMinutes() !== minute ||
+      parsed.getSeconds() !== second ||
+      parsed.getMilliseconds() !== millisecond)
+  ) {
+    return null;
+  }
+  return parsed.toISOString();
 }
 
 function enforceMeasurementBound(field: WaterQualityMeasurementKey, value: number): number {
@@ -456,6 +479,7 @@ export function buildMortalityPayload(values: MortalityInput): MortalityPayload 
 export function createMortalityDraftSignature(batchId: string, values: MortalityInput): string {
   return JSON.stringify({
     batchId,
+    normalizedObservedAt: normalizeMortalityObservedAt(values.observed_at),
     values: {
       count: values.count ?? '',
       observed_at: values.observed_at ?? '',
@@ -616,7 +640,25 @@ function classifyWriteFailure<TPayload extends Record<string, unknown>>(
     };
   }
 
-  if (error.phase === 'http' || error.phase === 'application') {
+  if (
+    error.phase === 'application' ||
+    (error.phase === 'http' &&
+      error.status !== undefined &&
+      error.status >= 500 &&
+      error.status < 600)
+  ) {
+    return {
+      outcome: 'outcome_unknown',
+      submission,
+      retrySubmission: submission,
+      posted: false,
+      reconciled: false,
+      response,
+      error,
+    };
+  }
+
+  if (error.phase === 'http') {
     return {
       outcome: 'write_failed',
       submission,

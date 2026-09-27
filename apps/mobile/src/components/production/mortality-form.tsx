@@ -18,6 +18,12 @@ import {
   type WaterQualityWriteContext,
 } from '../../features/production/production-write';
 
+function getLocalDateTimeInputValue(): string {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
 export interface MortalityFormProps {
   batchId: string;
   batchName?: string;
@@ -40,7 +46,7 @@ export function MortalityForm({
 }: MortalityFormProps) {
   const [values, setValues] = useState<Record<string, string>>({
     count: '',
-    observed_at: new Date().toISOString().slice(0, 16),
+    observed_at: getLocalDateTimeInputValue(),
     suspected_cause: '',
     disposal_method: '',
     photos: '',
@@ -106,6 +112,7 @@ export function MortalityForm({
       if (confirmedSnapshot !== signature) {
         setConfirmed(false);
         setConfirmedSnapshot(null);
+        retrySubmission.current = null;
         setError(
           'The mortality record changed after confirmation. Confirm the updated record before submitting.',
         );
