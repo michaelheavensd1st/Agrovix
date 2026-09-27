@@ -106,6 +106,11 @@ export default function ProductionBatchDetailScreen() {
         setProjection(reconciliation.projection);
         setEvents(reconciliation.events);
       }}
+      onMortalitySaved={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
       waterQualityContext={
         batchId
           ? {
@@ -122,6 +127,17 @@ export default function ProductionBatchDetailScreen() {
               batchId,
               batchName,
               farmName: farmName ?? undefined,
+              unitName: unitName ?? undefined,
+            }
+          : undefined
+      }
+      mortalityContext={
+        batchId
+          ? {
+              batchId,
+              batchName,
+              farmName: farmName ?? undefined,
+              siteName: typeof params.siteName === 'string' ? params.siteName : undefined,
               unitName: unitName ?? undefined,
             }
           : undefined

@@ -30,6 +30,7 @@ export interface WaterQualityWriteContext {
   batchId: string;
   batchName?: string;
   farmName?: string;
+  siteName?: string;
   unitName?: string;
 }
 
@@ -103,8 +104,40 @@ export interface FeedingPayload extends Record<string, unknown> {
   feeding_round?: number;
 }
 
+export type MortalityDisposalMethod = 'burial' | 'incineration' | 'compost' | 'rendering' | 'other';
+
+export interface MortalityEvidenceInput {
+  photos?: string[] | null;
+  lab_report_ref?: string | null;
+  veterinarian_id?: string | null;
+  notes?: string | null;
+}
+
+export interface MortalityInput {
+  count: number | string | null;
+  observed_at: string | null;
+  suspected_cause?: string | null;
+  disposal_method?: MortalityDisposalMethod | string | null;
+  evidence?: MortalityEvidenceInput | null;
+}
+
+export interface MortalityPayload extends Record<string, unknown> {
+  count: number;
+  observed_at: string;
+  suspected_cause?: string;
+  disposal_method?: MortalityDisposalMethod;
+  evidence?: {
+    photos?: string[];
+    lab_report_ref?: string;
+    veterinarian_id?: string;
+    notes?: string;
+  };
+}
+
 export type FeedingSubmission = ProductionSubmission<FeedingPayload>;
 export type FeedingWriteResult = ProductionWriteResult<FeedingPayload>;
+export type MortalitySubmission = ProductionSubmission<MortalityPayload>;
+export type MortalityWriteResult = ProductionWriteResult<MortalityPayload>;
 
 const WATER_QUALITY_FIELDS: readonly WaterQualityMeasurementKey[] = [
   'temperature',
@@ -164,6 +197,55 @@ function normalizeMeasuredAt(value: string | null | undefined): string | null {
 
   const parsed = new Date(withTimezone);
   if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+export function normalizeMortalityObservedAt(value: string | null): string | null {
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  const trimmed = value.trim();
+  const timestamp =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      trimmed,
+    );
+  if (!timestamp) return null;
+
+  const year = Number(timestamp[1]);
+  const month = Number(timestamp[2]);
+  const day = Number(timestamp[3]);
+  const hour = Number(timestamp[4]);
+  const minute = Number(timestamp[5]);
+  const second = Number(timestamp[6] ?? 0);
+  const fraction = timestamp[7] ?? '';
+  const millisecond = Number(`${fraction}000`.slice(0, 3));
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth[month - 1] ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return null;
+  }
+
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  if (
+    !timestamp[8] &&
+    (parsed.getFullYear() !== year ||
+      parsed.getMonth() !== month - 1 ||
+      parsed.getDate() !== day ||
+      parsed.getHours() !== hour ||
+      parsed.getMinutes() !== minute ||
+      parsed.getSeconds() !== second ||
+      parsed.getMilliseconds() !== millisecond)
+  ) {
+    return null;
+  }
   return parsed.toISOString();
 }
 
@@ -333,6 +415,101 @@ export function createFeedingSubmission(
   };
 }
 
+export function buildMortalityPayload(values: MortalityInput): MortalityPayload {
+  const count = toFiniteNumber(values.count);
+  if (count === null || !Number.isInteger(count) || count < 1) {
+    throw new Error('count must be a positive integer.');
+  }
+
+  const observedAt = normalizeMortalityObservedAt(values.observed_at);
+  if (!observedAt) throw new Error('A valid observed_at timestamp is required.');
+
+  const suspectedCause = readRequiredText(values.suspected_cause, 'suspected_cause', 255);
+  const disposalMethod = values.disposal_method ?? undefined;
+  if (
+    disposalMethod !== undefined &&
+    disposalMethod !== null &&
+    !['burial', 'incineration', 'compost', 'rendering', 'other'].includes(disposalMethod)
+  ) {
+    throw new Error('disposal_method is invalid.');
+  }
+
+  const evidenceInput = values.evidence ?? undefined;
+  let evidence: MortalityPayload['evidence'];
+  if (evidenceInput) {
+    const labReportRef = readRequiredText(
+      evidenceInput.lab_report_ref,
+      'evidence.lab_report_ref',
+      255,
+    );
+    const veterinarianId = readRequiredText(
+      evidenceInput.veterinarian_id,
+      'evidence.veterinarian_id',
+      255,
+    );
+    const evidenceNotes = readRequiredText(evidenceInput.notes, 'evidence.notes', 1000);
+    if (
+      evidenceInput.photos !== undefined &&
+      evidenceInput.photos !== null &&
+      (!Array.isArray(evidenceInput.photos) ||
+        evidenceInput.photos.some((photo) => typeof photo !== 'string'))
+    ) {
+      throw new Error('evidence.photos must be a list of strings.');
+    }
+    const photos = evidenceInput.photos?.filter((photo) => photo.trim().length > 0);
+    if (photos?.length || labReportRef || veterinarianId || evidenceNotes) {
+      evidence = {
+        ...(photos?.length ? { photos } : {}),
+        ...(labReportRef ? { lab_report_ref: labReportRef } : {}),
+        ...(veterinarianId ? { veterinarian_id: veterinarianId } : {}),
+        ...(evidenceNotes ? { notes: evidenceNotes } : {}),
+      };
+    }
+  }
+
+  return {
+    count,
+    observed_at: observedAt,
+    ...(suspectedCause ? { suspected_cause: suspectedCause } : {}),
+    ...(disposalMethod ? { disposal_method: disposalMethod as MortalityDisposalMethod } : {}),
+    ...(evidence ? { evidence } : {}),
+  };
+}
+
+export function createMortalityDraftSignature(batchId: string, values: MortalityInput): string {
+  return JSON.stringify({
+    batchId,
+    normalizedObservedAt: normalizeMortalityObservedAt(values.observed_at),
+    values: {
+      count: values.count ?? '',
+      observed_at: values.observed_at ?? '',
+      suspected_cause: values.suspected_cause?.trim() ?? '',
+      disposal_method: values.disposal_method ?? '',
+      evidence: {
+        photos: values.evidence?.photos ?? [],
+        lab_report_ref: values.evidence?.lab_report_ref?.trim() ?? '',
+        veterinarian_id: values.evidence?.veterinarian_id?.trim() ?? '',
+        notes: values.evidence?.notes?.trim() ?? '',
+      },
+    },
+  });
+}
+
+export function createMortalitySubmission(
+  batchId: string,
+  values: MortalityInput,
+  idempotencyKey?: string,
+  context?: Partial<WaterQualityWriteContext>,
+): MortalitySubmission {
+  return {
+    batchId,
+    payload: buildMortalityPayload(values),
+    idempotencyKey: idempotencyKey ?? makeOpaqueId('mortality'),
+    createdAt: new Date().toISOString(),
+    context: { ...(context ?? {}), batchId },
+  };
+}
+
 export function isSameLogicalSubmission(
   left: WaterQualitySubmission,
   right: WaterQualitySubmission,
@@ -400,7 +577,7 @@ export function resolveWriteOutcome({
   };
 }
 
-type ProductionEventType = 'WATER_QUALITY' | 'FEEDING';
+type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY';
 const PRODUCTION_WRITE_LEDGER = new Map<string, ProductionWriteResult<any>>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
   string,
@@ -463,7 +640,25 @@ function classifyWriteFailure<TPayload extends Record<string, unknown>>(
     };
   }
 
-  if (error.phase === 'http' || error.phase === 'application') {
+  if (
+    error.phase === 'application' ||
+    (error.phase === 'http' &&
+      error.status !== undefined &&
+      error.status >= 500 &&
+      error.status < 600)
+  ) {
+    return {
+      outcome: 'outcome_unknown',
+      submission,
+      retrySubmission: submission,
+      posted: false,
+      reconciled: false,
+      response,
+      error,
+    };
+  }
+
+  if (error.phase === 'http') {
     return {
       outcome: 'write_failed',
       submission,
@@ -506,6 +701,19 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
   submission: ProductionSubmission<TPayload>,
 ): Promise<ProductionWriteResult<TPayload>> {
   const prior = PRODUCTION_WRITE_LEDGER.get(submission.idempotencyKey);
+  if (prior && !isSameProductionSubmission(prior.submission, submission)) {
+    return {
+      outcome: 'write_failed',
+      submission,
+      retrySubmission: null,
+      posted: false,
+      reconciled: false,
+      response: null,
+      error: new Error(
+        'The idempotency key was already used for a different production submission.',
+      ),
+    };
+  }
   if (prior && prior.posted && prior.outcome !== 'rejected' && prior.outcome !== 'write_failed') {
     try {
       const reconciliation = await readAll(context.batchId);
@@ -722,6 +930,46 @@ export function reconcileFeedingWrite({
   return reconcileProductionWrite({
     context,
     eventType: 'FEEDING',
+    submission,
+    post,
+    readAll,
+  });
+}
+
+export function reconcileMortalityWrite({
+  context,
+  payload,
+  idempotencyKey,
+  submission: preservedSubmission,
+  post,
+  readAll,
+}: {
+  context: WaterQualityWriteContext;
+  payload: MortalityInput;
+  idempotencyKey: string;
+  submission?: MortalitySubmission;
+  post: (
+    batchId: string,
+    eventType: ProductionEventType,
+    data: Record<string, unknown>,
+    key: string,
+  ) => Promise<Record<string, unknown>>;
+  readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+}): Promise<MortalityWriteResult> {
+  const normalizedPayload = buildMortalityPayload(payload);
+  const submission =
+    preservedSubmission ??
+    createMortalitySubmission(context.batchId, payload, idempotencyKey, context);
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
+    throw new Error('The preserved mortality submission does not match the current intent.');
+  }
+  return reconcileProductionWrite({
+    context,
+    eventType: 'MORTALITY',
     submission,
     post,
     readAll,
