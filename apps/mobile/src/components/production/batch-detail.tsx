@@ -7,6 +7,7 @@ import {
 } from '../../features/production/production-state';
 import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
+import { SamplingForm } from './sampling-form';
 import { WaterQualityForm } from './water-quality-form';
 import type {
   WaterQualityReconciliationData,
@@ -23,6 +24,8 @@ export interface BatchDetailData {
   onFeedingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
   mortalityContext?: WaterQualityWriteContext;
   onMortalitySaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  samplingContext?: WaterQualityWriteContext;
+  onSamplingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
 export function BatchDetailPanel({
@@ -35,6 +38,8 @@ export function BatchDetailPanel({
   onFeedingSaved,
   mortalityContext,
   onMortalitySaved,
+  samplingContext,
+  onSamplingSaved,
 }: BatchDetailData) {
   const state = typeof batch.state === 'string' ? batch.state : 'unknown';
   const tone = getStatusTone(state);
@@ -132,6 +137,21 @@ export function BatchDetailPanel({
           siteName={mortalityContext.siteName}
           unitName={mortalityContext.unitName}
           onSaved={(_submission, reconciliation) => onMortalitySaved?.(reconciliation)}
+        />
+      ) : null}
+      {samplingContext ? (
+        <SamplingForm
+          batchId={samplingContext.batchId}
+          batchName={samplingContext.batchName}
+          farmName={samplingContext.farmName}
+          siteName={samplingContext.siteName}
+          unitName={samplingContext.unitName}
+          currentEstimatedRemainingPopulation={
+            typeof projection?.estimated_remaining_population === 'number'
+              ? projection.estimated_remaining_population
+              : null
+          }
+          onSaved={(_submission, reconciliation) => onSamplingSaved?.(reconciliation)}
         />
       ) : null}
     </ScrollView>

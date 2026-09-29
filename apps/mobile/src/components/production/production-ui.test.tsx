@@ -44,6 +44,7 @@ import { Pressable } from 'react-native';
 import ProductionBatchDetailScreen from '../../../app/production/batches/[batchId]';
 import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
+import { SamplingForm } from './sampling-form';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
@@ -313,6 +314,26 @@ describe('M2 shared production UI boundary', () => {
       const mortalityRefreshedValues = textValues(renderBatchDetail());
       expect(mortalityRefreshedValues).toContain('246');
       expect(mortalityRefreshedValues).toContain('MORTALITY');
+
+      const samplingForm = flattenNodes(renderBatchDetail()).find(
+        (node) => React.isValidElement(node) && node.type === SamplingForm,
+      ) as React.ReactElement<any>;
+      samplingForm.props.onSaved(
+        { idempotencyKey: 'sampling-key-route' },
+        {
+          batch: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' },
+          projection: {
+            initial_stocked_quantity: 250,
+            estimated_remaining_population: 228,
+            latest_average_weight: 4.8,
+            survival_rate: 0.912,
+          },
+          events: [{ event_type: 'SAMPLING', performed_at: '2026-09-27T00:00:00Z' }],
+        },
+      );
+      const samplingRefreshedValues = textValues(renderBatchDetail());
+      expect(samplingRefreshedValues).toContain('228');
+      expect(samplingRefreshedValues).toContain('SAMPLING');
     } finally {
       jest.restoreAllMocks();
     }
