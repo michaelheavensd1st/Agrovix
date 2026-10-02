@@ -10,12 +10,19 @@ import {
   buildSamplingPayload,
   createSamplingDraftSignature,
   createSamplingSubmission,
+  normalizeProductionEventTime,
   reconcileSamplingWrite,
   type SamplingInput,
   type SamplingSubmission,
   type WaterQualityReconciliationData,
   type WaterQualityWriteContext,
 } from '../../features/production/production-write';
+
+function getLocalDateTimeInputValue(): string {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
 
 export interface SamplingFormProps {
   batchId: string;
@@ -40,6 +47,7 @@ export function SamplingForm({
   onSaved,
 }: SamplingFormProps) {
   const [values, setValues] = useState<Record<string, string>>({
+    performed_at: getLocalDateTimeInputValue(),
     sample_size: '',
     average_weight: '',
     minimum_weight: '',
@@ -67,6 +75,7 @@ export function SamplingForm({
   const batchLabel = batchName ?? batchId;
 
   const toInput = (): SamplingInput => ({
+    performed_at: values.performed_at,
     sample_size: values.sample_size,
     average_weight: values.average_weight,
     minimum_weight: values.minimum_weight || null,
@@ -77,6 +86,7 @@ export function SamplingForm({
   });
 
   const updateField = (field: string, value: string) => {
+    if (submissionInFlight.current || busy) return;
     draftRevision.current += 1;
     retrySubmission.current = null;
     setValues((current) => ({ ...current, [field]: value }));
@@ -96,6 +106,13 @@ export function SamplingForm({
         return;
       }
       const input = toInput();
+      const normalizedPerformedAt = normalizeProductionEventTime(input.performed_at ?? null);
+      if (!normalizedPerformedAt) {
+        setConfirmed(false);
+        setConfirmedSnapshot(null);
+        setError('Enter a valid observation date and time before submitting.');
+        return;
+      }
       const signature = createSamplingDraftSignature(batchId, input);
       if (confirmedSnapshot !== signature) {
         setConfirmed(false);
@@ -133,8 +150,16 @@ export function SamplingForm({
         payload,
         idempotencyKey: submission.idempotencyKey,
         submission,
-        post: async (targetBatchId, eventType, data, key) =>
-          createBatchEvent(targetBatchId, { event_type: eventType, data }, key),
+        post: async (targetBatchId, eventType, data, key, performedAt) =>
+          createBatchEvent(
+            targetBatchId,
+            {
+              event_type: eventType,
+              ...(performedAt ? { performed_at: performedAt } : {}),
+              data,
+            },
+            key,
+          ),
         readAll: async (targetBatchId) => {
           const [batch, projection, eventData] = await Promise.all([
             getProductionBatch(targetBatchId),
@@ -186,6 +211,7 @@ export function SamplingForm({
   };
 
   const fields = [
+    ['performed_at', 'Observation time (device local)', 'default'],
     ['sample_size', 'Sample size (individuals weighed)', 'numeric'],
     ['average_weight', 'Average weight', 'numeric'],
     ['minimum_weight', 'Minimum weight (optional)', 'numeric'],
@@ -194,6 +220,8 @@ export function SamplingForm({
     ['notes', 'Notes (optional)', 'default'],
   ] as const;
   const weightUnits = ['g', 'kg'] as const;
+  const deviceTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'device local time';
+  const normalizedPerformedAt = normalizeProductionEventTime(values.performed_at);
   const estimatedPopulationEntered = values.estimated_population.trim().length > 0;
   const estimatedPopulation = Number(values.estimated_population);
   const populationChange =
@@ -218,6 +246,7 @@ export function SamplingForm({
             value={values[field]}
             onChangeText={(value) => updateField(field, value)}
             keyboardType={keyboardType === 'numeric' ? 'numeric' : 'default'}
+            editable={!busy}
             placeholder={field === 'sample_size' ? '30' : ''}
           />
         </View>
@@ -228,6 +257,7 @@ export function SamplingForm({
           <Pressable
             key={unit}
             onPress={() => updateField('weight_unit', unit)}
+            disabled={busy}
             style={[styles.secondaryButton, values.weight_unit === unit && styles.optionSelected]}
           >
             <Text
@@ -253,8 +283,15 @@ export function SamplingForm({
       ) : null}
       <Pressable
         onPress={() => {
+          if (submissionInFlight.current || busy) return;
           const next = !confirmed;
           if (next) {
+            if (!normalizeProductionEventTime(values.performed_at)) {
+              setConfirmed(false);
+              setConfirmedSnapshot(null);
+              setError('Enter a valid observation date and time before confirming.');
+              return;
+            }
             try {
               buildSamplingPayload(toInput());
             } catch (validationError) {
@@ -273,6 +310,7 @@ export function SamplingForm({
           setStatusMessage(null);
           setConfirmedSnapshot(next ? createSamplingDraftSignature(batchId, toInput()) : null);
         }}
+        disabled={busy}
         style={styles.checkboxRow}
       >
         <View style={[styles.checkbox, confirmed && styles.checkboxChecked]}>
@@ -282,6 +320,10 @@ export function SamplingForm({
       </Pressable>
       {confirmed ? (
         <View style={styles.confirmationSummary}>
+          <Text style={styles.summaryText}>
+            Observation time ({deviceTimeZone}): {values.performed_at}
+          </Text>
+          <Text style={styles.summaryText}>Sent as UTC: {normalizedPerformedAt}</Text>
           <Text style={styles.summaryText}>Sample size: {values.sample_size || 'Not entered'}</Text>
           <Text style={styles.summaryText}>
             Average weight:{' '}

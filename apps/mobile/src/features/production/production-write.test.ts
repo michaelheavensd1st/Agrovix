@@ -65,6 +65,7 @@ import {
   createMortalitySubmission,
   createSamplingSubmission,
   normalizeMortalityObservedAt,
+  normalizeProductionEventTime,
   createFeedingSubmission,
   hasActualWaterQualityMeasurement,
   isSameLogicalSubmission,
@@ -2030,6 +2031,7 @@ describe('sampling write workflow', () => {
     unitName: 'Pond 4',
   };
   const samplingInput: SamplingInput = {
+    performed_at: '2026-09-26T08:30',
     sample_size: '30',
     average_weight: '4.8',
     minimum_weight: '3.9',
@@ -2062,9 +2064,27 @@ describe('sampling write workflow', () => {
     });
     const signature = createSamplingDraftSignature('batch-sampling', samplingInput);
     expect(signature).toContain('batch-sampling');
+    expect(signature).toContain(normalizeProductionEventTime(samplingInput.performed_at ?? null));
     expect(
       createSamplingDraftSignature('batch-sampling', { ...samplingInput, sample_size: 40 }),
     ).not.toBe(signature);
+    expect(
+      createSamplingDraftSignature('batch-sampling', {
+        ...samplingInput,
+        performed_at: '2026-09-26T09:30',
+      }),
+    ).not.toBe(signature);
+  });
+
+  test('normalizes local sampling time and preserves explicit offsets while rejecting invalid local times', () => {
+    const localTime = '2026-09-26T08:30';
+    expect(normalizeProductionEventTime(localTime)).toBe(new Date(localTime).toISOString());
+    expect(normalizeProductionEventTime('2026-09-26T08:30Z')).toBe('2026-09-26T08:30:00.000Z');
+    expect(normalizeProductionEventTime('2026-09-26T08:30+02:30')).toBe('2026-09-26T06:00:00.000Z');
+    expect(normalizeProductionEventTime('2026-02-30T08:30')).toBeNull();
+    if (new Date('2026-03-08T02:30').getHours() !== 2) {
+      expect(normalizeProductionEventTime('2026-03-08T02:30')).toBeNull();
+    }
   });
 
   test('defaults weight_unit to g and accepts kg', () => {
@@ -2182,6 +2202,7 @@ describe('sampling write workflow', () => {
       'SAMPLING',
       submission.payload,
       submission.idempotencyKey,
+      submission.performedAt,
     );
     expect(result.outcome).toBe('accepted');
     expect(result.reconciliation).toEqual(samplingReconciliation);
@@ -2224,6 +2245,30 @@ describe('sampling write workflow', () => {
     expect(differentIntent.outcome).toBe('write_failed');
     expect(differentIntent.posted).toBe(false);
     expect(readAll).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('treats a different observation instant as a different submission under the same key', async () => {
+    const post = jest.fn().mockResolvedValue({ id: 'event-sampling', event_type: 'SAMPLING' });
+    const readAll = jest.fn().mockResolvedValue(samplingReconciliation);
+    const first = await reconcileSamplingWrite({
+      context: samplingContext,
+      payload: { ...samplingInput, performed_at: '2026-09-26T08:30Z' },
+      idempotencyKey: 'sampling-same-key-different-time',
+      post,
+      readAll,
+    });
+    const differentTime = await reconcileSamplingWrite({
+      context: samplingContext,
+      payload: { ...samplingInput, performed_at: '2026-09-26T09:30Z' },
+      idempotencyKey: 'sampling-same-key-different-time',
+      post,
+      readAll,
+    });
+
+    expect(first.outcome).toBe('accepted');
+    expect(differentTime.outcome).toBe('write_failed');
+    expect(differentTime.posted).toBe(false);
     expect(post).toHaveBeenCalledTimes(1);
   });
 
@@ -2271,6 +2316,10 @@ describe('sampling write workflow', () => {
     expect(post).toHaveBeenCalledTimes(2);
     expect(post.mock.calls[0][3]).toBe(submission.idempotencyKey);
     expect(post.mock.calls[1][3]).toBe(submission.idempotencyKey);
+    expect(post.mock.calls.map((call) => call[4])).toEqual([
+      submission.performedAt,
+      submission.performedAt,
+    ]);
     expect(retry.submission).toBe(submission);
   });
 
@@ -2334,6 +2383,10 @@ describe('sampling write workflow', () => {
     expect(retry.outcome).toBe('accepted');
     expect(retry.submission).toBe(submission);
     expect(post.mock.calls.map((call) => call[3])).toEqual([key, key]);
+    expect(post.mock.calls.map((call) => call[4])).toEqual([
+      submission.performedAt,
+      submission.performedAt,
+    ]);
   });
 
   test.each([409, 422])('does not retry a definitive HTTP %s rejection', async (status) => {
@@ -2432,6 +2485,7 @@ describe('sampling write workflow', () => {
 
   test('sampling form requires explicit confirmation, shows high-impact population warning, and blocks stale duplicate submit', async () => {
     let values: Record<string, string> = {
+      performed_at: '2026-09-26T08:30',
       sample_size: '30',
       average_weight: '4.8',
       minimum_weight: '3.9',
@@ -2557,6 +2611,9 @@ describe('sampling write workflow', () => {
       const confirmedElements = renderForm();
       const preview = textContent(lastTree).join('');
       expect(preview).toContain('Sample size: 30');
+      expect(preview).toContain('Observation time (');
+      expect(preview).toContain('2026-09-26T08:30');
+      expect(preview).toContain(`Sent as UTC: ${normalizeProductionEventTime('2026-09-26T08:30')}`);
       expect(preview).toContain('Average weight: 4.8 g');
       expect(preview).toContain('Minimum weight: 3.9 g');
       expect(preview).toContain('Maximum weight: 5.7 g');
@@ -2573,6 +2630,7 @@ describe('sampling write workflow', () => {
       expect(post.mock.calls[0][0]).toBe('batch-sampling');
       expect(post.mock.calls[0][1]).toMatchObject({
         event_type: 'SAMPLING',
+        performed_at: normalizeProductionEventTime('2026-09-26T08:30'),
         data: {
           sample_size: 30,
           average_weight: 4.8,
@@ -2582,6 +2640,7 @@ describe('sampling write workflow', () => {
           estimated_population: 22800,
         },
       });
+      expect(post.mock.calls[0][1].data).not.toHaveProperty('performed_at');
       expect(post.mock.calls[0][1].data).not.toHaveProperty('performed_by_id');
       expect(onSaved).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2602,6 +2661,165 @@ describe('sampling write workflow', () => {
       await buttonWithText(renderForm(), 'Submit sampling').props.onPress();
       expect(post).toHaveBeenCalledTimes(1);
       expect(error).toContain('confirm');
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('sampling draft stays locked during unresolved POST and unlocks with the exact ambiguous retry', async () => {
+    let values: Record<string, string> = {
+      performed_at: '2026-09-26T08:30',
+      sample_size: '30',
+      average_weight: '4.8',
+      minimum_weight: '',
+      maximum_weight: '',
+      weight_unit: 'g',
+      estimated_population: '',
+      notes: '',
+    };
+    let confirmed = false;
+    let confirmedSnapshot: string | null = null;
+    let busy = false;
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const submissionInFlight = { current: false };
+    const retrySubmission = { current: null as SamplingSubmission | null };
+    const draftRevision = { current: 0 };
+    const setters = [
+      (update: (current: Record<string, string>) => Record<string, string>) => {
+        values = update(values);
+      },
+      (next: boolean) => {
+        confirmed = next;
+      },
+      (next: string | null) => {
+        confirmedSnapshot = next;
+      },
+      (next: boolean) => {
+        busy = next;
+      },
+      jest.fn(),
+      jest.fn(),
+    ];
+    let rejectPost!: (error: unknown) => void;
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectPost = reject;
+        }),
+    );
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue({ id: 'batch-sampling' });
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockResolvedValue(samplingReconciliation.projection);
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: samplingReconciliation.events,
+      next_cursor: null,
+      limit: 25,
+    });
+
+    const renderForm = () => {
+      stateSpy.mockReset();
+      [values, confirmed, confirmedSnapshot, busy, null, null].forEach((value, index) =>
+        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      );
+      refSpy
+        .mockReset()
+        .mockReturnValueOnce(submissionInFlight)
+        .mockReturnValueOnce(retrySubmission)
+        .mockReturnValueOnce(draftRevision);
+      const tree = SamplingForm({ batchId: 'batch-sampling' });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(text),
+      ) as React.ReactElement<{ onPress: () => void; disabled?: boolean }>;
+
+    try {
+      const initial = renderForm();
+      buttonWithText(initial, 'I confirm this sampling record').props.onPress();
+      const confirmedElements = renderForm();
+      buttonWithText(confirmedElements, 'Submit sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(busy).toBe(true);
+      expect(submissionInFlight.current).toBe(true);
+
+      const busyElements = renderForm();
+      const busyInputs = busyElements.filter(
+        (element) => element.type === TextInput,
+      ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
+      expect(busyInputs.every((input) => input.props.editable === false)).toBe(true);
+      const busyUnit = buttonWithText(busyElements, 'kg');
+      const busyConfirm = buttonWithText(busyElements, 'I confirm this sampling record');
+      expect(busyUnit.props.disabled).toBe(true);
+      expect(busyConfirm.props.disabled).toBe(true);
+
+      busyInputs[1].props.onChangeText('99');
+      busyUnit.props.onPress();
+      busyConfirm.props.onPress();
+      expect(values.sample_size).toBe('30');
+      expect(values.weight_unit).toBe('g');
+      expect(confirmed).toBe(true);
+      expect(draftRevision.current).toBe(0);
+      expect(retrySubmission.current).toBeNull();
+
+      const submittedKey = post.mock.calls[0][2];
+      const submittedPerformedAt = post.mock.calls[0][1].performed_at;
+      rejectPost(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-sampling/events',
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(busy).toBe(false);
+      expect(submissionInFlight.current).toBe(false);
+      expect(retrySubmission.current?.idempotencyKey).toBe(submittedKey);
+      expect(retrySubmission.current?.performedAt).toBe(submittedPerformedAt);
+      expect(retrySubmission.current?.performedAt).toBe(
+        normalizeProductionEventTime('2026-09-26T08:30'),
+      );
+
+      const unlockedElements = renderForm();
+      const unlockedInputs = unlockedElements.filter(
+        (element) => element.type === TextInput,
+      ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
+      expect(unlockedInputs.every((input) => input.props.editable !== false)).toBe(true);
+      unlockedInputs[1].props.onChangeText('31');
+      expect(values.sample_size).toBe('31');
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+      expect(retrySubmission.current).toBeNull();
     } finally {
       jest.restoreAllMocks();
     }

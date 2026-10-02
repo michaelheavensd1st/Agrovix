@@ -373,7 +373,7 @@ export async function listBatchEvents(
 
 export async function createBatchEvent(
   batchId: string,
-  payload: { event_type: string; data?: Record<string, unknown> },
+  payload: { event_type: string; performed_at?: string; data?: Record<string, unknown> },
   idempotencyKey: string,
 ): Promise<Record<string, unknown>> {
   const path = `/v1/batches/${encodeURIComponent(batchId)}/events`;

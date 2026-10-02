@@ -57,6 +57,7 @@ export interface ProductionSubmission<TPayload extends Record<string, unknown>> 
   idempotencyKey: string;
   createdAt: string;
   context: WaterQualityWriteContext;
+  performedAt?: string;
 }
 
 export type WaterQualitySubmission = ProductionSubmission<WaterQualityPayload>;
@@ -144,6 +145,7 @@ export interface SamplingInput {
   weight_unit?: SamplingWeightUnit | string | null;
   estimated_population?: number | string | null;
   notes?: string | null;
+  performed_at?: string | null;
 }
 
 export interface SamplingPayload extends Record<string, unknown> {
@@ -224,7 +226,7 @@ function normalizeMeasuredAt(value: string | null | undefined): string | null {
   return parsed.toISOString();
 }
 
-export function normalizeMortalityObservedAt(value: string | null): string | null {
+export function normalizeProductionEventTime(value: string | null): string | null {
   if (typeof value !== 'string' || value.trim().length === 0) return null;
   const trimmed = value.trim();
   const timestamp =
@@ -271,6 +273,10 @@ export function normalizeMortalityObservedAt(value: string | null): string | nul
     return null;
   }
   return parsed.toISOString();
+}
+
+export function normalizeMortalityObservedAt(value: string | null): string | null {
+  return normalizeProductionEventTime(value);
 }
 
 function enforceMeasurementBound(field: WaterQualityMeasurementKey, value: number): number {
@@ -611,6 +617,7 @@ export function buildSamplingPayload(values: SamplingInput): SamplingPayload {
 export function createSamplingDraftSignature(batchId: string, values: SamplingInput): string {
   return JSON.stringify({
     batchId,
+    performedAt: normalizeProductionEventTime(values.performed_at ?? null),
     values: {
       sample_size: values.sample_size ?? '',
       average_weight: values.average_weight ?? '',
@@ -629,12 +636,15 @@ export function createSamplingSubmission(
   idempotencyKey?: string,
   context?: Partial<WaterQualityWriteContext>,
 ): SamplingSubmission {
+  const performedAt = normalizeProductionEventTime(values.performed_at ?? new Date().toISOString());
+  if (!performedAt) throw new Error('A valid sampling observation time is required.');
   return {
     batchId,
     payload: buildSamplingPayload(values),
     idempotencyKey: idempotencyKey ?? makeOpaqueId('sampling'),
     createdAt: new Date().toISOString(),
     context: { ...(context ?? {}), batchId },
+    performedAt,
   };
 }
 
@@ -719,6 +729,7 @@ function isSameProductionSubmission(
   return (
     left.batchId === right.batchId &&
     left.idempotencyKey === right.idempotencyKey &&
+    left.performedAt === right.performedAt &&
     JSON.stringify(left.payload) === JSON.stringify(right.payload)
   );
 }
@@ -823,6 +834,7 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
       eventType: ProductionEventType,
       data: Record<string, unknown>,
       key: string,
+      performedAt?: string,
     ) => Promise<Record<string, unknown>>;
     readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
   },
@@ -874,12 +886,16 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
   }
 
   try {
-    const writeResponse = await post(
-      context.batchId,
-      eventType,
-      submission.payload,
-      submission.idempotencyKey,
-    );
+    const writeResponse =
+      submission.performedAt === undefined
+        ? await post(context.batchId, eventType, submission.payload, submission.idempotencyKey)
+        : await post(
+            context.batchId,
+            eventType,
+            submission.payload,
+            submission.idempotencyKey,
+            submission.performedAt,
+          );
     const status = typeof writeResponse.status === 'number' ? writeResponse.status : undefined;
     const response = {
       ...(status === undefined ? {} : { status }),
@@ -1041,6 +1057,7 @@ export function reconcileFeedingWrite({
     eventType: ProductionEventType,
     data: Record<string, unknown>,
     key: string,
+    performedAt?: string,
   ) => Promise<Record<string, unknown>>;
   readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
 }): Promise<FeedingWriteResult> {
@@ -1121,16 +1138,27 @@ export function reconcileSamplingWrite({
     eventType: ProductionEventType,
     data: Record<string, unknown>,
     key: string,
+    performedAt?: string,
   ) => Promise<Record<string, unknown>>;
   readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
 }): Promise<SamplingWriteResult> {
   const normalizedPayload = buildSamplingPayload(payload);
+  const performedAt = normalizeProductionEventTime(
+    payload.performed_at ?? preservedSubmission?.performedAt ?? new Date().toISOString(),
+  );
+  if (!performedAt) throw new Error('A valid sampling observation time is required.');
   const submission =
     preservedSubmission ??
-    createSamplingSubmission(context.batchId, payload, idempotencyKey, context);
+    createSamplingSubmission(
+      context.batchId,
+      { ...payload, performed_at: performedAt },
+      idempotencyKey,
+      context,
+    );
   if (
     submission.batchId !== context.batchId ||
     submission.idempotencyKey !== idempotencyKey ||
+    submission.performedAt !== performedAt ||
     JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
   ) {
     throw new Error('The preserved sampling submission does not match the current intent.');
