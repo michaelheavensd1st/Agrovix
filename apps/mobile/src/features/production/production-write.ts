@@ -57,6 +57,7 @@ export interface ProductionSubmission<TPayload extends Record<string, unknown>> 
   idempotencyKey: string;
   createdAt: string;
   context: WaterQualityWriteContext;
+  performedAt?: string;
 }
 
 export type WaterQualitySubmission = ProductionSubmission<WaterQualityPayload>;
@@ -134,10 +135,35 @@ export interface MortalityPayload extends Record<string, unknown> {
   };
 }
 
+export type SamplingWeightUnit = 'g' | 'kg';
+
+export interface SamplingInput {
+  sample_size: number | string | null;
+  average_weight: number | string | null;
+  minimum_weight?: number | string | null;
+  maximum_weight?: number | string | null;
+  weight_unit?: SamplingWeightUnit | string | null;
+  estimated_population?: number | string | null;
+  notes?: string | null;
+  performed_at?: string | null;
+}
+
+export interface SamplingPayload extends Record<string, unknown> {
+  sample_size: number;
+  average_weight: number;
+  minimum_weight?: number;
+  maximum_weight?: number;
+  weight_unit: SamplingWeightUnit;
+  estimated_population?: number;
+  notes?: string;
+}
+
 export type FeedingSubmission = ProductionSubmission<FeedingPayload>;
 export type FeedingWriteResult = ProductionWriteResult<FeedingPayload>;
 export type MortalitySubmission = ProductionSubmission<MortalityPayload>;
 export type MortalityWriteResult = ProductionWriteResult<MortalityPayload>;
+export type SamplingSubmission = ProductionSubmission<SamplingPayload>;
+export type SamplingWriteResult = ProductionWriteResult<SamplingPayload>;
 
 const WATER_QUALITY_FIELDS: readonly WaterQualityMeasurementKey[] = [
   'temperature',
@@ -200,7 +226,7 @@ function normalizeMeasuredAt(value: string | null | undefined): string | null {
   return parsed.toISOString();
 }
 
-export function normalizeMortalityObservedAt(value: string | null): string | null {
+export function normalizeProductionEventTime(value: string | null): string | null {
   if (typeof value !== 'string' || value.trim().length === 0) return null;
   const trimmed = value.trim();
   const timestamp =
@@ -247,6 +273,10 @@ export function normalizeMortalityObservedAt(value: string | null): string | nul
     return null;
   }
   return parsed.toISOString();
+}
+
+export function normalizeMortalityObservedAt(value: string | null): string | null {
+  return normalizeProductionEventTime(value);
 }
 
 function enforceMeasurementBound(field: WaterQualityMeasurementKey, value: number): number {
@@ -510,6 +540,114 @@ export function createMortalitySubmission(
   };
 }
 
+export function buildSamplingPayload(values: SamplingInput): SamplingPayload {
+  const sampleSize = toFiniteNumber(values.sample_size);
+  if (sampleSize === null || !Number.isInteger(sampleSize) || sampleSize < 1) {
+    throw new Error('sample_size must be a positive integer.');
+  }
+
+  const averageWeight = toFiniteNumber(values.average_weight);
+  if (averageWeight === null || averageWeight < 0) {
+    throw new Error('average_weight must be zero or greater.');
+  }
+
+  let minimumWeight: number | undefined;
+  if (
+    values.minimum_weight !== null &&
+    values.minimum_weight !== undefined &&
+    values.minimum_weight !== ''
+  ) {
+    const parsed = toFiniteNumber(values.minimum_weight);
+    if (parsed === null || parsed < 0) throw new Error('minimum_weight must be zero or greater.');
+    minimumWeight = parsed;
+  }
+
+  let maximumWeight: number | undefined;
+  if (
+    values.maximum_weight !== null &&
+    values.maximum_weight !== undefined &&
+    values.maximum_weight !== ''
+  ) {
+    const parsed = toFiniteNumber(values.maximum_weight);
+    if (parsed === null || parsed < 0) throw new Error('maximum_weight must be zero or greater.');
+    maximumWeight = parsed;
+  }
+
+  if (minimumWeight !== undefined && minimumWeight > averageWeight) {
+    throw new Error('minimum_weight cannot exceed average_weight.');
+  }
+  if (maximumWeight !== undefined && maximumWeight < averageWeight) {
+    throw new Error('maximum_weight cannot be below average_weight.');
+  }
+  if (minimumWeight !== undefined && maximumWeight !== undefined && minimumWeight > maximumWeight) {
+    throw new Error('minimum_weight cannot exceed maximum_weight.');
+  }
+
+  const weightUnit = values.weight_unit ?? 'g';
+  if (weightUnit !== 'g' && weightUnit !== 'kg') {
+    throw new Error('weight_unit must be g or kg.');
+  }
+
+  let estimatedPopulation: number | undefined;
+  if (
+    values.estimated_population !== null &&
+    values.estimated_population !== undefined &&
+    values.estimated_population !== ''
+  ) {
+    const parsed = toFiniteNumber(values.estimated_population);
+    if (parsed === null || !Number.isInteger(parsed) || parsed < 0) {
+      throw new Error('estimated_population must be an integer zero or greater.');
+    }
+    estimatedPopulation = parsed;
+  }
+
+  const notes = readRequiredText(values.notes, 'notes', 1000);
+
+  return {
+    sample_size: sampleSize,
+    average_weight: averageWeight,
+    ...(minimumWeight === undefined ? {} : { minimum_weight: minimumWeight }),
+    ...(maximumWeight === undefined ? {} : { maximum_weight: maximumWeight }),
+    weight_unit: weightUnit as SamplingWeightUnit,
+    ...(estimatedPopulation === undefined ? {} : { estimated_population: estimatedPopulation }),
+    ...(notes ? { notes } : {}),
+  };
+}
+
+export function createSamplingDraftSignature(batchId: string, values: SamplingInput): string {
+  return JSON.stringify({
+    batchId,
+    performedAt: normalizeProductionEventTime(values.performed_at ?? null),
+    values: {
+      sample_size: values.sample_size ?? '',
+      average_weight: values.average_weight ?? '',
+      minimum_weight: values.minimum_weight ?? '',
+      maximum_weight: values.maximum_weight ?? '',
+      weight_unit: values.weight_unit ?? 'g',
+      estimated_population: values.estimated_population ?? '',
+      notes: values.notes?.trim() ?? '',
+    },
+  });
+}
+
+export function createSamplingSubmission(
+  batchId: string,
+  values: SamplingInput,
+  idempotencyKey?: string,
+  context?: Partial<WaterQualityWriteContext>,
+): SamplingSubmission {
+  const performedAt = normalizeProductionEventTime(values.performed_at ?? new Date().toISOString());
+  if (!performedAt) throw new Error('A valid sampling observation time is required.');
+  return {
+    batchId,
+    payload: buildSamplingPayload(values),
+    idempotencyKey: idempotencyKey ?? makeOpaqueId('sampling'),
+    createdAt: new Date().toISOString(),
+    context: { ...(context ?? {}), batchId },
+    performedAt,
+  };
+}
+
 export function isSameLogicalSubmission(
   left: WaterQualitySubmission,
   right: WaterQualitySubmission,
@@ -577,7 +715,7 @@ export function resolveWriteOutcome({
   };
 }
 
-type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY';
+type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING';
 const PRODUCTION_WRITE_LEDGER = new Map<string, ProductionWriteResult<any>>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
   string,
@@ -591,6 +729,7 @@ function isSameProductionSubmission(
   return (
     left.batchId === right.batchId &&
     left.idempotencyKey === right.idempotencyKey &&
+    left.performedAt === right.performedAt &&
     JSON.stringify(left.payload) === JSON.stringify(right.payload)
   );
 }
@@ -695,6 +834,7 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
       eventType: ProductionEventType,
       data: Record<string, unknown>,
       key: string,
+      performedAt?: string,
     ) => Promise<Record<string, unknown>>;
     readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
   },
@@ -746,12 +886,16 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
   }
 
   try {
-    const writeResponse = await post(
-      context.batchId,
-      eventType,
-      submission.payload,
-      submission.idempotencyKey,
-    );
+    const writeResponse =
+      submission.performedAt === undefined
+        ? await post(context.batchId, eventType, submission.payload, submission.idempotencyKey)
+        : await post(
+            context.batchId,
+            eventType,
+            submission.payload,
+            submission.idempotencyKey,
+            submission.performedAt,
+          );
     const status = typeof writeResponse.status === 'number' ? writeResponse.status : undefined;
     const response = {
       ...(status === undefined ? {} : { status }),
@@ -913,6 +1057,7 @@ export function reconcileFeedingWrite({
     eventType: ProductionEventType,
     data: Record<string, unknown>,
     key: string,
+    performedAt?: string,
   ) => Promise<Record<string, unknown>>;
   readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
 }): Promise<FeedingWriteResult> {
@@ -970,6 +1115,57 @@ export function reconcileMortalityWrite({
   return reconcileProductionWrite({
     context,
     eventType: 'MORTALITY',
+    submission,
+    post,
+    readAll,
+  });
+}
+
+export function reconcileSamplingWrite({
+  context,
+  payload,
+  idempotencyKey,
+  submission: preservedSubmission,
+  post,
+  readAll,
+}: {
+  context: WaterQualityWriteContext;
+  payload: SamplingInput;
+  idempotencyKey: string;
+  submission?: SamplingSubmission;
+  post: (
+    batchId: string,
+    eventType: ProductionEventType,
+    data: Record<string, unknown>,
+    key: string,
+    performedAt?: string,
+  ) => Promise<Record<string, unknown>>;
+  readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+}): Promise<SamplingWriteResult> {
+  const normalizedPayload = buildSamplingPayload(payload);
+  const performedAt = normalizeProductionEventTime(
+    payload.performed_at ?? preservedSubmission?.performedAt ?? new Date().toISOString(),
+  );
+  if (!performedAt) throw new Error('A valid sampling observation time is required.');
+  const submission =
+    preservedSubmission ??
+    createSamplingSubmission(
+      context.batchId,
+      { ...payload, performed_at: performedAt },
+      idempotencyKey,
+      context,
+    );
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    submission.performedAt !== performedAt ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
+    throw new Error('The preserved sampling submission does not match the current intent.');
+  }
+  return reconcileProductionWrite({
+    context,
+    eventType: 'SAMPLING',
     submission,
     post,
     readAll,
