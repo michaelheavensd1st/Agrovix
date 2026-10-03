@@ -24,6 +24,7 @@ export interface BatchDetailData {
   onFeedingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
   mortalityContext?: WaterQualityWriteContext;
   onMortalitySaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  onMortalityConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
   samplingContext?: WaterQualityWriteContext;
   onSamplingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
 }
@@ -38,6 +39,7 @@ export function BatchDetailPanel({
   onFeedingSaved,
   mortalityContext,
   onMortalitySaved,
+  onMortalityConflictRefreshed,
   samplingContext,
   onSamplingSaved,
 }: BatchDetailData) {
@@ -136,6 +138,12 @@ export function BatchDetailPanel({
           farmName={mortalityContext.farmName}
           siteName={mortalityContext.siteName}
           unitName={mortalityContext.unitName}
+          currentEstimatedRemainingPopulation={
+            typeof projection?.estimated_remaining_population === 'number'
+              ? projection.estimated_remaining_population
+              : null
+          }
+          onConflictRefreshed={onMortalityConflictRefreshed}
           onSaved={(_submission, reconciliation) => onMortalitySaved?.(reconciliation)}
         />
       ) : null}

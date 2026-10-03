@@ -243,7 +243,13 @@ describe('M2 shared production UI boundary', () => {
   test('displays authoritative batch state returned by water-quality reconciliation', () => {
     const routeState: { value: unknown }[] = [
       { value: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' } },
-      { value: { initial_stocked_quantity: 100, survival_rate: 0.8 } },
+      {
+        value: {
+          initial_stocked_quantity: 100,
+          estimated_remaining_population: 100,
+          survival_rate: 0.8,
+        },
+      },
       { value: [{ event_type: 'FEEDING', performed_at: '2026-09-24T10:00:00Z' }] },
       { value: false },
       { value: null },
@@ -276,6 +282,10 @@ describe('M2 shared production UI boundary', () => {
 
     try {
       const beforeReconciliation = renderBatchDetail();
+      const initialMortalityForm = flattenNodes(beforeReconciliation).find(
+        (node) => React.isValidElement(node) && node.type === MortalityForm,
+      ) as React.ReactElement<any>;
+      expect(initialMortalityForm.props.currentEstimatedRemainingPopulation).toBe(100);
       const form = flattenNodes(beforeReconciliation).find(
         (node) => React.isValidElement(node) && node.type === WaterQualityForm,
       ) as React.ReactElement<any>;
@@ -314,6 +324,30 @@ describe('M2 shared production UI boundary', () => {
       const mortalityRefreshedValues = textValues(renderBatchDetail());
       expect(mortalityRefreshedValues).toContain('246');
       expect(mortalityRefreshedValues).toContain('MORTALITY');
+
+      const mortalityFormAfterWrite = flattenNodes(renderBatchDetail()).find(
+        (node) => React.isValidElement(node) && node.type === MortalityForm,
+      ) as React.ReactElement<any>;
+      expect(mortalityFormAfterWrite.props.currentEstimatedRemainingPopulation).toBe(246);
+      mortalityFormAfterWrite.props.onConflictRefreshed({
+        batch: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' },
+        projection: {
+          initial_stocked_quantity: 250,
+          cumulative_mortality: 25,
+          estimated_remaining_population: 225,
+          survival_rate: 0.9,
+        },
+        events: [
+          { event_type: 'MORTALITY', performed_at: '2026-09-26T08:30:00Z' },
+          { event_type: 'MORTALITY', performed_at: '2026-09-27T09:00:00Z' },
+        ],
+      });
+      const conflictRefreshedValues = textValues(renderBatchDetail());
+      expect(conflictRefreshedValues).toContain('225');
+      const mortalityFormAfterConflict = flattenNodes(renderBatchDetail()).find(
+        (node) => React.isValidElement(node) && node.type === MortalityForm,
+      ) as React.ReactElement<any>;
+      expect(mortalityFormAfterConflict.props.currentEstimatedRemainingPopulation).toBe(225);
 
       const samplingForm = flattenNodes(renderBatchDetail()).find(
         (node) => React.isValidElement(node) && node.type === SamplingForm,

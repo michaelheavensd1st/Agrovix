@@ -1270,6 +1270,9 @@ describe('mortality write workflow', () => {
         notes: 'Sample retained for review',
       },
     });
+    expect(buildMortalityPayload({ ...mortalityInput, count: '1' }).count).toBe(1);
+    expect(buildMortalityPayload({ ...mortalityInput, count: '100' }).count).toBe(100);
+    expect(buildMortalityPayload({ ...mortalityInput, count: '101' }).count).toBe(101);
     const signature = createMortalityDraftSignature('batch-mortality', mortalityInput);
     expect(signature).toContain('batch-mortality');
     expect(signature).toContain('Low dissolved oxygen');
@@ -1389,6 +1392,7 @@ describe('mortality write workflow', () => {
       'MORTALITY',
       submission.payload,
       submission.idempotencyKey,
+      submission.performedAt,
     );
     expect(result.outcome).toBe('accepted');
     expect(result.reconciliation).toEqual(mortalityReconciliation);
@@ -1431,6 +1435,30 @@ describe('mortality write workflow', () => {
     expect(differentIntent.outcome).toBe('write_failed');
     expect(differentIntent.posted).toBe(false);
     expect(readAll).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('treats a different normalized observation instant as a different same-key submission', async () => {
+    const post = jest.fn().mockResolvedValue({ id: 'event-mortality', event_type: 'MORTALITY' });
+    const readAll = jest.fn().mockResolvedValue(mortalityReconciliation);
+    const first = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: { ...mortalityInput, observed_at: '2026-09-26T08:30Z' },
+      idempotencyKey: 'mortality-same-key-different-time',
+      post,
+      readAll,
+    });
+    const differentTime = await reconcileMortalityWrite({
+      context: mortalityContext,
+      payload: { ...mortalityInput, observed_at: '2026-09-26T09:30Z' },
+      idempotencyKey: 'mortality-same-key-different-time',
+      post,
+      readAll,
+    });
+
+    expect(first.outcome).toBe('accepted');
+    expect(differentTime.outcome).toBe('write_failed');
+    expect(differentTime.posted).toBe(false);
     expect(post).toHaveBeenCalledTimes(1);
   });
 
@@ -1478,6 +1506,10 @@ describe('mortality write workflow', () => {
     expect(post).toHaveBeenCalledTimes(2);
     expect(post.mock.calls[0][3]).toBe(submission.idempotencyKey);
     expect(post.mock.calls[1][3]).toBe(submission.idempotencyKey);
+    expect(post.mock.calls.map((call) => call[4])).toEqual([
+      submission.performedAt,
+      submission.performedAt,
+    ]);
     expect(retry.submission).toBe(submission);
   });
 
@@ -1541,6 +1573,10 @@ describe('mortality write workflow', () => {
     expect(retry.outcome).toBe('accepted');
     expect(retry.submission).toBe(submission);
     expect(post.mock.calls.map((call) => call[3])).toEqual([key, key]);
+    expect(post.mock.calls.map((call) => call[4])).toEqual([
+      submission.performedAt,
+      submission.performedAt,
+    ]);
   });
 
   test.each([409, 422])('does not retry a definitive HTTP %s rejection', async (status) => {
@@ -1758,6 +1794,7 @@ describe('mortality write workflow', () => {
         farmName: 'North Farm',
         siteName: 'Site 3',
         unitName: 'Pond 3',
+        currentEstimatedRemainingPopulation: 100,
         onSaved,
       });
       lastTree = tree;
@@ -1819,8 +1856,15 @@ describe('mortality write workflow', () => {
       expect(confirmed).toBe(true);
       const confirmedElements = renderForm();
       const preview = textContent(lastTree).join('');
+      const localTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const expectedObservedInstant = new Date('2026-09-26T08:30').toISOString();
       expect(preview).toContain('Mortality count: 3');
-      expect(preview).toContain('Observed at: 2026-09-26T08:30');
+      expect(preview).toContain('Current authoritative projected population: 100');
+      expect(preview).toContain('Preview only:');
+      expect(preview).toContain('estimated remaining population would be 97');
+      expect(preview).toContain(`Observation time (${localTimeZone}): 2026-09-26T08:30`);
+      expect(preview).toContain(`Sent as UTC: ${expectedObservedInstant}`);
+      expect(preview).toContain('not editable or reversible');
       expect(preview).toContain('Cause: Low dissolved oxygen');
       expect(preview).toContain('Disposal: compost');
 
@@ -1842,6 +1886,10 @@ describe('mortality write workflow', () => {
 
       expect(post).toHaveBeenCalledTimes(1);
       expect(post.mock.calls[0][0]).toBe('batch-mortality');
+      const postedEvent = post.mock.calls[0]?.[1] as
+        { performed_at?: string; data?: Record<string, unknown> } | undefined;
+      expect(postedEvent?.performed_at).toBe(normalizeMortalityObservedAt('2026-09-26T08:30'));
+      expect(postedEvent?.data?.observed_at).toBe(postedEvent?.performed_at);
       const firstKey = retrySubmission.current?.idempotencyKey;
       expect(firstKey).toBeTruthy();
       expect(retrySubmission.current?.payload).toEqual(
@@ -1887,6 +1935,7 @@ describe('mortality write workflow', () => {
       expect(secondKey).not.toBe(firstKey);
       expect(post.mock.calls[2][1]).toMatchObject({
         event_type: 'MORTALITY',
+        performed_at: normalizeMortalityObservedAt('2026-09-26T08:30'),
         data: {
           count: 4,
           observed_at: normalizeMortalityObservedAt('2026-09-26T08:30'),
@@ -1894,6 +1943,7 @@ describe('mortality write workflow', () => {
           disposal_method: 'compost',
         },
       });
+      expect(post.mock.calls[0][1].data).not.toHaveProperty('performed_at');
       expect(post.mock.calls[2][1].data).not.toHaveProperty('performed_by_id');
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(onSaved).toHaveBeenCalledWith(
@@ -1957,6 +2007,24 @@ describe('mortality write workflow', () => {
       confirmedSnapshot = value;
     };
     const post = jest.mocked(productionApi.createBatchEvent);
+    const refreshedReconciliation = {
+      batch: { id: 'batch-mortality', state: 'active' },
+      projection: {
+        ...mortalityReconciliation.projection,
+        estimated_remaining_population: 2,
+      },
+      events: [{ event_type: 'MORTALITY', performed_at: '2026-09-27T08:30:00Z' }],
+    };
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue(refreshedReconciliation.batch);
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockResolvedValue(refreshedReconciliation.projection);
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: refreshedReconciliation.events,
+      next_cursor: null,
+      limit: 25,
+    });
+    const onConflictRefreshed = jest.fn();
     post
       .mockReset()
       .mockRejectedValue(
@@ -1985,7 +2053,12 @@ describe('mortality write workflow', () => {
         .mockReturnValueOnce(inFlight)
         .mockReturnValueOnce(retryRef)
         .mockReturnValueOnce(revision);
-      const tree = MortalityForm({ batchId: 'batch-mortality', batchName: 'B-MORT' });
+      const tree = MortalityForm({
+        batchId: 'batch-mortality',
+        batchName: 'B-MORT',
+        currentEstimatedRemainingPopulation: 3,
+        onConflictRefreshed,
+      });
       const elements: React.ReactElement[] = [];
       const visit = (node: unknown): void => {
         if (Array.isArray(node)) node.forEach(visit);
@@ -2006,17 +2079,184 @@ describe('mortality write workflow', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0][1]).toMatchObject({
+        performed_at: normalizeMortalityObservedAt('2026-09-26T08:30Z'),
+        data: { observed_at: normalizeMortalityObservedAt('2026-09-26T08:30Z') },
+      });
       expect(confirmed).toBe(false);
       expect(confirmedSnapshot).toBeNull();
       expect(retryRef.current).toBeNull();
+      expect(onConflictRefreshed).toHaveBeenCalledWith(refreshedReconciliation);
+      expect(productionApi.getBatchProjections).toHaveBeenCalledWith('batch-mortality');
 
       const afterRejection = renderForm();
+      expect(setError).toHaveBeenCalledWith(
+        'The server rejected this mortality write (409). Current authoritative population and events have been refreshed. Review them and confirm a new record before submitting.',
+      );
       const retryButtons = afterRejection.filter((element) => element.type === Pressable);
       (retryButtons[retryButtons.length - 1].props as { onPress: () => void }).onPress();
       expect(post).toHaveBeenCalledTimes(1);
       expect(setError).toHaveBeenLastCalledWith(
         'Please confirm this mortality record before submission.',
       );
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+});
+
+describe('mortality in-flight draft lock', () => {
+  test('mortality draft stays locked during an unresolved POST and unlocks with the exact ambiguous retry', async () => {
+    let values: Record<string, string> = {
+      count: '3',
+      observed_at: '2026-09-26T08:30Z',
+      suspected_cause: '',
+      disposal_method: '',
+      photos: '',
+      lab_report_ref: '',
+      veterinarian_id: '',
+      evidence_notes: '',
+    };
+    let confirmed = false;
+    let confirmedSnapshot: string | null = null;
+    let busy = false;
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const submissionInFlight = { current: false };
+    const retryRef = { current: null as MortalitySubmission | null };
+    const revision = { current: 0 };
+    const setters = [
+      (update: (current: Record<string, string>) => Record<string, string>) => {
+        values = update(values);
+      },
+      (next: boolean) => {
+        confirmed = next;
+      },
+      (next: string | null) => {
+        confirmedSnapshot = next;
+      },
+      (next: boolean) => {
+        busy = next;
+      },
+      jest.fn(),
+      jest.fn(),
+    ];
+    let rejectPost!: (error: unknown) => void;
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectPost = reject;
+        }),
+    );
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue({ id: 'batch-mortality' });
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue({
+      estimated_remaining_population: 97,
+    });
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: [{ event_type: 'MORTALITY', performed_at: '2026-09-26T08:30:00.000Z' }],
+      next_cursor: null,
+      limit: 25,
+    });
+
+    const renderForm = () => {
+      stateSpy.mockReset();
+      [values, confirmed, confirmedSnapshot, busy, null, null].forEach((value, index) =>
+        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      );
+      refSpy
+        .mockReset()
+        .mockReturnValueOnce(submissionInFlight)
+        .mockReturnValueOnce(retryRef)
+        .mockReturnValueOnce(revision);
+      const tree = MortalityForm({ batchId: 'batch-mortality', batchName: 'B-MORT' });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(text),
+      ) as React.ReactElement<{ onPress: () => void; disabled?: boolean }>;
+
+    try {
+      const initial = renderForm();
+      buttonWithText(initial, 'I confirm this mortality record').props.onPress();
+      const confirmedElements = renderForm();
+      buttonWithText(confirmedElements, 'Submit mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(busy).toBe(true);
+      expect(submissionInFlight.current).toBe(true);
+
+      const busyElements = renderForm();
+      const busyInputs = busyElements.filter(
+        (element) => element.type === TextInput,
+      ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
+      expect(busyInputs.every((input) => input.props.editable === false)).toBe(true);
+      const busyConfirm = buttonWithText(busyElements, 'I confirm this mortality record');
+      expect(busyConfirm.props.disabled).toBe(true);
+      const busyDisposal = buttonWithText(busyElements, 'burial');
+      expect(busyDisposal.props.disabled).toBe(true);
+      busyInputs[0].props.onChangeText('99');
+      busyConfirm.props.onPress();
+      busyDisposal.props.onPress();
+      expect(values.count).toBe('3');
+      expect(values.disposal_method).toBe('');
+      expect(confirmed).toBe(true);
+      expect(revision.current).toBe(0);
+      expect(retryRef.current).toBeNull();
+
+      const submittedKey = post.mock.calls[0][2];
+      const submittedPerformedAt = post.mock.calls[0][1].performed_at;
+      rejectPost(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          '/v1/batches/batch-mortality/events',
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(busy).toBe(false);
+      expect(submissionInFlight.current).toBe(false);
+      expect(retryRef.current?.idempotencyKey).toBe(submittedKey);
+      expect(retryRef.current?.performedAt).toBe(submittedPerformedAt);
+      expect(retryRef.current?.payload.count).toBe(3);
+
+      const unlockedElements = renderForm();
+      const unlockedInputs = unlockedElements.filter(
+        (element) => element.type === TextInput,
+      ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
+      expect(unlockedInputs.every((input) => input.props.editable !== false)).toBe(true);
+      unlockedInputs[0].props.onChangeText('4');
+      expect(values.count).toBe('4');
+      expect(confirmed).toBe(false);
+      expect(confirmedSnapshot).toBeNull();
+      expect(retryRef.current).toBeNull();
     } finally {
       jest.restoreAllMocks();
     }

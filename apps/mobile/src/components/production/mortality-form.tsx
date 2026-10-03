@@ -30,6 +30,8 @@ export interface MortalityFormProps {
   farmName?: string;
   siteName?: string;
   unitName?: string;
+  currentEstimatedRemainingPopulation?: number | null;
+  onConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
   onSaved?: (
     submission: MortalitySubmission,
     reconciliation: WaterQualityReconciliationData,
@@ -42,6 +44,8 @@ export function MortalityForm({
   farmName,
   siteName,
   unitName,
+  currentEstimatedRemainingPopulation,
+  onConflictRefreshed,
   onSaved,
 }: MortalityFormProps) {
   const [values, setValues] = useState<Record<string, string>>({
@@ -71,6 +75,11 @@ export function MortalityForm({
     unitName,
   };
   const batchLabel = batchName ?? batchId;
+  const currentPopulation =
+    typeof currentEstimatedRemainingPopulation === 'number' &&
+    Number.isFinite(currentEstimatedRemainingPopulation)
+      ? currentEstimatedRemainingPopulation
+      : null;
 
   const toInput = (): MortalityInput => ({
     count: values.count,
@@ -89,6 +98,7 @@ export function MortalityForm({
   });
 
   const updateField = (field: string, value: string) => {
+    if (submissionInFlight.current || busy) return;
     draftRevision.current += 1;
     retrySubmission.current = null;
     setValues((current) => ({ ...current, [field]: value }));
@@ -145,8 +155,16 @@ export function MortalityForm({
         payload,
         idempotencyKey: submission.idempotencyKey,
         submission,
-        post: async (targetBatchId, eventType, data, key) =>
-          createBatchEvent(targetBatchId, { event_type: eventType, data }, key),
+        post: async (targetBatchId, eventType, data, key, performedAt) =>
+          createBatchEvent(
+            targetBatchId,
+            {
+              event_type: eventType,
+              ...(performedAt ? { performed_at: performedAt } : {}),
+              data,
+            },
+            key,
+          ),
         readAll: async (targetBatchId) => {
           const [batch, projection, eventData] = await Promise.all([
             getProductionBatch(targetBatchId),
@@ -173,9 +191,31 @@ export function MortalityForm({
         setConfirmed(false);
         setConfirmedSnapshot(null);
         retrySubmission.current = null;
-        setError(
-          'The server rejected this mortality record. Refresh the batch and review the current population before submitting a corrected record.',
-        );
+        if (result.response?.status === 409) {
+          try {
+            const [batch, projection, eventData] = await Promise.all([
+              getProductionBatch(batchId),
+              getBatchProjections(batchId),
+              listBatchEvents(batchId),
+            ]);
+            onConflictRefreshed?.({
+              batch,
+              projection,
+              events: Array.isArray(eventData.items) ? eventData.items : [],
+            });
+            setError(
+              'The server rejected this mortality write (409). Current authoritative population and events have been refreshed. Review them and confirm a new record before submitting.',
+            );
+          } catch {
+            setError(
+              'The server rejected this mortality record because the batch may have changed. Refresh the batch and review its current population before submitting again.',
+            );
+          }
+        } else {
+          setError(
+            'The server rejected this mortality record. Review the current batch state before submitting a corrected record.',
+          );
+        }
       } else if (result.outcome === 'reconciliation_failed') {
         setError(
           'The mortality event was accepted, but reconciliation failed. The immutable submission is preserved for a read-only retry.',
@@ -207,6 +247,12 @@ export function MortalityForm({
     ['evidence_notes', 'Evidence notes (optional)', 'default'],
   ] as const;
   const disposalMethods = ['burial', 'incineration', 'compost', 'rendering', 'other'] as const;
+  const mortalityCount = Number(values.count);
+  const projectedPopulationAfter =
+    currentPopulation !== null && Number.isInteger(mortalityCount) && mortalityCount > 0
+      ? currentPopulation - mortalityCount
+      : null;
+  const deviceTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'device local time';
 
   return (
     <View style={styles.card}>
@@ -214,6 +260,15 @@ export function MortalityForm({
       <Text style={styles.subtitle}>
         {`${batchLabel} · ${farmName ?? 'Farm'} · ${siteName ?? 'Site'} · ${unitName ?? 'Unit'}`}
       </Text>
+      <Text style={styles.subtitle}>
+        Current authoritative projected population: {currentPopulation ?? 'unavailable'}
+      </Text>
+      {projectedPopulationAfter !== null ? (
+        <Text style={styles.previewWarning}>
+          Preview only: after {values.count} mortalities, estimated remaining population would be{' '}
+          {projectedPopulationAfter}. The server validates the current population when submitted.
+        </Text>
+      ) : null}
       {fields.map(([field, label, keyboardType]) => (
         <View key={field} style={styles.row}>
           <Text style={styles.label}>{label}</Text>
@@ -222,6 +277,7 @@ export function MortalityForm({
             value={values[field]}
             onChangeText={(value) => updateField(field, value)}
             keyboardType={keyboardType === 'numeric' ? 'numeric' : 'default'}
+            editable={!busy}
             multiline={field === 'photos' || field === 'evidence_notes'}
             placeholder={field === 'count' ? '1' : ''}
           />
@@ -231,6 +287,7 @@ export function MortalityForm({
       <View style={styles.actions}>
         <Pressable
           onPress={() => updateField('disposal_method', '')}
+          disabled={busy}
           style={[styles.secondaryButton, !values.disposal_method && styles.optionSelected]}
         >
           <Text
@@ -246,6 +303,7 @@ export function MortalityForm({
           <Pressable
             key={method}
             onPress={() => updateField('disposal_method', method)}
+            disabled={busy}
             style={[
               styles.secondaryButton,
               values.disposal_method === method && styles.optionSelected,
@@ -264,6 +322,7 @@ export function MortalityForm({
       </View>
       <Pressable
         onPress={() => {
+          if (submissionInFlight.current || busy) return;
           const next = !confirmed;
           if (next && !normalizeMortalityObservedAt(values.observed_at)) {
             setConfirmed(false);
@@ -276,17 +335,26 @@ export function MortalityForm({
           setStatusMessage(null);
           setConfirmedSnapshot(next ? createMortalityDraftSignature(batchId, toInput()) : null);
         }}
+        disabled={busy}
         style={styles.checkboxRow}
       >
         <View style={[styles.checkbox, confirmed && styles.checkboxChecked]}>
           {confirmed ? <Text style={styles.checkboxMark}>✓</Text> : null}
         </View>
-        <Text style={styles.checkboxText}>I confirm this mortality record for {batchLabel}.</Text>
+        <Text style={styles.checkboxText}>
+          I confirm this mortality record for {batchLabel}. I understand an accepted mortality event
+          is not editable or reversible through the production API.
+        </Text>
       </Pressable>
       {confirmed ? (
         <View style={styles.confirmationSummary}>
           <Text style={styles.summaryText}>Mortality count: {values.count || 'Not entered'}</Text>
-          <Text style={styles.summaryText}>Observed at: {values.observed_at || 'Not entered'}</Text>
+          <Text style={styles.summaryText}>
+            Observation time ({deviceTimeZone}): {values.observed_at || 'Not entered'}
+          </Text>
+          <Text style={styles.summaryText}>
+            Sent as UTC: {normalizeMortalityObservedAt(values.observed_at) ?? 'Invalid'}
+          </Text>
           {values.suspected_cause ? (
             <Text style={styles.summaryText}>Cause: {values.suspected_cause}</Text>
           ) : null}
@@ -363,6 +431,7 @@ const styles = StyleSheet.create({
     paddingLeft: 10,
   },
   summaryText: { color: '#0f2e1e', fontSize: 12, marginTop: 4 },
+  previewWarning: { color: '#8a5a00', fontSize: 12, marginTop: 8 },
   error: { color: '#8d2c2c', marginTop: 12, fontSize: 12 },
   success: { color: '#1f5d40', marginTop: 12, fontSize: 12 },
   actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8, marginBottom: 8 },
