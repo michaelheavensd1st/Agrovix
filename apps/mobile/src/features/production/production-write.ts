@@ -531,12 +531,14 @@ export function createMortalitySubmission(
   idempotencyKey?: string,
   context?: Partial<WaterQualityWriteContext>,
 ): MortalitySubmission {
+  const payload = buildMortalityPayload(values);
   return {
     batchId,
-    payload: buildMortalityPayload(values),
+    payload,
     idempotencyKey: idempotencyKey ?? makeOpaqueId('mortality'),
     createdAt: new Date().toISOString(),
     context: { ...(context ?? {}), batchId },
+    performedAt: payload.observed_at,
   };
 }
 
@@ -1098,6 +1100,7 @@ export function reconcileMortalityWrite({
     eventType: ProductionEventType,
     data: Record<string, unknown>,
     key: string,
+    performedAt?: string,
   ) => Promise<Record<string, unknown>>;
   readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
 }): Promise<MortalityWriteResult> {
@@ -1108,6 +1111,7 @@ export function reconcileMortalityWrite({
   if (
     submission.batchId !== context.batchId ||
     submission.idempotencyKey !== idempotencyKey ||
+    submission.performedAt !== normalizedPayload.observed_at ||
     JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
   ) {
     throw new Error('The preserved mortality submission does not match the current intent.');

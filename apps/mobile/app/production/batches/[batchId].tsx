@@ -111,6 +111,11 @@ export default function ProductionBatchDetailScreen() {
         setProjection(reconciliation.projection);
         setEvents(reconciliation.events);
       }}
+      onMortalityConflictRefreshed={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
       onSamplingSaved={(reconciliation: WaterQualityReconciliationData) => {
         setBatch(reconciliation.batch);
         setProjection(reconciliation.projection);
