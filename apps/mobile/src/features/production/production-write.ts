@@ -723,7 +723,7 @@ export interface ProductionEventWriteRecovery {
   submission: ProductionSubmission<any>;
   inFlight: boolean;
   promise: Promise<ProductionWriteResult<any>> | null;
-  retryOutcome?: 'outcome_unknown' | 'reconciliation_failed';
+  retryOutcome?: 'accepted' | 'outcome_unknown' | 'reconciliation_failed';
 }
 
 export type MortalityWriteRecovery = ProductionEventWriteRecovery;
@@ -847,6 +847,13 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
               result.outcome === 'reconciliation_failed'
                 ? 'reconciliation_failed'
                 : 'outcome_unknown',
+          });
+        } else if (eventType === 'SAMPLING' && result.outcome === 'accepted') {
+          PRODUCTION_EVENT_WRITE_RECOVERY.set(recoveryKey, {
+            submission,
+            inFlight: false,
+            promise: null,
+            retryOutcome: 'accepted',
           });
         } else {
           PRODUCTION_EVENT_WRITE_RECOVERY.delete(recoveryKey);

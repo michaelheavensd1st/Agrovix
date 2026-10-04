@@ -109,6 +109,36 @@ export function SamplingForm({
     notes: values.notes,
   });
 
+  const reconcileSubmission = (submission: SamplingSubmission) =>
+    reconcileSamplingWrite({
+      context,
+      payload: { ...submission.payload, performed_at: submission.performedAt },
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post: async (targetBatchId, eventType, data, key, performedAt) =>
+        createBatchEvent(
+          targetBatchId,
+          {
+            event_type: eventType,
+            ...(performedAt ? { performed_at: performedAt } : {}),
+            data,
+          },
+          key,
+        ),
+      readAll: async (targetBatchId) => {
+        const [batch, projection, eventData] = await Promise.all([
+          getProductionBatch(targetBatchId),
+          getBatchProjections(targetBatchId),
+          listBatchEvents(targetBatchId),
+        ]);
+        return {
+          batch,
+          projection,
+          events: Array.isArray(eventData.items) ? eventData.items : [],
+        };
+      },
+    });
+
   const updateField = (field: string, value: string) => {
     if (submissionInFlight.current || busy || recoveryRequired) return;
     draftRevision.current += 1;
@@ -128,15 +158,30 @@ export function SamplingForm({
     submissionRevision: number,
   ) => {
     if (!mounted.current) return;
+    const recovery = getSamplingWriteRecovery(batchId);
+    const retainedSubmission =
+      recovery?.submission.idempotencyKey === result.submission.idempotencyKey
+        ? (recovery.submission as SamplingSubmission)
+        : null;
     retrySubmission.current =
-      draftRevision.current === submissionRevision ? result.retrySubmission : null;
-    setRecoveryRequired(Boolean(result.retrySubmission));
+      draftRevision.current === submissionRevision
+        ? (result.retrySubmission ?? (result.outcome === 'accepted' ? retainedSubmission : null))
+        : null;
+    setRecoveryRequired(Boolean(result.retrySubmission) || Boolean(retainedSubmission));
     if (result.outcome === 'accepted') {
       setConfirmed(false);
       setConfirmedSnapshot(null);
-      retrySubmission.current = null;
       setStatusMessage('Sampling has been recorded and reconciled against the current batch.');
-      if (result.reconciliation) onSaved?.(result.submission, result.reconciliation);
+      if (result.reconciliation) {
+        onSaved?.(result.submission, result.reconciliation);
+        clearSamplingWriteRecovery(batchId, result.submission.idempotencyKey);
+        retrySubmission.current = null;
+        setRecoveryRequired(false);
+      } else {
+        setError(
+          'The accepted sampling write is missing reconciliation data. Reconcile it before editing.',
+        );
+      }
     } else if (result.outcome === 'rejected') {
       setConfirmed(false);
       setConfirmedSnapshot(null);
@@ -184,6 +229,34 @@ export function SamplingForm({
     }
 
     retrySubmission.current = recovery.submission as SamplingSubmission;
+    if (recovery.retryOutcome === 'accepted') {
+      setRecoveryRequired(true);
+      setBusy(true);
+      submissionInFlight.current = true;
+      let subscribed = true;
+      void reconcileSubmission(recovery.submission as SamplingSubmission)
+        .then((result) => {
+          if (subscribed && mounted.current) {
+            handleWriteResultRef.current(result, draftRevision.current);
+          }
+        })
+        .catch((caught) => {
+          if (subscribed && mounted.current) {
+            setError(caught instanceof Error ? caught.message : 'Unable to reconcile sampling.');
+          }
+        })
+        .finally(() => {
+          if (subscribed && mounted.current) {
+            setBusy(false);
+            submissionInFlight.current = false;
+          }
+        });
+
+      return () => {
+        subscribed = false;
+      };
+    }
+
     if (!recovery.inFlight || !recovery.promise) {
       setRecoveryRequired(true);
       setBusy(false);
@@ -296,35 +369,7 @@ export function SamplingForm({
       setError(null);
       setStatusMessage(null);
 
-      const result = await reconcileSamplingWrite({
-        context,
-        payload,
-        idempotencyKey: submission.idempotencyKey,
-        submission,
-        post: async (targetBatchId, eventType, data, key, performedAt) =>
-          createBatchEvent(
-            targetBatchId,
-            {
-              event_type: eventType,
-              ...(performedAt ? { performed_at: performedAt } : {}),
-              data,
-            },
-            key,
-          ),
-        readAll: async (targetBatchId) => {
-          const [batch, projection, eventData] = await Promise.all([
-            getProductionBatch(targetBatchId),
-            getBatchProjections(targetBatchId),
-            listBatchEvents(targetBatchId),
-          ]);
-          return {
-            batch,
-            projection,
-            events: Array.isArray(eventData.items) ? eventData.items : [],
-          };
-        },
-      });
-
+      const result = await reconcileSubmission(submission);
       if (mounted.current) handleWriteResultRef.current(result, submissionRevision);
     } catch (caught) {
       if (mounted.current) {
@@ -377,9 +422,11 @@ export function SamplingForm({
           {busy
             ? 'A sampling submission from this batch is still resolving. No new write will be sent.'
             : recoveryRequired
-              ? getSamplingWriteRecovery(batchId)?.retryOutcome === 'reconciliation_failed'
-                ? 'A previous sampling was accepted but could not be reconciled. Editing is locked; use Reconcile previous sampling to refresh with the original submission.'
-                : 'A previous sampling submission has an uncertain outcome. Its original submission and key are retained. Editing is locked until you retry it explicitly.'
+              ? getSamplingWriteRecovery(batchId)?.retryOutcome === 'accepted'
+                ? 'A previous sampling was accepted. Authoritative batch data is being refreshed; editing remains locked.'
+                : getSamplingWriteRecovery(batchId)?.retryOutcome === 'reconciliation_failed'
+                  ? 'A previous sampling was accepted but could not be reconciled. Editing is locked; use Reconcile previous sampling to refresh with the original submission.'
+                  : 'A previous sampling submission has an uncertain outcome. Its original submission and key are retained. Editing is locked until you retry it explicitly.'
               : 'A previous sampling submission has an uncertain outcome. Confirming and retrying will reuse its original submission and key.'}
         </Text>
       ) : null}
@@ -524,7 +571,9 @@ export function SamplingForm({
           {busy
             ? 'Saving…'
             : recoveryRequired
-              ? getSamplingWriteRecovery(batchId)?.retryOutcome === 'reconciliation_failed'
+              ? ['accepted', 'reconciliation_failed'].includes(
+                  getSamplingWriteRecovery(batchId)?.retryOutcome ?? '',
+                )
                 ? 'Reconcile previous sampling'
                 : 'Retry previous sampling'
               : 'Submit sampling'}

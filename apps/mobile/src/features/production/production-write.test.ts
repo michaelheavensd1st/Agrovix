@@ -67,6 +67,7 @@ import {
   createSamplingSubmission,
   getMortalityWriteRecovery,
   getSamplingWriteRecovery,
+  clearSamplingWriteRecovery,
   normalizeMortalityObservedAt,
   normalizeProductionEventTime,
   createFeedingSubmission,
@@ -82,6 +83,7 @@ import {
   type MortalitySubmission,
   type SamplingInput,
   type SamplingSubmission,
+  type WaterQualityReconciliationData,
   type WaterQualitySubmission,
   type FeedingInput,
   type FeedingSubmission,
@@ -2948,7 +2950,13 @@ describe('sampling write workflow', () => {
     expect(result.reconciliation?.projection.estimated_remaining_population).toBe(22800);
     expect(result.submission.payload.sample_size).toBe(30);
     expect(result.submission.payload).not.toHaveProperty('performed_by_id');
-    expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
+    expect(getSamplingWriteRecovery(samplingContext.batchId)).toMatchObject({
+      submission,
+      inFlight: false,
+      promise: null,
+      retryOutcome: 'accepted',
+    });
+    clearSamplingWriteRecovery(samplingContext.batchId, submission.idempotencyKey);
 
     const replay = await reconcileSamplingWrite({
       context: samplingContext,
@@ -2961,6 +2969,8 @@ describe('sampling write workflow', () => {
     expect(replay.outcome).toBe('accepted');
     expect(post).toHaveBeenCalledTimes(1);
     expect(readAll).toHaveBeenCalledTimes(2);
+    expect(getSamplingWriteRecovery(samplingContext.batchId)?.retryOutcome).toBe('accepted');
+    clearSamplingWriteRecovery(samplingContext.batchId, submission.idempotencyKey);
     expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
   });
 
@@ -2975,6 +2985,8 @@ describe('sampling write workflow', () => {
       readAll,
     });
     expect(first.outcome).toBe('accepted');
+    expect(getSamplingWriteRecovery(samplingContext.batchId)?.retryOutcome).toBe('accepted');
+    clearSamplingWriteRecovery(samplingContext.batchId, first.submission.idempotencyKey);
 
     const differentIntent = await reconcileSamplingWrite({
       context: samplingContext,
@@ -2999,6 +3011,7 @@ describe('sampling write workflow', () => {
       post,
       readAll,
     });
+    clearSamplingWriteRecovery(samplingContext.batchId, first.submission.idempotencyKey);
     const differentTime = await reconcileSamplingWrite({
       context: samplingContext,
       payload: { ...samplingInput, performed_at: '2026-09-26T09:30Z' },
@@ -3061,6 +3074,7 @@ describe('sampling write workflow', () => {
       submission.performedAt,
       submission.performedAt,
     ]);
+    clearSamplingWriteRecovery(samplingContext.batchId, submission.idempotencyKey);
     expect(retry.submission).toBe(submission);
   });
 
@@ -3128,6 +3142,7 @@ describe('sampling write workflow', () => {
       submission.performedAt,
       submission.performedAt,
     ]);
+    clearSamplingWriteRecovery(samplingContext.batchId, submission.idempotencyKey);
   });
 
   test.each([409, 422])('does not retry a definitive HTTP %s rejection', async (status) => {
@@ -3185,6 +3200,7 @@ describe('sampling write workflow', () => {
     ]);
     expect(post).toHaveBeenCalledTimes(1);
     expect(second).toBe(first);
+    clearSamplingWriteRecovery(samplingContext.batchId, submission.idempotencyKey);
   });
 
   test('reconciliation failure retries reads only and never reposts sampling', async () => {
@@ -3229,6 +3245,8 @@ describe('sampling write workflow', () => {
     expect(retry.reconciled).toBe(true);
     expect(post).toHaveBeenCalledTimes(1);
     expect(readAll).toHaveBeenCalledTimes(2);
+    expect(getSamplingWriteRecovery(samplingContext.batchId)?.retryOutcome).toBe('accepted');
+    clearSamplingWriteRecovery(samplingContext.batchId, submission.idempotencyKey);
     expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
   });
 
@@ -3701,6 +3719,19 @@ describe('sampling write workflow', () => {
     const secondOriginalOnSaved = jest.fn();
     const secondPendingRemountedOnSaved = jest.fn();
     const settledRetryOnSaved = jest.fn();
+    const routeState: {
+      projection: Record<string, unknown>;
+      events: Record<string, unknown>[];
+    } = {
+      projection: { batch_id: batchId, estimated_remaining_population: 100 },
+      events: [{ event_type: 'STOCKING', performed_at: '2026-09-20T08:30:00.000Z' }],
+    };
+    const acceptedWhileUnmountedOnSaved = jest.fn(
+      (_submission: SamplingSubmission, acceptedReconciliation: WaterQualityReconciliationData) => {
+        routeState.projection = acceptedReconciliation.projection;
+        routeState.events = acceptedReconciliation.events;
+      },
+    );
 
     try {
       configureMount();
@@ -3869,6 +3900,97 @@ describe('sampling write workflow', () => {
       expect(settledRetryOnSaved).toHaveBeenCalledWith(secondSubmission, reconciliation);
       expect(getSamplingWriteRecovery(batchId)).toBeNull();
       expect(getMortalityWriteRecovery(batchId)).toBeNull();
+
+      configureMount();
+      elements = renderForm(acceptedWhileUnmountedOnSaved);
+      const thirdOriginalCleanups = effects.slice().map((effect) => effect());
+      inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>
+      >;
+      inputs[0].props.onChangeText('2026-09-28T08:30Z');
+      inputs[1].props.onChangeText('20');
+      inputs[2].props.onChangeText('6.1');
+      elements = renderForm(acceptedWhileUnmountedOnSaved);
+      buttonWithText(elements, 'I confirm this sampling record').props.onPress();
+      elements = renderForm(acceptedWhileUnmountedOnSaved);
+      buttonWithText(elements, 'Submit sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(4);
+      const thirdRecovery = getSamplingWriteRecovery(batchId);
+      if (!thirdRecovery?.promise) {
+        throw new Error(
+          'Expected the accepted-settlement SAMPLING recovery to retain its promise.',
+        );
+      }
+      const thirdSubmission = thirdRecovery.submission as SamplingSubmission;
+      const acceptedWritePromise = thirdRecovery.promise;
+      expect(post.mock.calls[3][0]).toBe(batchId);
+      expect(post.mock.calls[3][1]).toMatchObject({
+        event_type: 'SAMPLING',
+        performed_at: thirdSubmission.performedAt,
+        data: thirdSubmission.payload,
+      });
+      expect(post.mock.calls[3][2]).toBe(thirdSubmission.idempotencyKey);
+
+      thirdOriginalCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+      deferredPosts[2].resolve({
+        id: 'event-sampling-accepted-while-unmounted',
+        event_type: 'SAMPLING',
+        batch_id: batchId,
+      });
+      await acceptedWritePromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      const acceptedRecovery = getSamplingWriteRecovery(batchId);
+      expect(acceptedRecovery?.inFlight).toBe(false);
+      expect(acceptedRecovery?.retryOutcome).toBe('accepted');
+      expect(acceptedRecovery?.submission).toBe(thirdSubmission);
+      expect(acceptedWhileUnmountedOnSaved).not.toHaveBeenCalled();
+      expect(routeState.projection.estimated_remaining_population).toBe(100);
+      expect(routeState.events).toEqual([
+        { event_type: 'STOCKING', performed_at: '2026-09-20T08:30:00.000Z' },
+      ]);
+      expect(post).toHaveBeenCalledTimes(4);
+
+      const projectionReadCount = jest.mocked(productionApi.getBatchProjections).mock.calls.length;
+      jest
+        .mocked(productionApi.getBatchProjections)
+        .mockRejectedValueOnce(new Error('temporary projection read failure'))
+        .mockResolvedValueOnce(reconciliation.projection);
+      configureMount();
+      elements = renderForm(acceptedWhileUnmountedOnSaved);
+      const acceptedRemountCleanups = effects.slice().map((effect) => effect());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(4);
+      expect(productionApi.getBatchProjections).toHaveBeenCalledTimes(projectionReadCount + 1);
+      expect(getSamplingWriteRecovery(batchId)).toMatchObject({
+        submission: thirdSubmission,
+        inFlight: false,
+        promise: null,
+        retryOutcome: 'reconciliation_failed',
+      });
+      expect(acceptedWhileUnmountedOnSaved).not.toHaveBeenCalled();
+      expect(routeState.projection.estimated_remaining_population).toBe(100);
+
+      elements = renderForm(acceptedWhileUnmountedOnSaved);
+      expect(buttonWithText(elements, 'Reconcile previous sampling').props.disabled).toBe(false);
+      buttonWithText(elements, 'Reconcile previous sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(4);
+      expect(productionApi.getBatchProjections).toHaveBeenCalledTimes(projectionReadCount + 2);
+      expect(acceptedWhileUnmountedOnSaved).toHaveBeenCalledWith(thirdSubmission, reconciliation);
+      expect(routeState.projection.estimated_remaining_population).toBe(75);
+      expect(routeState.events).toEqual(reconciliation.events);
+      expect(getSamplingWriteRecovery(batchId)).toBeNull();
+      expect(getMortalityWriteRecovery(batchId)).toBeNull();
+      acceptedRemountCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
     } finally {
       jest.restoreAllMocks();
     }
