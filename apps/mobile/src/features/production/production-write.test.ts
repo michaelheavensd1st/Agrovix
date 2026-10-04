@@ -7,6 +7,7 @@ jest.mock('react', () => {
   const React = jest.requireActual('react');
   return {
     ...React,
+    useEffect: jest.fn(),
     useRef: jest.fn(),
     useState: jest.fn(),
   };
@@ -64,6 +65,7 @@ import {
   createWaterQualitySubmission,
   createMortalitySubmission,
   createSamplingSubmission,
+  getMortalityWriteRecovery,
   normalizeMortalityObservedAt,
   normalizeProductionEventTime,
   createFeedingSubmission,
@@ -1678,7 +1680,12 @@ describe('mortality write workflow', () => {
     const refSpy = React.useRef as unknown as jest.Mock;
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-09-26T15:30:00.000Z'));
-    stateSpy.mockReset().mockImplementation((initial: unknown) => [initial, jest.fn()]);
+    stateSpy
+      .mockReset()
+      .mockImplementation((initial: unknown) => [
+        typeof initial === 'function' ? (initial as () => unknown)() : initial,
+        jest.fn(),
+      ]);
     refSpy.mockReset().mockImplementation((initial: unknown) => ({ current: initial }));
 
     try {
@@ -1686,12 +1693,74 @@ describe('mortality write workflow', () => {
       const pad = (value: number) => String(value).padStart(2, '0');
       const expectedLocalTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
       expect(MortalityForm({ batchId: 'batch-mortality' })).toBeTruthy();
-      expect(stateSpy.mock.calls[0][0]).toMatchObject({ observed_at: expectedLocalTime });
+      const initializedValues = stateSpy.mock.results[0].value[0];
+      expect(initializedValues).toMatchObject({ observed_at: expectedLocalTime });
     } finally {
       jest.useRealTimers();
       jest.restoreAllMocks();
     }
   });
+
+  test.each([
+    ['UTC Z timestamp', '2026-09-26T08:30Z', 'UTC', '2026-09-26T08:30:00.000Z'],
+    [
+      'explicit offset timestamp',
+      '2026-09-26T08:30+02:30',
+      'entered offset +02:30',
+      '2026-09-26T06:00:00.000Z',
+    ],
+  ])(
+    'mortality confirmation labels %s accurately',
+    (_label, observedAt, expectedZone, expectedUtc) => {
+      const stateSpy = React.useState as unknown as jest.Mock;
+      const refSpy = React.useRef as unknown as jest.Mock;
+      const effectSpy = React.useEffect as unknown as jest.Mock;
+      const values: Record<string, string> = {
+        count: '3',
+        observed_at: observedAt,
+        suspected_cause: '',
+        disposal_method: '',
+        photos: '',
+        lab_report_ref: '',
+        veterinarian_id: '',
+        evidence_notes: '',
+      };
+      const input: MortalityInput = {
+        count: '3',
+        observed_at: observedAt,
+        evidence: { photos: [], notes: '', lab_report_ref: '', veterinarian_id: '' },
+      };
+      stateSpy.mockReset();
+      [
+        [values, jest.fn()],
+        [true, jest.fn()],
+        [createMortalityDraftSignature('batch-mortality', input), jest.fn()],
+        [false, jest.fn()],
+        [null, jest.fn()],
+        [null, jest.fn()],
+        [false, jest.fn()],
+      ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
+      refSpy.mockReset().mockImplementation((initial: unknown) => ({ current: initial }));
+      effectSpy.mockReset().mockImplementation(() => undefined);
+
+      const textContent = (node: unknown): string => {
+        if (Array.isArray(node)) return node.map(textContent).join(' ');
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (React.isValidElement(node)) {
+          return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+        }
+        return '';
+      };
+      try {
+        const tree = MortalityForm({ batchId: 'batch-mortality' });
+        const preview = textContent(tree).replace(/\s+/g, ' ').trim();
+        expect(preview).toContain(`Observation time ( ${expectedZone} ): ${observedAt}`);
+        expect(preview).toContain(`Sent as UTC: ${expectedUtc}`);
+      } finally {
+        jest.restoreAllMocks();
+      }
+    },
+  );
 
   test('mortality form requires explicit batch-specific confirmation and blocks stale duplicate submit', async () => {
     let values: Record<string, string> = {
@@ -1709,6 +1778,7 @@ describe('mortality write workflow', () => {
     let busy = false;
     let error: string | null = null;
     let statusMessage: string | null = null;
+    let recoveryRequired = false;
     const stateSpy = React.useState as unknown as jest.Mock;
     const refSpy = React.useRef as unknown as jest.Mock;
     const submissionInFlight = { current: false };
@@ -1732,6 +1802,9 @@ describe('mortality write workflow', () => {
       },
       (next: string | null) => {
         statusMessage = next;
+      },
+      (next: boolean) => {
+        recoveryRequired = next;
       },
     ];
     let lastTree: React.ReactElement | null = null;
@@ -1780,14 +1853,16 @@ describe('mortality write workflow', () => {
 
     const renderForm = () => {
       stateSpy.mockReset();
-      [values, confirmed, confirmedSnapshot, busy, error, statusMessage].forEach((value, index) =>
-        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      [values, confirmed, confirmedSnapshot, busy, error, statusMessage, recoveryRequired].forEach(
+        (value, index) => stateSpy.mockImplementationOnce(() => [value, setters[index]]),
       );
       refSpy
         .mockReset()
         .mockReturnValueOnce(submissionInFlight)
         .mockReturnValueOnce(retrySubmission)
-        .mockReturnValueOnce(draftRevision);
+        .mockReturnValueOnce(draftRevision)
+        .mockReturnValueOnce({ current: true })
+        .mockReturnValueOnce({ current: null });
       const tree = MortalityForm({
         batchId: 'batch-mortality',
         batchName: 'B-MORT',
@@ -1862,7 +1937,9 @@ describe('mortality write workflow', () => {
       expect(preview).toContain('Current authoritative projected population: 100');
       expect(preview).toContain('Preview only:');
       expect(preview).toContain('estimated remaining population would be 97');
-      expect(preview).toContain(`Observation time (${localTimeZone}): 2026-09-26T08:30`);
+      expect(preview).toContain(
+        `Observation time (device local time (${localTimeZone})): 2026-09-26T08:30`,
+      );
       expect(preview).toContain(`Sent as UTC: ${expectedObservedInstant}`);
       expect(preview).toContain('not editable or reversible');
       expect(preview).toContain('Cause: Low dissolved oxygen');
@@ -1908,36 +1985,32 @@ describe('mortality write workflow', () => {
       );
       expect(error).toContain('outcome is uncertain');
 
-      buttonWithText(renderForm(), 'Submit mortality').props.onPress();
+      buttonWithText(renderForm(), 'Retry previous mortality').props.onPress();
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(post).toHaveBeenCalledTimes(2);
       expect(post.mock.calls.map((call) => call[2])).toEqual([firstKey, firstKey]);
       expect(retrySubmission.current?.idempotencyKey).toBe(firstKey);
       expect(error).toContain('outcome is uncertain');
 
-      const editableElements = renderForm();
-      (
-        editableElements.filter((element) => element.type === TextInput)[0].props as {
-          onChangeText: (value: string) => void;
-        }
-      ).onChangeText('4');
-      expect(confirmed).toBe(false);
-      expect(confirmedSnapshot).toBeNull();
-      expect(retrySubmission.current).toBeNull();
-      await buttonWithText(renderForm(), 'Submit mortality').props.onPress();
-      expect(post).toHaveBeenCalledTimes(2);
-      expect(error).toContain('confirm');
-
-      buttonWithText(renderForm(), 'I confirm this mortality record').props.onPress();
-      await buttonWithText(renderForm(), 'Submit mortality').props.onPress();
+      const recoveryElements = renderForm();
+      const recoveryInputs = recoveryElements.filter(
+        (element) => element.type === TextInput,
+      ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
+      expect(recoveryInputs.every((input) => input.props.editable === false)).toBe(true);
+      recoveryInputs[0].props.onChangeText('4');
+      expect(values.count).toBe('3');
+      expect(retrySubmission.current?.idempotencyKey).toBe(firstKey);
+      await buttonWithText(recoveryElements, 'Retry previous mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(post).toHaveBeenCalledTimes(3);
-      const secondKey = post.mock.calls[2][2];
-      expect(secondKey).not.toBe(firstKey);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([firstKey, firstKey, firstKey]);
+      expect(retrySubmission.current).toBeNull();
+      expect(getMortalityWriteRecovery('batch-mortality')).toBeNull();
       expect(post.mock.calls[2][1]).toMatchObject({
         event_type: 'MORTALITY',
         performed_at: normalizeMortalityObservedAt('2026-09-26T08:30'),
         data: {
-          count: 4,
+          count: 3,
           observed_at: normalizeMortalityObservedAt('2026-09-26T08:30'),
           suspected_cause: 'Low dissolved oxygen',
           disposal_method: 'compost',
@@ -2047,12 +2120,15 @@ describe('mortality write workflow', () => {
         [false, jest.fn()],
         [null, setError],
         [null, jest.fn()],
+        [false, jest.fn()],
       ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
       refSpy
         .mockReset()
         .mockReturnValueOnce(inFlight)
         .mockReturnValueOnce(retryRef)
-        .mockReturnValueOnce(revision);
+        .mockReturnValueOnce(revision)
+        .mockReturnValueOnce({ current: true })
+        .mockReturnValueOnce({ current: null });
       const tree = MortalityForm({
         batchId: 'batch-mortality',
         batchName: 'B-MORT',
@@ -2105,6 +2181,354 @@ describe('mortality write workflow', () => {
   });
 });
 
+describe('mortality write recovery across form remount', () => {
+  test('reattaches to the retained promise when remounted during a pending mortality write', async () => {
+    const batchId = 'batch-mortality-pending-remount';
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const effectSpy = React.useEffect as unknown as jest.Mock;
+    let stateValues: unknown[] = [];
+    let refs: Array<{ current: unknown }> = [];
+    let effects: Array<() => unknown> = [];
+    let stateIndex = 0;
+    let refIndex = 0;
+    const configureMount = () => {
+      stateValues = [];
+      refs = [];
+      effects = [];
+      stateIndex = 0;
+      refIndex = 0;
+      stateSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = stateIndex++;
+        if (stateValues.length <= index) {
+          stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+        }
+        return [
+          stateValues[index],
+          (next: unknown) => {
+            stateValues[index] =
+              typeof next === 'function'
+                ? (next as (current: unknown) => unknown)(stateValues[index])
+                : next;
+          },
+        ];
+      });
+      refSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = refIndex++;
+        if (refs.length <= index) refs.push({ current: initial });
+        return refs[index];
+      });
+      effectSpy.mockReset().mockImplementation((effect: () => unknown) => {
+        effects.push(effect);
+      });
+    };
+    const renderForm = (onSaved: jest.Mock) => {
+      stateIndex = 0;
+      refIndex = 0;
+      const tree = MortalityForm({ batchId, batchName: 'B-PENDING', onSaved });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(text),
+      ) as React.ReactElement<{ onPress: () => void; disabled?: boolean }>;
+    let resolvePost!: (event: Record<string, unknown>) => void;
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePost = resolve;
+        }),
+    );
+    const reconciliation = {
+      batch: { id: batchId, state: 'active' },
+      projection: { estimated_remaining_population: 96 },
+      events: [{ event_type: 'MORTALITY', performed_at: '2026-09-26T08:30:00.000Z' }],
+    };
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue(reconciliation.batch);
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue(reconciliation.projection);
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: reconciliation.events,
+      next_cursor: null,
+      limit: 25,
+    });
+    const originalOnSaved = jest.fn();
+    const remountedOnSaved = jest.fn();
+
+    try {
+      configureMount();
+      let elements = renderForm(originalOnSaved);
+      const originalCleanups = effects.slice().map((effect) => effect());
+      const inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ onChangeText: (value: string) => void }>
+      >;
+      inputs[0].props.onChangeText('4');
+      inputs[1].props.onChangeText('2026-09-26T08:30Z');
+      elements = renderForm(originalOnSaved);
+      buttonWithText(elements, 'I confirm this mortality record').props.onPress();
+      elements = renderForm(originalOnSaved);
+      buttonWithText(elements, 'Submit mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      const originalRecovery = getMortalityWriteRecovery(batchId);
+      if (!originalRecovery?.promise) {
+        throw new Error('Expected the pending mortality recovery to retain its promise.');
+      }
+      const originalSubmission = originalRecovery.submission;
+      const retainedPromise = originalRecovery.promise;
+      expect(originalRecovery.inFlight).toBe(true);
+      expect(post.mock.calls[0][0]).toBe(batchId);
+      expect(post.mock.calls[0][1]).toMatchObject({
+        event_type: 'MORTALITY',
+        performed_at: originalSubmission.performedAt,
+        data: originalSubmission.payload,
+      });
+      expect(post.mock.calls[0][2]).toBe(originalSubmission.idempotencyKey);
+
+      originalCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+      configureMount();
+      elements = renderForm(remountedOnSaved);
+      const remountEffects = effects.slice();
+      expect(remountEffects).toHaveLength(2);
+      remountEffects.forEach((effect) => effect());
+      expect(getMortalityWriteRecovery(batchId)?.promise).toBe(retainedPromise);
+      expect(stateValues[3]).toBe(true);
+      expect(buttonWithText(elements, 'Saving…').props.disabled).toBe(true);
+      expect(post).toHaveBeenCalledTimes(1);
+      await Promise.resolve();
+      expect(post).toHaveBeenCalledTimes(1);
+
+      resolvePost({
+        id: 'event-mortality-pending-remount',
+        event_type: 'MORTALITY',
+        batch_id: batchId,
+      });
+      await retainedPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([originalSubmission.idempotencyKey]);
+      expect(post.mock.calls[0][1].performed_at).toBe(originalSubmission.performedAt);
+      expect(post.mock.calls[0][1].data).toEqual(originalSubmission.payload);
+      expect(originalOnSaved).not.toHaveBeenCalled();
+      expect(remountedOnSaved).toHaveBeenCalledWith(originalSubmission, reconciliation);
+      expect(stateValues[5]).toContain('Mortality has been recorded and reconciled');
+      expect(getMortalityWriteRecovery(batchId)).toBeNull();
+      effects.forEach((effect) => {
+        const cleanup = effect();
+        if (typeof cleanup === 'function') cleanup();
+      });
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('rehydrates unresolved identity after remount and retries the original submission', async () => {
+    const batchId = 'batch-mortality-remount';
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const effectSpy = React.useEffect as unknown as jest.Mock;
+    let stateValues: unknown[] = [];
+    let refs: Array<{ current: unknown }> = [];
+    let effects: Array<() => unknown> = [];
+    let stateIndex = 0;
+    let refIndex = 0;
+    const configureMount = () => {
+      stateValues = [];
+      refs = [];
+      effects = [];
+      stateIndex = 0;
+      refIndex = 0;
+      stateSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = stateIndex++;
+        if (stateValues.length <= index) {
+          stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+        }
+        return [
+          stateValues[index],
+          (next: unknown) => {
+            stateValues[index] =
+              typeof next === 'function'
+                ? (next as (current: unknown) => unknown)(stateValues[index])
+                : next;
+          },
+        ];
+      });
+      refSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = refIndex++;
+        if (refs.length <= index) refs.push({ current: initial });
+        return refs[index];
+      });
+      effectSpy.mockReset().mockImplementation((effect: () => unknown) => {
+        effects.push(effect);
+      });
+    };
+    const renderForm = () => {
+      stateIndex = 0;
+      refIndex = 0;
+      const tree = MortalityForm({ batchId, batchName: 'B-REMOUNT' });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(text),
+      ) as React.ReactElement<{ onPress: () => void; disabled?: boolean }>;
+    let rejectPost!: (error: unknown) => void;
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectPost = reject;
+        }),
+    );
+    jest
+      .mocked(productionApi.getProductionBatch)
+      .mockResolvedValue({ id: batchId, state: 'active' });
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue({
+      estimated_remaining_population: 96,
+    });
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: [],
+      next_cursor: null,
+      limit: 25,
+    });
+
+    try {
+      configureMount();
+      let elements = renderForm();
+      expect(effects).toHaveLength(2);
+      const originalCleanups = effects.map((effect) => effect());
+
+      const inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ onChangeText: (value: string) => void }>
+      >;
+      inputs[0].props.onChangeText('4');
+      inputs[1].props.onChangeText('2026-09-26T08:30');
+      inputs[2].props.onChangeText('Low dissolved oxygen');
+      elements = renderForm();
+      buttonWithText(elements, 'I confirm this mortality record').props.onPress();
+      elements = renderForm();
+      buttonWithText(elements, 'Submit mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(1);
+      const originalKey = post.mock.calls[0][2];
+      const originalPerformedAt = post.mock.calls[0][1].performed_at;
+      expect(originalKey).toBeTruthy();
+      expect(post.mock.calls[0][1].data).toMatchObject({
+        count: 4,
+        suspected_cause: 'Low dissolved oxygen',
+      });
+      originalCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+
+      rejectPost(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          `/v1/batches/${batchId}/events`,
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const recovered = getMortalityWriteRecovery(batchId);
+      expect(recovered?.inFlight).toBe(false);
+      expect(recovered?.retryOutcome).toBe('outcome_unknown');
+      expect(recovered?.submission.idempotencyKey).toBe(originalKey);
+      expect(getMortalityWriteRecovery('different-mortality-batch')).toBeNull();
+
+      configureMount();
+      elements = renderForm();
+      const remountCleanups = effects.map((effect) => effect());
+      const remountedInputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ editable?: boolean }>
+      >;
+      expect(stateValues[0]).toMatchObject({
+        count: '4',
+        observed_at: recovered?.submission.performedAt,
+        suspected_cause: 'Low dissolved oxygen',
+      });
+      expect(remountedInputs.every((input) => input.props.editable === false)).toBe(true);
+      const recoveredText = textContent(elements).replace(/\s+/g, ' ');
+      expect(recoveredText).toContain('uncertain outcome');
+      expect(recoveredText).toContain('Mortality count: 4');
+      expect(recoveredText).toContain(`Sent as UTC: ${recovered?.submission.performedAt}`);
+      expect(buttonWithText(elements, 'Retry previous mortality').props.disabled).toBe(false);
+      expect(post).toHaveBeenCalledTimes(1);
+
+      post.mockResolvedValueOnce({
+        id: 'event-mortality-remount',
+        event_type: 'MORTALITY',
+        batch_id: batchId,
+      });
+      buttonWithText(elements, 'Retry previous mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([originalKey, originalKey]);
+      expect(post.mock.calls.map((call) => call[1].performed_at)).toEqual([
+        originalPerformedAt,
+        originalPerformedAt,
+      ]);
+      expect(post.mock.calls[1][1].data).toEqual(post.mock.calls[0][1].data);
+      expect(getMortalityWriteRecovery(batchId)).toBeNull();
+      remountCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+});
+
 describe('mortality in-flight draft lock', () => {
   test('mortality draft stays locked during an unresolved POST and unlocks with the exact ambiguous retry', async () => {
     let values: Record<string, string> = {
@@ -2120,6 +2544,7 @@ describe('mortality in-flight draft lock', () => {
     let confirmed = false;
     let confirmedSnapshot: string | null = null;
     let busy = false;
+    let recoveryRequired = false;
     const stateSpy = React.useState as unknown as jest.Mock;
     const refSpy = React.useRef as unknown as jest.Mock;
     const submissionInFlight = { current: false };
@@ -2140,6 +2565,9 @@ describe('mortality in-flight draft lock', () => {
       },
       jest.fn(),
       jest.fn(),
+      (next: boolean) => {
+        recoveryRequired = next;
+      },
     ];
     let rejectPost!: (error: unknown) => void;
     const post = jest.mocked(productionApi.createBatchEvent);
@@ -2161,14 +2589,16 @@ describe('mortality in-flight draft lock', () => {
 
     const renderForm = () => {
       stateSpy.mockReset();
-      [values, confirmed, confirmedSnapshot, busy, null, null].forEach((value, index) =>
-        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      [values, confirmed, confirmedSnapshot, busy, null, null, recoveryRequired].forEach(
+        (value, index) => stateSpy.mockImplementationOnce(() => [value, setters[index]]),
       );
       refSpy
         .mockReset()
         .mockReturnValueOnce(submissionInFlight)
         .mockReturnValueOnce(retryRef)
-        .mockReturnValueOnce(revision);
+        .mockReturnValueOnce(revision)
+        .mockReturnValueOnce({ current: true })
+        .mockReturnValueOnce({ current: null });
       const tree = MortalityForm({ batchId: 'batch-mortality', batchName: 'B-MORT' });
       const elements: React.ReactElement[] = [];
       const visit = (node: unknown): void => {
@@ -2247,16 +2677,23 @@ describe('mortality in-flight draft lock', () => {
       expect(retryRef.current?.performedAt).toBe(submittedPerformedAt);
       expect(retryRef.current?.payload.count).toBe(3);
 
-      const unlockedElements = renderForm();
-      const unlockedInputs = unlockedElements.filter(
+      const recoveryElements = renderForm();
+      const recoveryInputs = recoveryElements.filter(
         (element) => element.type === TextInput,
       ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
-      expect(unlockedInputs.every((input) => input.props.editable !== false)).toBe(true);
-      unlockedInputs[0].props.onChangeText('4');
-      expect(values.count).toBe('4');
-      expect(confirmed).toBe(false);
-      expect(confirmedSnapshot).toBeNull();
+      expect(recoveryInputs.every((input) => input.props.editable === false)).toBe(true);
+      recoveryInputs[0].props.onChangeText('4');
+      expect(values.count).toBe('3');
+      expect(retryRef.current?.idempotencyKey).toBe(submittedKey);
+
+      post.mockResolvedValueOnce({ id: 'event-mortality-recovered', event_type: 'MORTALITY' });
+      await buttonWithText(recoveryElements, 'Retry previous mortality').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([submittedKey, submittedKey]);
+      expect(post.mock.calls[1][1].performed_at).toBe(submittedPerformedAt);
       expect(retryRef.current).toBeNull();
+      expect(getMortalityWriteRecovery('batch-mortality')).toBeNull();
     } finally {
       jest.restoreAllMocks();
     }

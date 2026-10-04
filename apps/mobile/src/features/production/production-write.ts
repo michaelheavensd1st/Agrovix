@@ -719,10 +719,34 @@ export function resolveWriteOutcome({
 
 type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING';
 const PRODUCTION_WRITE_LEDGER = new Map<string, ProductionWriteResult<any>>();
+export interface MortalityWriteRecovery {
+  submission: MortalitySubmission;
+  inFlight: boolean;
+  promise: Promise<MortalityWriteResult> | null;
+  retryOutcome?: 'outcome_unknown' | 'reconciliation_failed';
+}
+
+const MORTALITY_WRITE_RECOVERY = new Map<string, MortalityWriteRecovery>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
   string,
   { submission: ProductionSubmission<any>; promise: Promise<ProductionWriteResult<any>> }
 >();
+
+function mortalityRecoveryKey(batchId: string): string {
+  return JSON.stringify(['MORTALITY', batchId]);
+}
+
+export function getMortalityWriteRecovery(batchId: string): MortalityWriteRecovery | null {
+  return MORTALITY_WRITE_RECOVERY.get(mortalityRecoveryKey(batchId)) ?? null;
+}
+
+export function clearMortalityWriteRecovery(batchId: string, idempotencyKey: string): void {
+  const key = mortalityRecoveryKey(batchId);
+  const recovery = MORTALITY_WRITE_RECOVERY.get(key);
+  if (recovery?.submission.idempotencyKey === idempotencyKey && !recovery.inFlight) {
+    MORTALITY_WRITE_RECOVERY.delete(key);
+  }
+}
 
 function isSameProductionSubmission(
   left: ProductionSubmission<any>,
@@ -1116,13 +1140,64 @@ export function reconcileMortalityWrite({
   ) {
     throw new Error('The preserved mortality submission does not match the current intent.');
   }
-  return reconcileProductionWrite({
+  const recoveryKey = mortalityRecoveryKey(context.batchId);
+  const existingRecovery = MORTALITY_WRITE_RECOVERY.get(recoveryKey);
+  if (
+    existingRecovery &&
+    (existingRecovery.submission.idempotencyKey !== submission.idempotencyKey ||
+      !isSameProductionSubmission(existingRecovery.submission, submission))
+  ) {
+    throw new Error(
+      'An unresolved mortality submission must be reconciled before starting another.',
+    );
+  }
+
+  const corePromise = reconcileProductionWrite({
     context,
     eventType: 'MORTALITY',
     submission,
     post,
     readAll,
   });
+  const recovery: MortalityWriteRecovery = {
+    submission,
+    inFlight: true,
+    promise: null,
+  };
+  const trackedPromise = corePromise.then(
+    (result) => {
+      if (MORTALITY_WRITE_RECOVERY.get(recoveryKey) === recovery) {
+        if (result.retrySubmission) {
+          MORTALITY_WRITE_RECOVERY.set(recoveryKey, {
+            submission: result.retrySubmission as MortalitySubmission,
+            inFlight: false,
+            promise: null,
+            retryOutcome:
+              result.outcome === 'reconciliation_failed'
+                ? 'reconciliation_failed'
+                : 'outcome_unknown',
+          });
+        } else {
+          MORTALITY_WRITE_RECOVERY.delete(recoveryKey);
+        }
+      }
+      return result as MortalityWriteResult;
+    },
+    (error: unknown) => {
+      if (MORTALITY_WRITE_RECOVERY.get(recoveryKey) === recovery) {
+        MORTALITY_WRITE_RECOVERY.set(recoveryKey, {
+          submission,
+          inFlight: false,
+          promise: null,
+          retryOutcome: 'outcome_unknown',
+        });
+      }
+      throw error;
+    },
+  );
+  recovery.promise = trackedPromise;
+  MORTALITY_WRITE_RECOVERY.set(recoveryKey, recovery);
+  return trackedPromise;
 }
 
 export function reconcileSamplingWrite({
