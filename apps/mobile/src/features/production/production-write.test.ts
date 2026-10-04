@@ -66,6 +66,7 @@ import {
   createMortalitySubmission,
   createSamplingSubmission,
   getMortalityWriteRecovery,
+  getSamplingWriteRecovery,
   normalizeMortalityObservedAt,
   normalizeProductionEventTime,
   createFeedingSubmission,
@@ -2764,6 +2765,67 @@ describe('sampling write workflow', () => {
     }
   });
 
+  test.each([
+    ['timezone-free input', '2026-09-26T08:30', 'device'],
+    ['UTC Z input', '2026-09-26T08:30Z', 'UTC'],
+    ['explicit offset input', '2026-09-26T08:30+02:30', 'entered offset +02:30'],
+  ])('sampling confirmation labels %s accurately', (_label, performedAt, expectedZone) => {
+    const values: Record<string, string> = {
+      performed_at: performedAt,
+      sample_size: '30',
+      average_weight: '4.8',
+      minimum_weight: '',
+      maximum_weight: '',
+      weight_unit: 'g',
+      estimated_population: '',
+      notes: '',
+    };
+    const input: SamplingInput = {
+      performed_at: performedAt,
+      sample_size: '30',
+      average_weight: '4.8',
+      minimum_weight: null,
+      maximum_weight: null,
+      weight_unit: 'g',
+      estimated_population: null,
+      notes: '',
+    };
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    stateSpy.mockReset();
+    [
+      [values, jest.fn()],
+      [true, jest.fn()],
+      [createSamplingDraftSignature('batch-sampling', input), jest.fn()],
+      [false, jest.fn()],
+      [null, jest.fn()],
+      [null, jest.fn()],
+      [false, jest.fn()],
+    ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
+    refSpy.mockReset().mockImplementation((initial: unknown) => ({ current: initial }));
+
+    try {
+      const tree = SamplingForm({ batchId: 'batch-sampling' });
+      const textContent = (node: unknown): string => {
+        if (Array.isArray(node)) return node.map(textContent).join(' ');
+        if (typeof node === 'string' || typeof node === 'number') return String(node);
+        if (React.isValidElement(node)) {
+          return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+        }
+        return '';
+      };
+      const preview = textContent(tree).replace(/\s+/g, ' ');
+      const zone =
+        expectedZone === 'device'
+          ? `device local time (${Intl.DateTimeFormat().resolvedOptions().timeZone || 'device local time'})`
+          : expectedZone;
+      expect(preview).toContain(`Observation time ( ${zone} ): ${performedAt}`);
+      expect(preview).toContain(`Sent as UTC: ${normalizeProductionEventTime(performedAt)}`);
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
   test('defaults weight_unit to g and accepts kg', () => {
     const defaulted = buildSamplingPayload({ sample_size: '10', average_weight: '5' });
     expect(defaulted.weight_unit).toBe('g');
@@ -2886,6 +2948,7 @@ describe('sampling write workflow', () => {
     expect(result.reconciliation?.projection.estimated_remaining_population).toBe(22800);
     expect(result.submission.payload.sample_size).toBe(30);
     expect(result.submission.payload).not.toHaveProperty('performed_by_id');
+    expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
 
     const replay = await reconcileSamplingWrite({
       context: samplingContext,
@@ -2898,6 +2961,7 @@ describe('sampling write workflow', () => {
     expect(replay.outcome).toBe('accepted');
     expect(post).toHaveBeenCalledTimes(1);
     expect(readAll).toHaveBeenCalledTimes(2);
+    expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
   });
 
   test('does not reuse a settled sampling result for a different payload under the same key', async () => {
@@ -3095,6 +3159,7 @@ describe('sampling write workflow', () => {
     });
     expect(result.outcome).toBe('rejected');
     expect(result.retrySubmission).toBeNull();
+    expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
   });
 
   test('coalesces concurrent same-key sampling calls into one POST', async () => {
@@ -3145,6 +3210,12 @@ describe('sampling write workflow', () => {
     expect(first.outcome).toBe('reconciliation_failed');
     expect(first.posted).toBe(true);
     expect(first.retrySubmission).toBe(submission);
+    expect(getSamplingWriteRecovery(samplingContext.batchId)).toMatchObject({
+      submission,
+      inFlight: false,
+      promise: null,
+      retryOutcome: 'reconciliation_failed',
+    });
 
     const retry = await reconcileSamplingWrite({
       context: samplingContext,
@@ -3158,6 +3229,7 @@ describe('sampling write workflow', () => {
     expect(retry.reconciled).toBe(true);
     expect(post).toHaveBeenCalledTimes(1);
     expect(readAll).toHaveBeenCalledTimes(2);
+    expect(getSamplingWriteRecovery(samplingContext.batchId)).toBeNull();
   });
 
   test('sampling form requires explicit confirmation, shows high-impact population warning, and blocks stale duplicate submit', async () => {
@@ -3176,6 +3248,7 @@ describe('sampling write workflow', () => {
     let busy = false;
     let error: string | null = null;
     let statusMessage: string | null = null;
+    let recoveryRequired = false;
     const stateSpy = React.useState as unknown as jest.Mock;
     const refSpy = React.useRef as unknown as jest.Mock;
     const submissionInFlight = { current: false };
@@ -3199,6 +3272,9 @@ describe('sampling write workflow', () => {
       },
       (next: string | null) => {
         statusMessage = next;
+      },
+      (next: boolean) => {
+        recoveryRequired = next;
       },
     ];
     let lastTree: React.ReactElement | null = null;
@@ -3225,14 +3301,16 @@ describe('sampling write workflow', () => {
 
     const renderForm = () => {
       stateSpy.mockReset();
-      [values, confirmed, confirmedSnapshot, busy, error, statusMessage].forEach((value, index) =>
-        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      [values, confirmed, confirmedSnapshot, busy, error, statusMessage, recoveryRequired].forEach(
+        (value, index) => stateSpy.mockImplementationOnce(() => [value, setters[index]]),
       );
       refSpy
         .mockReset()
         .mockReturnValueOnce(submissionInFlight)
         .mockReturnValueOnce(retrySubmission)
-        .mockReturnValueOnce(draftRevision);
+        .mockReturnValueOnce(draftRevision)
+        .mockReturnValueOnce({ current: true })
+        .mockReturnValueOnce({ current: null });
       const tree = SamplingForm({
         batchId: 'batch-sampling',
         batchName: 'B-SAMPLE',
@@ -3343,7 +3421,7 @@ describe('sampling write workflow', () => {
     }
   });
 
-  test('sampling draft stays locked during unresolved POST and unlocks with the exact ambiguous retry', async () => {
+  test('sampling draft stays locked after ambiguity and explicitly retries the exact submission', async () => {
     let values: Record<string, string> = {
       performed_at: '2026-09-26T08:30',
       sample_size: '30',
@@ -3357,6 +3435,7 @@ describe('sampling write workflow', () => {
     let confirmed = false;
     let confirmedSnapshot: string | null = null;
     let busy = false;
+    let recoveryRequired = false;
     const stateSpy = React.useState as unknown as jest.Mock;
     const refSpy = React.useRef as unknown as jest.Mock;
     const submissionInFlight = { current: false };
@@ -3377,6 +3456,9 @@ describe('sampling write workflow', () => {
       },
       jest.fn(),
       jest.fn(),
+      (next: boolean) => {
+        recoveryRequired = next;
+      },
     ];
     let rejectPost!: (error: unknown) => void;
     const post = jest.mocked(productionApi.createBatchEvent);
@@ -3398,14 +3480,16 @@ describe('sampling write workflow', () => {
 
     const renderForm = () => {
       stateSpy.mockReset();
-      [values, confirmed, confirmedSnapshot, busy, null, null].forEach((value, index) =>
-        stateSpy.mockImplementationOnce(() => [value, setters[index]]),
+      [values, confirmed, confirmedSnapshot, busy, null, null, recoveryRequired].forEach(
+        (value, index) => stateSpy.mockImplementationOnce(() => [value, setters[index]]),
       );
       refSpy
         .mockReset()
         .mockReturnValueOnce(submissionInFlight)
         .mockReturnValueOnce(retrySubmission)
-        .mockReturnValueOnce(draftRevision);
+        .mockReturnValueOnce(draftRevision)
+        .mockReturnValueOnce({ current: true })
+        .mockReturnValueOnce({ current: null });
       const tree = SamplingForm({ batchId: 'batch-sampling' });
       const elements: React.ReactElement[] = [];
       const visit = (node: unknown): void => {
@@ -3487,16 +3571,304 @@ describe('sampling write workflow', () => {
         normalizeProductionEventTime('2026-09-26T08:30'),
       );
 
-      const unlockedElements = renderForm();
-      const unlockedInputs = unlockedElements.filter(
+      const recoveryElements = renderForm();
+      const recoveryInputs = recoveryElements.filter(
         (element) => element.type === TextInput,
       ) as React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>[];
-      expect(unlockedInputs.every((input) => input.props.editable !== false)).toBe(true);
-      unlockedInputs[1].props.onChangeText('31');
-      expect(values.sample_size).toBe('31');
-      expect(confirmed).toBe(false);
-      expect(confirmedSnapshot).toBeNull();
+      expect(recoveryInputs.every((input) => input.props.editable === false)).toBe(true);
+      recoveryInputs[1].props.onChangeText('31');
+      expect(values.sample_size).toBe('30');
+      expect(retrySubmission.current?.idempotencyKey).toBe(submittedKey);
+      post.mockResolvedValueOnce({ id: 'event-sampling-recovered', event_type: 'SAMPLING' });
+      buttonWithText(recoveryElements, 'Retry previous sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([submittedKey, submittedKey]);
+      expect(post.mock.calls.map((call) => call[1].performed_at)).toEqual([
+        submittedPerformedAt,
+        submittedPerformedAt,
+      ]);
+      expect(post.mock.calls[1][1].data).toEqual(post.mock.calls[0][1].data);
+      expect(getSamplingWriteRecovery('batch-sampling')).toBeNull();
       expect(retrySubmission.current).toBeNull();
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('sampling recovery reattaches pending writes and preserves settled ambiguity across remounts', async () => {
+    const batchId = 'batch-sampling-remount';
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const effectSpy = React.useEffect as unknown as jest.Mock;
+    let stateValues: unknown[] = [];
+    let refs: Array<{ current: unknown }> = [];
+    let effects: Array<() => unknown> = [];
+    let stateIndex = 0;
+    let refIndex = 0;
+    const configureMount = () => {
+      stateValues = [];
+      refs = [];
+      effects = [];
+      stateIndex = 0;
+      refIndex = 0;
+      stateSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = stateIndex++;
+        if (stateValues.length <= index) {
+          stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+        }
+        return [
+          stateValues[index],
+          (next: unknown) => {
+            stateValues[index] =
+              typeof next === 'function'
+                ? (next as (current: unknown) => unknown)(stateValues[index])
+                : next;
+          },
+        ];
+      });
+      refSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = refIndex++;
+        if (refs.length <= index) refs.push({ current: initial });
+        return refs[index];
+      });
+      effectSpy.mockReset().mockImplementation((effect: () => unknown) => {
+        effects.push(effect);
+      });
+    };
+    const renderForm = (onSaved: jest.Mock) => {
+      stateIndex = 0;
+      refIndex = 0;
+      const tree = SamplingForm({ batchId, batchName: 'B-SAMPLE-REMOUNT', onSaved });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(text),
+      ) as React.ReactElement<{ onPress: () => void; disabled?: boolean }>;
+    const deferredPosts: Array<{
+      resolve: (event: Record<string, unknown>) => void;
+      reject: (reason: unknown) => void;
+    }> = [];
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockImplementation(
+      () =>
+        new Promise<Record<string, unknown>>((resolve, reject) => {
+          deferredPosts.push({ resolve, reject });
+        }),
+    );
+    const reconciliation = {
+      batch: { id: batchId, code: 'B-SAMPLE-REMOUNT', state: 'active' },
+      projection: {
+        batch_id: batchId,
+        initial_stocked_quantity: 100,
+        estimated_remaining_population: 75,
+        latest_average_weight: 4.8,
+      },
+      events: [{ event_type: 'SAMPLING', performed_at: '2026-09-27T08:30:00.000Z' }],
+    };
+    jest.mocked(productionApi.getProductionBatch).mockResolvedValue(reconciliation.batch);
+    jest.mocked(productionApi.getBatchProjections).mockResolvedValue(reconciliation.projection);
+    jest.mocked(productionApi.listBatchEvents).mockResolvedValue({
+      items: reconciliation.events,
+      next_cursor: null,
+      limit: 25,
+    });
+    const firstOriginalOnSaved = jest.fn();
+    const firstRemountedOnSaved = jest.fn();
+    const secondOriginalOnSaved = jest.fn();
+    const secondPendingRemountedOnSaved = jest.fn();
+    const settledRetryOnSaved = jest.fn();
+
+    try {
+      configureMount();
+      let elements = renderForm(firstOriginalOnSaved);
+      const firstOriginalCleanups = effects.slice().map((effect) => effect());
+      let inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>
+      >;
+      inputs[0].props.onChangeText('2026-09-26T08:30Z');
+      inputs[1].props.onChangeText('30');
+      inputs[2].props.onChangeText('4.8');
+      elements = renderForm(firstOriginalOnSaved);
+      buttonWithText(elements, 'I confirm this sampling record').props.onPress();
+      elements = renderForm(firstOriginalOnSaved);
+      buttonWithText(elements, 'Submit sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      const firstRecovery = getSamplingWriteRecovery(batchId);
+      if (!firstRecovery?.promise) {
+        throw new Error('Expected the pending SAMPLING recovery to retain its promise.');
+      }
+      const firstSubmission = firstRecovery.submission as SamplingSubmission;
+      const firstPromise = firstRecovery.promise;
+      expect(firstRecovery.inFlight).toBe(true);
+      expect(getSamplingWriteRecovery('another-sampling-batch')).toBeNull();
+      expect(getMortalityWriteRecovery(batchId)).toBeNull();
+      expect(post.mock.calls[0][0]).toBe(batchId);
+      expect(post.mock.calls[0][1]).toMatchObject({
+        event_type: 'SAMPLING',
+        performed_at: firstSubmission.performedAt,
+        data: firstSubmission.payload,
+      });
+      expect(post.mock.calls[0][2]).toBe(firstSubmission.idempotencyKey);
+      expect(firstSubmission.performedAt).toBe('2026-09-26T08:30:00.000Z');
+
+      firstOriginalCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+      configureMount();
+      elements = renderForm(firstRemountedOnSaved);
+      const pendingRemountEffects = effects.slice();
+      const pendingRemountCleanups = pendingRemountEffects.map((effect) => effect());
+      expect(getSamplingWriteRecovery(batchId)?.promise).toBe(firstPromise);
+      expect(stateValues[3]).toBe(true);
+      expect(buttonWithText(elements, 'Saving…').props.disabled).toBe(true);
+      await Promise.resolve();
+      expect(post).toHaveBeenCalledTimes(1);
+
+      deferredPosts[0].resolve({
+        id: 'event-sampling-pending-remount',
+        event_type: 'SAMPLING',
+        batch_id: batchId,
+      });
+      await firstPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0][0]).toBe(batchId);
+      expect(post.mock.calls[0][2]).toBe(firstSubmission.idempotencyKey);
+      expect(post.mock.calls[0][1].performed_at).toBe(firstSubmission.performedAt);
+      expect(post.mock.calls[0][1].data).toEqual(firstSubmission.payload);
+      expect(firstOriginalOnSaved).not.toHaveBeenCalled();
+      expect(firstRemountedOnSaved).toHaveBeenCalledWith(firstSubmission, reconciliation);
+      expect(stateValues[5]).toContain('Sampling has been recorded and reconciled');
+      expect(getSamplingWriteRecovery(batchId)).toBeNull();
+      pendingRemountCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+
+      configureMount();
+      elements = renderForm(secondOriginalOnSaved);
+      const secondOriginalCleanups = effects.slice().map((effect) => effect());
+      inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ onChangeText: (value: string) => void }>
+      >;
+      inputs[0].props.onChangeText('2026-09-27T08:30Z');
+      inputs[1].props.onChangeText('25');
+      inputs[2].props.onChangeText('5.2');
+      elements = renderForm(secondOriginalOnSaved);
+      buttonWithText(elements, 'I confirm this sampling record').props.onPress();
+      elements = renderForm(secondOriginalOnSaved);
+      buttonWithText(elements, 'Submit sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(2);
+      const secondRecovery = getSamplingWriteRecovery(batchId);
+      if (!secondRecovery?.promise) {
+        throw new Error('Expected the second pending SAMPLING recovery to retain its promise.');
+      }
+      const secondSubmission = secondRecovery.submission as SamplingSubmission;
+      const secondPromise = secondRecovery.promise;
+      expect(secondRecovery.inFlight).toBe(true);
+      expect(secondSubmission.idempotencyKey).not.toBe(firstSubmission.idempotencyKey);
+      expect(post.mock.calls[1][0]).toBe(batchId);
+      expect(post.mock.calls[1][1]).toMatchObject({
+        event_type: 'SAMPLING',
+        performed_at: secondSubmission.performedAt,
+        data: secondSubmission.payload,
+      });
+
+      secondOriginalCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+      configureMount();
+      elements = renderForm(secondPendingRemountedOnSaved);
+      const secondPendingEffects = effects.slice();
+      const secondPendingCleanups = secondPendingEffects.map((effect) => effect());
+      expect(getSamplingWriteRecovery(batchId)?.promise).toBe(secondPromise);
+      expect(getSamplingWriteRecovery('other-sampling-batch')).toBeNull();
+      expect(getMortalityWriteRecovery(batchId)).toBeNull();
+      expect(stateValues[3]).toBe(true);
+      expect(post).toHaveBeenCalledTimes(2);
+
+      deferredPosts[1].reject(
+        new ApiFailure(
+          'network',
+          'http://localhost:8000/api',
+          `/v1/batches/${batchId}/events`,
+          undefined,
+          'TypeError',
+          'Network request failed',
+        ),
+      );
+      await secondPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const settledRecovery = getSamplingWriteRecovery(batchId);
+      expect(settledRecovery?.inFlight).toBe(false);
+      expect(settledRecovery?.retryOutcome).toBe('outcome_unknown');
+      expect(settledRecovery?.submission).toBe(secondSubmission);
+      expect(secondPendingRemountedOnSaved).not.toHaveBeenCalled();
+      expect(post).toHaveBeenCalledTimes(2);
+      secondPendingCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+
+      configureMount();
+      elements = renderForm(settledRetryOnSaved);
+      effects.slice().forEach((effect) => effect());
+      inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ editable?: boolean; onChangeText: (value: string) => void }>
+      >;
+      expect(inputs.every((input) => input.props.editable === false)).toBe(true);
+      expect(textContent(elements)).toContain('uncertain outcome');
+      expect(buttonWithText(elements, 'Retry previous sampling').props.disabled).toBe(false);
+      inputs[1].props.onChangeText('99');
+      expect(stateValues[0]).toMatchObject({ sample_size: '25' });
+      expect(getSamplingWriteRecovery(batchId)?.submission).toBe(secondSubmission);
+      expect(post).toHaveBeenCalledTimes(2);
+
+      post.mockResolvedValueOnce({
+        id: 'event-sampling-settled-retry',
+        event_type: 'SAMPLING',
+        batch_id: batchId,
+      });
+      buttonWithText(elements, 'Retry previous sampling').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(post).toHaveBeenCalledTimes(3);
+      expect(post.mock.calls[2][0]).toBe(batchId);
+      expect(post.mock.calls.map((call) => call[2])).toEqual([
+        firstSubmission.idempotencyKey,
+        secondSubmission.idempotencyKey,
+        secondSubmission.idempotencyKey,
+      ]);
+      expect(post.mock.calls[2][1].performed_at).toBe(secondSubmission.performedAt);
+      expect(post.mock.calls[2][1].data).toEqual(post.mock.calls[1][1].data);
+      expect(settledRetryOnSaved).toHaveBeenCalledWith(secondSubmission, reconciliation);
+      expect(getSamplingWriteRecovery(batchId)).toBeNull();
+      expect(getMortalityWriteRecovery(batchId)).toBeNull();
     } finally {
       jest.restoreAllMocks();
     }
@@ -3504,6 +3876,7 @@ describe('sampling write workflow', () => {
 
   test('sampling form does not claim population replacement when estimated_population is omitted', () => {
     let values: Record<string, string> = {
+      performed_at: '2026-09-26T08:30',
       sample_size: '30',
       average_weight: '4.8',
       minimum_weight: '',
@@ -3527,12 +3900,15 @@ describe('sampling write workflow', () => {
       [false, jest.fn()],
       [null, jest.fn()],
       [null, jest.fn()],
+      [false, jest.fn()],
     ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
     refSpy
       .mockReset()
       .mockReturnValueOnce({ current: false })
       .mockReturnValueOnce({ current: null })
-      .mockReturnValueOnce({ current: 0 });
+      .mockReturnValueOnce({ current: 0 })
+      .mockReturnValueOnce({ current: true })
+      .mockReturnValueOnce({ current: null });
 
     try {
       const tree = SamplingForm({
@@ -3580,6 +3956,7 @@ describe('sampling write workflow', () => {
       expectedAverage,
     ) => {
       const values: Record<string, string> = {
+        performed_at: '2026-09-26T08:30',
         sample_size: '30',
         average_weight: averageWeight,
         minimum_weight: '0',
@@ -3590,6 +3967,7 @@ describe('sampling write workflow', () => {
       };
       let confirmed = true;
       let confirmedSnapshot: string | null = createSamplingDraftSignature('batch-sampling', {
+        performed_at: '2026-09-26T08:30',
         sample_size: '30',
         average_weight: averageWeight,
         minimum_weight: '0',
@@ -3619,12 +3997,15 @@ describe('sampling write workflow', () => {
           [false, jest.fn()],
           [null, jest.fn()],
           [null, jest.fn()],
+          [false, jest.fn()],
         ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
         refSpy
           .mockReset()
           .mockReturnValueOnce(inFlight)
           .mockReturnValueOnce(retrySubmission)
-          .mockReturnValueOnce(draftRevision);
+          .mockReturnValueOnce(draftRevision)
+          .mockReturnValueOnce({ current: true })
+          .mockReturnValueOnce({ current: null });
         return SamplingForm({
           batchId: 'batch-sampling',
           currentEstimatedRemainingPopulation: currentPopulation,
@@ -3654,6 +4035,7 @@ describe('sampling write workflow', () => {
 
   test('sampling form edit invalidates confirmation and a retained ambiguous retry', async () => {
     const values: Record<string, string> = {
+      performed_at: '2026-09-26T08:30',
       sample_size: '30',
       average_weight: '4.8',
       minimum_weight: '',
@@ -3664,6 +4046,7 @@ describe('sampling write workflow', () => {
     };
     let confirmed = true;
     let confirmedSnapshot: string | null = createSamplingDraftSignature('batch-sampling', {
+      performed_at: '2026-09-26T08:30',
       sample_size: '30',
       average_weight: '4.8',
       minimum_weight: null,
@@ -3698,12 +4081,15 @@ describe('sampling write workflow', () => {
         [false, jest.fn()],
         [null, jest.fn()],
         [null, jest.fn()],
+        [false, jest.fn()],
       ].forEach((state) => stateSpy.mockImplementationOnce(() => state));
       refSpy
         .mockReset()
         .mockReturnValueOnce(inFlight)
         .mockReturnValueOnce(retryRef)
-        .mockReturnValueOnce(revision);
+        .mockReturnValueOnce(revision)
+        .mockReturnValueOnce({ current: true })
+        .mockReturnValueOnce({ current: null });
       return SamplingForm({ batchId: 'batch-sampling' });
     };
 
