@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import {
   createBatchEvent,
@@ -8,8 +8,10 @@ import {
 } from '../../lib/production-api';
 import {
   buildSamplingPayload,
+  clearSamplingWriteRecovery,
   createSamplingDraftSignature,
   createSamplingSubmission,
+  getSamplingWriteRecovery,
   normalizeProductionEventTime,
   reconcileSamplingWrite,
   type SamplingInput,
@@ -22,6 +24,32 @@ function getLocalDateTimeInputValue(): string {
   const now = new Date();
   const pad = (value: number) => String(value).padStart(2, '0');
   return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+function getSamplingFormValues(submission?: SamplingSubmission | null): Record<string, string> {
+  if (!submission) {
+    return {
+      performed_at: getLocalDateTimeInputValue(),
+      sample_size: '',
+      average_weight: '',
+      minimum_weight: '',
+      maximum_weight: '',
+      weight_unit: 'g',
+      estimated_population: '',
+      notes: '',
+    };
+  }
+
+  return {
+    performed_at: submission.performedAt ?? '',
+    sample_size: String(submission.payload.sample_size),
+    average_weight: String(submission.payload.average_weight),
+    minimum_weight: submission.payload.minimum_weight?.toString() ?? '',
+    maximum_weight: submission.payload.maximum_weight?.toString() ?? '',
+    weight_unit: submission.payload.weight_unit,
+    estimated_population: submission.payload.estimated_population?.toString() ?? '',
+    notes: submission.payload.notes ?? '',
+  };
 }
 
 export interface SamplingFormProps {
@@ -46,24 +74,20 @@ export function SamplingForm({
   currentEstimatedRemainingPopulation,
   onSaved,
 }: SamplingFormProps) {
-  const [values, setValues] = useState<Record<string, string>>({
-    performed_at: getLocalDateTimeInputValue(),
-    sample_size: '',
-    average_weight: '',
-    minimum_weight: '',
-    maximum_weight: '',
-    weight_unit: 'g',
-    estimated_population: '',
-    notes: '',
-  });
+  const recoveryAtMount = getSamplingWriteRecovery(batchId);
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    getSamplingFormValues(recoveryAtMount?.submission),
+  );
   const [confirmed, setConfirmed] = useState(false);
   const [confirmedSnapshot, setConfirmedSnapshot] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(recoveryAtMount?.inFlight ?? false);
   const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const submissionInFlight = useRef(false);
-  const retrySubmission = useRef<SamplingSubmission | null>(null);
+  const [recoveryRequired, setRecoveryRequired] = useState(Boolean(recoveryAtMount));
+  const submissionInFlight = useRef(recoveryAtMount?.inFlight ?? false);
+  const retrySubmission = useRef<SamplingSubmission | null>(recoveryAtMount?.submission ?? null);
   const draftRevision = useRef(0);
+  const mounted = useRef(true);
 
   const context: WaterQualityWriteContext = {
     batchId,
@@ -85,9 +109,42 @@ export function SamplingForm({
     notes: values.notes,
   });
 
+  const reconcileSubmission = (submission: SamplingSubmission) =>
+    reconcileSamplingWrite({
+      context,
+      payload: { ...submission.payload, performed_at: submission.performedAt },
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post: async (targetBatchId, eventType, data, key, performedAt) =>
+        createBatchEvent(
+          targetBatchId,
+          {
+            event_type: eventType,
+            ...(performedAt ? { performed_at: performedAt } : {}),
+            data,
+          },
+          key,
+        ),
+      readAll: async (targetBatchId) => {
+        const [batch, projection, eventData] = await Promise.all([
+          getProductionBatch(targetBatchId),
+          getBatchProjections(targetBatchId),
+          listBatchEvents(targetBatchId),
+        ]);
+        return {
+          batch,
+          projection,
+          events: Array.isArray(eventData.items) ? eventData.items : [],
+        };
+      },
+    });
+
   const updateField = (field: string, value: string) => {
-    if (submissionInFlight.current || busy) return;
+    if (submissionInFlight.current || busy || recoveryRequired) return;
     draftRevision.current += 1;
+    if (retrySubmission.current) {
+      clearSamplingWriteRecovery(batchId, retrySubmission.current.idempotencyKey);
+    }
     retrySubmission.current = null;
     setValues((current) => ({ ...current, [field]: value }));
     setConfirmed(false);
@@ -96,12 +153,159 @@ export function SamplingForm({
     setStatusMessage(null);
   };
 
+  const handleWriteResult = (
+    result: Awaited<ReturnType<typeof reconcileSamplingWrite>>,
+    submissionRevision: number,
+  ) => {
+    if (!mounted.current) return;
+    const recovery = getSamplingWriteRecovery(batchId);
+    const retainedSubmission =
+      recovery?.submission.idempotencyKey === result.submission.idempotencyKey
+        ? (recovery.submission as SamplingSubmission)
+        : null;
+    retrySubmission.current =
+      draftRevision.current === submissionRevision
+        ? (result.retrySubmission ?? (result.outcome === 'accepted' ? retainedSubmission : null))
+        : null;
+    setRecoveryRequired(Boolean(result.retrySubmission) || Boolean(retainedSubmission));
+    if (result.outcome === 'accepted') {
+      setConfirmed(false);
+      setConfirmedSnapshot(null);
+      setStatusMessage('Sampling has been recorded and reconciled against the current batch.');
+      if (result.reconciliation) {
+        onSaved?.(result.submission, result.reconciliation);
+        clearSamplingWriteRecovery(batchId, result.submission.idempotencyKey);
+        retrySubmission.current = null;
+        setRecoveryRequired(false);
+      } else {
+        setError(
+          'The accepted sampling write is missing reconciliation data. Reconcile it before editing.',
+        );
+      }
+    } else if (result.outcome === 'rejected') {
+      setConfirmed(false);
+      setConfirmedSnapshot(null);
+      retrySubmission.current = null;
+      setError(
+        'The server rejected this sampling record. Refresh the batch and review the current state before submitting a corrected record.',
+      );
+    } else if (result.outcome === 'reconciliation_failed') {
+      setError(
+        'The sampling event was accepted, but reconciliation failed. The immutable submission is preserved for a read-only retry.',
+      );
+    } else if (result.outcome === 'outcome_unknown') {
+      setError(
+        'The sampling write outcome is uncertain. The immutable submission has been preserved for retry with the same key.',
+      );
+    } else {
+      setError(
+        'The sampling write failed. No retry submission was preserved; review the record before starting a new submission.',
+      );
+    }
+  };
+
+  const handleWriteResultRef = useRef(handleWriteResult);
+  handleWriteResultRef.current = handleWriteResult;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const recovery = getSamplingWriteRecovery(batchId);
+    if (!recovery) {
+      setRecoveryRequired(false);
+      if (submissionInFlight.current) {
+        submissionInFlight.current = false;
+        retrySubmission.current = null;
+        setConfirmed(false);
+        setConfirmedSnapshot(null);
+        setBusy(false);
+      }
+      return;
+    }
+
+    retrySubmission.current = recovery.submission as SamplingSubmission;
+    if (recovery.retryOutcome === 'accepted') {
+      setRecoveryRequired(true);
+      setBusy(true);
+      submissionInFlight.current = true;
+      let subscribed = true;
+      void reconcileSubmission(recovery.submission as SamplingSubmission)
+        .then((result) => {
+          if (subscribed && mounted.current) {
+            handleWriteResultRef.current(result, draftRevision.current);
+          }
+        })
+        .catch((caught) => {
+          if (subscribed && mounted.current) {
+            setError(caught instanceof Error ? caught.message : 'Unable to reconcile sampling.');
+          }
+        })
+        .finally(() => {
+          if (subscribed && mounted.current) {
+            setBusy(false);
+            submissionInFlight.current = false;
+          }
+        });
+
+      return () => {
+        subscribed = false;
+      };
+    }
+
+    if (!recovery.inFlight || !recovery.promise) {
+      setRecoveryRequired(true);
+      setBusy(false);
+      submissionInFlight.current = false;
+      setError(
+        recovery.retryOutcome === 'reconciliation_failed'
+          ? 'A previous sampling was accepted but could not be reconciled. Use Reconcile previous sampling to refresh with the original submission.'
+          : 'A previous sampling submission has an uncertain outcome. Its original details and key are retained. Use Retry previous sampling to resolve it before editing.',
+      );
+      return;
+    }
+
+    setRecoveryRequired(true);
+    submissionInFlight.current = true;
+    setBusy(true);
+    let subscribed = true;
+    void recovery.promise
+      .then((result) => {
+        if (subscribed && mounted.current) {
+          handleWriteResultRef.current(
+            result as Awaited<ReturnType<typeof reconcileSamplingWrite>>,
+            draftRevision.current,
+          );
+        }
+      })
+      .catch((caught) => {
+        if (subscribed && mounted.current) {
+          setError(caught instanceof Error ? caught.message : 'Unable to record sampling.');
+        }
+      })
+      .finally(() => {
+        if (subscribed && mounted.current) {
+          setBusy(false);
+          submissionInFlight.current = false;
+        }
+      });
+
+    return () => {
+      subscribed = false;
+    };
+  }, [batchId]);
+
   const handleSubmit = async () => {
     if (submissionInFlight.current) return;
     submissionInFlight.current = true;
     try {
       if (busy) return;
-      if (!confirmed) {
+      const recovering = recoveryRequired;
+      if (!confirmed && !recovering) {
         setError('Please confirm this sampling record before submission.');
         return;
       }
@@ -114,9 +318,12 @@ export function SamplingForm({
         return;
       }
       const signature = createSamplingDraftSignature(batchId, input);
-      if (confirmedSnapshot !== signature) {
+      if (!recovering && confirmedSnapshot !== signature) {
         setConfirmed(false);
         setConfirmedSnapshot(null);
+        if (retrySubmission.current) {
+          clearSamplingWriteRecovery(batchId, retrySubmission.current.idempotencyKey);
+        }
         retrySubmission.current = null;
         setError(
           'The sampling record changed after confirmation. Confirm the updated record before submitting.',
@@ -137,81 +344,47 @@ export function SamplingForm({
       }
 
       const submissionRevision = draftRevision.current;
-      const submission =
-        retrySubmission.current?.batchId === batchId
-          ? retrySubmission.current
-          : createSamplingSubmission(batchId, input, undefined, context);
+      let submission: SamplingSubmission;
+      if (recovering) {
+        const recovered = retrySubmission.current;
+        if (
+          !recovered ||
+          recovered.batchId !== batchId ||
+          JSON.stringify(recovered.payload) !== JSON.stringify(payload) ||
+          recovered.performedAt !== normalizedPerformedAt
+        ) {
+          setError(
+            'The retained sampling submission does not match this batch and cannot be retried safely.',
+          );
+          return;
+        }
+        submission = recovered;
+      } else {
+        submission =
+          retrySubmission.current?.batchId === batchId
+            ? retrySubmission.current
+            : createSamplingSubmission(batchId, input, undefined, context);
+      }
       setBusy(true);
       setError(null);
       setStatusMessage(null);
 
-      const result = await reconcileSamplingWrite({
-        context,
-        payload,
-        idempotencyKey: submission.idempotencyKey,
-        submission,
-        post: async (targetBatchId, eventType, data, key, performedAt) =>
-          createBatchEvent(
-            targetBatchId,
-            {
-              event_type: eventType,
-              ...(performedAt ? { performed_at: performedAt } : {}),
-              data,
-            },
-            key,
-          ),
-        readAll: async (targetBatchId) => {
-          const [batch, projection, eventData] = await Promise.all([
-            getProductionBatch(targetBatchId),
-            getBatchProjections(targetBatchId),
-            listBatchEvents(targetBatchId),
-          ]);
-          return {
-            batch,
-            projection,
-            events: Array.isArray(eventData.items) ? eventData.items : [],
-          };
-        },
-      });
-
-      retrySubmission.current =
-        draftRevision.current === submissionRevision ? result.retrySubmission : null;
-      if (result.outcome === 'accepted') {
-        setConfirmed(false);
-        setConfirmedSnapshot(null);
-        retrySubmission.current = null;
-        setStatusMessage('Sampling has been recorded and reconciled against the current batch.');
-        if (result.reconciliation) onSaved?.(result.submission, result.reconciliation);
-      } else if (result.outcome === 'rejected') {
-        setConfirmed(false);
-        setConfirmedSnapshot(null);
-        retrySubmission.current = null;
-        setError(
-          'The server rejected this sampling record. Refresh the batch and review the current state before submitting a corrected record.',
-        );
-      } else if (result.outcome === 'reconciliation_failed') {
-        setError(
-          'The sampling event was accepted, but reconciliation failed. The immutable submission is preserved for a read-only retry.',
-        );
-      } else if (result.outcome === 'outcome_unknown') {
-        setError(
-          'The sampling write outcome is uncertain. The immutable submission has been preserved for retry with the same key.',
-        );
-      } else {
-        setError(
-          'The sampling write failed. No retry submission was preserved; review the record before starting a new submission.',
-        );
-      }
+      const result = await reconcileSubmission(submission);
+      if (mounted.current) handleWriteResultRef.current(result, submissionRevision);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Unable to record sampling.');
+      if (mounted.current) {
+        setError(caught instanceof Error ? caught.message : 'Unable to record sampling.');
+      }
     } finally {
-      setBusy(false);
-      submissionInFlight.current = false;
+      if (mounted.current) {
+        setBusy(false);
+        submissionInFlight.current = false;
+      }
     }
   };
 
   const fields = [
-    ['performed_at', 'Observation time (device local)', 'default'],
+    ['performed_at', 'Observation time', 'default'],
     ['sample_size', 'Sample size (individuals weighed)', 'numeric'],
     ['average_weight', 'Average weight', 'numeric'],
     ['minimum_weight', 'Minimum weight (optional)', 'numeric'],
@@ -221,6 +394,12 @@ export function SamplingForm({
   ] as const;
   const weightUnits = ['g', 'kg'] as const;
   const deviceTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'device local time';
+  const enteredOffset = /(?:Z|([+-]\d{2}:?\d{2}))$/i.exec(values.performed_at.trim());
+  const observationTimeZone = enteredOffset
+    ? enteredOffset[0].toUpperCase() === 'Z'
+      ? 'UTC'
+      : `entered offset ${enteredOffset[1]}`
+    : `device local time (${deviceTimeZone})`;
   const normalizedPerformedAt = normalizeProductionEventTime(values.performed_at);
   const estimatedPopulationEntered = values.estimated_population.trim().length > 0;
   const estimatedPopulation = Number(values.estimated_population);
@@ -238,6 +417,19 @@ export function SamplingForm({
       <Text style={styles.subtitle}>
         {`${batchLabel} · ${farmName ?? 'Farm'} · ${siteName ?? 'Site'} · ${unitName ?? 'Unit'}`}
       </Text>
+      {retrySubmission.current ? (
+        <Text style={styles.warning}>
+          {busy
+            ? 'A sampling submission from this batch is still resolving. No new write will be sent.'
+            : recoveryRequired
+              ? getSamplingWriteRecovery(batchId)?.retryOutcome === 'accepted'
+                ? 'A previous sampling was accepted. Authoritative batch data is being refreshed; editing remains locked.'
+                : getSamplingWriteRecovery(batchId)?.retryOutcome === 'reconciliation_failed'
+                  ? 'A previous sampling was accepted but could not be reconciled. Editing is locked; use Reconcile previous sampling to refresh with the original submission.'
+                  : 'A previous sampling submission has an uncertain outcome. Its original submission and key are retained. Editing is locked until you retry it explicitly.'
+              : 'A previous sampling submission has an uncertain outcome. Confirming and retrying will reuse its original submission and key.'}
+        </Text>
+      ) : null}
       {fields.map(([field, label, keyboardType]) => (
         <View key={field} style={styles.row}>
           <Text style={styles.label}>{label}</Text>
@@ -246,7 +438,7 @@ export function SamplingForm({
             value={values[field]}
             onChangeText={(value) => updateField(field, value)}
             keyboardType={keyboardType === 'numeric' ? 'numeric' : 'default'}
-            editable={!busy}
+            editable={!busy && !recoveryRequired}
             placeholder={field === 'sample_size' ? '30' : ''}
           />
         </View>
@@ -257,7 +449,7 @@ export function SamplingForm({
           <Pressable
             key={unit}
             onPress={() => updateField('weight_unit', unit)}
-            disabled={busy}
+            disabled={busy || recoveryRequired}
             style={[styles.secondaryButton, values.weight_unit === unit && styles.optionSelected]}
           >
             <Text
@@ -283,7 +475,7 @@ export function SamplingForm({
       ) : null}
       <Pressable
         onPress={() => {
-          if (submissionInFlight.current || busy) return;
+          if (submissionInFlight.current || busy || recoveryRequired) return;
           const next = !confirmed;
           if (next) {
             if (!normalizeProductionEventTime(values.performed_at)) {
@@ -310,18 +502,22 @@ export function SamplingForm({
           setStatusMessage(null);
           setConfirmedSnapshot(next ? createSamplingDraftSignature(batchId, toInput()) : null);
         }}
-        disabled={busy}
+        disabled={busy || recoveryRequired}
         style={styles.checkboxRow}
       >
         <View style={[styles.checkbox, confirmed && styles.checkboxChecked]}>
           {confirmed ? <Text style={styles.checkboxMark}>✓</Text> : null}
         </View>
-        <Text style={styles.checkboxText}>I confirm this sampling record for {batchLabel}.</Text>
+        <Text style={styles.checkboxText}>
+          {recoveryRequired
+            ? `Previously confirmed sampling for ${batchLabel}; recovery is locked until its outcome is resolved.`
+            : `I confirm this sampling record for ${batchLabel}.`}
+        </Text>
       </Pressable>
-      {confirmed ? (
+      {confirmed || recoveryRequired ? (
         <View style={styles.confirmationSummary}>
           <Text style={styles.summaryText}>
-            Observation time ({deviceTimeZone}): {values.performed_at}
+            Observation time ({observationTimeZone}): {values.performed_at}
           </Text>
           <Text style={styles.summaryText}>Sent as UTC: {normalizedPerformedAt}</Text>
           <Text style={styles.summaryText}>Sample size: {values.sample_size || 'Not entered'}</Text>
@@ -371,7 +567,17 @@ export function SamplingForm({
         onPress={() => void handleSubmit()}
         disabled={busy}
       >
-        <Text style={styles.primaryButtonText}>{busy ? 'Saving…' : 'Submit sampling'}</Text>
+        <Text style={styles.primaryButtonText}>
+          {busy
+            ? 'Saving…'
+            : recoveryRequired
+              ? ['accepted', 'reconciliation_failed'].includes(
+                  getSamplingWriteRecovery(batchId)?.retryOutcome ?? '',
+                )
+                ? 'Reconcile previous sampling'
+                : 'Retry previous sampling'
+              : 'Submit sampling'}
+        </Text>
       </Pressable>
     </View>
   );
