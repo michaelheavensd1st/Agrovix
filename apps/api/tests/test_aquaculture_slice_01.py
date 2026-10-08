@@ -403,7 +403,7 @@ async def test_final_harvest_transitions_to_harvested(client: AsyncClient) -> No
     batch_id, _, _ = await _prepare_active_grow_out(client)
     r = await client.post(
         f"/api/v1/batches/{batch_id}/events",
-        json={"event_type": "HARVEST", "data": harvest_payload(is_final=True)},
+        json={"event_type": "HARVEST", "data": harvest_payload(quantity=25_000, is_final=True)},
     )
     assert r.status_code == 201, r.text
     r = await client.get(f"/api/v1/batches/{batch_id}")

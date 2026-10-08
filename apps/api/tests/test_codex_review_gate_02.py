@@ -23,17 +23,22 @@ from __future__ import annotations
 
 import asyncio
 import os
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.production import ProductionEvent
+from app.repositories.production import ProductionBatchRepository
 from tests._helpers import (
     create_org,
     create_verified_user,
     harvest_payload,
     invite_and_accept,
     mortality_payload,
+    sampling_payload,
     stocking_payload,
     switch_user,
     transfer_payload,
@@ -280,14 +285,13 @@ async def test_second_final_harvest_rejected(client: AsyncClient) -> None:
         json={
             "event_type": "HARVEST",
             "data": harvest_payload(
-                quantity=30, total_weight=10, harvest_type="total", is_final=True
+                quantity=80, total_weight=10, harvest_type="total", is_final=True
             ),
         },
     )
     assert r.status_code == 201, r.text
 
-    # Second final harvest — batch already HARVESTED so the terminal
-    # guard fires first.
+    # Second final harvest — rejected by the final-harvest guard.
     r = await client.post(
         f"/api/v1/batches/{ctx['batch_id']}/events",
         json={
@@ -298,6 +302,270 @@ async def test_second_final_harvest_rejected(client: AsyncClient) -> None:
         },
     )
     assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_already_final"
+
+
+# --------------------------------------------------------------------- #
+# 3b. HARVEST safety (final = ACTIVE-only, full remaining, once)
+# --------------------------------------------------------------------- #
+def _events_url(ctx: dict) -> str:
+    return f"/api/v1/batches/{ctx['batch_id']}/events"
+
+
+def _harvest_body(
+    quantity: int, *, final: bool, total_weight: float = 10.0, harvested_at: str | None = None
+) -> dict:
+    data = harvest_payload(
+        quantity=quantity,
+        total_weight=total_weight,
+        harvest_type="total" if final else "partial",
+        is_final=final,
+    )
+    if harvested_at is not None:
+        data["harvested_at"] = harvested_at
+    return {"event_type": "HARVEST", "data": data}
+
+
+async def _harvest_event_count(client: AsyncClient, ctx: dict) -> int:
+    r = await client.get(_events_url(ctx), params={"event_type": "HARVEST"})
+    assert r.status_code == 200, r.text
+    return len(r.json()["items"])
+
+
+async def _batch_state(client: AsyncClient, ctx: dict) -> str:
+    r = await client.get(f"/api/v1/batches/{ctx['batch_id']}")
+    assert r.status_code == 200, r.text
+    return r.json()["state"]
+
+
+async def test_final_harvest_equal_to_remaining_transitions_to_harvested(
+    client: AsyncClient,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, ctx) == "harvested"
+
+
+async def test_final_harvest_after_partial_must_equal_remaining(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(40, final=False))
+    assert r.status_code == 201, r.text
+    r = await client.post(_events_url(ctx), json=_harvest_body(60, final=True))
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, ctx) == "harvested"
+
+
+@pytest.mark.parametrize("target", ["stocked", "suspended"])
+async def test_final_harvest_requires_active_batch(client: AsyncClient, target: str) -> None:
+    ctx = await _prepare_planned_batch(client)
+    r = await client.post(
+        _events_url(ctx), json={"event_type": "STOCKING", "data": stocking_payload(quantity=100)}
+    )
+    assert r.status_code == 201, r.text
+    if target == "suspended":
+        r = await client.post(
+            f"/api/v1/batches/{ctx['batch_id']}/transitions", json={"target_state": "suspended"}
+        )
+        assert r.status_code == 200, r.text
+    assert await _batch_state(client, ctx) == target
+
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "harvest_final_requires_active"
+    assert detail["current_state"] == target
+    assert detail["required_state"] == "active"
+    assert await _harvest_event_count(client, ctx) == 0
+    assert await _batch_state(client, ctx) == target
+
+
+async def test_partial_harvest_still_allowed_on_active_batch(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(30, final=False))
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, ctx) == "active"
+    proj = (await client.get(f"/api/v1/batches/{ctx['batch_id']}/projections")).json()
+    assert proj["cumulative_harvest"] == 30
+    assert proj["estimated_remaining_population"] == 70
+
+
+async def test_final_harvest_below_remaining_rejected(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(99, final=True))
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "harvest_final_quantity_mismatch"
+    assert detail["quantity"] == 99
+    assert detail["estimated_remaining_population"] == 100
+    assert await _harvest_event_count(client, ctx) == 0
+    assert await _batch_state(client, ctx) == "active"
+
+
+async def test_final_harvest_above_remaining_rejected(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(101, final=True))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_exceeds_population"
+    assert await _harvest_event_count(client, ctx) == 0
+    assert await _batch_state(client, ctx) == "active"
+
+
+async def test_final_harvest_uses_sampling_population_override(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(
+        _events_url(ctx),
+        json={
+            "event_type": "SAMPLING",
+            "data": sampling_payload(estimated_population=80),
+        },
+    )
+    assert r.status_code == 201, r.text
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_exceeds_population"
+    r = await client.post(_events_url(ctx), json=_harvest_body(79, final=True))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_final_quantity_mismatch"
+    assert r.json()["detail"]["estimated_remaining_population"] == 80
+    r = await client.post(_events_url(ctx), json=_harvest_body(80, final=True))
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, ctx) == "harvested"
+
+
+async def test_final_harvest_includes_transfer_in(client: AsyncClient) -> None:
+    source = await _prepare_active_batch(client, quantity=100)
+    destination_unit = await _create_unit(client, source["site_id"], source["unit_type_id"])
+    destination_batch = await _prepare_receiving_batch(client, destination_unit, quantity=50)
+    r = await client.post(
+        f"/api/v1/batches/{destination_batch}/transitions", json={"target_state": "active"}
+    )
+    assert r.status_code == 200, r.text
+    r = await client.post(
+        _events_url(source),
+        json={
+            "event_type": "TRANSFER",
+            "data": transfer_payload(
+                source_unit_id=source["unit_id"],
+                destination_unit_id=destination_unit,
+                destination_batch_id=destination_batch,
+                quantity=20,
+                transfer_loss=0,
+            ),
+        },
+    )
+    assert r.status_code == 201, r.text
+    destination = {"batch_id": destination_batch}
+    r = await client.post(_events_url(destination), json=_harvest_body(50, final=True))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_final_quantity_mismatch"
+    assert r.json()["detail"]["estimated_remaining_population"] == 70
+    r = await client.post(_events_url(destination), json=_harvest_body(70, final=True))
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, destination) == "harvested"
+
+
+async def test_partial_harvest_rejected_after_final(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 201, r.text
+    r = await client.post(_events_url(ctx), json=_harvest_body(1, final=False))
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_already_final"
+    assert await _harvest_event_count(client, ctx) == 1
+
+
+async def test_final_harvest_replay_after_transition_returns_original_event(
+    client: AsyncClient,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    body = _harvest_body(100, final=True)
+    headers = {"Idempotency-Key": f"harvest-{uuid4().hex}"}
+    first = await client.post(_events_url(ctx), json=body, headers=headers)
+    assert first.status_code == 201, first.text
+    assert await _batch_state(client, ctx) == "harvested"
+
+    replay = await client.post(_events_url(ctx), json=body, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.headers.get("X-Idempotent-Replay") == "true"
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["data"] == first.json()["data"]
+    assert await _harvest_event_count(client, ctx) == 1
+    assert await _batch_state(client, ctx) == "harvested"
+
+
+async def test_final_harvest_same_key_different_payload_conflicts(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    headers = {"Idempotency-Key": f"harvest-{uuid4().hex}"}
+    body = _harvest_body(100, final=True)
+    first = await client.post(_events_url(ctx), json=body, headers=headers)
+    assert first.status_code == 201, first.text
+
+    changed = _harvest_body(
+        100, final=True, total_weight=11.0, harvested_at=body["data"]["harvested_at"]
+    )
+    r = await client.post(_events_url(ctx), json=changed, headers=headers)
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "idempotency_key_payload_conflict"
+    assert await _harvest_event_count(client, ctx) == 1
+
+
+# SQLite's driver does not honour SAVEPOINT rollback of the event insert, so
+# request-level rollback is only provable on PostgreSQL.
+@_postgres_only
+async def test_final_harvest_transition_failure_rolls_back_event(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    original = ProductionBatchRepository.compare_and_set_state
+
+    async def lose_race(self, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(ProductionBatchRepository, "compare_and_set_state", lose_race)
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    monkeypatch.setattr(ProductionBatchRepository, "compare_and_set_state", original)
+
+    assert r.status_code == 409, r.text
+    db_session.expire_all()
+    count = await db_session.scalar(
+        select(func.count(ProductionEvent.id)).where(
+            ProductionEvent.batch_id == UUID(str(ctx["batch_id"])),
+            ProductionEvent.event_type == "HARVEST",
+        )
+    )
+    assert count == 0
+    assert await _batch_state(client, ctx) == "active"
+
+
+async def test_viewer_cannot_harvest_and_outsider_gets_404(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    owner_email = ctx["owner"]
+
+    outsider = f"outsider-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(outsider)
+    await switch_user(client, outsider)
+    await create_org(client, slug=f"out-{uuid4().hex[:6]}")
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 404, r.text
+
+    await switch_user(client, owner_email)
+    viewer = f"viewer-{uuid4().hex[:8]}@agrovix.dev"
+    await create_verified_user(viewer)
+    await invite_and_accept(
+        client,
+        inviter_email=owner_email,
+        invitee_email=viewer,
+        org_id=ctx["org_id"],
+        role_name="viewer",
+    )
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 403, r.text
+    await switch_user(client, owner_email)
+    assert await _harvest_event_count(client, ctx) == 0
+    assert await _batch_state(client, ctx) == "active"
 
 
 # ===================================================================== #

@@ -910,7 +910,11 @@ class ProductionEventService:
             # HARVEST only closes the batch when marked final.
             if entry.code == "HARVEST" and not is_final:
                 pass
-            elif batch.state != target and target in _ALLOWED_TRANSITIONS.get(batch.state, set()):
+            elif entry.code == "HARVEST" or (
+                batch.state != target and target in _ALLOWED_TRANSITIONS.get(batch.state, set())
+            ):
+                # A final HARVEST must never skip the transition; an invalid
+                # one raises 409 and the request rollback removes the event.
                 await self.batch_service.transition(
                     actor=actor,
                     batch=batch,
@@ -1156,8 +1160,11 @@ class ProductionEventService:
 
         * ``quantity <= remaining_population``
         * ``total_weight > 0`` (schema enforced; guarded again here)
-        * A second final HARVEST is rejected 409
-          ``harvest_already_final`` — atomic with the transition.
+        * Any HARVEST after a final HARVEST is rejected 409
+          ``harvest_already_final``.
+        * A final HARVEST requires an ACTIVE batch and a quantity equal to
+          the remaining population (``harvest_final_requires_active``,
+          ``harvest_final_quantity_mismatch``).
         """
         from app.services.projections import compute_batch_projections  # cycle-safe
 
@@ -1169,6 +1176,29 @@ class ProductionEventService:
                 {
                     "code": "harvest_total_weight_required",
                     "message": "HARVEST total_weight must be greater than zero.",
+                },
+            )
+
+        if await self.event_repo.has_final_harvest(batch.id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "harvest_already_final",
+                    "message": (
+                        "This batch already has a final HARVEST event. "
+                        "Additional harvests are not permitted."
+                    ),
+                },
+            )
+
+        if is_final and batch.state != ProductionBatchState.ACTIVE:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "harvest_final_requires_active",
+                    "message": "A final HARVEST requires an ACTIVE batch.",
+                    "current_state": batch.state.value,
+                    "required_state": ProductionBatchState.ACTIVE.value,
                 },
             )
 
@@ -1189,15 +1219,17 @@ class ProductionEventService:
                 },
             )
 
-        if is_final and await self.event_repo.has_final_harvest(batch.id):
+        if is_final and qty != remaining:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {
-                    "code": "harvest_already_final",
+                    "code": "harvest_final_quantity_mismatch",
                     "message": (
-                        "This batch already has a final HARVEST event. "
-                        "Additional harvests are not permitted."
+                        f"A final HARVEST quantity {qty} must equal the estimated "
+                        f"remaining population {remaining}."
                     ),
+                    "quantity": qty,
+                    "estimated_remaining_population": remaining,
                 },
             )
 
