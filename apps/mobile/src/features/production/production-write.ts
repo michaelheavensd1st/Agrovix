@@ -135,6 +135,26 @@ export interface MortalityPayload extends Record<string, unknown> {
   };
 }
 
+export interface StockingInput {
+  species_code: string | null;
+  quantity: number | string | null;
+  average_weight: number | string | null;
+  weight_unit?: 'g' | 'kg' | string | null;
+  stocked_at: string | null;
+  source?: string | null;
+  notes?: string | null;
+}
+
+export interface StockingPayload extends Record<string, unknown> {
+  species_code: string;
+  quantity: number;
+  average_weight: number;
+  weight_unit: 'g' | 'kg';
+  stocked_at: string;
+  source?: string;
+  notes?: string;
+}
+
 export type SamplingWeightUnit = 'g' | 'kg';
 
 export interface SamplingInput {
@@ -164,6 +184,8 @@ export type MortalitySubmission = ProductionSubmission<MortalityPayload>;
 export type MortalityWriteResult = ProductionWriteResult<MortalityPayload>;
 export type SamplingSubmission = ProductionSubmission<SamplingPayload>;
 export type SamplingWriteResult = ProductionWriteResult<SamplingPayload>;
+export type StockingSubmission = ProductionSubmission<StockingPayload>;
+export type StockingWriteResult = ProductionWriteResult<StockingPayload>;
 
 const WATER_QUALITY_FIELDS: readonly WaterQualityMeasurementKey[] = [
   'temperature',
@@ -650,6 +672,72 @@ export function createSamplingSubmission(
   };
 }
 
+export function buildStockingPayload(values: StockingInput): StockingPayload {
+  const speciesCode = readRequiredText(values.species_code, 'species_code', 64);
+  if (!speciesCode) throw new Error('species_code is required.');
+
+  const quantity = toFiniteNumber(values.quantity);
+  if (quantity === null || !Number.isInteger(quantity) || quantity < 1) {
+    throw new Error('quantity must be a positive integer.');
+  }
+
+  const averageWeight = toFiniteNumber(values.average_weight);
+  if (averageWeight === null || averageWeight < 0) {
+    throw new Error('average_weight must be zero or greater.');
+  }
+
+  const weightUnit = values.weight_unit ?? 'g';
+  if (weightUnit !== 'g' && weightUnit !== 'kg') {
+    throw new Error('weight_unit must be g or kg.');
+  }
+
+  const physicalStockedAt = normalizeProductionEventTime(values.stocked_at);
+  if (!physicalStockedAt) throw new Error('A valid physical stocking time is required.');
+
+  const source = readRequiredText(values.source, 'source', 255);
+  const notes = readRequiredText(values.notes, 'notes', 1000);
+
+  return {
+    species_code: speciesCode,
+    quantity,
+    average_weight: averageWeight,
+    weight_unit: weightUnit,
+    stocked_at: physicalStockedAt,
+    ...(source ? { source } : {}),
+    ...(notes ? { notes } : {}),
+  };
+}
+
+export function createStockingDraftSignature(batchId: string, values: StockingInput): string {
+  return JSON.stringify({
+    batchId,
+    values: {
+      species_code: values.species_code?.trim() ?? '',
+      quantity: values.quantity ?? '',
+      average_weight: values.average_weight ?? '',
+      weight_unit: values.weight_unit ?? 'g',
+      stocked_at: normalizeProductionEventTime(values.stocked_at),
+      source: values.source?.trim() ?? '',
+      notes: values.notes?.trim() ?? '',
+    },
+  });
+}
+
+export function createStockingSubmission(
+  batchId: string,
+  values: StockingInput,
+  idempotencyKey?: string,
+  context?: Partial<WaterQualityWriteContext>,
+): StockingSubmission {
+  return {
+    batchId,
+    payload: buildStockingPayload(values),
+    idempotencyKey: idempotencyKey ?? makeOpaqueId('stocking'),
+    createdAt: new Date().toISOString(),
+    context: { ...(context ?? {}), batchId },
+  };
+}
+
 export function isSameLogicalSubmission(
   left: WaterQualitySubmission,
   right: WaterQualitySubmission,
@@ -717,7 +805,7 @@ export function resolveWriteOutcome({
   };
 }
 
-type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING';
+type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING' | 'STOCKING';
 const PRODUCTION_WRITE_LEDGER = new Map<string, ProductionWriteResult<any>>();
 export interface ProductionEventWriteRecovery {
   submission: ProductionSubmission<any>;
@@ -728,6 +816,7 @@ export interface ProductionEventWriteRecovery {
 
 export type MortalityWriteRecovery = ProductionEventWriteRecovery;
 export type SamplingWriteRecovery = ProductionEventWriteRecovery;
+export type StockingWriteRecovery = ProductionEventWriteRecovery;
 
 const PRODUCTION_EVENT_WRITE_RECOVERY = new Map<string, ProductionEventWriteRecovery>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
@@ -774,6 +863,14 @@ export function getSamplingWriteRecovery(batchId: string): SamplingWriteRecovery
 
 export function clearSamplingWriteRecovery(batchId: string, idempotencyKey: string): void {
   clearProductionEventWriteRecovery('SAMPLING', batchId, idempotencyKey);
+}
+
+export function getStockingWriteRecovery(batchId: string): StockingWriteRecovery | null {
+  return getProductionEventWriteRecovery('STOCKING', batchId);
+}
+
+export function clearStockingWriteRecovery(batchId: string, idempotencyKey: string): void {
+  clearProductionEventWriteRecovery('STOCKING', batchId, idempotencyKey);
 }
 
 function isSameProductionSubmission(
@@ -848,7 +945,10 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
                 ? 'reconciliation_failed'
                 : 'outcome_unknown',
           });
-        } else if (eventType === 'SAMPLING' && result.outcome === 'accepted') {
+        } else if (
+          (eventType === 'SAMPLING' || eventType === 'STOCKING') &&
+          result.outcome === 'accepted'
+        ) {
           PRODUCTION_EVENT_WRITE_RECOVERY.set(recoveryKey, {
             submission,
             inFlight: false,
@@ -1312,6 +1412,48 @@ export function reconcileSamplingWrite({
   return reconcileProductionEventWrite({
     context,
     eventType: 'SAMPLING',
+    submission,
+    post,
+    readAll,
+  });
+}
+
+export function reconcileStockingWrite({
+  context,
+  payload,
+  idempotencyKey,
+  submission: preservedSubmission,
+  post,
+  readAll,
+}: {
+  context: WaterQualityWriteContext;
+  payload: StockingInput;
+  idempotencyKey: string;
+  submission?: StockingSubmission;
+  post: (
+    batchId: string,
+    eventType: ProductionEventType,
+    data: Record<string, unknown>,
+    key: string,
+    performedAt?: string,
+  ) => Promise<Record<string, unknown>>;
+  readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+}): Promise<StockingWriteResult> {
+  const normalizedPayload = buildStockingPayload(payload);
+  const submission =
+    preservedSubmission ??
+    createStockingSubmission(context.batchId, payload, idempotencyKey, context);
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    submission.performedAt !== undefined ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
+    throw new Error('The preserved stocking submission does not match the current intent.');
+  }
+  return reconcileProductionEventWrite({
+    context,
+    eventType: 'STOCKING',
     submission,
     post,
     readAll,
