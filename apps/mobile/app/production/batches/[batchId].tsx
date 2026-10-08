@@ -131,6 +131,16 @@ export default function ProductionBatchDetailScreen() {
         setProjection(reconciliation.projection);
         setEvents(reconciliation.events);
       }}
+      onTransferSaved={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
+      onTransferConflictRefreshed={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
       waterQualityContext={
         batchId
           ? {
@@ -180,6 +190,18 @@ export default function ProductionBatchDetailScreen() {
               batchName,
               farmName: farmName ?? undefined,
               unitName: unitName ?? undefined,
+            }
+          : undefined
+      }
+      transferContext={
+        batchId
+          ? {
+              batchId,
+              batchName,
+              farmName: farmName ?? undefined,
+              siteName: typeof params.siteName === 'string' ? params.siteName : undefined,
+              unitName: unitName ?? undefined,
+              sourceUnitId: typeof params.unitId === 'string' ? params.unitId : undefined,
             }
           : undefined
       }

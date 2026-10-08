@@ -46,6 +46,7 @@ import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
 import { StockingForm } from './stocking-form';
+import { TransferForm } from './transfer-form';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
@@ -439,5 +440,39 @@ describe('M2 shared production UI boundary', () => {
       (node) => React.isValidElement(node) && node.type === StockingForm,
     ) as React.ReactElement<any>;
     expect(disabledStocking.props.batchState).toBe('stocked');
+  });
+
+  test('mounts TRANSFER only for STOCKED or ACTIVE batches and wires reconciliation callbacks', () => {
+    const onTransferSaved = jest.fn();
+    const onTransferConflictRefreshed = jest.fn();
+    const findTransfer = (state: string, withContext = true) =>
+      flattenNodes(
+        BatchDetailPanel({
+          batch: { id: 'batch-t', code: 'B-T', state, unit_id: 'unit-t' },
+          projection: { estimated_remaining_population: 500 },
+          events: [],
+          transferContext: withContext
+            ? { batchId: 'batch-t', batchName: 'B-T', sourceUnitId: 'unit-fallback' }
+            : undefined,
+          onTransferSaved,
+          onTransferConflictRefreshed,
+        }),
+      ).find((node) => React.isValidElement(node) && node.type === TransferForm) as
+        React.ReactElement<any> | undefined;
+
+    expect(findTransfer('planned')).toBeUndefined();
+    expect(findTransfer('harvested')).toBeUndefined();
+    expect(findTransfer('active', false)).toBeUndefined();
+    for (const state of ['stocked', 'active']) {
+      const transfer = findTransfer(state);
+      expect(transfer).toBeTruthy();
+      expect(transfer!.props.batchId).toBe('batch-t');
+      expect(transfer!.props.batchState).toBe(state);
+      expect(transfer!.props.sourceUnitId).toBe('unit-t');
+      expect(transfer!.props.currentEstimatedRemainingPopulation).toBe(500);
+      expect(transfer!.props.onConflictRefreshed).toBe(onTransferConflictRefreshed);
+    }
+    findTransfer('active')!.props.onSaved({}, { batch: {}, projection: {}, events: [] });
+    expect(onTransferSaved).toHaveBeenCalledTimes(1);
   });
 });
