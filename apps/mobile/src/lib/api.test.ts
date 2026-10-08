@@ -311,6 +311,45 @@ describe('mobile API configuration and native auth transport', () => {
     });
   });
 
+  test('structured error details expose only a valid string code on ApiError', async () => {
+    const attempt = async (body: unknown) => {
+      fetchMock.mockResolvedValue(jsonResponse(body, 409) as never);
+      try {
+        await register({ email: 'a@example.com', password: 'Secret123!', full_name: null });
+      } catch (error) {
+        return error;
+      }
+      return undefined;
+    };
+
+    const structured = await attempt({
+      detail: { code: 'unit_closed_no_writes', message: 'closed', resource: 'unit' },
+    });
+    expect(structured).toBeInstanceOf(ApiError);
+    expect((structured as ApiError).code).toBe('unit_closed_no_writes');
+    expect((structured as ApiError).status).toBe(409);
+    expect((structured as ApiError).safeMessage).toBe('Request validation failed.');
+
+    const stringDetail = await attempt({ detail: 'Plain failure' });
+    expect((stringDetail as ApiError).code).toBeUndefined();
+    expect((stringDetail as ApiError).safeMessage).toBe('Plain failure');
+
+    for (const body of [
+      { detail: { code: 42 } },
+      { detail: { code: 'Not A Code!' } },
+      { detail: { message: 'no code' } },
+      { detail: [{ code: 'site_closed_no_writes' }] },
+      { detail: { code: 'x'.repeat(65) } },
+      { other: true },
+    ]) {
+      const failure = await attempt(body);
+      expect(failure).toBeInstanceOf(ApiError);
+      expect((failure as ApiError).code).toBeUndefined();
+    }
+
+    expect(new ApiError(409, 'Conflict').code).toBeUndefined();
+  });
+
   test('diagnostics enabled show only sanitized classification metadata', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ detail: 'Account private@example.com password: Secret123!' }, 409) as never,

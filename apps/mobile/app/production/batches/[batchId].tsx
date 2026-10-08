@@ -121,6 +121,16 @@ export default function ProductionBatchDetailScreen() {
         setProjection(reconciliation.projection);
         setEvents(reconciliation.events);
       }}
+      onStockingSaved={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
+      onStockingConflictRefreshed={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
       waterQualityContext={
         batchId
           ? {
@@ -159,6 +169,16 @@ export default function ProductionBatchDetailScreen() {
               batchName,
               farmName: farmName ?? undefined,
               siteName: typeof params.siteName === 'string' ? params.siteName : undefined,
+              unitName: unitName ?? undefined,
+            }
+          : undefined
+      }
+      stockingContext={
+        batchId
+          ? {
+              batchId,
+              batchName,
+              farmName: farmName ?? undefined,
               unitName: unitName ?? undefined,
             }
           : undefined

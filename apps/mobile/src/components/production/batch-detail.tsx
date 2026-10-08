@@ -8,6 +8,7 @@ import {
 import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
+import { StockingForm } from './stocking-form';
 import { WaterQualityForm } from './water-quality-form';
 import type {
   WaterQualityReconciliationData,
@@ -27,6 +28,9 @@ export interface BatchDetailData {
   onMortalityConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
   samplingContext?: WaterQualityWriteContext;
   onSamplingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  stockingContext?: WaterQualityWriteContext;
+  onStockingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  onStockingConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
 export function BatchDetailPanel({
@@ -42,6 +46,9 @@ export function BatchDetailPanel({
   onMortalityConflictRefreshed,
   samplingContext,
   onSamplingSaved,
+  stockingContext,
+  onStockingSaved,
+  onStockingConflictRefreshed,
 }: BatchDetailData) {
   const state = typeof batch.state === 'string' ? batch.state : 'unknown';
   const tone = getStatusTone(state);
@@ -160,6 +167,17 @@ export function BatchDetailPanel({
               : null
           }
           onSaved={(_submission, reconciliation) => onSamplingSaved?.(reconciliation)}
+        />
+      ) : null}
+      {stockingContext ? (
+        <StockingForm
+          batchId={stockingContext.batchId}
+          batchName={stockingContext.batchName}
+          farmName={stockingContext.farmName}
+          unitName={stockingContext.unitName}
+          batchState={state}
+          onSaved={(_submission, reconciliation) => onStockingSaved?.(reconciliation)}
+          onConflictRefreshed={onStockingConflictRefreshed}
         />
       ) : null}
     </ScrollView>

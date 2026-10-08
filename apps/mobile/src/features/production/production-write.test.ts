@@ -49,14 +49,16 @@ import { Pressable, TextInput } from 'react-native';
 import { FeedingForm } from '../../components/production/feeding-form';
 import { MortalityForm } from '../../components/production/mortality-form';
 import { SamplingForm } from '../../components/production/sampling-form';
+import { StockingForm } from '../../components/production/stocking-form';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
-import { ApiFailure } from '../../lib/api';
+import { ApiError, ApiFailure } from '../../lib/api';
 import * as productionApi from '../../lib/production-api';
 import {
   buildWaterQualityPayload,
   buildFeedingPayload,
   buildMortalityPayload,
   buildSamplingPayload,
+  buildStockingPayload,
   createFeedingDraftSignature,
   createMortalityDraftSignature,
   createSamplingDraftSignature,
@@ -65,8 +67,11 @@ import {
   createWaterQualitySubmission,
   createMortalitySubmission,
   createSamplingSubmission,
+  createStockingSubmission,
   getMortalityWriteRecovery,
   getSamplingWriteRecovery,
+  getStockingWriteRecovery,
+  clearStockingWriteRecovery,
   clearSamplingWriteRecovery,
   normalizeMortalityObservedAt,
   normalizeProductionEventTime,
@@ -75,6 +80,7 @@ import {
   isSameLogicalSubmission,
   reconcileMortalityWrite,
   reconcileSamplingWrite,
+  reconcileStockingWrite,
   reconcileWaterQualityWrite,
   reconcileFeedingWrite,
   resolveWriteOutcome,
@@ -83,6 +89,8 @@ import {
   type MortalitySubmission,
   type SamplingInput,
   type SamplingSubmission,
+  type StockingInput,
+  type StockingSubmission,
   type WaterQualityReconciliationData,
   type WaterQualitySubmission,
   type FeedingInput,
@@ -2702,6 +2710,683 @@ describe('mortality in-flight draft lock', () => {
     }
   });
 });
+describe('stocking write workflow', () => {
+  const stockingContext: WaterQualityWriteContext = {
+    batchId: 'batch-stocking',
+    batchName: 'B-STOCK',
+    farmName: 'North Farm',
+    unitName: 'Pond 1',
+  };
+  const stockingInput: StockingInput = {
+    species_code: 'WHITE_SHRIMP',
+    quantity: '25000',
+    average_weight: '0.02',
+    weight_unit: 'g',
+    stocked_at: '2026-10-04T08:30',
+    source: 'Hatchery 4',
+    notes: 'PL10 cohort',
+  };
+  const stockingReconciliation: WaterQualityReconciliationData = {
+    batch: {
+      id: 'batch-stocking',
+      code: 'B-STOCK',
+      state: 'stocked',
+      stocked_at: '2026-10-04T08:31:00Z',
+    },
+    projection: {
+      batch_id: 'batch-stocking',
+      initial_stocked_quantity: 25000,
+      estimated_remaining_population: 25000,
+      latest_average_weight: 0.02,
+      weight_unit: 'g',
+    },
+    events: [{ event_type: 'STOCKING', performed_at: '2026-10-04T08:31:00.000Z' }],
+  };
+
+  test('validates STOCKING fields and preserves physical stocked_at as event data', () => {
+    expect(buildStockingPayload(stockingInput)).toEqual({
+      species_code: 'WHITE_SHRIMP',
+      quantity: 25000,
+      average_weight: 0.02,
+      weight_unit: 'g',
+      stocked_at: normalizeProductionEventTime(stockingInput.stocked_at),
+      source: 'Hatchery 4',
+      notes: 'PL10 cohort',
+    });
+    expect(buildStockingPayload({ ...stockingInput, weight_unit: undefined }).weight_unit).toBe(
+      'g',
+    );
+    expect(() => buildStockingPayload({ ...stockingInput, quantity: 0 })).toThrow(
+      /positive integer/,
+    );
+    expect(() => buildStockingPayload({ ...stockingInput, average_weight: -1 })).toThrow(
+      /zero or greater/,
+    );
+    expect(() => buildStockingPayload({ ...stockingInput, species_code: ' ' })).toThrow(
+      /species_code/,
+    );
+    expect(() => buildStockingPayload({ ...stockingInput, stocked_at: 'invalid' })).toThrow(
+      /physical stocking time/,
+    );
+  });
+
+  test('disables STOCKING inputs and submit when the authoritative batch is not PLANNED', () => {
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const effectSpy = React.useEffect as unknown as jest.Mock;
+    stateSpy
+      .mockReset()
+      .mockImplementation((initial: unknown) => [
+        typeof initial === 'function' ? (initial as () => unknown)() : initial,
+        jest.fn(),
+      ]);
+    refSpy.mockReset().mockImplementation((initial: unknown) => ({ current: initial }));
+    effectSpy.mockReset().mockImplementation(() => undefined);
+    const onSaved = jest.fn();
+    const tree = StockingForm({ batchId: 'batch-stocked', batchState: 'stocked', onSaved });
+    const elements: React.ReactElement[] = [];
+    const visit = (node: unknown): void => {
+      if (Array.isArray(node)) node.forEach(visit);
+      else if (React.isValidElement(node)) {
+        const element = node as React.ReactElement<{ children?: unknown }>;
+        elements.push(element);
+        visit(element.props.children);
+      }
+    };
+    visit(tree);
+    const inputs = elements.filter((element) => element.type === TextInput) as Array<
+      React.ReactElement<{ editable?: boolean }>
+    >;
+    const pressables = elements.filter((element) => element.type === Pressable) as Array<
+      React.ReactElement<{ disabled?: boolean }>
+    >;
+    const submit = pressables[pressables.length - 1];
+    const visibleText = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(visibleText).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return visibleText((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const normalizedVisibleText = visibleText(tree).replace(/\s+/g, ' ').trim();
+    expect(normalizedVisibleText).toContain('Stocking requires an authoritative PLANNED batch');
+    expect(inputs).toHaveLength(6);
+    expect(inputs.every((input) => input.props.editable === false)).toBe(true);
+    expect(submit.props.disabled).toBe(true);
+    expect(normalizedVisibleText).toContain('Current state: stocked');
+    jest.restoreAllMocks();
+  });
+
+  test('accepted STOCKING settlement survives unmount and remounts into read-only reconciliation', async () => {
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const effectSpy = React.useEffect as unknown as jest.Mock;
+    let stateValues: unknown[] = [];
+    let refs: Array<{ current: unknown }> = [];
+    let effects: Array<() => unknown> = [];
+    let stateIndex = 0;
+    let refIndex = 0;
+    const configureMount = () => {
+      stateValues = [];
+      refs = [];
+      effects = [];
+      stateIndex = 0;
+      refIndex = 0;
+      stateSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = stateIndex++;
+        if (stateValues.length <= index) {
+          stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+        }
+        return [
+          stateValues[index],
+          (next: unknown) => {
+            stateValues[index] =
+              typeof next === 'function'
+                ? (next as (current: unknown) => unknown)(stateValues[index])
+                : next;
+          },
+        ];
+      });
+      refSpy.mockReset().mockImplementation((initial: unknown) => {
+        const index = refIndex++;
+        if (refs.length <= index) refs.push({ current: initial });
+        return refs[index];
+      });
+      effectSpy.mockReset().mockImplementation((effect: () => unknown) => {
+        effects.push(effect);
+      });
+    };
+    const renderForm = (onSaved: jest.Mock) => {
+      stateIndex = 0;
+      refIndex = 0;
+      const tree = StockingForm({
+        batchId: stockingContext.batchId,
+        batchName: stockingContext.batchName,
+        batchState: 'planned',
+        onSaved,
+      });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return elements;
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const buttonWithText = (elements: React.ReactElement[], text: string) =>
+      elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(text),
+      ) as React.ReactElement<{ onPress: () => void; disabled?: boolean }>;
+    let resolvePost!: (event: Record<string, unknown>) => void;
+    const post = jest.mocked(productionApi.createBatchEvent);
+    post.mockReset().mockImplementation(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          resolvePost = resolve;
+        }),
+    );
+    type StockingProjection = {
+      batch_id: string;
+      estimated_remaining_population: number;
+    };
+    const isStockingProjection = (
+      value: Record<string, unknown>,
+    ): value is Record<string, unknown> & StockingProjection =>
+      typeof value.batch_id === 'string' &&
+      typeof value.estimated_remaining_population === 'number';
+    let projection: StockingProjection = {
+      batch_id: stockingContext.batchId,
+      estimated_remaining_population: 100,
+    };
+    let events: Record<string, unknown>[] = [{ event_type: 'STOCKING', performed_at: 'old' }];
+    jest.mocked(productionApi.getProductionBatch).mockClear();
+    jest.mocked(productionApi.getBatchProjections).mockClear();
+    jest.mocked(productionApi.listBatchEvents).mockClear();
+    jest
+      .mocked(productionApi.getProductionBatch)
+      .mockResolvedValue({ id: stockingContext.batchId, state: 'stocked' });
+    jest.mocked(productionApi.getBatchProjections).mockImplementation(async () => projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockImplementation(async () => ({ items: events, next_cursor: null, limit: 25 }));
+    const originalOnSaved = jest.fn();
+    const remountedOnSaved = jest.fn(
+      (_submission: StockingSubmission, result: WaterQualityReconciliationData) => {
+        if (!isStockingProjection(result.projection)) {
+          throw new Error('Expected the STOCKING reconciliation to include a valid projection.');
+        }
+        projection = result.projection;
+        events = result.events;
+      },
+    );
+
+    try {
+      configureMount();
+      let elements = renderForm(originalOnSaved);
+      const originalCleanups = effects.map((effect) => effect());
+      const inputs = elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ onChangeText: (value: string) => void }>
+      >;
+      inputs[0].props.onChangeText(stockingInput.species_code!);
+      inputs[1].props.onChangeText(stockingInput.quantity!.toString());
+      inputs[2].props.onChangeText(stockingInput.average_weight!.toString());
+      inputs[3].props.onChangeText(stockingInput.stocked_at!);
+      inputs[4].props.onChangeText(stockingInput.source!);
+      inputs[5].props.onChangeText(stockingInput.notes!);
+      elements = renderForm(originalOnSaved);
+      buttonWithText(elements, 'I confirm initial stocking').props.onPress();
+      elements = renderForm(originalOnSaved);
+      buttonWithText(elements, 'Submit stocking').props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      const recovery = getStockingWriteRecovery(stockingContext.batchId);
+      if (!recovery?.promise)
+        throw new Error('Expected STOCKING recovery to retain the pending promise.');
+      const submission = recovery.submission as StockingSubmission;
+      const pendingPromise = recovery.promise;
+      const firstPostCall = post.mock.calls[0];
+      if (!firstPostCall) throw new Error('Expected the initial STOCKING POST call.');
+      expect(firstPostCall[0]).toBe(stockingContext.batchId);
+      expect(firstPostCall[1]).toMatchObject({
+        event_type: 'STOCKING',
+        data: submission.payload,
+      });
+      const firstPostData = firstPostCall[1].data;
+      if (!firstPostData) throw new Error('Expected the STOCKING POST body to include event data.');
+      expect(firstPostData.stocked_at).toBe(submission.payload.stocked_at);
+      expect(firstPostCall[1]).not.toHaveProperty('performed_at');
+      expect(firstPostCall[2]).toBe(submission.idempotencyKey);
+      originalCleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+
+      resolvePost({
+        id: 'stocking-event-1',
+        event_type: 'STOCKING',
+        batch_id: stockingContext.batchId,
+      });
+      await pendingPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(originalOnSaved).not.toHaveBeenCalled();
+      expect(getStockingWriteRecovery(stockingContext.batchId)?.retryOutcome).toBe('accepted');
+      expect(projection.estimated_remaining_population).toBe(100);
+      const initialEvent = events[0];
+      if (!initialEvent)
+        throw new Error('Expected the initial STOCKING event to remain unchanged.');
+      expect(initialEvent.performed_at).toBe('old');
+
+      const authoritative = {
+        batch: {
+          id: stockingContext.batchId,
+          state: 'stocked',
+          stocked_at: '2026-10-04T08:31:00Z',
+        },
+        projection: { batch_id: stockingContext.batchId, estimated_remaining_population: 25000 },
+        events: [{ event_type: 'STOCKING', performed_at: '2026-10-04T08:31:00.000Z' }],
+      };
+      jest.mocked(productionApi.getProductionBatch).mockResolvedValue(authoritative.batch);
+      jest
+        .mocked(productionApi.getBatchProjections)
+        .mockResolvedValueOnce(authoritative.projection);
+      jest
+        .mocked(productionApi.listBatchEvents)
+        .mockResolvedValueOnce({ items: authoritative.events, next_cursor: null, limit: 25 });
+      jest.mocked(productionApi.getBatchProjections).mockClear();
+      configureMount();
+      elements = renderForm(remountedOnSaved);
+      effects.forEach((effect) => effect());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(productionApi.getBatchProjections).toHaveBeenCalledTimes(1);
+      expect(remountedOnSaved).toHaveBeenCalledWith(
+        submission,
+        expect.objectContaining(authoritative),
+      );
+      expect(projection.estimated_remaining_population).toBe(25000);
+      expect(events).toEqual(authoritative.events);
+      expect(getStockingWriteRecovery(stockingContext.batchId)).toBeNull();
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('retains accepted-but-unreconciled STOCKING and retries authoritative reads without posting', async () => {
+    const submission = createStockingSubmission(
+      stockingContext.batchId,
+      stockingInput,
+      'stocking-readonly-key',
+      stockingContext,
+    );
+    const post = jest.fn().mockResolvedValue({ id: 'event-stocking', event_type: 'STOCKING' });
+    const readAll = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('projection unavailable'))
+      .mockResolvedValue(stockingReconciliation);
+    const first = await reconcileStockingWrite({
+      context: stockingContext,
+      payload: stockingInput,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('reconciliation_failed');
+    expect(getStockingWriteRecovery(stockingContext.batchId)).toMatchObject({
+      submission,
+      inFlight: false,
+      retryOutcome: 'reconciliation_failed',
+    });
+
+    const retry = await reconcileStockingWrite({
+      context: stockingContext,
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(retry.outcome).toBe('accepted');
+    expect(retry.reconciliation).toEqual(stockingReconciliation);
+    expect(post).toHaveBeenCalledTimes(1);
+    clearStockingWriteRecovery(stockingContext.batchId, submission.idempotencyKey);
+    expect(getStockingWriteRecovery(stockingContext.batchId)).toBeNull();
+  });
+});
+
+describe('stocking definitive-rejection handling', () => {
+  const stockingValues = [
+    'WHITE_SHRIMP',
+    '25000',
+    '0.02',
+    '2026-10-04T08:30',
+    'Hatchery 4',
+    'PL10 cohort',
+  ];
+  const refreshed: WaterQualityReconciliationData = {
+    batch: { id: 'batch-reject', state: 'stocked' },
+    projection: {
+      batch_id: 'batch-reject',
+      initial_stocked_quantity: 25000,
+      estimated_remaining_population: 25000,
+      survival_rate: null,
+    },
+    events: [{ event_type: 'STOCKING' }],
+  };
+
+  const mountForm = (batchId: string, onConflictRefreshed: jest.Mock) => {
+    const stateSpy = React.useState as unknown as jest.Mock;
+    const refSpy = React.useRef as unknown as jest.Mock;
+    const effectSpy = React.useEffect as unknown as jest.Mock;
+    const stateValues: unknown[] = [];
+    const refs: Array<{ current: unknown }> = [];
+    let stateIndex = 0;
+    let refIndex = 0;
+    stateSpy.mockReset().mockImplementation((initial: unknown) => {
+      const index = stateIndex++;
+      if (stateValues.length <= index) {
+        stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+      }
+      return [
+        stateValues[index],
+        (next: unknown) => {
+          stateValues[index] =
+            typeof next === 'function'
+              ? (next as (current: unknown) => unknown)(stateValues[index])
+              : next;
+        },
+      ];
+    });
+    refSpy.mockReset().mockImplementation((initial: unknown) => {
+      const index = refIndex++;
+      if (refs.length <= index) refs.push({ current: initial });
+      return refs[index];
+    });
+    effectSpy.mockReset().mockImplementation(() => undefined);
+    const render = () => {
+      stateIndex = 0;
+      refIndex = 0;
+      const tree = StockingForm({
+        batchId,
+        batchName: 'B-REJECT',
+        batchState: 'planned',
+        onConflictRefreshed,
+      });
+      const elements: React.ReactElement[] = [];
+      const visit = (node: unknown): void => {
+        if (Array.isArray(node)) node.forEach(visit);
+        else if (React.isValidElement(node)) {
+          const element = node as React.ReactElement<{ children?: unknown }>;
+          elements.push(element);
+          visit(element.props.children);
+        }
+      };
+      visit(tree);
+      return { tree, elements };
+    };
+    const textContent = (node: unknown): string => {
+      if (Array.isArray(node)) return node.map(textContent).join(' ');
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (React.isValidElement(node)) {
+        return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+      }
+      return '';
+    };
+    const text = () => textContent(render().tree).replace(/\s+/g, ' ');
+    const button = (label: string) =>
+      render().elements.find(
+        (element) =>
+          element.type === Pressable &&
+          textContent(
+            (element as React.ReactElement<{ children?: unknown }>).props.children,
+          ).includes(label),
+      ) as React.ReactElement<{ onPress: () => void }> | undefined;
+    const submit = async () => {
+      const inputs = render().elements.filter((element) => element.type === TextInput) as Array<
+        React.ReactElement<{ onChangeText: (value: string) => void }>
+      >;
+      stockingValues.forEach((value, index) => inputs[index]?.props.onChangeText(value));
+      button('I confirm initial stocking')?.props.onPress();
+      const submitButton = button('Submit stocking');
+      if (!submitButton) throw new Error('Expected the submit button.');
+      submitButton.props.onPress();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    return { text, button, submit };
+  };
+
+  const rejectWith = (status: number, detail: string) =>
+    jest
+      .mocked(productionApi.createBatchEvent)
+      .mockReset()
+      .mockRejectedValue(new ApiFailure('http', 'api', '/events', status, 'ApiError', detail));
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test('409 stocking_only_in_planned_state clears retry identity, refreshes authoritatively and offers no retry', async () => {
+    const batchId = 'batch-reject-409';
+    const post = rejectWith(409, 'stocking_only_in_planned_state');
+    jest.mocked(productionApi.getProductionBatch).mockReset().mockResolvedValue(refreshed.batch);
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockReset()
+      .mockResolvedValue(refreshed.projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockReset()
+      .mockResolvedValue({ items: refreshed.events, next_cursor: null, limit: 25 });
+    const onConflictRefreshed = jest.fn();
+    const form = mountForm(batchId, onConflictRefreshed);
+
+    await form.submit();
+
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(getStockingWriteRecovery(batchId)).toBeNull();
+    expect(productionApi.getProductionBatch).toHaveBeenCalledWith(batchId);
+    expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
+    expect(onConflictRefreshed).toHaveBeenCalledWith(refreshed);
+    const text = form.text();
+    expect(text).toContain('current state changed');
+    expect(text).not.toContain('Retry previous stocking');
+    expect(text).not.toContain('Reconcile previous stocking');
+    expect(text).toContain('Submit stocking');
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('failed authoritative refresh after 409 is surfaced, not silent, and does not restore retry', async () => {
+    const batchId = 'batch-reject-refresh-failed';
+    const post = rejectWith(409, 'stocking_only_in_planned_state');
+    jest
+      .mocked(productionApi.getProductionBatch)
+      .mockReset()
+      .mockRejectedValue(new Error('network down'));
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockReset()
+      .mockResolvedValue(refreshed.projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockReset()
+      .mockResolvedValue({ items: refreshed.events, next_cursor: null, limit: 25 });
+    const onConflictRefreshed = jest.fn();
+    const form = mountForm(batchId, onConflictRefreshed);
+
+    await form.submit();
+
+    expect(onConflictRefreshed).not.toHaveBeenCalled();
+    const text = form.text();
+    expect(text).toContain('could not be refreshed');
+    expect(text).toContain('not confirmed');
+    expect(text).toContain('Reload the batch');
+    expect(text).not.toContain('Retry previous stocking');
+    expect(getStockingWriteRecovery(batchId)).toBeNull();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ['site_closed_no_writes', 'site for this batch is closed', 'reopen or reactivate the site'],
+    [
+      'unit_closed_no_writes',
+      'production unit for this batch is closed',
+      'reopen or reactivate the unit',
+    ],
+    [
+      'site_under_maintenance',
+      'site for this batch is under maintenance',
+      'returned to an operational state',
+    ],
+    [
+      'unit_under_maintenance',
+      'production unit for this batch is under maintenance',
+      'returned to an operational state',
+    ],
+  ])(
+    'lifecycle 409 %s shows parent-resource guidance without claiming a batch-state change',
+    async (code, subject, action) => {
+      const batchId = `batch-lifecycle-${code}`;
+      const post = jest
+        .mocked(productionApi.createBatchEvent)
+        .mockReset()
+        .mockRejectedValue(new ApiError(409, 'Request validation failed.', 'api', '/events', code));
+      jest.mocked(productionApi.getProductionBatch).mockReset().mockResolvedValue({
+        id: batchId,
+        state: 'planned',
+      });
+      jest
+        .mocked(productionApi.getBatchProjections)
+        .mockReset()
+        .mockResolvedValue(refreshed.projection);
+      jest
+        .mocked(productionApi.listBatchEvents)
+        .mockReset()
+        .mockResolvedValue({ items: [], next_cursor: null, limit: 25 });
+      const onConflictRefreshed = jest.fn();
+      const form = mountForm(batchId, onConflictRefreshed);
+
+      await form.submit();
+
+      const text = form.text();
+      expect(text).toContain(subject);
+      expect(text).toContain(action);
+      expect(text).not.toContain('current state changed');
+      expect(text).not.toContain('Retry previous stocking');
+      expect(getStockingWriteRecovery(batchId)).toBeNull();
+      expect(productionApi.getProductionBatch).toHaveBeenCalledWith(batchId);
+      expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
+      expect(post).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test('lifecycle 409 with failed refresh keeps lifecycle guidance and stale-state warning', async () => {
+    const batchId = 'batch-lifecycle-refresh-failed';
+    const post = jest
+      .mocked(productionApi.createBatchEvent)
+      .mockReset()
+      .mockRejectedValue(
+        new ApiError(409, 'Request validation failed.', 'api', '/events', 'site_closed_no_writes'),
+      );
+    jest
+      .mocked(productionApi.getProductionBatch)
+      .mockReset()
+      .mockRejectedValue(new Error('network down'));
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockReset()
+      .mockResolvedValue(refreshed.projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockReset()
+      .mockResolvedValue({ items: [], next_cursor: null, limit: 25 });
+    const form = mountForm(batchId, jest.fn());
+
+    await form.submit();
+
+    const text = form.text();
+    expect(text).toContain('site for this batch is closed');
+    expect(text).toContain('not confirmed');
+    expect(text).toContain('Reload the batch');
+    expect(text).not.toContain('current state changed');
+    expect(getStockingWriteRecovery(batchId)).toBeNull();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('409 with an unrecognized structured code keeps the batch-state message', async () => {
+    const batchId = 'batch-unknown-409-code';
+    const post = jest
+      .mocked(productionApi.createBatchEvent)
+      .mockReset()
+      .mockRejectedValue(
+        new ApiError(
+          409,
+          'Request validation failed.',
+          'api',
+          '/events',
+          'stocking_only_in_planned_state',
+        ),
+      );
+    jest.mocked(productionApi.getProductionBatch).mockReset().mockResolvedValue(refreshed.batch);
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockReset()
+      .mockResolvedValue(refreshed.projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockReset()
+      .mockResolvedValue({ items: refreshed.events, next_cursor: null, limit: 25 });
+    const form = mountForm(batchId, jest.fn());
+
+    await form.submit();
+
+    expect(form.text()).toContain('current state changed');
+    expect(getStockingWriteRecovery(batchId)).toBeNull();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    [403, 'You do not have permission to stock this batch'],
+    [404, 'This batch could not be found'],
+  ])(
+    'HTTP %i is definitive, shows its specific message and offers no retry',
+    async (status, message) => {
+      const batchId = `batch-reject-${status}`;
+      const post = rejectWith(status, 'denied');
+      jest.mocked(productionApi.getProductionBatch).mockReset();
+      const onConflictRefreshed = jest.fn();
+      const form = mountForm(batchId, onConflictRefreshed);
+
+      await form.submit();
+
+      const text = form.text();
+      expect(text).toContain(message);
+      expect(text).not.toContain('Retry previous stocking');
+      expect(getStockingWriteRecovery(batchId)).toBeNull();
+      expect(onConflictRefreshed).not.toHaveBeenCalled();
+      expect(productionApi.getProductionBatch).not.toHaveBeenCalled();
+      expect(post).toHaveBeenCalledTimes(1);
+    },
+  );
+});
 
 describe('sampling write workflow', () => {
   const samplingContext: WaterQualityWriteContext = {
@@ -4236,5 +4921,100 @@ describe('sampling write workflow', () => {
     } finally {
       jest.restoreAllMocks();
     }
+  });
+});
+
+describe('stocking write workflow', () => {
+  const stockingContext: WaterQualityWriteContext = {
+    batchId: 'batch-stocking',
+    batchName: 'B-STOCK',
+    farmName: 'North Farm',
+    unitName: 'Pond 1',
+  };
+  const stockingInput: StockingInput = {
+    species_code: 'WHITE_SHRIMP',
+    quantity: '25000',
+    average_weight: '0.02',
+    weight_unit: 'g',
+    stocked_at: '2026-10-04T08:30',
+    source: 'Hatchery 4',
+    notes: 'PL10 cohort',
+  };
+
+  test('builds the physical stocking payload without moving stocked_at into lifecycle performed_at', () => {
+    const payload = buildStockingPayload(stockingInput);
+    expect(payload).toEqual({
+      species_code: 'WHITE_SHRIMP',
+      quantity: 25000,
+      average_weight: 0.02,
+      weight_unit: 'g',
+      stocked_at: normalizeProductionEventTime(stockingInput.stocked_at),
+      source: 'Hatchery 4',
+      notes: 'PL10 cohort',
+    });
+    expect(payload).not.toHaveProperty('performed_at');
+    expect(() => buildStockingPayload({ ...stockingInput, quantity: '0' })).toThrow(
+      /positive integer/,
+    );
+    expect(() => buildStockingPayload({ ...stockingInput, average_weight: '-1' })).toThrow(
+      /zero or greater/,
+    );
+    expect(() => buildStockingPayload({ ...stockingInput, species_code: ' ' })).toThrow(
+      /species_code/,
+    );
+  });
+
+  test('preserves identity and accepted reconciliation state without generating another POST', async () => {
+    const submission = createStockingSubmission(
+      stockingContext.batchId,
+      stockingInput,
+      'stocking-recovery-key',
+      stockingContext,
+    );
+    const reconciliation: WaterQualityReconciliationData = {
+      batch: { id: stockingContext.batchId, state: 'stocked', stocked_at: '2026-10-04T08:31:00Z' },
+      projection: { batch_id: stockingContext.batchId, initial_stocked_quantity: 25000 },
+      events: [{ event_type: 'STOCKING', performed_at: '2026-10-04T08:31:00Z' }],
+    };
+    const post = jest.fn().mockResolvedValue({ id: 'event-stocking', event_type: 'STOCKING' });
+    const readAll = jest.fn().mockResolvedValue(reconciliation);
+    const first = await reconcileStockingWrite({
+      context: stockingContext,
+      payload: stockingInput,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(first.outcome).toBe('accepted');
+    expect(submission.performedAt).toBeUndefined();
+    expect(post).toHaveBeenCalledWith(
+      stockingContext.batchId,
+      'STOCKING',
+      submission.payload,
+      submission.idempotencyKey,
+    );
+    expect(getStockingWriteRecovery(stockingContext.batchId)).toMatchObject({
+      submission,
+      inFlight: false,
+      retryOutcome: 'accepted',
+    });
+    expect(getSamplingWriteRecovery(stockingContext.batchId)).toBeNull();
+    clearStockingWriteRecovery(stockingContext.batchId, submission.idempotencyKey);
+    const replay = await reconcileStockingWrite({
+      context: stockingContext,
+      payload: stockingInput,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readAll,
+    });
+    expect(replay.outcome).toBe('accepted');
+    expect(replay.reconciliation).toEqual(reconciliation);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(readAll).toHaveBeenCalledTimes(2);
+    expect(getStockingWriteRecovery(stockingContext.batchId)?.retryOutcome).toBe('accepted');
+    clearStockingWriteRecovery(stockingContext.batchId, submission.idempotencyKey);
+    expect(getStockingWriteRecovery(stockingContext.batchId)).toBeNull();
   });
 });

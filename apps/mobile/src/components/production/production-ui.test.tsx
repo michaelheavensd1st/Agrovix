@@ -45,6 +45,7 @@ import ProductionBatchDetailScreen from '../../../app/production/batches/[batchI
 import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
+import { StockingForm } from './stocking-form';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
@@ -385,5 +386,58 @@ describe('M2 shared production UI boundary', () => {
       (node) => React.isValidElement(node) && node.type === FeedingForm,
     ) as React.ReactElement<any>;
     expect(feedingElement).toBeTruthy();
+  });
+
+  test('passes authoritative lifecycle state and reconciliation callbacks to STOCKING', () => {
+    const onStockingSaved = jest.fn();
+    const onStockingConflictRefreshed = jest.fn();
+    const tree = BatchDetailPanel({
+      batch: { id: 'batch-stock', code: 'B-STOCK', state: 'planned' },
+      projection: null,
+      events: [],
+      stockingContext: { batchId: 'batch-stock', batchName: 'B-STOCK' },
+      onStockingSaved,
+      onStockingConflictRefreshed,
+    });
+    const stocking = flattenNodes(tree).find(
+      (node) => React.isValidElement(node) && node.type === StockingForm,
+    ) as React.ReactElement<any>;
+    expect(stocking).toBeTruthy();
+    expect(stocking.props.batchState).toBe('planned');
+    stocking.props.onSaved({}, { batch: { state: 'stocked' }, projection: {}, events: [] });
+    stocking.props.onConflictRefreshed({ batch: { state: 'planned' }, projection: {}, events: [] });
+    expect(onStockingSaved).toHaveBeenCalledTimes(1);
+    expect(onStockingConflictRefreshed).toHaveBeenCalledTimes(1);
+  });
+
+  test('renders STOCKING only as a PLANNED batch workflow and wires authoritative refresh', () => {
+    const onSaved = jest.fn();
+    const onConflictRefreshed = jest.fn();
+    const plannedTree = BatchDetailPanel({
+      batch: { id: 'batch-stock', code: 'B-STOCK', state: 'planned' },
+      projection: null,
+      events: [],
+      stockingContext: { batchId: 'batch-stock', batchName: 'B-STOCK' },
+      onStockingSaved: onSaved,
+      onStockingConflictRefreshed: onConflictRefreshed,
+    });
+    const stocking = flattenNodes(plannedTree).find(
+      (node) => React.isValidElement(node) && node.type === StockingForm,
+    ) as React.ReactElement<any>;
+    expect(stocking).toBeTruthy();
+    expect(stocking.props.batchState).toBe('planned');
+    expect(stocking.props.onSaved).toEqual(expect.any(Function));
+    expect(stocking.props.onConflictRefreshed).toBe(onConflictRefreshed);
+
+    const stockedTree = BatchDetailPanel({
+      batch: { id: 'batch-stock', code: 'B-STOCK', state: 'stocked' },
+      projection: null,
+      events: [],
+      stockingContext: { batchId: 'batch-stock', batchName: 'B-STOCK' },
+    });
+    const disabledStocking = flattenNodes(stockedTree).find(
+      (node) => React.isValidElement(node) && node.type === StockingForm,
+    ) as React.ReactElement<any>;
+    expect(disabledStocking.props.batchState).toBe('stocked');
   });
 });

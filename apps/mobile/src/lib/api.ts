@@ -152,6 +152,7 @@ export class ApiError extends ApiFailure {
     public readonly detail: string,
     apiBase = '[unavailable]',
     path = '[unavailable]',
+    public readonly code?: string,
   ) {
     super('http', apiBase, path, status, 'ApiError', detail);
   }
@@ -289,6 +290,16 @@ function normalizeApiDetail(body: unknown): string {
   return 'Request failed';
 }
 
+const API_ERROR_CODE_PATTERN = /^[a-z0-9_]{1,64}$/;
+
+export function extractApiErrorCode(body: unknown): string | undefined {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined;
+  const detail = (body as { detail?: unknown }).detail;
+  if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) return undefined;
+  const code = (detail as { code?: unknown }).code;
+  return typeof code === 'string' && API_ERROR_CODE_PATTERN.test(code) ? code : undefined;
+}
+
 async function request<T>(
   path: string,
   init: RequestInit = {},
@@ -360,7 +371,13 @@ async function request<T>(
     }
   }
   if (!res.ok) {
-    throw new ApiError(status, normalizeApiDetail(body), location.base, location.diagnosticPath);
+    throw new ApiError(
+      status,
+      normalizeApiDetail(body),
+      location.base,
+      location.diagnosticPath,
+      extractApiErrorCode(body),
+    );
   }
   if (contract.expectedStatus !== undefined && status !== contract.expectedStatus) {
     throw new ApiFailure(
