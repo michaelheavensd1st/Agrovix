@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -431,6 +432,144 @@ async def test_final_harvest_uses_sampling_population_override(client: AsyncClie
     r = await client.post(_events_url(ctx), json=_harvest_body(80, final=True))
     assert r.status_code == 201, r.text
     assert await _batch_state(client, ctx) == "harvested"
+
+
+def _days_from_now(days: int) -> str:
+    return (datetime.now(UTC) + timedelta(days=days)).isoformat()
+
+
+async def _post_dated(client: AsyncClient, ctx: dict, event_type: str, data: dict, days: int):
+    return await client.post(
+        _events_url(ctx),
+        json={"event_type": event_type, "data": data, "performed_at": _days_from_now(days)},
+    )
+
+
+async def test_final_harvest_backdated_before_sampling_is_rejected(client: AsyncClient) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await _post_dated(client, ctx, "SAMPLING", sampling_payload(estimated_population=80), 3)
+    assert r.status_code == 201, r.text
+    body = _harvest_body(80, final=True)
+    r = await client.post(_events_url(ctx), json={**body, "performed_at": _days_from_now(2)})
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_final_backdated"
+    assert await _harvest_event_count(client, ctx) == 0
+    assert await _batch_state(client, ctx) == "active"
+
+
+@pytest.mark.parametrize("later_type", ["MORTALITY", "HARVEST"])
+async def test_final_harvest_backdated_before_population_event_is_rejected(
+    client: AsyncClient, later_type: str
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    if later_type == "MORTALITY":
+        later = await _post_dated(client, ctx, "MORTALITY", mortality_payload(count=10), 3)
+    else:
+        later = await _post_dated(client, ctx, "HARVEST", _harvest_body(10, final=False)["data"], 3)
+    assert later.status_code == 201, later.text
+    r = await client.post(
+        _events_url(ctx),
+        json={**_harvest_body(90, final=True), "performed_at": _days_from_now(2)},
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "harvest_final_backdated"
+    assert await _batch_state(client, ctx) == "active"
+
+
+async def test_final_harvest_chronologically_after_sampling_is_accepted(
+    client: AsyncClient,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await _post_dated(client, ctx, "SAMPLING", sampling_payload(estimated_population=80), 2)
+    assert r.status_code == 201, r.text
+    r = await client.post(
+        _events_url(ctx),
+        json={**_harvest_body(80, final=True), "performed_at": _days_from_now(3)},
+    )
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, ctx) == "harvested"
+
+
+async def _projection(client: AsyncClient, ctx: dict) -> dict:
+    r = await client.get(f"/api/v1/batches/{ctx['batch_id']}/projections")
+    assert r.status_code == 200, r.text
+    return {k: v for k, v in r.json().items() if k != "computed_at"}
+
+
+async def _sampling_count(client: AsyncClient, ctx: dict) -> int:
+    r = await client.get(_events_url(ctx), params={"event_type": "SAMPLING"})
+    assert r.status_code == 200, r.text
+    return len(r.json()["items"])
+
+
+@pytest.mark.parametrize("offset_days", [-1, 0, 1])
+async def test_sampling_estimate_after_final_harvest_is_rejected(
+    client: AsyncClient, offset_days: int
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    harvest_at = datetime.now(UTC) + timedelta(days=2)
+    r = await client.post(
+        _events_url(ctx),
+        json={**_harvest_body(100, final=True), "performed_at": harvest_at.isoformat()},
+    )
+    assert r.status_code == 201, r.text
+    before = await _projection(client, ctx)
+    r = await client.post(
+        _events_url(ctx),
+        json={
+            "event_type": "SAMPLING",
+            "data": sampling_payload(estimated_population=80),
+            "performed_at": (harvest_at + timedelta(days=offset_days)).isoformat(),
+        },
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "sampling_after_final_harvest"
+    assert await _sampling_count(client, ctx) == 0
+    assert await _batch_state(client, ctx) == "harvested"
+    assert await _projection(client, ctx) == before
+
+
+async def test_sampling_without_estimate_allowed_after_final_harvest(
+    client: AsyncClient,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(_events_url(ctx), json=_harvest_body(100, final=True))
+    assert r.status_code == 201, r.text
+    r = await client.post(
+        _events_url(ctx), json={"event_type": "SAMPLING", "data": sampling_payload()}
+    )
+    assert r.status_code == 201, r.text
+    assert await _batch_state(client, ctx) == "harvested"
+
+
+async def test_sampling_replay_after_final_harvest_returns_original(
+    client: AsyncClient,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    headers = {"Idempotency-Key": "sampling-replay-after-final-0001"}
+    body = {"event_type": "SAMPLING", "data": sampling_payload(estimated_population=90)}
+    first = await client.post(_events_url(ctx), json=body, headers=headers)
+    assert first.status_code == 201, first.text
+    r = await client.post(_events_url(ctx), json=_harvest_body(90, final=True))
+    assert r.status_code == 201, r.text
+    replay = await client.post(_events_url(ctx), json=body, headers=headers)
+    assert replay.status_code == 200, replay.text
+    assert replay.headers.get("X-Idempotent-Replay") == "true"
+    assert replay.json()["id"] == first.json()["id"]
+    assert await _sampling_count(client, ctx) == 1
+
+
+async def test_sampling_estimate_before_final_harvest_remains_valid(
+    client: AsyncClient,
+) -> None:
+    ctx = await _prepare_active_batch(client, quantity=100)
+    r = await client.post(
+        _events_url(ctx),
+        json={"event_type": "SAMPLING", "data": sampling_payload(estimated_population=90)},
+    )
+    assert r.status_code == 201, r.text
+    assert await _sampling_count(client, ctx) == 1
+    assert await _batch_state(client, ctx) == "active"
 
 
 async def test_final_harvest_includes_transfer_in(client: AsyncClient) -> None:

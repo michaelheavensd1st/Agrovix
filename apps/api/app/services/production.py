@@ -562,6 +562,13 @@ class ProductionBatchService:
 # --------------------------------------------------------------------- #
 # ProductionEvent service — validates payload + drives batch transitions
 # --------------------------------------------------------------------- #
+_POPULATION_EVENT_TYPES = frozenset({"STOCKING", "MORTALITY", "TRANSFER", "HARVEST"})
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
 class ProductionEventService:
     def __init__(
         self,
@@ -734,6 +741,7 @@ class ProductionEventService:
             unit=unit,
             farm=farm,
             is_final=is_final,
+            performed_at=payload.get("performed_at"),
         )
 
         if entry.code == "TRANSFER":
@@ -1042,6 +1050,7 @@ class ProductionEventService:
         unit: ProductionUnit,
         farm: Farm,
         is_final: bool = False,
+        performed_at: datetime | None = None,
     ) -> None:
         """Vertical-neutral pre-insert guards.
 
@@ -1074,7 +1083,32 @@ class ProductionEventService:
         elif code == "TRANSFER":
             await self._enforce_transfer_scope(batch=batch, unit=unit, farm=farm, data=data)
         elif code == "HARVEST":
-            await self._enforce_harvest_rules(batch=batch, data=data, is_final=is_final)
+            await self._enforce_harvest_rules(
+                batch=batch, data=data, is_final=is_final, performed_at=performed_at
+            )
+        elif code == "SAMPLING":
+            await self._enforce_sampling_after_final(batch=batch, data=data)
+
+    async def _enforce_sampling_after_final(self, *, batch: ProductionBatch, data: dict) -> None:
+        """Reject a population-estimate SAMPLING once a final HARVEST exists.
+
+        The projection replays by ``performed_at``, so a SAMPLING estimate
+        (before, at or after the final HARVEST) could restore population
+        on a finalized batch. Applies regardless of the incoming timestamp.
+        """
+        if data.get("estimated_population") is None:
+            return
+        if await self.event_repo.has_final_harvest(batch.id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {
+                    "code": "sampling_after_final_harvest",
+                    "message": (
+                        "A SAMPLING population estimate cannot be recorded after "
+                        "a final HARVEST."
+                    ),
+                },
+            )
 
     async def _enforce_stocking_once(self, *, batch: ProductionBatch) -> None:
         """Sprint 3 STOCKING policy: exactly one STOCKING per batch, PLANNED only.
@@ -1155,6 +1189,7 @@ class ProductionEventService:
         batch: ProductionBatch,
         data: dict,
         is_final: bool,
+        performed_at: datetime | None = None,
     ) -> None:
         """Harvest validation completeness (Codex Review Gate 02):
 
@@ -1165,6 +1200,10 @@ class ProductionEventService:
         * A final HARVEST requires an ACTIVE batch and a quantity equal to
           the remaining population (``harvest_final_requires_active``,
           ``harvest_final_quantity_mismatch``).
+        * A final HARVEST may not be backdated before an existing
+          population-affecting event (``harvest_final_backdated``): the
+          projection replays by ``performed_at``, so a later SAMPLING
+          override would otherwise restore population after finalization.
         """
         from app.services.projections import compute_batch_projections  # cycle-safe
 
@@ -1203,6 +1242,26 @@ class ProductionEventService:
             )
 
         events = await self.event_repo.list_all_for_batch_asc(batch.id)
+        if is_final:
+            effective_at = _as_utc(performed_at or datetime.now(UTC))
+            for evt in events:
+                affects_population = evt.event_type in _POPULATION_EVENT_TYPES or (
+                    evt.event_type == "SAMPLING"
+                    and (evt.data or {}).get("estimated_population") is not None
+                )
+                if affects_population and _as_utc(evt.performed_at) > effective_at:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        {
+                            "code": "harvest_final_backdated",
+                            "message": (
+                                "A final HARVEST cannot be dated before an existing "
+                                "population-affecting event on this batch."
+                            ),
+                            "conflicting_event_type": evt.event_type,
+                            "conflicting_performed_at": _as_utc(evt.performed_at).isoformat(),
+                        },
+                    )
         projections = compute_batch_projections(batch, events)
         remaining = projections.estimated_remaining_population
         if qty > remaining:
