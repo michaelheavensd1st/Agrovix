@@ -5583,7 +5583,7 @@ describe('transfer form workflow', () => {
   test('is disabled for non-STOCKED/ACTIVE source batches', async () => {
     configureMount();
     const view = render({ batchState: 'planned' });
-    expect(view.text).toContain('Transfers require an authoritative STOCKED or ACTIVE');
+    expect(view.text).toContain('Transfers require an authoritative STOCKED, ACTIVE or SUSPENDED');
     expect(inputs(view.elements).every((input) => input.props.editable === false)).toBe(true);
     expect(button(view.elements, 'Submit transfer')!.props.disabled).toBe(true);
     expect(api.listTransferDestinations).not.toHaveBeenCalled();
@@ -5716,6 +5716,97 @@ describe('transfer form workflow', () => {
     expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
     after = render();
     expect(after.text).toContain('recorded and verified on both');
+  });
+
+  test('allows a SUSPENDED source with valid population to transfer', async () => {
+    const props = { batchState: 'suspended' };
+    await mount(props);
+    expect(api.listTransferDestinations).toHaveBeenCalledTimes(1);
+    const view = fillAndConfirm(props);
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(render(props).text).toContain('recorded and verified on both');
+  });
+
+  test.each(['failed', 'cancelled', 'closed', 'planned'])(
+    'does not allow a new transfer from a %s source batch',
+    async (batchState) => {
+      configureMount();
+      const view = render({ batchState });
+      effects.forEach((effect) => effect());
+      await flush();
+      expect(view.text).toContain('STOCKED, ACTIVE or SUSPENDED');
+      expect(button(view.elements, 'Submit transfer')!.props.disabled).toBe(true);
+      expect(api.listTransferDestinations).not.toHaveBeenCalled();
+      await button(view.elements, 'Submit transfer')!.props.onPress();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(['suspended', 'failed'])(
+    'keeps an uncertain transfer recoverable with the same key after the source becomes %s',
+    async (laterState) => {
+      const { cleanups } = await mount();
+      api.createBatchEvent.mockReset().mockImplementationOnce(async (_b, body, key) => {
+        lastKey = key;
+        lastData = (body.data ?? {}) as Record<string, unknown>;
+        throw new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'timeout');
+      });
+      const view = fillAndConfirm();
+      await button(view.elements, 'Submit transfer')!.props.onPress();
+      await flush();
+      const firstKey = lastKey;
+      cleanups.forEach((cleanup) => typeof cleanup === 'function' && cleanup());
+
+      const props = { batchState: laterState };
+      configureMount();
+      render(props);
+      effects.forEach((effect) => effect());
+      await flush();
+      const remounted = render(props);
+      expect(remounted.text).not.toContain('STOCKED, ACTIVE or SUSPENDED');
+      expect(inputs(remounted.elements).every((input) => input.props.editable === false)).toBe(
+        true,
+      );
+      api.createBatchEvent.mockImplementationOnce(async (_b, body, key) => {
+        lastKey = key;
+        lastData = (body.data ?? {}) as Record<string, unknown>;
+        return {
+          id: 'event-out',
+          event_type: 'TRANSFER',
+          batch_id: BATCH,
+          transfer_id: 'transfer-form-1',
+          transfer_role: 'out',
+          idempotency_key: key,
+        };
+      });
+      await button(remounted.elements, 'Retry same transfer')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(firstKey);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+      expect(render(props).text).toContain('recorded and verified on both');
+    },
+  );
+
+  test('reconciles an accepted transfer read-only after the source becomes terminal', async () => {
+    const { cleanups } = await mount();
+    transferEventsReady = false;
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    expect(getTransferWriteRecovery(BATCH)?.retryOutcome).toBe('reconciliation_failed');
+    cleanups.forEach((cleanup) => typeof cleanup === 'function' && cleanup());
+
+    transferEventsReady = true;
+    const props = { batchState: 'failed' };
+    configureMount();
+    render(props);
+    effects.forEach((effect) => effect());
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(render(props).text).toContain('recorded and verified on both');
+    expect(getTransferWriteRecovery(BATCH)).toBeNull();
   });
 
   test('reports a fully read pair-less timeline as an integrity anomaly', async () => {

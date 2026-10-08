@@ -162,7 +162,8 @@ export function TransferForm({
   const mounted = useRef(true);
   const context: WaterQualityWriteContext = { batchId, batchName, farmName, unitName };
   const batchLabel = batchName ?? batchId;
-  const isEligibleState = batchState === 'stocked' || batchState === 'active';
+  const isEligibleState =
+    batchState === 'stocked' || batchState === 'active' || batchState === 'suspended';
   const locked = busy || recoveryRequired || !isEligibleState;
 
   const toInput = (): TransferInput => ({
@@ -468,7 +469,9 @@ export function TransferForm({
       if (busy) return;
       const recovering = recoveryRequired;
       if (!isEligibleState && !recovering) {
-        setError('Transfers require a STOCKED or ACTIVE source batch. Refresh the batch state.');
+        setError(
+          'Transfers require a STOCKED, ACTIVE or SUSPENDED source batch. Refresh the batch state.',
+        );
         return;
       }
       if (!confirmed && !recovering) {
@@ -547,8 +550,8 @@ export function TransferForm({
       >{`${batchLabel} · ${farmName ?? 'Farm'} · ${unitName ?? 'Unit'}`}</Text>
       {!isEligibleState && !recoveryRequired ? (
         <Text style={styles.warning}>
-          Transfers require an authoritative STOCKED or ACTIVE source batch. Current state:{' '}
-          {batchState}.
+          Transfers require an authoritative STOCKED, ACTIVE or SUSPENDED source batch. Current
+          state: {batchState}.
         </Text>
       ) : null}
       {recoveryRequired ? (

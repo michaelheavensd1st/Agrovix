@@ -11,6 +11,7 @@ import { SamplingForm } from './sampling-form';
 import { StockingForm } from './stocking-form';
 import { TransferForm } from './transfer-form';
 import { WaterQualityForm } from './water-quality-form';
+import { getTransferWriteRecovery } from '../../features/production/production-write';
 import type {
   WaterQualityReconciliationData,
   WaterQualityWriteContext,
@@ -187,7 +188,11 @@ export function BatchDetailPanel({
           onConflictRefreshed={onStockingConflictRefreshed}
         />
       ) : null}
-      {transferContext && (state === 'stocked' || state === 'active') ? (
+      {transferContext &&
+      (state === 'stocked' ||
+        state === 'active' ||
+        state === 'suspended' ||
+        getTransferWriteRecovery(transferContext.batchId)) ? (
         <TransferForm
           batchId={transferContext.batchId}
           batchName={transferContext.batchName}
