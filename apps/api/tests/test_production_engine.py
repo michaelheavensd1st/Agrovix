@@ -261,7 +261,7 @@ async def test_batch_lifecycle_via_event_and_explicit_transitions(client: AsyncC
         f"/api/v1/batches/{batch_id}/events",
         json={
             "event_type": "HARVEST",
-            "data": harvest_payload(quantity=9500, total_weight=1200.0, is_final=True),
+            "data": harvest_payload(quantity=10_000, total_weight=1200.0, is_final=True),
         },
     )
     assert r.status_code == 201
