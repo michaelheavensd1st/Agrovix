@@ -46,6 +46,12 @@ import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
 import { StockingForm } from './stocking-form';
+import { TransferForm } from './transfer-form';
+import {
+  clearTransferWriteRecovery,
+  getTransferWriteRecovery,
+  reconcileTransferWrite,
+} from '../../features/production/production-write';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
 import { ResourceListScreen } from './resource-list';
@@ -439,5 +445,81 @@ describe('M2 shared production UI boundary', () => {
       (node) => React.isValidElement(node) && node.type === StockingForm,
     ) as React.ReactElement<any>;
     expect(disabledStocking.props.batchState).toBe('stocked');
+  });
+
+  test('mounts TRANSFER only for STOCKED, ACTIVE or SUSPENDED batches and wires reconciliation callbacks', () => {
+    const onTransferSaved = jest.fn();
+    const onTransferConflictRefreshed = jest.fn();
+    const findTransfer = (state: string, withContext = true) =>
+      flattenNodes(
+        BatchDetailPanel({
+          batch: { id: 'batch-t', code: 'B-T', state, unit_id: 'unit-t' },
+          projection: { estimated_remaining_population: 500 },
+          events: [],
+          transferContext: withContext
+            ? { batchId: 'batch-t', batchName: 'B-T', sourceUnitId: 'unit-fallback' }
+            : undefined,
+          onTransferSaved,
+          onTransferConflictRefreshed,
+        }),
+      ).find((node) => React.isValidElement(node) && node.type === TransferForm) as
+        React.ReactElement<any> | undefined;
+
+    expect(findTransfer('planned')).toBeUndefined();
+    expect(findTransfer('harvested')).toBeUndefined();
+    expect(findTransfer('failed')).toBeUndefined();
+    expect(findTransfer('active', false)).toBeUndefined();
+    for (const state of ['stocked', 'active', 'suspended']) {
+      const transfer = findTransfer(state);
+      expect(transfer).toBeTruthy();
+      expect(transfer!.props.batchId).toBe('batch-t');
+      expect(transfer!.props.batchState).toBe(state);
+      expect(transfer!.props.sourceUnitId).toBe('unit-t');
+      expect(transfer!.props.currentEstimatedRemainingPopulation).toBe(500);
+      expect(transfer!.props.onConflictRefreshed).toBe(onTransferConflictRefreshed);
+    }
+    findTransfer('active')!.props.onSaved({}, { batch: {}, projection: {}, events: [] });
+    expect(onTransferSaved).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps TRANSFER mounted for an unresolved write after the source becomes terminal', async () => {
+    const batchId = 'batch-recover';
+    const post = jest.fn().mockRejectedValue(new Error('network down'));
+    const readers = {
+      getBatch: jest.fn(),
+      getProjection: jest.fn(),
+      listEvents: jest.fn(),
+    };
+    await reconcileTransferWrite({
+      context: { batchId },
+      payload: {
+        source_unit_id: 'unit-a',
+        destination_unit_id: 'unit-b',
+        destination_batch_id: 'batch-b',
+        quantity: '5',
+        transfer_loss: '0',
+        transferred_at: '2020-01-01T00:00:00Z',
+      },
+      idempotencyKey: 'ui-recover-key',
+      post,
+      readers,
+    });
+    expect(getTransferWriteRecovery(batchId)).not.toBeNull();
+    try {
+      const tree = BatchDetailPanel({
+        batch: { id: batchId, code: 'B-R', state: 'failed' },
+        projection: null,
+        events: [],
+        transferContext: { batchId, batchName: 'B-R' },
+      });
+      const transfer = flattenNodes(tree).find(
+        (node) => React.isValidElement(node) && node.type === TransferForm,
+      ) as React.ReactElement<any> | undefined;
+      expect(transfer).toBeTruthy();
+      expect(transfer!.props.batchState).toBe('failed');
+    } finally {
+      clearTransferWriteRecovery(batchId, 'ui-recover-key');
+    }
+    expect(post).toHaveBeenCalledTimes(1);
   });
 });

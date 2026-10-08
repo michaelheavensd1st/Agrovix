@@ -9,7 +9,9 @@ import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
 import { StockingForm } from './stocking-form';
+import { TransferForm } from './transfer-form';
 import { WaterQualityForm } from './water-quality-form';
+import { getTransferWriteRecovery } from '../../features/production/production-write';
 import type {
   WaterQualityReconciliationData,
   WaterQualityWriteContext,
@@ -31,6 +33,9 @@ export interface BatchDetailData {
   stockingContext?: WaterQualityWriteContext;
   onStockingSaved?: (reconciliation: WaterQualityReconciliationData) => void;
   onStockingConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
+  transferContext?: WaterQualityWriteContext & { sourceUnitId?: string };
+  onTransferSaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  onTransferConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
 export function BatchDetailPanel({
@@ -49,6 +54,9 @@ export function BatchDetailPanel({
   stockingContext,
   onStockingSaved,
   onStockingConflictRefreshed,
+  transferContext,
+  onTransferSaved,
+  onTransferConflictRefreshed,
 }: BatchDetailData) {
   const state = typeof batch.state === 'string' ? batch.state : 'unknown';
   const tone = getStatusTone(state);
@@ -178,6 +186,29 @@ export function BatchDetailPanel({
           batchState={state}
           onSaved={(_submission, reconciliation) => onStockingSaved?.(reconciliation)}
           onConflictRefreshed={onStockingConflictRefreshed}
+        />
+      ) : null}
+      {transferContext &&
+      (state === 'stocked' ||
+        state === 'active' ||
+        state === 'suspended' ||
+        getTransferWriteRecovery(transferContext.batchId)) ? (
+        <TransferForm
+          batchId={transferContext.batchId}
+          batchName={transferContext.batchName}
+          farmName={transferContext.farmName}
+          unitName={transferContext.unitName}
+          sourceUnitId={
+            typeof batch.unit_id === 'string' ? batch.unit_id : transferContext.sourceUnitId
+          }
+          batchState={state}
+          currentEstimatedRemainingPopulation={
+            typeof projection?.estimated_remaining_population === 'number'
+              ? projection.estimated_remaining_population
+              : null
+          }
+          onSaved={(_submission, reconciliation) => onTransferSaved?.(reconciliation)}
+          onConflictRefreshed={onTransferConflictRefreshed}
         />
       ) : null}
     </ScrollView>

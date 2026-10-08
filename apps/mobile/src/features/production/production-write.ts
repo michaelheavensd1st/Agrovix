@@ -187,6 +187,33 @@ export type SamplingWriteResult = ProductionWriteResult<SamplingPayload>;
 export type StockingSubmission = ProductionSubmission<StockingPayload>;
 export type StockingWriteResult = ProductionWriteResult<StockingPayload>;
 
+export interface TransferInput {
+  source_unit_id: string | null;
+  destination_unit_id: string | null;
+  destination_batch_id: string | null;
+  quantity: number | string | null;
+  transfer_loss?: number | string | null;
+  average_weight?: number | string | null;
+  weight_unit?: 'g' | 'kg' | string | null;
+  transferred_at: string | null;
+  notes?: string | null;
+}
+
+export interface TransferPayload extends Record<string, unknown> {
+  source_unit_id: string;
+  destination_unit_id: string;
+  destination_batch_id: string;
+  quantity: number;
+  transfer_loss: number;
+  average_weight?: number;
+  weight_unit?: 'g' | 'kg';
+  transferred_at: string;
+  notes?: string;
+}
+
+export type TransferSubmission = ProductionSubmission<TransferPayload>;
+export type TransferWriteResult = ProductionWriteResult<TransferPayload>;
+
 const WATER_QUALITY_FIELDS: readonly WaterQualityMeasurementKey[] = [
   'temperature',
   'ph',
@@ -738,6 +765,103 @@ export function createStockingSubmission(
   };
 }
 
+const TRANSFER_FUTURE_TOLERANCE_MS = 60_000;
+
+export function buildTransferPayload(
+  values: TransferInput,
+  now: number = Date.now(),
+): TransferPayload {
+  const sourceUnitId = readRequiredText(values.source_unit_id, 'source_unit_id', 64);
+  if (!sourceUnitId) throw new Error('The source unit is required.');
+  const destinationUnitId = readRequiredText(values.destination_unit_id, 'destination_unit_id', 64);
+  const destinationBatchId = readRequiredText(
+    values.destination_batch_id,
+    'destination_batch_id',
+    64,
+  );
+  if (!destinationUnitId || !destinationBatchId) {
+    throw new Error('Select a destination from the server-provided eligible destinations.');
+  }
+  if (destinationUnitId === sourceUnitId) {
+    throw new Error('The destination unit must differ from the source unit.');
+  }
+
+  const quantity = toFiniteNumber(values.quantity);
+  if (quantity === null || !Number.isInteger(quantity) || quantity < 1) {
+    throw new Error('quantity must be a positive integer.');
+  }
+  const transferLoss = toFiniteNumber(values.transfer_loss ?? 0);
+  if (transferLoss === null || !Number.isInteger(transferLoss) || transferLoss < 0) {
+    throw new Error('transfer_loss must be zero or a positive integer.');
+  }
+
+  const rawWeight = values.average_weight;
+  const hasWeight =
+    rawWeight !== null && rawWeight !== undefined && String(rawWeight).trim() !== '';
+  let averageWeight: number | undefined;
+  let weightUnit: 'g' | 'kg' | undefined;
+  if (hasWeight) {
+    const parsed = toFiniteNumber(rawWeight);
+    if (parsed === null || parsed < 0) throw new Error('average_weight must be zero or greater.');
+    averageWeight = parsed;
+    const unit = values.weight_unit || 'g';
+    if (unit !== 'g' && unit !== 'kg') throw new Error('weight_unit must be g or kg.');
+    weightUnit = unit;
+  }
+
+  const transferredAt = normalizeProductionEventTime(values.transferred_at);
+  if (!transferredAt) throw new Error('A valid physical transfer time is required.');
+  if (Date.parse(transferredAt) > now + TRANSFER_FUTURE_TOLERANCE_MS) {
+    throw new Error('The physical transfer time cannot be in the future.');
+  }
+
+  const notes = readRequiredText(values.notes, 'notes', 1000);
+
+  return {
+    source_unit_id: sourceUnitId,
+    destination_unit_id: destinationUnitId,
+    destination_batch_id: destinationBatchId,
+    quantity,
+    transfer_loss: transferLoss,
+    ...(averageWeight === undefined ? {} : { average_weight: averageWeight }),
+    ...(weightUnit === undefined ? {} : { weight_unit: weightUnit }),
+    transferred_at: transferredAt,
+    ...(notes ? { notes } : {}),
+  };
+}
+
+export function createTransferDraftSignature(batchId: string, values: TransferInput): string {
+  return JSON.stringify({
+    batchId,
+    values: {
+      source_unit_id: values.source_unit_id?.trim() ?? '',
+      destination_unit_id: values.destination_unit_id?.trim() ?? '',
+      destination_batch_id: values.destination_batch_id?.trim() ?? '',
+      quantity: values.quantity ?? '',
+      transfer_loss: values.transfer_loss ?? '',
+      average_weight: values.average_weight ?? '',
+      weight_unit: values.weight_unit ?? 'g',
+      transferred_at: normalizeProductionEventTime(values.transferred_at),
+      notes: values.notes?.trim() ?? '',
+    },
+  });
+}
+
+export function createTransferSubmission(
+  batchId: string,
+  values: TransferInput,
+  idempotencyKey?: string,
+  context?: Partial<WaterQualityWriteContext>,
+): TransferSubmission {
+  return {
+    batchId,
+    payload: buildTransferPayload(values),
+    idempotencyKey: idempotencyKey ?? makeOpaqueId('transfer'),
+    createdAt: new Date().toISOString(),
+    context: { ...(context ?? {}), batchId },
+  };
+}
+
 export function isSameLogicalSubmission(
   left: WaterQualitySubmission,
   right: WaterQualitySubmission,
@@ -805,7 +929,8 @@ export function resolveWriteOutcome({
   };
 }
 
-type ProductionEventType = 'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING' | 'STOCKING';
+type ProductionEventType =
+  'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING' | 'STOCKING' | 'TRANSFER';
 const PRODUCTION_WRITE_LEDGER = new Map<string, ProductionWriteResult<any>>();
 export interface ProductionEventWriteRecovery {
   submission: ProductionSubmission<any>;
@@ -817,6 +942,7 @@ export interface ProductionEventWriteRecovery {
 export type MortalityWriteRecovery = ProductionEventWriteRecovery;
 export type SamplingWriteRecovery = ProductionEventWriteRecovery;
 export type StockingWriteRecovery = ProductionEventWriteRecovery;
+export type TransferWriteRecovery = ProductionEventWriteRecovery;
 
 const PRODUCTION_EVENT_WRITE_RECOVERY = new Map<string, ProductionEventWriteRecovery>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
@@ -871,6 +997,14 @@ export function getStockingWriteRecovery(batchId: string): StockingWriteRecovery
 
 export function clearStockingWriteRecovery(batchId: string, idempotencyKey: string): void {
   clearProductionEventWriteRecovery('STOCKING', batchId, idempotencyKey);
+}
+
+export function getTransferWriteRecovery(batchId: string): TransferWriteRecovery | null {
+  return getProductionEventWriteRecovery('TRANSFER', batchId);
+}
+
+export function clearTransferWriteRecovery(batchId: string, idempotencyKey: string): void {
+  clearProductionEventWriteRecovery('TRANSFER', batchId, idempotencyKey);
 }
 
 function isSameProductionSubmission(
@@ -946,7 +1080,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
                 : 'outcome_unknown',
           });
         } else if (
-          (eventType === 'SAMPLING' || eventType === 'STOCKING') &&
+          (eventType === 'SAMPLING' || eventType === 'STOCKING' || eventType === 'TRANSFER') &&
           result.outcome === 'accepted'
         ) {
           PRODUCTION_EVENT_WRITE_RECOVERY.set(recoveryKey, {
@@ -1459,4 +1593,249 @@ export function reconcileStockingWrite({
     post,
     readAll,
   });
+}
+
+export type TransferReconciliationFailureKind =
+  'incomplete_read' | 'integrity_anomaly' | 'pair_mismatch';
+
+export class TransferReconciliationError extends Error {
+  constructor(
+    public readonly kind: TransferReconciliationFailureKind,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'TransferReconciliationError';
+  }
+}
+
+export interface TransferEventPage {
+  items: Record<string, unknown>[];
+  next_cursor: string | null;
+}
+
+export interface TransferReaders {
+  getBatch: (batchId: string) => Promise<Record<string, unknown>>;
+  getProjection: (batchId: string) => Promise<Record<string, unknown>>;
+  listEvents: (
+    batchId: string,
+    options: { limit: number; cursor?: string; eventType?: string },
+  ) => Promise<TransferEventPage>;
+}
+
+export interface TransferReconciliationData extends WaterQualityReconciliationData {
+  destination: WaterQualityReconciliationData;
+  transfer_id: string;
+}
+
+export function isTransferReconciliation(
+  value: WaterQualityReconciliationData | null | undefined,
+): value is TransferReconciliationData {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'destination' in value &&
+    'transfer_id' in value &&
+    typeof value.transfer_id === 'string'
+  );
+}
+
+export const TRANSFER_EVENT_PAGE_LIMIT = 100;
+export const TRANSFER_EVENT_MAX_PAGES = 20;
+const TRANSFER_DISPLAY_EVENT_LIMIT = 50;
+
+const TRANSFER_CAPTURED_IDS = new Map<string, string>();
+
+function isTransferRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function transferEventData(event: Record<string, unknown>): Record<string, unknown> {
+  return isTransferRecord(event.data) ? event.data : {};
+}
+
+function assertTransferEventMatches(
+  event: Record<string, unknown>,
+  side: 'out' | 'in',
+  batchId: string,
+  payload: TransferPayload,
+): void {
+  const data = transferEventData(event);
+  const label = side === 'out' ? 'source OUT' : 'destination IN';
+  if (
+    event.event_type !== 'TRANSFER' ||
+    event.transfer_role !== side ||
+    event.batch_id !== batchId
+  ) {
+    throw new TransferReconciliationError(
+      'pair_mismatch',
+      `The ${label} transfer event does not match the submitted batch or role.`,
+    );
+  }
+  if (
+    data.quantity !== payload.quantity ||
+    (data.transfer_loss ?? 0) !== payload.transfer_loss ||
+    data.source_unit_id !== payload.source_unit_id ||
+    data.destination_unit_id !== payload.destination_unit_id ||
+    data.destination_batch_id !== payload.destination_batch_id
+  ) {
+    throw new TransferReconciliationError(
+      'pair_mismatch',
+      `The ${label} transfer event quantities or units do not match the submitted transfer.`,
+    );
+  }
+}
+
+async function scanTransferEvents(
+  readers: TransferReaders,
+  batchId: string,
+  predicate: (event: Record<string, unknown>) => boolean,
+): Promise<{ event: Record<string, unknown> | null; exhausted: boolean }> {
+  let cursor: string | undefined;
+  for (let page = 0; page < TRANSFER_EVENT_MAX_PAGES; page += 1) {
+    const result = await readers.listEvents(batchId, {
+      limit: TRANSFER_EVENT_PAGE_LIMIT,
+      eventType: 'TRANSFER',
+      ...(cursor ? { cursor } : {}),
+    });
+    const found = result.items.find(
+      (event) => isTransferRecord(event) && event.event_type === 'TRANSFER' && predicate(event),
+    );
+    if (found) return { event: found, exhausted: false };
+    if (!result.next_cursor) return { event: null, exhausted: true };
+    if (result.next_cursor === cursor) {
+      throw new TransferReconciliationError(
+        'incomplete_read',
+        'The transfer timeline cursor did not advance, so the read is incomplete.',
+      );
+    }
+    cursor = result.next_cursor;
+  }
+  return { event: null, exhausted: false };
+}
+
+async function readTransferSide(
+  readers: TransferReaders,
+  batchId: string,
+): Promise<WaterQualityReconciliationData> {
+  const [batch, projection, eventPage] = await Promise.all([
+    readers.getBatch(batchId),
+    readers.getProjection(batchId),
+    readers.listEvents(batchId, { limit: TRANSFER_DISPLAY_EVENT_LIMIT }),
+  ]);
+  return { batch, projection, events: eventPage.items };
+}
+
+// TRANSFER verification confirms the server-recorded atomic OUT/IN event pair and retrieves
+// authoritative projections. It does not independently establish projection deltas under
+// concurrent production activity.
+async function reconcileTransferPair(
+  readers: TransferReaders,
+  submission: TransferSubmission,
+): Promise<TransferReconciliationData> {
+  const sourceBatchId = submission.batchId;
+  const destinationBatchId = submission.payload.destination_batch_id;
+  const [source, destination] = await Promise.all([
+    readTransferSide(readers, sourceBatchId),
+    readTransferSide(readers, destinationBatchId),
+  ]);
+
+  const capturedId = TRANSFER_CAPTURED_IDS.get(submission.idempotencyKey);
+  const outScan = await scanTransferEvents(
+    readers,
+    sourceBatchId,
+    (event) => event.transfer_role === 'out' && event.idempotency_key === submission.idempotencyKey,
+  );
+  if (!outScan.event) {
+    throw new TransferReconciliationError(
+      outScan.exhausted ? 'integrity_anomaly' : 'incomplete_read',
+      outScan.exhausted
+        ? 'INTEGRITY ANOMALY: the source timeline was fully read and contains no OUT event for this transfer. Do not submit a new transfer; escalate to an administrator.'
+        : 'The source transfer timeline could not be fully read, so the OUT event is unconfirmed.',
+    );
+  }
+  assertTransferEventMatches(outScan.event, 'out', sourceBatchId, submission.payload);
+  const transferId = outScan.event.transfer_id;
+  if (typeof transferId !== 'string' || transferId.length === 0) {
+    throw new TransferReconciliationError(
+      'pair_mismatch',
+      'The source OUT event has no transfer_id.',
+    );
+  }
+  if (capturedId !== undefined && capturedId !== transferId) {
+    throw new TransferReconciliationError(
+      'pair_mismatch',
+      'The source OUT event transfer_id differs from the transfer_id returned by the server.',
+    );
+  }
+
+  const inScan = await scanTransferEvents(
+    readers,
+    destinationBatchId,
+    (event) => event.transfer_id === transferId && event.transfer_role === 'in',
+  );
+  if (!inScan.event) {
+    throw new TransferReconciliationError(
+      inScan.exhausted ? 'integrity_anomaly' : 'incomplete_read',
+      inScan.exhausted
+        ? 'INTEGRITY ANOMALY: the destination timeline was fully read and has no IN event paired with this transfer. Do not submit a new transfer; escalate to an administrator.'
+        : 'The destination transfer timeline could not be fully read, so the IN event is unconfirmed.',
+    );
+  }
+  assertTransferEventMatches(inScan.event, 'in', destinationBatchId, submission.payload);
+  if (inScan.event.transfer_id !== transferId) {
+    throw new TransferReconciliationError('pair_mismatch', 'The IN and OUT transfer ids differ.');
+  }
+  return { ...source, destination, transfer_id: transferId };
+}
+
+export function reconcileTransferWrite({
+  context,
+  payload,
+  idempotencyKey,
+  submission: preservedSubmission,
+  post,
+  readers,
+}: {
+  context: WaterQualityWriteContext;
+  payload: TransferInput;
+  idempotencyKey: string;
+  submission?: TransferSubmission;
+  post: (
+    batchId: string,
+    eventType: ProductionEventType,
+    data: Record<string, unknown>,
+    key: string,
+    performedAt?: string,
+  ) => Promise<Record<string, unknown>>;
+  readers: TransferReaders;
+}): Promise<TransferWriteResult> {
+  const submission =
+    preservedSubmission ??
+    createTransferSubmission(context.batchId, payload, idempotencyKey, context);
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    submission.performedAt !== undefined ||
+    JSON.stringify(submission.payload) !==
+      JSON.stringify(buildTransferPayload(payload, Number.POSITIVE_INFINITY))
+  ) {
+    throw new Error('The preserved transfer submission does not match the current intent.');
+  }
+  return reconcileProductionEventWrite({
+    context,
+    eventType: 'TRANSFER',
+    submission,
+    post: async (batchId, eventType, data, key, performedAt) => {
+      const response = await post(batchId, eventType, data, key, performedAt);
+      if (typeof response.transfer_id !== 'string' || response.transfer_id.length === 0) {
+        throw new TransferReconciliationError(
+          'pair_mismatch',
+          'The server response did not include a transfer_id.',
+        );
+      }
+      TRANSFER_CAPTURED_IDS.set(key, response.transfer_id);
+      return response;
+    },
+    readAll: () => reconcileTransferPair(readers, submission),
+  }) as Promise<TransferWriteResult>;
 }

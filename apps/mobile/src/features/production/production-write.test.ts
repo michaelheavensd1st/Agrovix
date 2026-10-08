@@ -42,6 +42,7 @@ jest.mock('../../lib/production-api', () => ({
   getBatchProjections: jest.fn(),
   getProductionBatch: jest.fn(),
   listBatchEvents: jest.fn(),
+  listTransferDestinations: jest.fn(),
 }));
 
 import React from 'react';
@@ -50,6 +51,7 @@ import { FeedingForm } from '../../components/production/feeding-form';
 import { MortalityForm } from '../../components/production/mortality-form';
 import { SamplingForm } from '../../components/production/sampling-form';
 import { StockingForm } from '../../components/production/stocking-form';
+import { TransferForm } from '../../components/production/transfer-form';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
 import { ApiError, ApiFailure } from '../../lib/api';
 import * as productionApi from '../../lib/production-api';
@@ -72,6 +74,14 @@ import {
   getSamplingWriteRecovery,
   getStockingWriteRecovery,
   clearStockingWriteRecovery,
+  buildTransferPayload,
+  clearTransferWriteRecovery,
+  createTransferSubmission,
+  getTransferWriteRecovery,
+  TransferReconciliationError,
+  type TransferInput,
+  type TransferReaders,
+  type TransferSubmission,
   clearSamplingWriteRecovery,
   normalizeMortalityObservedAt,
   normalizeProductionEventTime,
@@ -81,6 +91,7 @@ import {
   reconcileMortalityWrite,
   reconcileSamplingWrite,
   reconcileStockingWrite,
+  reconcileTransferWrite,
   reconcileWaterQualityWrite,
   reconcileFeedingWrite,
   resolveWriteOutcome,
@@ -5016,5 +5027,881 @@ describe('stocking write workflow', () => {
     expect(getStockingWriteRecovery(stockingContext.batchId)?.retryOutcome).toBe('accepted');
     clearStockingWriteRecovery(stockingContext.batchId, submission.idempotencyKey);
     expect(getStockingWriteRecovery(stockingContext.batchId)).toBeNull();
+  });
+});
+
+describe('transfer write workflow', () => {
+  const SOURCE = 'batch-src';
+  const DEST = 'batch-dst';
+  const transferInput: TransferInput = {
+    source_unit_id: 'unit-src',
+    destination_unit_id: 'unit-dst',
+    destination_batch_id: DEST,
+    quantity: '200',
+    transfer_loss: '5',
+    average_weight: '1.5',
+    weight_unit: 'g',
+    transferred_at: '2024-05-01T10:00:00Z',
+    notes: 'Move to grow-out',
+  };
+  const networkFailure = () =>
+    new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'Network request failed');
+  const httpFailure = (status: number, code?: string) =>
+    new ApiError(status, 'rejected', 'http://api', '/p', code);
+
+  const pairEvents = (
+    submission: TransferSubmission,
+    transferId = 'transfer-1',
+    overrides: { out?: Record<string, unknown>; in?: Record<string, unknown> } = {},
+  ) => {
+    const base = {
+      event_type: 'TRANSFER',
+      transfer_id: transferId,
+      data: submission.payload,
+    };
+    return {
+      out: {
+        ...base,
+        id: 'event-out',
+        batch_id: SOURCE,
+        transfer_role: 'out',
+        idempotency_key: submission.idempotencyKey,
+        ...overrides.out,
+      },
+      in: {
+        ...base,
+        id: 'event-in',
+        batch_id: DEST,
+        transfer_role: 'in',
+        idempotency_key: null,
+        ...overrides.in,
+      },
+    };
+  };
+
+  type Pages = Record<string, Array<Record<string, unknown>[]>>;
+  const makeReaders = (pages: Pages) => {
+    const listEvents = jest.fn(
+      async (batchId: string, options: { limit: number; cursor?: string; eventType?: string }) => {
+        const list = pages[batchId] ?? [[]];
+        const index = options.cursor ? Number(options.cursor.replace('cursor-', '')) : 0;
+        return {
+          items: list[index] ?? [],
+          next_cursor: index + 1 < list.length ? `cursor-${index + 1}` : null,
+        };
+      },
+    );
+    const getBatch = jest.fn(async (id: string) => ({ id, state: 'active' }));
+    const getProjection = jest.fn(async (id: string) => ({ batch_id: id }));
+    const readers: TransferReaders = { getBatch, getProjection, listEvents };
+    return { readers, listEvents, getBatch, getProjection };
+  };
+
+  const run = (
+    submission: TransferSubmission,
+    post: jest.Mock,
+    readers: TransferReaders,
+    batchId = SOURCE,
+  ) =>
+    reconcileTransferWrite({
+      context: { batchId },
+      payload: submission.payload,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      post,
+      readers,
+    });
+  const newSubmission = (key: string, input: TransferInput = transferInput) =>
+    createTransferSubmission(SOURCE, input, key, { batchId: SOURCE });
+  const cleanup = (submission: TransferSubmission) =>
+    clearTransferWriteRecovery(submission.batchId, submission.idempotencyKey);
+  afterEach(() => {
+    const leftover = getTransferWriteRecovery(SOURCE);
+    if (leftover) clearTransferWriteRecovery(SOURCE, leftover.submission.idempotencyKey);
+  });
+
+  test('validates TRANSFER payload and normalizes the physical time to UTC', () => {
+    expect(buildTransferPayload(transferInput)).toEqual({
+      source_unit_id: 'unit-src',
+      destination_unit_id: 'unit-dst',
+      destination_batch_id: DEST,
+      quantity: 200,
+      transfer_loss: 5,
+      average_weight: 1.5,
+      weight_unit: 'g',
+      transferred_at: '2024-05-01T10:00:00.000Z',
+      notes: 'Move to grow-out',
+    });
+    const offset = buildTransferPayload({
+      ...transferInput,
+      transferred_at: '2024-05-01T10:00:00-05:00',
+    });
+    expect(offset.transferred_at).toBe('2024-05-01T15:00:00.000Z');
+    const minimal = buildTransferPayload({
+      ...transferInput,
+      average_weight: '',
+      transfer_loss: undefined,
+      notes: ' ',
+    });
+    expect(minimal).not.toHaveProperty('average_weight');
+    expect(minimal).not.toHaveProperty('weight_unit');
+    expect(minimal).not.toHaveProperty('notes');
+    expect(minimal.transfer_loss).toBe(0);
+    expect(buildTransferPayload({ ...transferInput, weight_unit: 'kg' }).weight_unit).toBe('kg');
+  });
+
+  test('rejects invalid TRANSFER input before any write', () => {
+    const invalid = (patch: Partial<TransferInput>) =>
+      buildTransferPayload({ ...transferInput, ...patch });
+    expect(() => invalid({ quantity: 0 })).toThrow(/positive integer/);
+    expect(() => invalid({ quantity: '1.5' })).toThrow(/positive integer/);
+    expect(() => invalid({ transfer_loss: -1 })).toThrow(/transfer_loss/);
+    expect(() => invalid({ transfer_loss: '1.2' })).toThrow(/transfer_loss/);
+    expect(() => invalid({ average_weight: -1 })).toThrow(/zero or greater/);
+    expect(() => invalid({ weight_unit: 'lb' })).toThrow(/g or kg/);
+    expect(() => invalid({ transferred_at: 'invalid' })).toThrow(/physical transfer time/);
+    expect(() => invalid({ transferred_at: '2999-01-01T00:00:00Z' })).toThrow(/future/);
+    expect(() => invalid({ destination_batch_id: '' })).toThrow(/eligible destinations/);
+    expect(() => invalid({ destination_unit_id: 'unit-src' })).toThrow(/differ/);
+    expect(() => invalid({ source_unit_id: null })).toThrow(/source unit/);
+    expect(() => invalid({ notes: 'x'.repeat(1001) })).toThrow(/at most 1000/);
+  });
+
+  test('posts once, reconciles both batches, and matches OUT and IN by transfer_id', async () => {
+    const submission = newSubmission('transfer-key-ok');
+    const events = pairEvents(submission);
+    const { readers, getBatch, getProjection, listEvents } = makeReaders({
+      [SOURCE]: [[events.out]],
+      [DEST]: [[events.in]],
+    });
+    const post = jest.fn().mockResolvedValue({ ...events.out, transfer_id: 'transfer-1' });
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe('accepted');
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      SOURCE,
+      'TRANSFER',
+      submission.payload,
+      'transfer-key-ok',
+      undefined,
+    );
+    expect(getBatch.mock.calls.map((call) => call[0]).sort()).toEqual([DEST, SOURCE]);
+    expect(getProjection.mock.calls.map((call) => call[0]).sort()).toEqual([DEST, SOURCE]);
+    expect(
+      listEvents.mock.calls.filter((call) => call[1].eventType === 'TRANSFER').map((c) => c[0]),
+    ).toEqual([SOURCE, DEST]);
+    expect(result.reconciliation).toMatchObject({
+      transfer_id: 'transfer-1',
+      batch: { id: SOURCE },
+      destination: { batch: { id: DEST } },
+    });
+    expect(getTransferWriteRecovery(SOURCE)?.retryOutcome).toBe('accepted');
+    cleanup(submission);
+    expect(getTransferWriteRecovery(SOURCE)).toBeNull();
+  });
+
+  test('pages TRANSFER timelines with opaque cursors on both batches', async () => {
+    const submission = newSubmission('transfer-key-paging');
+    const events = pairEvents(submission);
+    const noise = { event_type: 'TRANSFER', transfer_id: 'other', transfer_role: 'out' };
+    const { readers, listEvents } = makeReaders({
+      [SOURCE]: [[noise], [noise], [events.out]],
+      [DEST]: [[noise], [events.in]],
+    });
+    const post = jest.fn().mockResolvedValue({ ...events.out });
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe('accepted');
+    const transferCalls = listEvents.mock.calls.filter((c) => c[1].eventType === 'TRANSFER');
+    expect(transferCalls.map((c) => [c[0], c[1].cursor])).toEqual([
+      [SOURCE, undefined],
+      [SOURCE, 'cursor-1'],
+      [SOURCE, 'cursor-2'],
+      [DEST, undefined],
+      [DEST, 'cursor-1'],
+    ]);
+    cleanup(submission);
+  });
+
+  test('reports a fully read timeline without the pair as an integrity anomaly and never re-posts', async () => {
+    const submission = newSubmission('transfer-key-anomaly');
+    const events = pairEvents(submission);
+    const { readers } = makeReaders({ [SOURCE]: [[events.out]], [DEST]: [[]] });
+    const post = jest.fn().mockResolvedValue({ ...events.out });
+    const first = await run(submission, post, readers);
+    expect(first.outcome).toBe('reconciliation_failed');
+    expect(first.posted).toBe(true);
+    expect(first.error).toBeInstanceOf(TransferReconciliationError);
+    expect((first.error as TransferReconciliationError).kind).toBe('integrity_anomaly');
+    expect(getTransferWriteRecovery(SOURCE)?.retryOutcome).toBe('reconciliation_failed');
+    const second = await run(submission, post, readers);
+    expect(second.outcome).toBe('reconciliation_failed');
+    expect(post).toHaveBeenCalledTimes(1);
+    cleanup(submission);
+  });
+
+  test('treats read failures as incomplete reconciliation, preserves acceptance, and recovers read-only', async () => {
+    const submission = newSubmission('transfer-key-readfail');
+    const events = pairEvents(submission);
+    const { readers, getBatch } = makeReaders({
+      [SOURCE]: [[events.out]],
+      [DEST]: [[events.in]],
+    });
+    getBatch.mockRejectedValueOnce(new Error('destination unavailable'));
+    const post = jest.fn().mockResolvedValue({ ...events.out });
+    const failed = await run(submission, post, readers);
+    expect(failed.outcome).toBe('reconciliation_failed');
+    expect(failed.retrySubmission).toBe(submission);
+    expect(getTransferWriteRecovery(SOURCE)?.retryOutcome).toBe('reconciliation_failed');
+    const recovered = await run(submission, post, readers);
+    expect(recovered.outcome).toBe('accepted');
+    expect(post).toHaveBeenCalledTimes(1);
+    cleanup(submission);
+  });
+
+  test('flags an exhausted-cap pagination as an incomplete read, not an anomaly', async () => {
+    const submission = newSubmission('transfer-key-cap');
+    const events = pairEvents(submission);
+    const listEvents = jest.fn(async () => ({
+      items: [{ event_type: 'TRANSFER', transfer_id: 'noise', transfer_role: 'out' }],
+      next_cursor: `c-${Math.random()}`,
+    }));
+    const readers: TransferReaders = {
+      getBatch: async (id) => ({ id }),
+      getProjection: async (id) => ({ id }),
+      listEvents,
+    };
+    const post = jest.fn().mockResolvedValue({ ...events.out });
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe('reconciliation_failed');
+    expect((result.error as TransferReconciliationError).kind).toBe('incomplete_read');
+    cleanup(submission);
+  });
+
+  test.each([
+    ['wrong source role', { out: { transfer_role: 'in' } }],
+    ['mismatched quantity', { out: { data: { quantity: 1 } } }],
+    ['mismatched destination batch', { out: { data: { destination_batch_id: 'other' } } }],
+  ])('fails reconciliation on %s for the OUT event', async (_label, overrides) => {
+    const submission = newSubmission(`transfer-key-mm-${_label}`);
+    const events = pairEvents(submission);
+    const out = {
+      ...events.out,
+      ...overrides.out,
+      data: { ...submission.payload, ...((overrides.out as { data?: object }).data ?? {}) },
+    };
+    const { readers } = makeReaders({ [SOURCE]: [[out]], [DEST]: [[events.in]] });
+    const post = jest.fn().mockResolvedValue({ ...events.out });
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe('reconciliation_failed');
+    expect(post).toHaveBeenCalledTimes(1);
+    cleanup(submission);
+  });
+
+  test('fails reconciliation when the destination IN event is on the wrong batch or mismatched', async () => {
+    const submission = newSubmission('transfer-key-in-mismatch');
+    const events = pairEvents(submission);
+    const badIn = { ...events.in, data: { ...submission.payload, quantity: 199 } };
+    const { readers } = makeReaders({ [SOURCE]: [[events.out]], [DEST]: [[badIn]] });
+    const post = jest.fn().mockResolvedValue({ ...events.out });
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe('reconciliation_failed');
+    expect((result.error as TransferReconciliationError).kind).toBe('pair_mismatch');
+    cleanup(submission);
+  });
+
+  test('fails reconciliation when the server transfer_id differs from the OUT event', async () => {
+    const submission = newSubmission('transfer-key-id-mismatch');
+    const events = pairEvents(submission, 'transfer-A');
+    const { readers } = makeReaders({ [SOURCE]: [[events.out]], [DEST]: [[events.in]] });
+    const post = jest.fn().mockResolvedValue({ ...events.out, transfer_id: 'transfer-B' });
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe('reconciliation_failed');
+    expect((result.error as TransferReconciliationError).kind).toBe('pair_mismatch');
+    cleanup(submission);
+  });
+
+  test('a response without transfer_id is an uncertain outcome that retries with the same key', async () => {
+    const submission = newSubmission('transfer-key-no-id');
+    const events = pairEvents(submission);
+    const { readers } = makeReaders({ [SOURCE]: [[events.out]], [DEST]: [[events.in]] });
+    const post = jest
+      .fn()
+      .mockResolvedValueOnce({ id: 'event-out', transfer_id: null })
+      .mockResolvedValueOnce({ ...events.out });
+    const first = await run(submission, post, readers);
+    expect(first.outcome).toBe('outcome_unknown');
+    expect(first.retrySubmission).toBe(submission);
+    const retry = await run(submission, post, readers);
+    expect(retry.outcome).toBe('accepted');
+    expect(post.mock.calls.map((c) => c[3])).toEqual(['transfer-key-no-id', 'transfer-key-no-id']);
+    cleanup(submission);
+  });
+
+  test('retries a timeout with the exact original submission and idempotency key', async () => {
+    const submission = newSubmission('transfer-key-timeout');
+    const events = pairEvents(submission);
+    const { readers } = makeReaders({ [SOURCE]: [[events.out]], [DEST]: [[events.in]] });
+    const post = jest
+      .fn()
+      .mockRejectedValueOnce(networkFailure())
+      .mockResolvedValueOnce({ ...events.out });
+    const first = await run(submission, post, readers);
+    expect(first.outcome).toBe('outcome_unknown');
+    expect(first.retrySubmission).toBe(submission);
+    expect(getTransferWriteRecovery(SOURCE)?.retryOutcome).toBe('outcome_unknown');
+    const retry = await run(first.retrySubmission as TransferSubmission, post, readers);
+    expect(retry.outcome).toBe('accepted');
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[1]).toEqual(post.mock.calls[0]);
+    cleanup(submission);
+  });
+
+  test('does not allow a different payload under the same key or a second unresolved transfer', async () => {
+    const submission = newSubmission('transfer-key-guard');
+    const post = jest.fn().mockRejectedValue(networkFailure());
+    const { readers } = makeReaders({ [SOURCE]: [[]], [DEST]: [[]] });
+    await run(submission, post, readers);
+    const changed = newSubmission('transfer-key-guard', { ...transferInput, quantity: '201' });
+    expect(() => run(changed, post, readers)).toThrow(/unresolved TRANSFER/);
+    const other = newSubmission('transfer-key-other');
+    expect(() => run(other, post, readers)).toThrow(/unresolved TRANSFER/);
+    expect(post).toHaveBeenCalledTimes(1);
+    cleanup(submission);
+  });
+
+  test('rejects a preserved submission that no longer matches the intent', () => {
+    const submission = newSubmission('transfer-key-intent');
+    const { readers } = makeReaders({});
+    expect(() =>
+      reconcileTransferWrite({
+        context: { batchId: SOURCE },
+        payload: { ...transferInput, quantity: '201' },
+        idempotencyKey: submission.idempotencyKey,
+        submission,
+        post: jest.fn(),
+        readers,
+      }),
+    ).toThrow(/does not match the current intent/);
+  });
+
+  test.each([
+    [403, undefined, 'write_failed'],
+    [404, undefined, 'write_failed'],
+    [409, 'transfer_exceeds_population', 'rejected'],
+    [409, 'unit_under_maintenance', 'rejected'],
+    [409, undefined, 'rejected'],
+    [422, 'transfer_destination_ineligible', 'rejected'],
+  ])('treats HTTP %s (%s) as definitive with no retry', async (status, code, outcome) => {
+    const submission = newSubmission(`transfer-key-http-${status}-${code}`);
+    const { readers } = makeReaders({});
+    const post = jest.fn().mockRejectedValue(httpFailure(status, code));
+    const result = await run(submission, post, readers);
+    expect(result.outcome).toBe(outcome);
+    expect(result.retrySubmission).toBeNull();
+    expect(result.response?.status).toBe(status);
+    expect(result.response?.code).toBe(code);
+    expect(getTransferWriteRecovery(SOURCE)).toBeNull();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('transfer form workflow', () => {
+  const BATCH = 'batch-form';
+  const DEST = 'batch-form-dst';
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+  let stateValues: unknown[] = [];
+  let refs: Array<{ current: unknown }> = [];
+  let effects: Array<() => unknown> = [];
+  let stateIndex = 0;
+  let refIndex = 0;
+  let lastKey = '';
+  let lastData: Record<string, unknown> = {};
+  let transferEventsReady = true;
+
+  const textContent = (node: unknown): string => {
+    if (Array.isArray(node)) return node.map(textContent).join(' ');
+    if (typeof node === 'string' || typeof node === 'number') return String(node);
+    if (React.isValidElement(node)) {
+      return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+    }
+    return '';
+  };
+  const configureMount = () => {
+    stateValues = [];
+    refs = [];
+    effects = [];
+    stateIndex = 0;
+    refIndex = 0;
+    (React.useState as unknown as jest.Mock).mockReset().mockImplementation((initial: unknown) => {
+      const index = stateIndex++;
+      if (stateValues.length <= index) {
+        stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+      }
+      return [
+        stateValues[index],
+        (next: unknown) => {
+          stateValues[index] =
+            typeof next === 'function'
+              ? (next as (current: unknown) => unknown)(stateValues[index])
+              : next;
+        },
+      ];
+    });
+    (React.useRef as unknown as jest.Mock).mockReset().mockImplementation((initial: unknown) => {
+      const index = refIndex++;
+      if (refs.length <= index) refs.push({ current: initial });
+      return refs[index];
+    });
+    (React.useEffect as unknown as jest.Mock).mockReset().mockImplementation((e: () => unknown) => {
+      effects.push(e);
+    });
+  };
+  const render = (props: Partial<React.ComponentProps<typeof TransferForm>> = {}) => {
+    stateIndex = 0;
+    refIndex = 0;
+    const onSaved = props.onSaved ?? jest.fn();
+    const tree = TransferForm({
+      batchId: BATCH,
+      batchName: 'B-SRC',
+      farmName: 'North Farm',
+      unitName: 'Pond 1',
+      sourceUnitId: 'unit-src',
+      batchState: 'active',
+      currentEstimatedRemainingPopulation: 1000,
+      onSaved,
+      ...props,
+    });
+    const elements: React.ReactElement[] = [];
+    const visit = (node: unknown): void => {
+      if (Array.isArray(node)) node.forEach(visit);
+      else if (React.isValidElement(node)) {
+        const element = node as React.ReactElement<{ children?: unknown }>;
+        elements.push(element);
+        visit(element.props.children);
+      }
+    };
+    visit(tree);
+    return { tree, elements, text: textContent(tree).replace(/\s+/g, ' ') };
+  };
+  type Pressed = React.ReactElement<{ onPress: () => unknown; disabled?: boolean }>;
+  const button = (elements: React.ReactElement[], text: string) =>
+    elements.find(
+      (element) =>
+        element.type === Pressable &&
+        textContent(
+          (element as React.ReactElement<{ children?: unknown }>).props.children,
+        ).includes(text),
+    ) as Pressed | undefined;
+  const inputs = (elements: React.ReactElement[]) =>
+    elements.filter((element) => element.type === TextInput) as Array<
+      React.ReactElement<{ onChangeText: (value: string) => void; editable?: boolean }>
+    >;
+
+  const api = productionApi as jest.Mocked<typeof productionApi>;
+  const installApi = () => {
+    lastKey = '';
+    transferEventsReady = true;
+    api.createBatchEvent.mockReset().mockImplementation(async (_batchId, body, key) => {
+      lastKey = key;
+      lastData = (body.data ?? {}) as Record<string, unknown>;
+      return {
+        id: 'event-out',
+        event_type: 'TRANSFER',
+        batch_id: BATCH,
+        transfer_id: 'transfer-form-1',
+        transfer_role: 'out',
+        idempotency_key: key,
+      };
+    });
+    api.getProductionBatch.mockReset().mockImplementation(async (id) => ({ id, state: 'active' }));
+    api.getBatchProjections
+      .mockReset()
+      .mockImplementation(async (id) => ({ batch_id: id, estimated_remaining_population: 1000 }));
+    api.listBatchEvents.mockReset().mockImplementation(async (id, options) => {
+      if (options?.eventType !== 'TRANSFER' || !transferEventsReady) {
+        return { items: [], next_cursor: null, limit: 25 };
+      }
+      const isSource = id === BATCH;
+      return {
+        items: [
+          {
+            event_type: 'TRANSFER',
+            transfer_id: 'transfer-form-1',
+            transfer_role: isSource ? 'out' : 'in',
+            batch_id: id,
+            idempotency_key: isSource ? lastKey : null,
+            data: lastData,
+          },
+        ],
+        next_cursor: null,
+        limit: 100,
+      };
+    });
+    api.listTransferDestinations.mockReset().mockResolvedValue([
+      { id: DEST, unit_id: 'unit-dst', label: 'Pond 2 · B-DST' },
+      { id: BATCH, unit_id: 'unit-other', label: 'Source batch should be hidden' },
+      { id: 'batch-same-unit', unit_id: 'unit-src', label: 'Same unit should be hidden' },
+    ]);
+  };
+
+  const mount = async (props: Partial<React.ComponentProps<typeof TransferForm>> = {}) => {
+    configureMount();
+    render(props);
+    const cleanups = effects.map((effect) => effect());
+    await flush();
+    return { cleanups, view: render(props) };
+  };
+  const fillAndConfirm = (props: Partial<React.ComponentProps<typeof TransferForm>> = {}) => {
+    let view = render(props);
+    button(view.elements, 'Pond 2')!.props.onPress();
+    view = render(props);
+    const fields = inputs(view.elements);
+    fields[0].props.onChangeText('200');
+    fields[1].props.onChangeText('5');
+    fields[2].props.onChangeText('1.5');
+    fields[3].props.onChangeText('2024-05-01T10:00:00Z');
+    view = render(props);
+    button(view.elements, 'I confirm transferring')!.props.onPress();
+    return render(props);
+  };
+
+  beforeEach(() => installApi());
+  afterEach(() => {
+    const leftover = getTransferWriteRecovery(BATCH);
+    if (leftover) clearTransferWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+    jest.restoreAllMocks();
+  });
+
+  test('offers only server-returned destinations and excludes the source batch and unit', async () => {
+    const { view } = await mount();
+    expect(api.listTransferDestinations).toHaveBeenCalledWith(BATCH);
+    expect(view.text).toContain('Pond 2 · B-DST');
+    expect(view.text).not.toContain('Source batch should be hidden');
+    expect(view.text).not.toContain('Same unit should be hidden');
+  });
+
+  test('is disabled for non-STOCKED/ACTIVE source batches', async () => {
+    configureMount();
+    const view = render({ batchState: 'planned' });
+    expect(view.text).toContain('Transfers require an authoritative STOCKED, ACTIVE or SUSPENDED');
+    expect(inputs(view.elements).every((input) => input.props.editable === false)).toBe(true);
+    expect(button(view.elements, 'Submit transfer')!.props.disabled).toBe(true);
+    expect(api.listTransferDestinations).not.toHaveBeenCalled();
+  });
+
+  test('requires explicit confirmation with source, destination, and remaining-population review', async () => {
+    await mount();
+    let view = render();
+    button(view.elements, 'Pond 2')!.props.onPress();
+    view = render();
+    const fields = inputs(view.elements);
+    fields[0].props.onChangeText('200');
+    fields[1].props.onChangeText('5');
+    view = render();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    view = render();
+    expect(view.text).toContain('Explicitly confirm the source and destination');
+    button(view.elements, 'I confirm transferring')!.props.onPress();
+    view = render();
+    expect(view.text).toContain('Source: B-SRC · Pond 1 ( unit-src )');
+    expect(view.text).toContain('Destination: Pond 2 · B-DST');
+    expect(view.text).toContain('Net transferred: 200');
+    expect(view.text).toContain('Loss in transit: 5');
+    expect(view.text).toContain('Source remaining after transfer: 795');
+    expect(view.text).toContain('Farm: North Farm');
+  });
+
+  test('rejects quantity plus loss above the known remaining population before posting', async () => {
+    await mount();
+    let view = render();
+    button(view.elements, 'Pond 2')!.props.onPress();
+    view = render();
+    const fields = inputs(view.elements);
+    fields[0].props.onChangeText('999');
+    fields[1].props.onChangeText('5');
+    view = render();
+    button(view.elements, 'I confirm transferring')!.props.onPress();
+    view = render();
+    expect(view.text).toContain('exceeds the current remaining population');
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+  });
+
+  test('submits once with UTC transferred_at, no performed_at, and reconciles both batches', async () => {
+    const onSaved = jest.fn();
+    await mount({ onSaved });
+    const view = fillAndConfirm({ onSaved });
+    const submit = button(view.elements, 'Submit transfer')!;
+    const first = submit.props.onPress();
+    const second = submit.props.onPress();
+    await Promise.all([first, second]);
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    const [batchId, body, key] = api.createBatchEvent.mock.calls[0];
+    expect(batchId).toBe(BATCH);
+    expect(body).not.toHaveProperty('performed_at');
+    expect(body.data).toMatchObject({
+      source_unit_id: 'unit-src',
+      destination_unit_id: 'unit-dst',
+      destination_batch_id: DEST,
+      quantity: 200,
+      transfer_loss: 5,
+      average_weight: 1.5,
+      weight_unit: 'g',
+      transferred_at: '2024-05-01T10:00:00.000Z',
+    });
+    expect(key).toBe(lastKey);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    const reconciliation = onSaved.mock.calls[0][1];
+    expect(reconciliation.transfer_id).toBe('transfer-form-1');
+    expect(reconciliation.destination.batch.id).toBe(DEST);
+    expect(getTransferWriteRecovery(BATCH)).toBeNull();
+    expect(render().text).toContain('recorded and verified on both');
+  });
+
+  test('resets the draft after a verified transfer and requires fresh input and confirmation', async () => {
+    await mount();
+    const destinationLoadsBefore = api.listTransferDestinations.mock.calls.length;
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    const after = render();
+    expect(after.text).toContain('recorded and verified on both');
+    expect(api.listTransferDestinations.mock.calls.length).toBe(destinationLoadsBefore + 1);
+    const fields = inputs(after.elements) as Array<
+      React.ReactElement<{ value?: string; onChangeText: (value: string) => void }>
+    >;
+    expect(fields[0].props.value).toBe('');
+    expect(fields[1].props.value).toBe('0');
+    expect(fields[2].props.value).toBe('');
+    expect(fields[4].props.value).toBe('');
+    expect(after.text).not.toContain('Source remaining after transfer');
+    expect(after.text).toContain('I confirm transferring from B-SRC to the selected destination');
+    fields[0].props.onChangeText('10');
+    await button(render().elements, 'Submit transfer')!.props.onPress();
+    expect(render().text).toContain('Explicitly confirm the source and destination');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not reset into a writable form while an accepted transfer is unreconciled', async () => {
+    await mount();
+    transferEventsReady = false;
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    const after = render();
+    const first = inputs(after.elements)[0] as React.ReactElement<{ value?: string }>;
+    expect(first.props.value).toBe('200');
+    expect(after.text).not.toContain('recorded and verified on both');
+    expect(button(after.elements, 'Submit transfer')).toBeUndefined();
+    expect(button(after.elements, 'Reconcile previous transfer')).toBeTruthy();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps the accepted write through failed reconciliation and never posts again', async () => {
+    await mount();
+    transferEventsReady = false;
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    let after = render();
+    expect(after.text).toContain('Transfer recorded — refresh to confirm');
+    expect(getTransferWriteRecovery(BATCH)?.retryOutcome).toBe('reconciliation_failed');
+    expect(button(after.elements, 'Reconcile previous transfer')).toBeTruthy();
+    expect(button(after.elements, 'Submit transfer')).toBeUndefined();
+    expect(inputs(after.elements).every((input) => input.props.editable === false)).toBe(true);
+    transferEventsReady = true;
+    await button(after.elements, 'Reconcile previous transfer')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    after = render();
+    expect(after.text).toContain('recorded and verified on both');
+  });
+
+  test('allows a SUSPENDED source with valid population to transfer', async () => {
+    const props = { batchState: 'suspended' };
+    await mount(props);
+    expect(api.listTransferDestinations).toHaveBeenCalledTimes(1);
+    const view = fillAndConfirm(props);
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(render(props).text).toContain('recorded and verified on both');
+  });
+
+  test.each(['failed', 'cancelled', 'closed', 'planned'])(
+    'does not allow a new transfer from a %s source batch',
+    async (batchState) => {
+      configureMount();
+      const view = render({ batchState });
+      effects.forEach((effect) => effect());
+      await flush();
+      expect(view.text).toContain('STOCKED, ACTIVE or SUSPENDED');
+      expect(button(view.elements, 'Submit transfer')!.props.disabled).toBe(true);
+      expect(api.listTransferDestinations).not.toHaveBeenCalled();
+      await button(view.elements, 'Submit transfer')!.props.onPress();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  test.each(['suspended', 'failed'])(
+    'keeps an uncertain transfer recoverable with the same key after the source becomes %s',
+    async (laterState) => {
+      const { cleanups } = await mount();
+      api.createBatchEvent.mockReset().mockImplementationOnce(async (_b, body, key) => {
+        lastKey = key;
+        lastData = (body.data ?? {}) as Record<string, unknown>;
+        throw new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'timeout');
+      });
+      const view = fillAndConfirm();
+      await button(view.elements, 'Submit transfer')!.props.onPress();
+      await flush();
+      const firstKey = lastKey;
+      cleanups.forEach((cleanup) => typeof cleanup === 'function' && cleanup());
+
+      const props = { batchState: laterState };
+      configureMount();
+      render(props);
+      effects.forEach((effect) => effect());
+      await flush();
+      const remounted = render(props);
+      expect(remounted.text).not.toContain('STOCKED, ACTIVE or SUSPENDED');
+      expect(inputs(remounted.elements).every((input) => input.props.editable === false)).toBe(
+        true,
+      );
+      api.createBatchEvent.mockImplementationOnce(async (_b, body, key) => {
+        lastKey = key;
+        lastData = (body.data ?? {}) as Record<string, unknown>;
+        return {
+          id: 'event-out',
+          event_type: 'TRANSFER',
+          batch_id: BATCH,
+          transfer_id: 'transfer-form-1',
+          transfer_role: 'out',
+          idempotency_key: key,
+        };
+      });
+      await button(remounted.elements, 'Retry same transfer')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(firstKey);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+      expect(render(props).text).toContain('recorded and verified on both');
+    },
+  );
+
+  test('reconciles an accepted transfer read-only after the source becomes terminal', async () => {
+    const { cleanups } = await mount();
+    transferEventsReady = false;
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    expect(getTransferWriteRecovery(BATCH)?.retryOutcome).toBe('reconciliation_failed');
+    cleanups.forEach((cleanup) => typeof cleanup === 'function' && cleanup());
+
+    transferEventsReady = true;
+    const props = { batchState: 'failed' };
+    configureMount();
+    render(props);
+    effects.forEach((effect) => effect());
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(render(props).text).toContain('recorded and verified on both');
+    expect(getTransferWriteRecovery(BATCH)).toBeNull();
+  });
+
+  test('reports a fully read pair-less timeline as an integrity anomaly', async () => {
+    await mount();
+    api.listBatchEvents.mockImplementation(async () => ({
+      items: [],
+      next_cursor: null,
+      limit: 25,
+    }));
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    expect(render().text).toContain('INTEGRITY ANOMALY');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('retries an ambiguous timeout with the identical submission and survives remount', async () => {
+    const onSaved = jest.fn();
+    const { cleanups } = await mount({ onSaved });
+    api.createBatchEvent.mockReset().mockImplementationOnce(async (_b, body, key) => {
+      lastKey = key;
+      lastData = (body.data ?? {}) as Record<string, unknown>;
+      throw new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'timeout');
+    });
+    const view = fillAndConfirm({ onSaved });
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    const firstKey = lastKey;
+    const firstData = lastData;
+    expect(getTransferWriteRecovery(BATCH)?.retryOutcome).toBe('outcome_unknown');
+    expect(render().text).toContain('outcome is uncertain');
+    cleanups.forEach((cleanup) => typeof cleanup === 'function' && cleanup());
+
+    configureMount();
+    render({ onSaved });
+    effects.map((effect) => effect());
+    await flush();
+    const remounted = render({ onSaved });
+    expect(remounted.text).toContain('Pond 2'.slice(0, 0) + 'Batch ' + DEST);
+    expect(inputs(remounted.elements).every((input) => input.props.editable === false)).toBe(true);
+    api.createBatchEvent.mockImplementationOnce(async (_b, body, key) => {
+      lastKey = key;
+      lastData = (body.data ?? {}) as Record<string, unknown>;
+      return {
+        id: 'event-out',
+        event_type: 'TRANSFER',
+        batch_id: BATCH,
+        transfer_id: 'transfer-form-1',
+        transfer_role: 'out',
+        idempotency_key: key,
+      };
+    });
+    await button(remounted.elements, 'Retry same transfer')!.props.onPress();
+    await flush();
+    expect(lastKey).toBe(firstKey);
+    expect(lastData).toEqual(firstData);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    [403, undefined, 'do not have permission'],
+    [404, undefined, 'source batch could not be found'],
+    [409, 'unit_under_maintenance', 'unit is under maintenance'],
+    [409, 'transfer_exceeds_population', 'exceeds'],
+    [409, 'transfer_source_changed', 'source batch or unit changed'],
+    [422, 'transfer_destination_ineligible', 'destination is no longer eligible'],
+  ])('handles definitive HTTP %s (%s) with guidance and no retry', async (status, code, copy) => {
+    await mount();
+    api.createBatchEvent
+      .mockReset()
+      .mockRejectedValue(new ApiError(status, 'rejected', 'http://api', '/p', code));
+    const view = fillAndConfirm();
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    const after = render();
+    expect(after.text).toContain(copy);
+    expect(after.text).toContain('Nothing was transferred');
+    expect(getTransferWriteRecovery(BATCH)).toBeNull();
+    expect(button(after.elements, 'Retry same transfer')).toBeUndefined();
+    expect(button(after.elements, 'Submit transfer')).toBeTruthy();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('refreshes the source and destinations after a conflict', async () => {
+    const onConflictRefreshed = jest.fn();
+    await mount({ onConflictRefreshed });
+    api.createBatchEvent
+      .mockReset()
+      .mockRejectedValue(
+        new ApiError(409, 'changed', 'http://api', '/p', 'transfer_destination_batch_state'),
+      );
+    const view = fillAndConfirm({ onConflictRefreshed });
+    await button(view.elements, 'Submit transfer')!.props.onPress();
+    await flush();
+    expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
+    expect(api.listTransferDestinations).toHaveBeenCalledTimes(2);
   });
 });
