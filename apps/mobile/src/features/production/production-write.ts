@@ -1,4 +1,4 @@
-import { ApiFailure } from '../../lib/api';
+import { ApiError, ApiFailure } from '../../lib/api';
 
 export const WATER_QUALITY_CANONICAL_UNITS = {
   temperature: 'C',
@@ -72,7 +72,7 @@ export interface ProductionWriteResult<TPayload extends Record<string, unknown>>
   posted: boolean;
   reconciled: boolean;
   reconciliation?: WaterQualityReconciliationData;
-  response?: { status?: number; detail?: unknown } | null;
+  response?: { status?: number; detail?: unknown; code?: string } | null;
   error?: Error | null;
 }
 
@@ -997,6 +997,7 @@ function classifyWriteFailure<TPayload extends Record<string, unknown>>(
   const response = {
     status: error.status,
     detail: error.safeMessage,
+    ...(error instanceof ApiError && error.code ? { code: error.code } : {}),
   };
 
   if (error.phase === 'network') {

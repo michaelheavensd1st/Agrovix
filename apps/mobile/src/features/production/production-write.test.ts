@@ -51,7 +51,7 @@ import { MortalityForm } from '../../components/production/mortality-form';
 import { SamplingForm } from '../../components/production/sampling-form';
 import { StockingForm } from '../../components/production/stocking-form';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
-import { ApiFailure } from '../../lib/api';
+import { ApiError, ApiFailure } from '../../lib/api';
 import * as productionApi from '../../lib/production-api';
 import {
   buildWaterQualityPayload,
@@ -3240,6 +3240,125 @@ describe('stocking definitive-rejection handling', () => {
     expect(text).toContain('not confirmed');
     expect(text).toContain('Reload the batch');
     expect(text).not.toContain('Retry previous stocking');
+    expect(getStockingWriteRecovery(batchId)).toBeNull();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    ['site_closed_no_writes', 'site for this batch is closed', 'reopen or reactivate the site'],
+    [
+      'unit_closed_no_writes',
+      'production unit for this batch is closed',
+      'reopen or reactivate the unit',
+    ],
+    [
+      'site_under_maintenance',
+      'site for this batch is under maintenance',
+      'returned to an operational state',
+    ],
+    [
+      'unit_under_maintenance',
+      'production unit for this batch is under maintenance',
+      'returned to an operational state',
+    ],
+  ])(
+    'lifecycle 409 %s shows parent-resource guidance without claiming a batch-state change',
+    async (code, subject, action) => {
+      const batchId = `batch-lifecycle-${code}`;
+      const post = jest
+        .mocked(productionApi.createBatchEvent)
+        .mockReset()
+        .mockRejectedValue(new ApiError(409, 'Request validation failed.', 'api', '/events', code));
+      jest.mocked(productionApi.getProductionBatch).mockReset().mockResolvedValue({
+        id: batchId,
+        state: 'planned',
+      });
+      jest
+        .mocked(productionApi.getBatchProjections)
+        .mockReset()
+        .mockResolvedValue(refreshed.projection);
+      jest
+        .mocked(productionApi.listBatchEvents)
+        .mockReset()
+        .mockResolvedValue({ items: [], next_cursor: null, limit: 25 });
+      const onConflictRefreshed = jest.fn();
+      const form = mountForm(batchId, onConflictRefreshed);
+
+      await form.submit();
+
+      const text = form.text();
+      expect(text).toContain(subject);
+      expect(text).toContain(action);
+      expect(text).not.toContain('current state changed');
+      expect(text).not.toContain('Retry previous stocking');
+      expect(getStockingWriteRecovery(batchId)).toBeNull();
+      expect(productionApi.getProductionBatch).toHaveBeenCalledWith(batchId);
+      expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
+      expect(post).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test('lifecycle 409 with failed refresh keeps lifecycle guidance and stale-state warning', async () => {
+    const batchId = 'batch-lifecycle-refresh-failed';
+    const post = jest
+      .mocked(productionApi.createBatchEvent)
+      .mockReset()
+      .mockRejectedValue(
+        new ApiError(409, 'Request validation failed.', 'api', '/events', 'site_closed_no_writes'),
+      );
+    jest
+      .mocked(productionApi.getProductionBatch)
+      .mockReset()
+      .mockRejectedValue(new Error('network down'));
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockReset()
+      .mockResolvedValue(refreshed.projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockReset()
+      .mockResolvedValue({ items: [], next_cursor: null, limit: 25 });
+    const form = mountForm(batchId, jest.fn());
+
+    await form.submit();
+
+    const text = form.text();
+    expect(text).toContain('site for this batch is closed');
+    expect(text).toContain('not confirmed');
+    expect(text).toContain('Reload the batch');
+    expect(text).not.toContain('current state changed');
+    expect(getStockingWriteRecovery(batchId)).toBeNull();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('409 with an unrecognized structured code keeps the batch-state message', async () => {
+    const batchId = 'batch-unknown-409-code';
+    const post = jest
+      .mocked(productionApi.createBatchEvent)
+      .mockReset()
+      .mockRejectedValue(
+        new ApiError(
+          409,
+          'Request validation failed.',
+          'api',
+          '/events',
+          'stocking_only_in_planned_state',
+        ),
+      );
+    jest.mocked(productionApi.getProductionBatch).mockReset().mockResolvedValue(refreshed.batch);
+    jest
+      .mocked(productionApi.getBatchProjections)
+      .mockReset()
+      .mockResolvedValue(refreshed.projection);
+    jest
+      .mocked(productionApi.listBatchEvents)
+      .mockReset()
+      .mockResolvedValue({ items: refreshed.events, next_cursor: null, limit: 25 });
+    const form = mountForm(batchId, jest.fn());
+
+    await form.submit();
+
+    expect(form.text()).toContain('current state changed');
     expect(getStockingWriteRecovery(batchId)).toBeNull();
     expect(post).toHaveBeenCalledTimes(1);
   });

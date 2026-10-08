@@ -49,6 +49,17 @@ function getStockingFormValues(submission?: StockingSubmission | null): Record<s
   };
 }
 
+const LIFECYCLE_CONFLICT_MESSAGES: Record<string, string> = {
+  site_closed_no_writes:
+    'The site for this batch is closed. An authorized operator must reopen or reactivate the site before stocking can proceed. The batch itself has not changed.',
+  unit_closed_no_writes:
+    'The production unit for this batch is closed. An authorized operator must reopen or reactivate the unit before stocking can proceed. The batch itself has not changed.',
+  site_under_maintenance:
+    'The site for this batch is under maintenance. It must be returned to an operational state before stocking can proceed. The batch itself has not changed.',
+  unit_under_maintenance:
+    'The production unit for this batch is under maintenance. It must be returned to an operational state before stocking can proceed. The batch itself has not changed.',
+};
+
 export interface StockingFormProps {
   batchId: string;
   batchName?: string;
@@ -182,6 +193,9 @@ export function StockingForm({
       setConfirmedSnapshot(null);
       retrySubmission.current = null;
       if (result.response?.status === 409) {
+        const lifecycleMessage = result.response.code
+          ? LIFECYCLE_CONFLICT_MESSAGES[result.response.code]
+          : undefined;
         void readAll(batchId)
           .then((reconciliation) => {
             if (mounted.current) onConflictRefreshed?.(reconciliation);
@@ -189,12 +203,15 @@ export function StockingForm({
           .catch(() => {
             if (mounted.current) {
               setError(
-                'The batch rejected stocking because its current state changed, but the current batch state could not be refreshed. The state shown may be stale and is not confirmed. Reload the batch before proceeding.',
+                lifecycleMessage
+                  ? `${lifecycleMessage} The current batch state could not be refreshed, so the state shown may be stale and is not confirmed. Reload the batch before proceeding.`
+                  : 'The batch rejected stocking because its current state changed, but the current batch state could not be refreshed. The state shown may be stale and is not confirmed. Reload the batch before proceeding.',
               );
             }
           });
         setError(
-          'The batch rejected stocking because its current state changed. Review authoritative batch data before proceeding.',
+          lifecycleMessage ??
+            'The batch rejected stocking because its current state changed. Review authoritative batch data before proceeding.',
         );
       } else if (result.response?.status === 403) {
         setError(
