@@ -214,6 +214,29 @@ export interface TransferPayload extends Record<string, unknown> {
 export type TransferSubmission = ProductionSubmission<TransferPayload>;
 export type TransferWriteResult = ProductionWriteResult<TransferPayload>;
 
+export interface HarvestInput {
+  quantity: number | string | null;
+  total_weight: number | string | null;
+  weight_unit?: 'g' | 'kg' | string | null;
+  average_weight?: number | string | null;
+  notes?: string | null;
+  is_final: boolean;
+}
+
+export interface HarvestPayload extends Record<string, unknown> {
+  harvest_type: 'partial' | 'total';
+  is_final: boolean;
+  quantity: number;
+  total_weight: number;
+  weight_unit: 'g' | 'kg';
+  harvested_at: string;
+  average_weight?: number;
+  notes?: string;
+}
+
+export type HarvestSubmission = ProductionSubmission<HarvestPayload>;
+export type HarvestWriteResult = ProductionWriteResult<HarvestPayload>;
+
 const WATER_QUALITY_FIELDS: readonly WaterQualityMeasurementKey[] = [
   'temperature',
   'ph',
@@ -862,6 +885,86 @@ export function createTransferSubmission(
   };
 }
 
+export function buildHarvestPayload(values: HarvestInput, harvestedAt: string): HarvestPayload {
+  const quantity = toFiniteNumber(values.quantity);
+  if (quantity === null || !Number.isInteger(quantity) || quantity < 1) {
+    throw new Error('quantity must be a positive integer.');
+  }
+
+  const totalWeight = toFiniteNumber(values.total_weight);
+  if (totalWeight === null || totalWeight <= 0) {
+    throw new Error('total_weight must be greater than zero.');
+  }
+
+  const weightUnit = values.weight_unit ?? 'kg';
+  if (weightUnit !== 'g' && weightUnit !== 'kg') {
+    throw new Error('weight_unit must be g or kg.');
+  }
+
+  const canonicalHarvestedAt = normalizeProductionEventTime(harvestedAt);
+  if (!canonicalHarvestedAt) throw new Error('A valid harvest time is required.');
+
+  const rawAverage = values.average_weight;
+  const hasAverage =
+    rawAverage !== null &&
+    rawAverage !== undefined &&
+    !(typeof rawAverage === 'string' && rawAverage.trim().length === 0);
+  const averageWeight = hasAverage ? toFiniteNumber(rawAverage) : null;
+  if (hasAverage && (averageWeight === null || averageWeight <= 0)) {
+    throw new Error('average_weight must be greater than zero.');
+  }
+
+  const notes = readRequiredText(values.notes, 'notes', 1000);
+
+  return {
+    harvest_type: values.is_final ? 'total' : 'partial',
+    is_final: values.is_final,
+    quantity,
+    total_weight: totalWeight,
+    weight_unit: weightUnit,
+    harvested_at: canonicalHarvestedAt,
+    ...(averageWeight !== null ? { average_weight: averageWeight } : {}),
+    ...(notes ? { notes } : {}),
+  };
+}
+
+export function createHarvestDraftSignature(
+  batchId: string,
+  values: HarvestInput,
+  projectedRemaining?: number | null,
+): string {
+  return JSON.stringify({
+    batchId,
+    values: {
+      is_final: values.is_final,
+      quantity: values.quantity ?? '',
+      total_weight: values.total_weight ?? '',
+      weight_unit: values.weight_unit ?? 'kg',
+      average_weight: values.average_weight ?? '',
+      notes: values.notes?.trim() ?? '',
+    },
+    projectedRemaining: values.is_final ? (projectedRemaining ?? null) : null,
+  });
+}
+
+export function createHarvestSubmission(
+  batchId: string,
+  values: HarvestInput,
+  idempotencyKey?: string,
+  context?: Partial<WaterQualityWriteContext>,
+  now: Date = new Date(),
+): HarvestSubmission {
+  const harvestedAt = now.toISOString();
+  return {
+    batchId,
+    payload: buildHarvestPayload(values, harvestedAt),
+    idempotencyKey: idempotencyKey ?? makeOpaqueId('harvest'),
+    createdAt: harvestedAt,
+    performedAt: harvestedAt,
+    context: { ...(context ?? {}), batchId },
+  };
+}
+
 export function isSameLogicalSubmission(
   left: WaterQualitySubmission,
   right: WaterQualitySubmission,
@@ -930,7 +1033,7 @@ export function resolveWriteOutcome({
 }
 
 type ProductionEventType =
-  'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING' | 'STOCKING' | 'TRANSFER';
+  'WATER_QUALITY' | 'FEEDING' | 'MORTALITY' | 'SAMPLING' | 'STOCKING' | 'TRANSFER' | 'HARVEST';
 const PRODUCTION_WRITE_LEDGER = new Map<string, ProductionWriteResult<any>>();
 export interface ProductionEventWriteRecovery {
   submission: ProductionSubmission<any>;
@@ -943,6 +1046,7 @@ export type MortalityWriteRecovery = ProductionEventWriteRecovery;
 export type SamplingWriteRecovery = ProductionEventWriteRecovery;
 export type StockingWriteRecovery = ProductionEventWriteRecovery;
 export type TransferWriteRecovery = ProductionEventWriteRecovery;
+export type HarvestWriteRecovery = ProductionEventWriteRecovery;
 
 const PRODUCTION_EVENT_WRITE_RECOVERY = new Map<string, ProductionEventWriteRecovery>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
@@ -1005,6 +1109,34 @@ export function getTransferWriteRecovery(batchId: string): TransferWriteRecovery
 
 export function clearTransferWriteRecovery(batchId: string, idempotencyKey: string): void {
   clearProductionEventWriteRecovery('TRANSFER', batchId, idempotencyKey);
+}
+
+export function getHarvestWriteRecovery(batchId: string): HarvestWriteRecovery | null {
+  return getProductionEventWriteRecovery('HARVEST', batchId);
+}
+
+export function clearHarvestWriteRecovery(batchId: string, idempotencyKey: string): void {
+  clearProductionEventWriteRecovery('HARVEST', batchId, idempotencyKey);
+}
+
+/**
+ * Registers a submission restored from durable storage so it flows through the
+ * existing same-key recovery path. Never replaces a different unresolved entry.
+ */
+export function restoreHarvestWriteRecovery(
+  submission: HarvestSubmission,
+  retryOutcome: 'outcome_unknown' | 'reconciliation_failed' = 'outcome_unknown',
+): boolean {
+  const key = productionEventRecoveryKey('HARVEST', submission.batchId);
+  const existing = PRODUCTION_EVENT_WRITE_RECOVERY.get(key);
+  if (existing) return isSameProductionSubmission(existing.submission, submission);
+  PRODUCTION_EVENT_WRITE_RECOVERY.set(key, {
+    submission,
+    inFlight: false,
+    promise: null,
+    retryOutcome,
+  });
+  return true;
 }
 
 function isSameProductionSubmission(
@@ -1080,7 +1212,10 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
                 : 'outcome_unknown',
           });
         } else if (
-          (eventType === 'SAMPLING' || eventType === 'STOCKING' || eventType === 'TRANSFER') &&
+          (eventType === 'SAMPLING' ||
+            eventType === 'STOCKING' ||
+            eventType === 'TRANSFER' ||
+            eventType === 'HARVEST') &&
           result.outcome === 'accepted'
         ) {
           PRODUCTION_EVENT_WRITE_RECOVERY.set(recoveryKey, {
@@ -1592,6 +1727,96 @@ export function reconcileStockingWrite({
     submission,
     post,
     readAll,
+  });
+}
+
+export class HarvestReconciliationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HarvestReconciliationError';
+  }
+}
+
+export function verifyHarvestReconciliation(
+  reconciliation: WaterQualityReconciliationData,
+  submission: HarvestSubmission,
+): void {
+  const events = Array.isArray(reconciliation.events) ? reconciliation.events : [];
+  const accepted = events.find((event) => {
+    const record = event as Record<string, unknown>;
+    return record.event_type === 'HARVEST' && record.idempotency_key === submission.idempotencyKey;
+  }) as Record<string, unknown> | undefined;
+  if (!accepted) {
+    throw new HarvestReconciliationError(
+      'The accepted HARVEST event was not found in the refreshed timeline.',
+    );
+  }
+  const data =
+    typeof accepted.data === 'object' && accepted.data !== null
+      ? (accepted.data as Record<string, unknown>)
+      : {};
+  if (
+    data.quantity !== submission.payload.quantity ||
+    data.is_final !== submission.payload.is_final ||
+    data.harvested_at !== submission.payload.harvested_at
+  ) {
+    throw new HarvestReconciliationError(
+      'The accepted HARVEST event does not match the submitted harvest.',
+    );
+  }
+  if (submission.payload.is_final) {
+    const state = (reconciliation.batch as Record<string, unknown> | null)?.state;
+    if (typeof state !== 'string' || state.toLowerCase() !== 'harvested') {
+      throw new HarvestReconciliationError(
+        'The final HARVEST was accepted but the batch is not yet HARVESTED in the refreshed state.',
+      );
+    }
+  }
+}
+
+export function reconcileHarvestWrite({
+  context,
+  payload,
+  idempotencyKey,
+  submission: preservedSubmission,
+  post,
+  readAll,
+}: {
+  context: WaterQualityWriteContext;
+  payload: HarvestInput;
+  idempotencyKey: string;
+  submission?: HarvestSubmission;
+  post: (
+    batchId: string,
+    eventType: ProductionEventType,
+    data: Record<string, unknown>,
+    key: string,
+    performedAt?: string,
+  ) => Promise<Record<string, unknown>>;
+  readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+}): Promise<HarvestWriteResult> {
+  const submission =
+    preservedSubmission ??
+    createHarvestSubmission(context.batchId, payload, idempotencyKey, context);
+  const normalizedPayload = buildHarvestPayload(payload, submission.payload.harvested_at);
+  if (
+    submission.batchId !== context.batchId ||
+    submission.idempotencyKey !== idempotencyKey ||
+    submission.performedAt !== submission.payload.harvested_at ||
+    JSON.stringify(submission.payload) !== JSON.stringify(normalizedPayload)
+  ) {
+    throw new Error('The preserved harvest submission does not match the current intent.');
+  }
+  return reconcileProductionEventWrite({
+    context,
+    eventType: 'HARVEST',
+    submission,
+    post,
+    readAll: async (batchId) => {
+      const reconciliation = await readAll(batchId);
+      verifyHarvestReconciliation(reconciliation, submission);
+      return reconciliation;
+    },
   });
 }
 

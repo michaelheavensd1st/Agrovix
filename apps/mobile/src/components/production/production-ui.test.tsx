@@ -24,6 +24,12 @@ jest.mock('react-native', () => {
     View: ({ children, ...props }: any) => React.createElement('View', props, children),
   };
 });
+jest.mock('expo-secure-store', () => ({
+  WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'when-unlocked',
+  setItemAsync: jest.fn(),
+  getItemAsync: jest.fn(),
+  deleteItemAsync: jest.fn(),
+}));
 jest.mock('../../lib/secure-storage', () => ({
   setTokens: jest.fn(),
   clearTokens: jest.fn(),
@@ -43,6 +49,7 @@ jest.mock('expo-router', () => ({
 import { Pressable } from 'react-native';
 import ProductionBatchDetailScreen from '../../../app/production/batches/[batchId]';
 import { FeedingForm } from './feeding-form';
+import { HarvestForm } from './harvest-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
 import { StockingForm } from './stocking-form';
@@ -51,6 +58,9 @@ import {
   clearTransferWriteRecovery,
   getTransferWriteRecovery,
   reconcileTransferWrite,
+  reconcileHarvestWrite,
+  getHarvestWriteRecovery,
+  clearHarvestWriteRecovery,
 } from '../../features/production/production-write';
 import { WaterQualityForm } from './water-quality-form';
 import { BatchDetailPanel } from './batch-detail';
@@ -521,5 +531,116 @@ describe('M2 shared production UI boundary', () => {
       clearTransferWriteRecovery(batchId, 'ui-recover-key');
     }
     expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('mounts HARVEST for STOCKED, ACTIVE or SUSPENDED batches and wires reconciliation callbacks', () => {
+    const onHarvestSaved = jest.fn();
+    const onHarvestConflictRefreshed = jest.fn();
+    const findHarvest = (state: string, withContext = true) =>
+      flattenNodes(
+        BatchDetailPanel({
+          batch: { id: 'batch-h', code: 'B-H', state },
+          projection: { estimated_remaining_population: 321 },
+          events: [],
+          harvestContext: withContext ? { batchId: 'batch-h', batchName: 'B-H' } : undefined,
+          onHarvestSaved,
+          onHarvestConflictRefreshed,
+        }),
+      ).find((node) => React.isValidElement(node) && node.type === HarvestForm) as
+        React.ReactElement<any> | undefined;
+
+    for (const state of ['planned', 'failed', 'closed']) {
+      expect(findHarvest(state)).toBeUndefined();
+    }
+    expect(findHarvest('active', false)).toBeUndefined();
+    for (const state of ['stocked', 'active', 'suspended']) {
+      const harvest = findHarvest(state);
+      expect(harvest).toBeTruthy();
+      expect(harvest!.props.batchState).toBe(state);
+      expect(harvest!.props.currentEstimatedRemainingPopulation).toBe(321);
+      expect(harvest!.props.onConflictRefreshed).toBe(onHarvestConflictRefreshed);
+    }
+    expect(findHarvest('harvested')!.key).toBe('batch-h');
+    findHarvest('active')!.props.onSaved({}, { batch: {}, projection: {}, events: [] });
+    expect(onHarvestSaved).toHaveBeenCalledTimes(1);
+  });
+
+  test('keeps HARVEST mounted for an unresolved write after the batch becomes HARVESTED', async () => {
+    const batchId = 'batch-harvest-recover';
+    const post = jest.fn().mockRejectedValue(new Error('network down'));
+    await reconcileHarvestWrite({
+      context: { batchId },
+      payload: { quantity: '5', total_weight: '2', weight_unit: 'kg', is_final: false },
+      idempotencyKey: 'ui-harvest-recover',
+      post,
+      readAll: jest.fn(),
+    });
+    expect(getHarvestWriteRecovery(batchId)).not.toBeNull();
+    try {
+      const tree = BatchDetailPanel({
+        batch: { id: batchId, code: 'B-R', state: 'harvested' },
+        projection: null,
+        events: [],
+        harvestContext: { batchId, batchName: 'B-R' },
+      });
+      const harvest = flattenNodes(tree).find(
+        (node) => React.isValidElement(node) && node.type === HarvestForm,
+      ) as React.ReactElement<any> | undefined;
+      expect(harvest).toBeTruthy();
+      expect(harvest!.props.batchState).toBe('harvested');
+    } finally {
+      clearHarvestWriteRecovery(batchId, 'ui-harvest-recover');
+    }
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  test('the batch screen wires HARVEST context and authoritative refresh callbacks', () => {
+    const routeState: { value: unknown }[] = [
+      { value: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' } },
+      { value: { initial_stocked_quantity: 100, estimated_remaining_population: 100 } },
+      { value: [] },
+      { value: false },
+      { value: null },
+    ];
+    let stateIndex = 0;
+    const useStateSpy = React.useState as unknown as jest.Mock;
+    const useEffectSpy = React.useEffect as unknown as jest.Mock;
+    const useMemoSpy = React.useMemo as unknown as jest.Mock;
+    useStateSpy.mockReset();
+    useEffectSpy.mockReset();
+    useMemoSpy.mockReset();
+    useStateSpy.mockImplementation(() => {
+      const slot = routeState[stateIndex++];
+      return [
+        slot.value,
+        (next: unknown) => {
+          slot.value =
+            typeof next === 'function' ? (next as (value: unknown) => unknown)(slot.value) : next;
+        },
+      ];
+    });
+    useEffectSpy.mockImplementation(() => undefined);
+    useMemoSpy.mockImplementation((factory: () => unknown) => factory());
+    const renderPanel = () => {
+      stateIndex = 0;
+      const panel = ProductionBatchDetailScreen() as React.ReactElement<any>;
+      return panel.props;
+    };
+    const props = renderPanel();
+    expect(props.harvestContext).toMatchObject({ batchId: 'batch-refresh' });
+    props.onHarvestSaved({
+      batch: { id: 'batch-refresh', code: 'B-009', state: 'harvested', species: 'Shrimp' },
+      projection: { initial_stocked_quantity: 100, estimated_remaining_population: 0 },
+      events: [{ event_type: 'HARVEST', performed_at: '2026-09-26T08:30:00Z' }],
+    });
+    const refreshed = renderPanel();
+    expect(refreshed.batch.state).toBe('harvested');
+    expect(refreshed.projection.estimated_remaining_population).toBe(0);
+    refreshed.onHarvestConflictRefreshed({
+      batch: { id: 'batch-refresh', code: 'B-009', state: 'active', species: 'Shrimp' },
+      projection: { initial_stocked_quantity: 100, estimated_remaining_population: 60 },
+      events: [],
+    });
+    expect(renderPanel().projection.estimated_remaining_population).toBe(60);
   });
 });
