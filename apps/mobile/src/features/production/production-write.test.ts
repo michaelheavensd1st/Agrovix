@@ -151,6 +151,7 @@ import {
   createHarvestSubmission,
   getHarvestWriteRecovery,
   reconcileHarvestWrite,
+  verifyHarvestReconciliation,
   type HarvestInput,
   restoreHarvestWriteRecovery,
 } from './production-write';
@@ -6026,6 +6027,165 @@ describe('harvest write workflow', () => {
   afterEach(() => {
     const leftover = getHarvestWriteRecovery(BATCH);
     if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+  });
+
+  const verifyTimestamp = (
+    sent: string,
+    returned: unknown,
+    isFinal = false,
+    state = 'harvested',
+    overrides: Record<string, unknown> = {},
+  ) => {
+    const submission = createHarvestSubmission(
+      BATCH,
+      isFinal ? finalInput : partialInput,
+      'harvest-timestamp',
+      context,
+      new Date('2026-05-01T10:00:00.123Z'),
+    );
+    submission.payload.harvested_at = sent;
+    submission.performedAt = sent;
+    verifyHarvestReconciliation(
+      {
+        batch: { id: BATCH, state },
+        projection: {},
+        events: [
+          {
+            event_type: 'HARVEST',
+            idempotency_key: submission.idempotencyKey,
+            data: { ...submission.payload, harvested_at: returned },
+            ...overrides,
+          },
+        ],
+      },
+      submission,
+    );
+  };
+
+  test.each([
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T10:00:00.123000Z'],
+    ['2026-05-01T10:00:00.000Z', '2026-05-01T10:00:00Z'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T10:00:00.123+00:00'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T12:00:00.123000+02:00'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T04:30:00.123000-05:30'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T10:00:00.123000000Z'],
+    ['2026-05-01T10:00:00.1230001Z', '2026-05-01T10:00:00.1230001000Z'],
+    ['2026-05-01T00:00:00.000Z', '2026-04-30T23:00:00-01:00'],
+    ['2024-02-29T23:00:00.000Z', '2024-03-01T01:00:00+02:00'],
+    ['2000-02-29T10:00:00.000Z', '2000-02-29T10:00:00Z'],
+    ['0001-01-01T00:00:00.000Z', '0001-01-01T01:00:00+01:00'],
+  ])('reconciliation accepts exact equivalent instants %s and %s', (sent, returned) => {
+    expect(() => verifyTimestamp(sent, returned)).not.toThrow();
+    expect(() => verifyTimestamp(sent, returned, true)).not.toThrow();
+  });
+
+  test.each([
+    '2026-05-01T10:00:00.124Z',
+    '2026-05-01T10:00:00.123001Z',
+    '2026-05-01T10:00:00.1230001Z',
+    'not-a-time',
+    '2026-02-29T10:00:00.123Z',
+    '1900-02-29T10:00:00.123Z',
+    '2026-04-31T10:00:00.123Z',
+    '2026-00-01T10:00:00.123Z',
+    '2026-13-01T10:00:00.123Z',
+    '2026-05-00T10:00:00.123Z',
+    '2026-05-01T24:00:00.123Z',
+    '2026-05-01T10:60:00.123Z',
+    '2026-05-01T10:00:60.123Z',
+    '2026-05-01T10:00:00.123+24:00',
+    '2026-05-01T10:00:00.123+00:60',
+    '2026-05-01T10:00:00.123+2:00',
+    '2026-05-01T10:00:00.123',
+    '2026-05-01T10:00:00.Z',
+    '2026-05-01T10:00:00.123Z\n',
+    undefined,
+    null,
+    123,
+    {},
+  ])('reconciliation rejects different or invalid returned timestamp %p', (returned) => {
+    expect(() => verifyTimestamp('2026-05-01T10:00:00.123Z', returned)).toThrow(/does not match/);
+  });
+
+  test.each([
+    'not-a-time',
+    '2026-02-29T10:00:00Z',
+    '1900-02-29T10:00:00Z',
+    '2026-04-31T10:00:00Z',
+    '2026-05-01T10:00:00+24:00',
+    '2026-05-01T10:00:00+00:60',
+    '2026-05-01T10:00:00',
+    '0000-01-01T10:00:00Z',
+  ])('reconciliation rejects identical invalid timestamps %s', (invalid) => {
+    expect(() => verifyTimestamp(invalid, invalid)).toThrow(/does not match/);
+  });
+
+  test('reconciliation distinguishes nonzero fractional digits beyond microseconds', () => {
+    expect(() =>
+      verifyTimestamp('2026-05-01T10:00:00.1230001Z', '2026-05-01T10:00:00.1230002Z'),
+    ).toThrow(/does not match/);
+  });
+
+  test('timestamp equivalence preserves event identity and final-state checks', () => {
+    const sent = '2026-05-01T10:00:00.123Z';
+    const returned = '2026-05-01T10:00:00.123000Z';
+    expect(() => verifyTimestamp(sent, returned, true, 'active')).toThrow(/not yet HARVESTED/);
+    expect(() =>
+      verifyTimestamp(sent, returned, false, 'active', { idempotency_key: 'other' }),
+    ).toThrow(/not found/);
+    for (const data of [
+      { quantity: 41, is_final: false, harvested_at: returned },
+      { quantity: 40, is_final: true, harvested_at: returned },
+      { quantity: 40, is_final: false },
+    ]) {
+      expect(() => verifyTimestamp(sent, returned, false, 'active', { data })).toThrow(
+        /does not match/,
+      );
+    }
+  });
+
+  test('backend-serialized accepted-event recovery stays read-only and preserves identity', async () => {
+    const submission = createHarvestSubmission(
+      BATCH,
+      partialInput,
+      'harvest-backend-timestamp',
+      context,
+      new Date('2026-05-01T10:00:00.123Z'),
+    );
+    const original = JSON.stringify(submission);
+    const backendEvent = {
+      event_type: 'HARVEST',
+      idempotency_key: submission.idempotencyKey,
+      data: {
+        quantity: 40,
+        total_weight: 12.5,
+        weight_unit: 'kg',
+        harvest_type: 'partial',
+        is_final: false,
+        harvested_at: '2026-05-01T10:00:00.123000Z',
+        notes: 'first pass',
+      },
+    };
+    api.listBatchEvents
+      .mockResolvedValueOnce({ items: [], next_cursor: null, limit: 25 })
+      .mockResolvedValue({ items: [backendEvent], next_cursor: null, limit: 25 });
+    const first = await reconcile(partialInput, {
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+    });
+    expect(first.outcome).toBe('reconciliation_failed');
+    expect(first.retrySubmission).toEqual(submission);
+    const second = await reconcile(partialInput, {
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+    });
+    expect(second.outcome).toBe('accepted');
+    expect(second.reconciled).toBe(true);
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(api.createBatchEvent.mock.calls[0][2]).toBe(submission.idempotencyKey);
+    expect(api.createBatchEvent.mock.calls[0][1].data).toEqual(submission.payload);
+    expect(api.createBatchEvent.mock.calls[0][1].performed_at).toBe(submission.performedAt);
+    expect(JSON.stringify(submission)).toBe(original);
   });
 
   test('builds exact partial and final payloads with one canonical timestamp', () => {

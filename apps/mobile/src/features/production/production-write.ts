@@ -1737,6 +1737,59 @@ export class HarvestReconciliationError extends Error {
   }
 }
 
+function parseReconciliationInstant(value: unknown): { seconds: number; fraction: string } | null {
+  if (typeof value !== 'string') return null;
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(
+      value,
+    );
+  if (!match || match[0] !== value) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = Number(match[10] ?? 0);
+  const offsetMinute = Number(match[11] ?? 0);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth[month - 1] ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
+  ) {
+    return null;
+  }
+  // Date supplies integral calendar seconds only; fractional digits never pass through it.
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year, month - 1, day);
+  calendar.setUTCHours(hour, minute, second, 0);
+  const offsetSeconds = (offsetHour * 60 + offsetMinute) * 60;
+  return {
+    seconds: calendar.getTime() / 1000 - (match[9] === '-' ? -offsetSeconds : offsetSeconds),
+    fraction: (match[7] ?? '').replace(/0+$/, ''),
+  };
+}
+
+function equivalentReconciliationInstants(left: unknown, right: unknown): boolean {
+  const leftInstant = parseReconciliationInstant(left);
+  const rightInstant = parseReconciliationInstant(right);
+  return (
+    leftInstant !== null &&
+    rightInstant !== null &&
+    leftInstant.seconds === rightInstant.seconds &&
+    leftInstant.fraction === rightInstant.fraction
+  );
+}
+
 export function verifyHarvestReconciliation(
   reconciliation: WaterQualityReconciliationData,
   submission: HarvestSubmission,
@@ -1758,7 +1811,7 @@ export function verifyHarvestReconciliation(
   if (
     data.quantity !== submission.payload.quantity ||
     data.is_final !== submission.payload.is_final ||
-    data.harvested_at !== submission.payload.harvested_at
+    !equivalentReconciliationInstants(data.harvested_at, submission.payload.harvested_at)
   ) {
     throw new HarvestReconciliationError(
       'The accepted HARVEST event does not match the submitted harvest.',
