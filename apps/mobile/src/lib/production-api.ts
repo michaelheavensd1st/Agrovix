@@ -1,4 +1,5 @@
 import { ApiFailure, authenticatedRequest } from './api';
+import type { AuthOperation } from './auth-operations';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -375,13 +376,18 @@ export async function createBatchEvent(
   batchId: string,
   payload: { event_type: string; performed_at?: string; data?: Record<string, unknown> },
   idempotencyKey: string,
+  operation?: AuthOperation,
 ): Promise<Record<string, unknown>> {
   const path = `/v1/batches/${encodeURIComponent(batchId)}/events`;
-  const body = await authenticatedRequest<unknown>(path, {
-    method: 'POST',
-    headers: { 'Idempotency-Key': idempotencyKey },
-    body: JSON.stringify(payload),
-  });
+  const body = await authenticatedRequest<unknown>(
+    path,
+    {
+      method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(payload),
+    },
+    operation,
+  );
   const record = assertRecord(body, path);
   if (!isBatchEvent(record)) {
     contractFailure(

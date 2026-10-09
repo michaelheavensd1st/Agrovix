@@ -15,7 +15,10 @@ jest.mock('./secure-storage', () => ({
   getRefreshToken: jest.fn().mockResolvedValue('refresh-123'),
 }));
 
+import { StaleAuthOperationError } from './api';
+import { beginAuthOperation, currentAuthOperation } from './auth-operations';
 import { createBatchEvent } from './production-api';
+import { getAccessToken } from './secure-storage';
 
 describe('production event request timestamps', () => {
   let fetchMock: jest.Mock;
@@ -76,5 +79,54 @@ describe('production event request timestamps', () => {
       event_type: 'FEEDING',
       data: { quantity: 1 },
     });
+  });
+
+  test('a bound auth operation that is superseded sends no request', async () => {
+    const bound = currentAuthOperation();
+    beginAuthOperation();
+
+    await expect(
+      createBatchEvent(
+        'batch-123',
+        { event_type: 'FEEDING', data: { quantity: 1 } },
+        'feed-key',
+        bound,
+      ),
+    ).rejects.toBeInstanceOf(StaleAuthOperationError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('a bound auth operation that is still current sends the request', async () => {
+    await createBatchEvent(
+      'batch-123',
+      { event_type: 'FEEDING', data: { quantity: 1 } },
+      'feed-key',
+      currentAuthOperation(),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('a HARVEST operation superseded during credential selection rejects before fetch', async () => {
+    let release!: (token: string) => void;
+    const tokenRead = new Promise<string>((resolve) => {
+      release = resolve;
+    });
+    jest.mocked(getAccessToken).mockReturnValueOnce(tokenRead);
+    const operation = currentAuthOperation();
+    const post = createBatchEvent(
+      'batch-123',
+      {
+        event_type: 'HARVEST',
+        performed_at: '2026-10-02T08:30:00.000Z',
+        data: { quantity: 40, total_weight: 2, weight_unit: 'kg', is_final: false },
+      },
+      'original-harvest-key',
+      operation,
+    );
+    const rejection = expect(post).rejects.toBeInstanceOf(StaleAuthOperationError);
+    beginAuthOperation();
+    release('different-account-token');
+    await rejection;
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

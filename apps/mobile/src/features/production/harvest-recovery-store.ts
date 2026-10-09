@@ -70,6 +70,17 @@ export class HarvestRecoveryStorageError extends Error {
 }
 
 const KEY_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
+// Serialize mutations so a conditional delete cannot race a replacement write.
+let recoveryMutationQueue: Promise<void> = Promise.resolve();
+
+function serializeRecoveryMutation<T>(mutation: () => Promise<T>): Promise<T> {
+  const result = recoveryMutationQueue.then(mutation, mutation);
+  recoveryMutationQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
 
 export function harvestRecoveryStorageKey(batchId: string): string | null {
   return KEY_PATTERN.test(batchId) ? `agrovix.harvest_recovery.${batchId}` : null;
@@ -283,7 +294,7 @@ function existingKeyOf(raw: string): string | null {
  * are identical, so the caller may then POST. Never overwrites a record that
  * belongs to a different idempotency key.
  */
-export async function persistHarvestRecoveryRecord(record: HarvestRecoveryRecord): Promise<void> {
+async function persistHarvestRecoveryRecordUnlocked(record: HarvestRecoveryRecord): Promise<void> {
   const key = storageKeyOrThrow(record.batchId);
   const serialized = JSON.stringify(record);
   if (utf8Length(serialized) > HARVEST_RECOVERY_MAX_BYTES) {
@@ -318,21 +329,45 @@ export async function persistHarvestRecoveryRecord(record: HarvestRecoveryRecord
   }
 }
 
+export function persistHarvestRecoveryRecord(record: HarvestRecoveryRecord): Promise<void> {
+  return serializeRecoveryMutation(() => persistHarvestRecoveryRecordUnlocked(record));
+}
+
 /**
  * Deletes the batch's record only when it still carries the given idempotency
  * key, and confirms it is gone. A different key's record is never touched.
  */
-export async function deleteHarvestRecoveryRecord(
+async function deleteHarvestRecoveryRecordUnlocked(
   batchId: string,
   idempotencyKey: string,
+  expectedRecord?: HarvestRecoveryRecord,
+  canDelete: () => boolean = () => true,
 ): Promise<void> {
   const key = storageKeyOrThrow(batchId);
+  if (!canDelete()) {
+    throw new HarvestRecoveryStorageError(
+      'delete_failed',
+      'The recovery owner is no longer active.',
+    );
+  }
   const existing = await readRaw(key);
   if (existing === null) return;
   if (existingKeyOf(existing) !== idempotencyKey) {
     throw new HarvestRecoveryStorageError(
       'unresolved_record_exists',
       'The stored recovery record belongs to a different submission and was not deleted.',
+    );
+  }
+  if (expectedRecord && existing !== JSON.stringify(expectedRecord)) {
+    throw new HarvestRecoveryStorageError(
+      'unresolved_record_exists',
+      'The stored recovery record no longer matches the submission being reconciled.',
+    );
+  }
+  if (!canDelete()) {
+    throw new HarvestRecoveryStorageError(
+      'delete_failed',
+      'The recovery owner is no longer active.',
     );
   }
   try {
@@ -349,4 +384,15 @@ export async function deleteHarvestRecoveryRecord(
       'The recovery record is still present after deletion.',
     );
   }
+}
+
+export function deleteHarvestRecoveryRecord(
+  batchId: string,
+  idempotencyKey: string,
+  expectedRecord?: HarvestRecoveryRecord,
+  canDelete: () => boolean = () => true,
+): Promise<void> {
+  return serializeRecoveryMutation(() =>
+    deleteHarvestRecoveryRecordUnlocked(batchId, idempotencyKey, expectedRecord, canDelete),
+  );
 }

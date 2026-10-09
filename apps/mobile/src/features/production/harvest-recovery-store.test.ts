@@ -7,6 +7,8 @@ const mockFaults = {
   skipDelete: false,
 };
 let mockPlatform = 'android';
+let mockDeleteGate: Promise<void> | null = null;
+let mockNotifyDeleteStarted: (() => void) | null = null;
 
 jest.mock('react-native', () => ({
   Platform: {
@@ -26,6 +28,8 @@ jest.mock('expo-secure-store', () => ({
     return mockValues.get(key) ?? null;
   },
   deleteItemAsync: async (key: string) => {
+    mockNotifyDeleteStarted?.();
+    if (mockDeleteGate) await mockDeleteGate;
     if (mockFaults.failDelete) throw new Error('delete failed');
     if (!mockFaults.skipDelete) mockValues.delete(key);
   },
@@ -65,6 +69,8 @@ beforeEach(() => {
     skipDelete: false,
   });
   mockPlatform = 'android';
+  mockDeleteGate = null;
+  mockNotifyDeleteStarted = null;
   (getCurrentUser as jest.Mock).mockReset().mockResolvedValue({ id: 'user-1' });
 });
 
@@ -212,6 +218,70 @@ describe('harvest recovery store', () => {
     expect(mockValues.has(KEY)).toBe(true);
     await deleteHarvestRecoveryRecord(BATCH, original.idempotencyKey);
     expect(mockValues.has(KEY)).toBe(false);
+  });
+
+  test('does not delete a replaced record even when it reuses the original key', async () => {
+    const original = record();
+    await persistHarvestRecoveryRecord(original);
+    const replacement = {
+      ...record(),
+      userId: 'user-2',
+      payload: { ...original.payload, quantity: 60 },
+    };
+    mockValues.set(KEY, JSON.stringify(replacement));
+
+    expect(
+      await kindOf(deleteHarvestRecoveryRecord(BATCH, original.idempotencyKey, original)),
+    ).toBe('unresolved_record_exists');
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(replacement));
+  });
+
+  test('a replacement write waits for an active conditional deletion', async () => {
+    const original = record();
+    await persistHarvestRecoveryRecord(original);
+    let releaseDelete!: () => void;
+    const deletionGate = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    let announceStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      announceStarted = resolve;
+    });
+    mockDeleteGate = deletionGate;
+    mockNotifyDeleteStarted = announceStarted;
+    const deletion = deleteHarvestRecoveryRecord(BATCH, original.idempotencyKey, original);
+    await started;
+
+    const replacement = record(BATCH, 'replacement-key');
+    const persistence = persistHarvestRecoveryRecord(replacement);
+    releaseDelete();
+    await deletion;
+    await persistence;
+
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(replacement));
+  });
+
+  test('a queued deletion rechecks ownership before touching storage', async () => {
+    const original = record();
+    await persistHarvestRecoveryRecord(original);
+    let allowDelete = true;
+    let releaseQueue!: () => void;
+    const queueGate = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+    mockDeleteGate = queueGate;
+    const deletion = deleteHarvestRecoveryRecord(
+      BATCH,
+      original.idempotencyKey,
+      original,
+      () => allowDelete,
+    );
+    await Promise.resolve();
+    allowDelete = false;
+    releaseQueue();
+
+    expect(await kindOf(deletion)).toBe('delete_failed');
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(original));
   });
 
   test('reports delete failure and unverified removal', async () => {

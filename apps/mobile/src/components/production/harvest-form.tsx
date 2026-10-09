@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useAuth } from '../../lib/auth-context';
+import { type AuthOperation, currentAuthOperation } from '../../lib/auth-operations';
 import {
   createBatchEvent,
   getBatchProjections,
@@ -76,6 +78,8 @@ const BLOCK_MESSAGES: Record<string, string> = {
     'The stored harvest recovery record does not match the unresolved submission held in memory. New harvests are blocked. Escalate to a supervisor.',
   identity_changed:
     'The signed-in account changed after this form loaded. The harvest was not sent or saved. Reopen the batch so recovery can be re-checked under the current account.',
+  missing:
+    'The stored harvest recovery record could not be found or no longer matches the submission held on this screen. Retry is blocked and nothing was sent. Escalate to a supervisor; do not start a new harvest.',
   cleanup:
     'The unsent harvest record could not be removed from secure storage. New harvests are blocked for this batch. Reopen the batch to re-check recovery.',
 };
@@ -147,6 +151,14 @@ export interface HarvestFormProps {
   onConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
+interface HarvestResultContext {
+  epoch: number;
+  userId: string;
+  batchId: string;
+  submission: HarvestSubmission;
+  recoveryRecord: HarvestRecoveryRecord | null;
+}
+
 export function HarvestForm({
   batchId,
   batchName,
@@ -158,6 +170,8 @@ export function HarvestForm({
   onSaved,
   onConflictRefreshed,
 }: HarvestFormProps) {
+  const { session } = useAuth();
+  const sessionUserId = session.status === 'authenticated' ? session.user.id : null;
   const [mode, setMode] = useState<HarvestMode>('partial');
   const [values, setValues] = useState<Record<string, string>>(() => getFormValues(null));
   const [fresh, setFresh] = useState<FreshState | null>(null);
@@ -175,6 +189,11 @@ export function HarvestForm({
   const draftRevision = useRef(0);
   const mounted = useRef(true);
   const userIdRef = useRef<string | null>(null);
+  const boundUserRef = useRef<string | null>(null);
+  const boundBatchRef = useRef<string | null>(null);
+  const sessionEpoch = useRef(0);
+  const currentContextRef = useRef({ batchId, userId: sessionUserId });
+  currentContextRef.current = { batchId, userId: sessionUserId };
   const durableRecord = useRef<HarvestRecoveryRecord | null>(null);
   const context: WaterQualityWriteContext = { batchId, batchName, farmName, unitName };
   const batchLabel = batchName ?? batchId;
@@ -230,17 +249,18 @@ export function HarvestForm({
     return changed;
   };
 
-  const refreshFresh = async (): Promise<FreshState | null> => {
+  const refreshFresh = async (isCurrent = () => mounted.current): Promise<FreshState | null> => {
     try {
       const [batch, projection] = await Promise.all([
         getProductionBatch(batchId),
         getBatchProjections(batchId),
       ]);
+      if (!isCurrent()) return null;
       const next = readFresh(batch, projection);
       applyFresh(next);
       return next;
     } catch {
-      if (mounted.current) {
+      if (isCurrent()) {
         setFreshError(
           'The latest batch state and projection could not be loaded. A final harvest cannot be confirmed until they are refreshed.',
         );
@@ -249,7 +269,7 @@ export function HarvestForm({
     }
   };
 
-  const reconcileSubmission = (submission: HarvestSubmission) =>
+  const reconcileSubmission = (submission: HarvestSubmission, authOperation?: AuthOperation) =>
     reconcileHarvestWrite({
       context,
       payload: {
@@ -271,6 +291,7 @@ export function HarvestForm({
             data,
           },
           key,
+          authOperation,
         ),
       readAll: readSource,
     });
@@ -294,15 +315,33 @@ export function HarvestForm({
     setMode(next);
   };
 
-  const clearDurable = async (idempotencyKey: string): Promise<boolean> => {
+  const clearDurable = async (
+    idempotencyKey: string,
+    expectedRecord: HarvestRecoveryRecord | null,
+    isCurrent = () => mounted.current,
+  ): Promise<boolean> => {
+    if (!isCurrent() || !expectedRecord) return false;
     try {
-      await deleteHarvestRecoveryRecord(batchId, idempotencyKey);
-      durableRecord.current = null;
+      await deleteHarvestRecoveryRecord(batchId, idempotencyKey, expectedRecord, isCurrent);
+      if (isCurrent()) durableRecord.current = null;
       return true;
     } catch {
       return false;
     }
   };
+
+  const isResultContextCurrent = (context: HarvestResultContext): boolean =>
+    mounted.current &&
+    sessionEpoch.current === context.epoch &&
+    currentContextRef.current.userId === context.userId &&
+    currentContextRef.current.batchId === context.batchId;
+
+  const sameSubmission = (left: HarvestSubmission, right: HarvestSubmission): boolean =>
+    left.batchId === right.batchId &&
+    left.idempotencyKey === right.idempotencyKey &&
+    left.createdAt === right.createdAt &&
+    left.performedAt === right.performedAt &&
+    JSON.stringify(left.payload) === JSON.stringify(right.payload);
 
   const keepSafetyLock = (submission: HarvestSubmission): boolean => {
     if (!restoreHarvestWriteRecovery(submission)) {
@@ -319,10 +358,13 @@ export function HarvestForm({
   const handleWriteResult = async (
     result: Awaited<ReturnType<typeof reconcileHarvestWrite>>,
     submissionRevision: number,
+    context: HarvestResultContext,
     firstAttempt = false,
   ): Promise<void> => {
-    if (!mounted.current) return;
-    const recovery = getHarvestWriteRecovery(batchId);
+    const isCurrent = () =>
+      isResultContextCurrent(context) && sameSubmission(result.submission, context.submission);
+    if (!isCurrent()) return;
+    const recovery = getHarvestWriteRecovery(context.batchId);
     const retainedAccepted =
       recovery?.retryOutcome === 'accepted' &&
       recovery.submission.idempotencyKey === result.submission.idempotencyKey;
@@ -334,9 +376,13 @@ export function HarvestForm({
     setRecoveryRequired(Boolean(result.retrySubmission) || Boolean(retainedAccepted));
 
     if (result.outcome === 'accepted' && result.reconciliation) {
-      const cleaned = await clearDurable(result.submission.idempotencyKey);
-      if (cleaned) clearHarvestWriteRecovery(batchId, result.submission.idempotencyKey);
-      if (!mounted.current) return;
+      const cleaned = await clearDurable(
+        result.submission.idempotencyKey,
+        context.recoveryRecord,
+        isCurrent,
+      );
+      if (cleaned) clearHarvestWriteRecovery(context.batchId, result.submission.idempotencyKey);
+      if (!isCurrent()) return;
       onSaved?.(result.submission, result.reconciliation);
       if (!cleaned) {
         keepSafetyLock(result.submission);
@@ -345,7 +391,7 @@ export function HarvestForm({
         );
         return;
       }
-      clearHarvestWriteRecovery(batchId, result.submission.idempotencyKey);
+      clearHarvestWriteRecovery(context.batchId, result.submission.idempotencyKey);
       retrySubmission.current = null;
       draftRevision.current += 1;
       setRecoveryRequired(false);
@@ -390,25 +436,31 @@ export function HarvestForm({
         );
         return;
       }
-      if (!(await clearDurable(result.submission.idempotencyKey))) {
+      const cleaned = await clearDurable(
+        result.submission.idempotencyKey,
+        context.recoveryRecord,
+        isCurrent,
+      );
+      if (cleaned) clearHarvestWriteRecovery(context.batchId, result.submission.idempotencyKey);
+      if (!isCurrent()) return;
+      if (!cleaned) {
         keepSafetyLock(result.submission);
         setError(
           'The server rejected the harvest, but its local recovery record could not be cleared. Editing stays locked. Retry the same harvest to clear it; do not start a new harvest.',
         );
         return;
       }
-      if (!mounted.current) return;
       if (status === 409) {
         const message = (code ? CONFLICT_MESSAGES[code] : undefined) ?? GENERIC_CONFLICT_MESSAGE;
         void readSource()
           .then((reconciliation) => {
-            if (!mounted.current) return;
+            if (!isCurrent()) return;
             freshRef.current = readFresh(reconciliation.batch, reconciliation.projection);
             setFresh(freshRef.current);
             onConflictRefreshed?.(reconciliation);
           })
           .catch(() => {
-            if (mounted.current) {
+            if (isCurrent()) {
               setError(
                 `${message} The current batch state could not be refreshed, so the state shown may be stale. Reload the batch before proceeding.`,
               );
@@ -458,9 +510,42 @@ export function HarvestForm({
 
   useEffect(() => {
     let active = true;
+    if (
+      (boundUserRef.current !== null && boundUserRef.current !== sessionUserId) ||
+      (boundBatchRef.current !== null && boundBatchRef.current !== batchId)
+    ) {
+      // The session changed while mounted: drop everything derived from the previous account.
+      sessionEpoch.current += 1;
+      boundUserRef.current = null;
+      boundBatchRef.current = null;
+      userIdRef.current = null;
+      retrySubmission.current = null;
+      durableRecord.current = null;
+      draftRevision.current += 1;
+      submissionInFlight.current = false;
+      setBusy(false);
+      setMode('partial');
+      setValues(getFormValues(null));
+      setRecoveryRequired(false);
+      setError(null);
+      setStatusMessage(null);
+      resetConfirmations();
+      setHydration({ status: 'loading' });
+    }
+    const hydrationEpoch = sessionEpoch.current;
     const hydrate = async () => {
+      if (!sessionUserId) {
+        setHydration({ status: 'blocked', message: BLOCK_MESSAGES.identity_unavailable });
+        return;
+      }
       const loaded = await loadHarvestRecovery(batchId);
-      if (!active || !mounted.current) return;
+      if (!active || !mounted.current || sessionEpoch.current !== hydrationEpoch) return;
+      if ((loaded.kind === 'none' || loaded.kind === 'record') && loaded.userId !== sessionUserId) {
+        setHydration({ status: 'blocked', message: BLOCK_MESSAGES.identity_changed });
+        return;
+      }
+      boundUserRef.current = sessionUserId;
+      boundBatchRef.current = batchId;
       if (loaded.kind === 'blocked' || loaded.kind === 'foreign') {
         setHydration({ status: 'blocked', message: blockMessageFor(loaded) });
         return;
@@ -501,39 +586,58 @@ export function HarvestForm({
     return () => {
       active = false;
     };
-  }, [batchId]);
+  }, [batchId, sessionUserId]);
 
   useEffect(() => {
     if (isFinal && !getHarvestWriteRecovery(batchId)) void refreshFresh();
   }, [batchId, isFinal]);
 
   useEffect(() => {
-    if (!hydrated) return;
+    // A render that still shows the previous account's hydrated state must not adopt in-memory recovery.
+    if (!hydrated || boundUserRef.current !== sessionUserId || boundBatchRef.current !== batchId) {
+      return;
+    }
+    const subscriptionEpoch = sessionEpoch.current;
+    const resultOwnerId = durableRecord.current?.userId ?? userIdRef.current;
+    if (!resultOwnerId) return;
     const recovery = getHarvestWriteRecovery(batchId);
     if (!recovery) {
       setRecoveryRequired(false);
       return;
     }
+    const resultContext: HarvestResultContext = {
+      epoch: subscriptionEpoch,
+      userId: resultOwnerId,
+      batchId,
+      submission: recovery.submission as HarvestSubmission,
+      recoveryRecord: durableRecord.current,
+    };
     retrySubmission.current = recovery.submission as HarvestSubmission;
     if (recovery.retryOutcome === 'accepted' || recovery.retryOutcome === 'reconciliation_failed') {
       setRecoveryRequired(true);
       setBusy(true);
       submissionInFlight.current = true;
       let subscribed = true;
+      const isCurrent = () =>
+        subscribed &&
+        mounted.current &&
+        sessionEpoch.current === subscriptionEpoch &&
+        currentContextRef.current.userId === sessionUserId &&
+        currentContextRef.current.batchId === batchId;
       void reconcileSubmission(recovery.submission as HarvestSubmission)
         .then((result) => {
-          if (subscribed && mounted.current) {
-            return handleWriteResultRef.current(result, draftRevision.current);
+          if (isCurrent()) {
+            return handleWriteResultRef.current(result, draftRevision.current, resultContext);
           }
           return undefined;
         })
         .catch((caught) => {
-          if (subscribed && mounted.current) {
+          if (isCurrent()) {
             setError(caught instanceof Error ? caught.message : 'Unable to reconcile harvest.');
           }
         })
         .finally(() => {
-          if (subscribed && mounted.current) {
+          if (isCurrent()) {
             setBusy(false);
             submissionInFlight.current = false;
           }
@@ -557,23 +661,30 @@ export function HarvestForm({
     setBusy(true);
     submissionInFlight.current = true;
     let subscribed = true;
+    const isCurrent = () =>
+      subscribed &&
+      mounted.current &&
+      sessionEpoch.current === subscriptionEpoch &&
+      currentContextRef.current.userId === sessionUserId &&
+      currentContextRef.current.batchId === batchId;
     void recovery.promise
       .then((result) => {
-        if (subscribed && mounted.current) {
+        if (isCurrent()) {
           return handleWriteResultRef.current(
             result as Awaited<ReturnType<typeof reconcileHarvestWrite>>,
             draftRevision.current,
+            resultContext,
           );
         }
         return undefined;
       })
       .catch((caught) => {
-        if (subscribed && mounted.current) {
+        if (isCurrent()) {
           setError(caught instanceof Error ? caught.message : 'Unable to record harvest.');
         }
       })
       .finally(() => {
-        if (subscribed && mounted.current) {
+        if (isCurrent()) {
           setBusy(false);
           submissionInFlight.current = false;
         }
@@ -581,7 +692,7 @@ export function HarvestForm({
     return () => {
       subscribed = false;
     };
-  }, [batchId, hydrated]);
+  }, [batchId, hydrated, sessionUserId]);
 
   const validateDraft = (state: FreshState | null): string | null => {
     try {
@@ -624,9 +735,33 @@ export function HarvestForm({
     if (step === 1) setConfirmedSnapshot(signatureFor(fresh));
   };
 
+  const failRestoredRetry = (message: string) => {
+    resetConfirmations();
+    retrySubmission.current = null;
+    durableRecord.current = null;
+    setValues(getFormValues(null));
+    setError(null);
+    setHydration({ status: 'blocked', message });
+  };
+
   const handleSubmit = async () => {
-    if (submissionInFlight.current || !hydrated) return;
+    if (
+      submissionInFlight.current ||
+      !hydrated ||
+      !sessionUserId ||
+      currentContextRef.current.userId !== sessionUserId ||
+      currentContextRef.current.batchId !== batchId
+    ) {
+      return;
+    }
     submissionInFlight.current = true;
+    const epoch = sessionEpoch.current;
+    const authOperation = currentAuthOperation();
+    const stale = () =>
+      !mounted.current ||
+      sessionEpoch.current !== epoch ||
+      currentContextRef.current.userId !== sessionUserId ||
+      currentContextRef.current.batchId !== batchId;
     try {
       if (busy) return;
       const recovering = recoveryRequired;
@@ -655,12 +790,55 @@ export function HarvestForm({
           );
           return;
         }
+        const owner = durableRecord.current;
+        if (!owner) {
+          setHydration({ status: 'blocked', message: BLOCK_MESSAGES.missing });
+          return;
+        }
+        let stored: HarvestRecoveryLoad;
+        try {
+          stored = await loadHarvestRecovery(batchId);
+        } catch {
+          if (!stale()) setError(BLOCK_MESSAGES.identity_unavailable);
+          return;
+        }
+        if (stale()) return;
+        if (stored.kind === 'blocked' && stored.reason === 'identity_unavailable') {
+          setError(BLOCK_MESSAGES.identity_unavailable);
+          return;
+        }
+        if (
+          stored.kind === 'foreign' ||
+          (stored.kind === 'record' && stored.userId !== owner.userId)
+        ) {
+          failRestoredRetry(BLOCK_MESSAGES.identity_changed);
+          return;
+        }
+        if (stored.kind !== 'record') {
+          failRestoredRetry(
+            stored.kind === 'none' ? BLOCK_MESSAGES.missing : blockMessageFor(stored),
+          );
+          return;
+        }
+        const original = harvestSubmissionFromRecord(stored.record);
+        if (
+          stored.userId !== sessionUserId ||
+          stored.record.userId !== owner.userId ||
+          original.batchId !== retained.batchId ||
+          original.idempotencyKey !== retained.idempotencyKey ||
+          original.performedAt !== retained.performedAt ||
+          JSON.stringify(original.payload) !== JSON.stringify(retained.payload)
+        ) {
+          failRestoredRetry(BLOCK_MESSAGES.missing);
+          return;
+        }
         submission = retained;
       } else {
         let latest = fresh;
         if (isFinal) {
           setBusy(true);
-          latest = await refreshFresh();
+          latest = await refreshFresh(() => !stale());
+          if (stale()) return;
           if (!latest) {
             resetConfirmations();
             return;
@@ -692,11 +870,13 @@ export function HarvestForm({
         try {
           userId = await resolveHarvestRecoveryUserId();
         } catch {
+          if (stale()) return;
           resetConfirmations();
           setError(BLOCK_MESSAGES.identity_unavailable);
           return;
         }
-        if (userId !== hydratedUserId) {
+        if (stale()) return;
+        if (userId !== hydratedUserId || userId !== sessionUserId) {
           resetConfirmations();
           userIdRef.current = null;
           retrySubmission.current = null;
@@ -707,6 +887,7 @@ export function HarvestForm({
         try {
           await persistHarvestRecoveryRecord(record);
         } catch (storageError) {
+          if (stale()) return;
           resetConfirmations();
           if (
             storageError instanceof HarvestRecoveryStorageError &&
@@ -715,7 +896,9 @@ export function HarvestForm({
             setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
             return;
           }
-          if (!(await clearDurable(submission.idempotencyKey))) {
+          const cleaned = await clearDurable(submission.idempotencyKey, record, () => !stale());
+          if (stale()) return;
+          if (!cleaned) {
             setHydration({ status: 'blocked', message: BLOCK_MESSAGES.cleanup });
             return;
           }
@@ -728,20 +911,35 @@ export function HarvestForm({
           );
           return;
         }
+        if (stale()) return;
         durableRecord.current = record;
         retrySubmission.current = submission;
       }
+      if (stale()) return;
       setBusy(true);
       setError(null);
       setStatusMessage(null);
+      const resultContext: HarvestResultContext = {
+        epoch,
+        userId: sessionUserId,
+        batchId,
+        submission,
+        recoveryRecord:
+          durableRecord.current?.idempotencyKey === submission.idempotencyKey
+            ? durableRecord.current
+            : null,
+      };
+      const outcome = await reconcileSubmission(submission, authOperation);
+      if (stale()) return;
       await handleWriteResultRef.current(
-        await reconcileSubmission(submission),
+        outcome,
         draftRevision.current,
+        resultContext,
         !recovering,
       );
     } catch (caught) {
       const pending = retrySubmission.current;
-      if (mounted.current) {
+      if (!stale()) {
         if (pending && durableRecord.current) {
           resetConfirmations();
           keepSafetyLock(pending);
@@ -751,7 +949,7 @@ export function HarvestForm({
         );
       }
     } finally {
-      if (mounted.current) {
+      if (!stale()) {
         setBusy(false);
         submissionInFlight.current = false;
       }
@@ -796,6 +994,17 @@ export function HarvestForm({
     : [
         `I confirm ${values.quantity || 'the entered quantity'} individuals were actually harvested from ${batchLabel}.`,
       ];
+
+  if (
+    (boundUserRef.current !== null && boundUserRef.current !== sessionUserId) ||
+    (boundBatchRef.current !== null && boundBatchRef.current !== batchId)
+  ) {
+    return (
+      <View style={styles.card}>
+        <Text style={styles.error}>{BLOCK_MESSAGES.identity_changed}</Text>
+      </View>
+    );
+  }
 
   // A terminal batch only keeps the form visible while recovery or a result needs the operator.
   if (
