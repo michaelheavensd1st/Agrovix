@@ -9,9 +9,13 @@ import { FeedingForm } from './feeding-form';
 import { MortalityForm } from './mortality-form';
 import { SamplingForm } from './sampling-form';
 import { StockingForm } from './stocking-form';
+import { HarvestForm } from './harvest-form';
 import { TransferForm } from './transfer-form';
 import { WaterQualityForm } from './water-quality-form';
-import { getTransferWriteRecovery } from '../../features/production/production-write';
+import {
+  getHarvestWriteRecovery,
+  getTransferWriteRecovery,
+} from '../../features/production/production-write';
 import type {
   WaterQualityReconciliationData,
   WaterQualityWriteContext,
@@ -36,6 +40,9 @@ export interface BatchDetailData {
   transferContext?: WaterQualityWriteContext & { sourceUnitId?: string };
   onTransferSaved?: (reconciliation: WaterQualityReconciliationData) => void;
   onTransferConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
+  harvestContext?: WaterQualityWriteContext;
+  onHarvestSaved?: (reconciliation: WaterQualityReconciliationData) => void;
+  onHarvestConflictRefreshed?: (reconciliation: WaterQualityReconciliationData) => void;
 }
 
 export function BatchDetailPanel({
@@ -57,6 +64,9 @@ export function BatchDetailPanel({
   transferContext,
   onTransferSaved,
   onTransferConflictRefreshed,
+  harvestContext,
+  onHarvestSaved,
+  onHarvestConflictRefreshed,
 }: BatchDetailData) {
   const state = typeof batch.state === 'string' ? batch.state : 'unknown';
   const tone = getStatusTone(state);
@@ -209,6 +219,29 @@ export function BatchDetailPanel({
           }
           onSaved={(_submission, reconciliation) => onTransferSaved?.(reconciliation)}
           onConflictRefreshed={onTransferConflictRefreshed}
+        />
+      ) : null}
+      {harvestContext &&
+      (state === 'stocked' ||
+        state === 'active' ||
+        state === 'suspended' ||
+        state === 'harvested' ||
+        getHarvestWriteRecovery(harvestContext.batchId)) ? (
+        <HarvestForm
+          key={harvestContext.batchId}
+          batchId={harvestContext.batchId}
+          batchName={harvestContext.batchName}
+          farmName={harvestContext.farmName}
+          siteName={harvestContext.siteName}
+          unitName={harvestContext.unitName}
+          batchState={state}
+          currentEstimatedRemainingPopulation={
+            typeof projection?.estimated_remaining_population === 'number'
+              ? projection.estimated_remaining_population
+              : null
+          }
+          onSaved={(_submission, reconciliation) => onHarvestSaved?.(reconciliation)}
+          onConflictRefreshed={onHarvestConflictRefreshed}
         />
       ) : null}
     </ScrollView>

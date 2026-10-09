@@ -205,6 +205,27 @@ export default function ProductionBatchDetailScreen() {
             }
           : undefined
       }
+      onHarvestSaved={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
+      onHarvestConflictRefreshed={(reconciliation: WaterQualityReconciliationData) => {
+        setBatch(reconciliation.batch);
+        setProjection(reconciliation.projection);
+        setEvents(reconciliation.events);
+      }}
+      harvestContext={
+        batchId
+          ? {
+              batchId,
+              batchName,
+              farmName: farmName ?? undefined,
+              siteName: typeof params.siteName === 'string' ? params.siteName : undefined,
+              unitName: unitName ?? undefined,
+            }
+          : undefined
+      }
     />
   );
 }

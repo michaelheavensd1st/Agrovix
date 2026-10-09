@@ -37,6 +37,43 @@ jest.mock('../../lib/secure-storage', () => ({
   getAccessToken: jest.fn(),
   getRefreshToken: jest.fn(),
 }));
+const mockSecureValues = new Map<string, string>();
+const mockSecureLog: string[] = [];
+const mockSecureFaults = {
+  unavailable: false,
+  failSet: false,
+  corruptReadBack: false,
+  failDelete: false,
+};
+jest.mock('expo-secure-store', () => ({
+  WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'when-unlocked',
+  setItemAsync: async (key: string, value: string) => {
+    mockSecureLog.push(`set:${key}`);
+    if (mockSecureFaults.failSet) throw new Error('set failed');
+    mockSecureValues.set(key, mockSecureFaults.corruptReadBack ? `${value} ` : value);
+  },
+  getItemAsync: async (key: string) => {
+    if (mockSecureFaults.unavailable) throw new Error('storage unavailable');
+    return mockSecureValues.get(key) ?? null;
+  },
+  deleteItemAsync: async (key: string) => {
+    mockSecureLog.push(`delete:${key}`);
+    if (mockSecureFaults.failDelete) throw new Error('delete failed');
+    mockSecureValues.delete(key);
+  },
+}));
+let mockSessionUserId: string | null = 'user-1';
+jest.mock('../../lib/auth-context', () => ({
+  useAuth: () => ({
+    session: mockSessionUserId
+      ? { status: 'authenticated', user: { id: mockSessionUserId } }
+      : { status: 'unauthenticated' },
+  }),
+}));
+jest.mock('../../lib/api', () => ({
+  ...jest.requireActual('../../lib/api'),
+  getCurrentUser: jest.fn(),
+}));
 jest.mock('../../lib/production-api', () => ({
   createBatchEvent: jest.fn(),
   getBatchProjections: jest.fn(),
@@ -48,12 +85,14 @@ jest.mock('../../lib/production-api', () => ({
 import React from 'react';
 import { Pressable, TextInput } from 'react-native';
 import { FeedingForm } from '../../components/production/feeding-form';
+import { HarvestForm } from '../../components/production/harvest-form';
 import { MortalityForm } from '../../components/production/mortality-form';
 import { SamplingForm } from '../../components/production/sampling-form';
 import { StockingForm } from '../../components/production/stocking-form';
 import { TransferForm } from '../../components/production/transfer-form';
 import { WaterQualityForm } from '../../components/production/water-quality-form';
-import { ApiError, ApiFailure } from '../../lib/api';
+import { ApiError, ApiFailure, getCurrentUser, StaleAuthOperationError } from '../../lib/api';
+import { beginAuthOperation, currentAuthOperation } from '../../lib/auth-operations';
 import * as productionApi from '../../lib/production-api';
 import {
   buildWaterQualityPayload,
@@ -106,8 +145,18 @@ import {
   type WaterQualitySubmission,
   type FeedingInput,
   type FeedingSubmission,
+  buildHarvestPayload,
+  clearHarvestWriteRecovery,
+  createHarvestDraftSignature,
+  createHarvestSubmission,
+  getHarvestWriteRecovery,
+  reconcileHarvestWrite,
+  verifyHarvestReconciliation,
+  type HarvestInput,
+  restoreHarvestWriteRecovery,
 } from './production-write';
 import * as productionWrite from './production-write';
+import * as harvestRecoveryStore from './harvest-recovery-store';
 
 describe('water-quality write workflow', () => {
   const nowIso = '2026-09-25T14:30:00Z';
@@ -5903,5 +5952,1853 @@ describe('transfer form workflow', () => {
     await flush();
     expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
     expect(api.listTransferDestinations).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('harvest write workflow', () => {
+  const BATCH = 'batch-harvest';
+  const partialInput: HarvestInput = {
+    quantity: '40',
+    total_weight: '12.5',
+    weight_unit: 'kg',
+    average_weight: '',
+    notes: ' first pass ',
+    is_final: false,
+  };
+  const finalInput: HarvestInput = { ...partialInput, quantity: '100', is_final: true };
+  const api = productionApi as jest.Mocked<typeof productionApi>;
+  const context = { batchId: BATCH };
+  let batchState = 'active';
+  let remaining = 100;
+  let lastKey = '';
+  let lastData: Record<string, unknown> = {};
+  let eventsReady = true;
+
+  const installApi = () => {
+    batchState = 'active';
+    remaining = 100;
+    lastKey = '';
+    lastData = {};
+    eventsReady = true;
+    api.createBatchEvent.mockReset().mockImplementation(async (_id, body, key) => {
+      lastKey = key;
+      lastData = (body.data ?? {}) as Record<string, unknown>;
+      if (lastData.is_final === true) batchState = 'harvested';
+      return { id: 'event-h', event_type: 'HARVEST', idempotency_key: key };
+    });
+    api.getProductionBatch
+      .mockReset()
+      .mockImplementation(async (id) => ({ id, state: batchState }));
+    api.getBatchProjections.mockReset().mockImplementation(async (id) => ({
+      batch_id: id,
+      estimated_remaining_population: remaining,
+    }));
+    api.listBatchEvents.mockReset().mockImplementation(async () => ({
+      items: eventsReady
+        ? [{ event_type: 'HARVEST', idempotency_key: lastKey, data: lastData }]
+        : [],
+      next_cursor: null,
+      limit: 25,
+    }));
+  };
+  const reconcile = (
+    input: HarvestInput,
+    extra: Partial<Parameters<typeof reconcileHarvestWrite>[0]> = {},
+  ) =>
+    reconcileHarvestWrite({
+      context,
+      payload: input,
+      idempotencyKey: extra.submission?.idempotencyKey ?? 'harvest-key-1',
+      post: async (id, type, data, key, performedAt) =>
+        api.createBatchEvent(
+          id,
+          { event_type: type, ...(performedAt ? { performed_at: performedAt } : {}), data },
+          key,
+        ),
+      readAll: async (id) => ({
+        batch: await api.getProductionBatch(id),
+        projection: await api.getBatchProjections(id),
+        events: (await api.listBatchEvents(id)).items,
+      }),
+      ...extra,
+    });
+
+  beforeEach(() => installApi());
+  afterEach(() => {
+    const leftover = getHarvestWriteRecovery(BATCH);
+    if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+  });
+
+  const verifyTimestamp = (
+    sent: string,
+    returned: unknown,
+    isFinal = false,
+    state = 'harvested',
+    overrides: Record<string, unknown> = {},
+  ) => {
+    const submission = createHarvestSubmission(
+      BATCH,
+      isFinal ? finalInput : partialInput,
+      'harvest-timestamp',
+      context,
+      new Date('2026-05-01T10:00:00.123Z'),
+    );
+    submission.payload.harvested_at = sent;
+    submission.performedAt = sent;
+    verifyHarvestReconciliation(
+      {
+        batch: { id: BATCH, state },
+        projection: {},
+        events: [
+          {
+            event_type: 'HARVEST',
+            idempotency_key: submission.idempotencyKey,
+            data: { ...submission.payload, harvested_at: returned },
+            ...overrides,
+          },
+        ],
+      },
+      submission,
+    );
+  };
+
+  test.each([
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T10:00:00.123000Z'],
+    ['2026-05-01T10:00:00.000Z', '2026-05-01T10:00:00Z'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T10:00:00.123+00:00'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T12:00:00.123000+02:00'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T04:30:00.123000-05:30'],
+    ['2026-05-01T10:00:00.123Z', '2026-05-01T10:00:00.123000000Z'],
+    ['2026-05-01T10:00:00.1230001Z', '2026-05-01T10:00:00.1230001000Z'],
+    ['2026-05-01T00:00:00.000Z', '2026-04-30T23:00:00-01:00'],
+    ['2024-02-29T23:00:00.000Z', '2024-03-01T01:00:00+02:00'],
+    ['2000-02-29T10:00:00.000Z', '2000-02-29T10:00:00Z'],
+    ['0001-01-01T00:00:00.000Z', '0001-01-01T01:00:00+01:00'],
+  ])('reconciliation accepts exact equivalent instants %s and %s', (sent, returned) => {
+    expect(() => verifyTimestamp(sent, returned)).not.toThrow();
+    expect(() => verifyTimestamp(sent, returned, true)).not.toThrow();
+  });
+
+  test.each([
+    '2026-05-01T10:00:00.124Z',
+    '2026-05-01T10:00:00.123001Z',
+    '2026-05-01T10:00:00.1230001Z',
+    'not-a-time',
+    '2026-02-29T10:00:00.123Z',
+    '1900-02-29T10:00:00.123Z',
+    '2026-04-31T10:00:00.123Z',
+    '2026-00-01T10:00:00.123Z',
+    '2026-13-01T10:00:00.123Z',
+    '2026-05-00T10:00:00.123Z',
+    '2026-05-01T24:00:00.123Z',
+    '2026-05-01T10:60:00.123Z',
+    '2026-05-01T10:00:60.123Z',
+    '2026-05-01T10:00:00.123+24:00',
+    '2026-05-01T10:00:00.123+00:60',
+    '2026-05-01T10:00:00.123+2:00',
+    '2026-05-01T10:00:00.123',
+    '2026-05-01T10:00:00.Z',
+    '2026-05-01T10:00:00.123Z\n',
+    undefined,
+    null,
+    123,
+    {},
+  ])('reconciliation rejects different or invalid returned timestamp %p', (returned) => {
+    expect(() => verifyTimestamp('2026-05-01T10:00:00.123Z', returned)).toThrow(/does not match/);
+  });
+
+  test.each([
+    'not-a-time',
+    '2026-02-29T10:00:00Z',
+    '1900-02-29T10:00:00Z',
+    '2026-04-31T10:00:00Z',
+    '2026-05-01T10:00:00+24:00',
+    '2026-05-01T10:00:00+00:60',
+    '2026-05-01T10:00:00',
+    '0000-01-01T10:00:00Z',
+  ])('reconciliation rejects identical invalid timestamps %s', (invalid) => {
+    expect(() => verifyTimestamp(invalid, invalid)).toThrow(/does not match/);
+  });
+
+  test('reconciliation distinguishes nonzero fractional digits beyond microseconds', () => {
+    expect(() =>
+      verifyTimestamp('2026-05-01T10:00:00.1230001Z', '2026-05-01T10:00:00.1230002Z'),
+    ).toThrow(/does not match/);
+  });
+
+  test('timestamp equivalence preserves event identity and final-state checks', () => {
+    const sent = '2026-05-01T10:00:00.123Z';
+    const returned = '2026-05-01T10:00:00.123000Z';
+    expect(() => verifyTimestamp(sent, returned, true, 'active')).toThrow(/not yet HARVESTED/);
+    expect(() =>
+      verifyTimestamp(sent, returned, false, 'active', { idempotency_key: 'other' }),
+    ).toThrow(/not found/);
+    for (const data of [
+      { quantity: 41, is_final: false, harvested_at: returned },
+      { quantity: 40, is_final: true, harvested_at: returned },
+      { quantity: 40, is_final: false },
+    ]) {
+      expect(() => verifyTimestamp(sent, returned, false, 'active', { data })).toThrow(
+        /does not match/,
+      );
+    }
+  });
+
+  test('backend-serialized accepted-event recovery stays read-only and preserves identity', async () => {
+    const submission = createHarvestSubmission(
+      BATCH,
+      partialInput,
+      'harvest-backend-timestamp',
+      context,
+      new Date('2026-05-01T10:00:00.123Z'),
+    );
+    const original = JSON.stringify(submission);
+    const backendEvent = {
+      event_type: 'HARVEST',
+      idempotency_key: submission.idempotencyKey,
+      data: {
+        quantity: 40,
+        total_weight: 12.5,
+        weight_unit: 'kg',
+        harvest_type: 'partial',
+        is_final: false,
+        harvested_at: '2026-05-01T10:00:00.123000Z',
+        notes: 'first pass',
+      },
+    };
+    api.listBatchEvents
+      .mockResolvedValueOnce({ items: [], next_cursor: null, limit: 25 })
+      .mockResolvedValue({ items: [backendEvent], next_cursor: null, limit: 25 });
+    const first = await reconcile(partialInput, {
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+    });
+    expect(first.outcome).toBe('reconciliation_failed');
+    expect(first.retrySubmission).toEqual(submission);
+    const second = await reconcile(partialInput, {
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+    });
+    expect(second.outcome).toBe('accepted');
+    expect(second.reconciled).toBe(true);
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(api.createBatchEvent.mock.calls[0][2]).toBe(submission.idempotencyKey);
+    expect(api.createBatchEvent.mock.calls[0][1].data).toEqual(submission.payload);
+    expect(api.createBatchEvent.mock.calls[0][1].performed_at).toBe(submission.performedAt);
+    expect(JSON.stringify(submission)).toBe(original);
+  });
+
+  test('builds exact partial and final payloads with one canonical timestamp', () => {
+    const at = '2026-05-01T10:00:00.000Z';
+    expect(buildHarvestPayload(partialInput, at)).toEqual({
+      harvest_type: 'partial',
+      is_final: false,
+      quantity: 40,
+      total_weight: 12.5,
+      weight_unit: 'kg',
+      harvested_at: at,
+      notes: 'first pass',
+    });
+    expect(buildHarvestPayload({ ...finalInput, average_weight: '0.4' }, at)).toMatchObject({
+      harvest_type: 'total',
+      is_final: true,
+      quantity: 100,
+      average_weight: 0.4,
+    });
+    for (const bad of [
+      { quantity: '0' },
+      { quantity: '1.5' },
+      { total_weight: '0' },
+      { weight_unit: 'lb' },
+      { average_weight: '-1' },
+    ]) {
+      expect(() => buildHarvestPayload({ ...partialInput, ...bad }, at)).toThrow();
+    }
+    expect(() => buildHarvestPayload(partialInput, 'not-a-time')).toThrow();
+  });
+
+  test('submission uses the identical timestamp for performed_at and harvested_at', () => {
+    const submission = createHarvestSubmission(
+      BATCH,
+      partialInput,
+      undefined,
+      undefined,
+      new Date('2026-05-01T10:00:00Z'),
+    );
+    expect(submission.performedAt).toBe('2026-05-01T10:00:00.000Z');
+    expect(submission.payload.harvested_at).toBe(submission.performedAt);
+    expect(submission.idempotencyKey.length).toBeLessThanOrEqual(64);
+  });
+
+  test('draft signature changes with any edit and with the final projection', () => {
+    const base = createHarvestDraftSignature(BATCH, finalInput, 100);
+    expect(createHarvestDraftSignature(BATCH, { ...finalInput, quantity: '99' }, 100)).not.toBe(
+      base,
+    );
+    expect(createHarvestDraftSignature(BATCH, finalInput, 99)).not.toBe(base);
+    expect(createHarvestDraftSignature(BATCH, { ...finalInput, is_final: false }, 100)).not.toBe(
+      base,
+    );
+  });
+
+  test('posts once with matching top-level and data timestamps and reconciles', async () => {
+    const result = await reconcile(partialInput);
+    expect(result.outcome).toBe('accepted');
+    const [, body, key] = api.createBatchEvent.mock.calls[0];
+    expect(body.event_type).toBe('HARVEST');
+    expect(body.performed_at).toBe(body.data?.harvested_at);
+    expect(key).toBe('harvest-key-1');
+    expect(getHarvestWriteRecovery(BATCH)?.retryOutcome).toBe('accepted');
+  });
+
+  test('final harvest is verified against a HARVESTED batch and retained until cleared', async () => {
+    const result = await reconcile(finalInput, { idempotencyKey: 'harvest-key-final' } as never);
+    expect(result.outcome).toBe('accepted');
+    expect(result.submission.payload).toMatchObject({ harvest_type: 'total', is_final: true });
+    expect((result.reconciliation?.batch as { state: string }).state).toBe('harvested');
+  });
+
+  test('final harvest accepted while the batch is not HARVESTED is not marked reconciled', async () => {
+    api.getProductionBatch.mockImplementation(async (id) => ({ id, state: 'active' }));
+    const result = await reconcile(finalInput, { idempotencyKey: 'harvest-key-nf' } as never);
+    expect(result.outcome).toBe('reconciliation_failed');
+    expect(result.reconciled).toBe(false);
+    expect(result.retrySubmission).not.toBeNull();
+    expect(getHarvestWriteRecovery(BATCH)?.retryOutcome).toBe('reconciliation_failed');
+  });
+
+  test('accepted but missing timeline event retries read-only without a second POST', async () => {
+    eventsReady = false;
+    const first = await reconcile(partialInput, { idempotencyKey: 'harvest-key-ro' } as never);
+    expect(first.outcome).toBe('reconciliation_failed');
+    eventsReady = true;
+    const retained = getHarvestWriteRecovery(BATCH)!.submission as never;
+    const second = await reconcile(partialInput, {
+      idempotencyKey: 'harvest-key-ro',
+      submission: retained,
+    } as never);
+    expect(second.outcome).toBe('accepted');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('ambiguous network failure retains the same key, payload and timestamps for retry', async () => {
+    api.createBatchEvent
+      .mockReset()
+      .mockRejectedValueOnce(
+        new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'timeout'),
+      );
+    const first = await reconcile(partialInput, { idempotencyKey: 'harvest-key-net' } as never);
+    expect(first.outcome).toBe('outcome_unknown');
+    const retained = first.retrySubmission!;
+    expect(getHarvestWriteRecovery(BATCH)?.submission).toEqual(retained);
+    api.createBatchEvent.mockImplementation(async (_id, body, key) => {
+      lastKey = key;
+      lastData = (body.data ?? {}) as Record<string, unknown>;
+      expect(body.performed_at).toBe(retained.performedAt);
+      expect(body.data?.harvested_at).toBe(retained.payload.harvested_at);
+      return { id: 'event-h' };
+    });
+    const second = await reconcile(partialInput, {
+      idempotencyKey: 'harvest-key-net',
+      submission: retained,
+    } as never);
+    expect(second.outcome).toBe('accepted');
+    expect(lastKey).toBe('harvest-key-net');
+  });
+
+  test('rejects a preserved submission that differs from the intent or its timestamps', () => {
+    const submission = createHarvestSubmission(BATCH, partialInput, 'harvest-key-x');
+    expect(() =>
+      reconcile({ ...partialInput, quantity: '41' }, {
+        idempotencyKey: 'harvest-key-x',
+        submission,
+      } as never),
+    ).toThrow(/does not match/);
+    expect(() =>
+      reconcile(partialInput, {
+        idempotencyKey: 'harvest-key-x',
+        submission: { ...submission, performedAt: '2020-01-01T00:00:00.000Z' },
+      } as never),
+    ).toThrow(/does not match/);
+    expect(() => reconcile(partialInput, { idempotencyKey: 'other', submission } as never)).toThrow(
+      /does not match/,
+    );
+  });
+
+  test.each([
+    'harvest_final_backdated',
+    'harvest_final_quantity_mismatch',
+    'harvest_final_requires_active',
+    'harvest_already_final',
+    'harvest_exceeds_population',
+    'idempotency_key_payload_conflict',
+  ])('definitive 409 %s is rejected, not retried and clears recovery', async (code) => {
+    api.createBatchEvent
+      .mockReset()
+      .mockRejectedValueOnce(new ApiError(409, 'conflict', 'http://api', '/p', code));
+    const result = await reconcile(finalInput, {
+      idempotencyKey: `harvest-${code}`.slice(0, 60),
+    } as never);
+    expect(result.outcome).toBe('rejected');
+    expect(result.response?.status).toBe(409);
+    expect(result.response?.code).toBe(code);
+    expect(result.retrySubmission).toBeNull();
+    expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+  });
+
+  test('permission denial is a non-retryable failure and 422 is rejected', async () => {
+    api.createBatchEvent
+      .mockReset()
+      .mockRejectedValueOnce(new ApiError(403, 'forbidden', 'http://api', '/p'));
+    const denied = await reconcile(partialInput, { idempotencyKey: 'harvest-key-403' } as never);
+    expect(denied.outcome).toBe('write_failed');
+    expect(denied.response?.status).toBe(403);
+    expect(denied.retrySubmission).toBeNull();
+    api.createBatchEvent
+      .mockReset()
+      .mockRejectedValueOnce(
+        new ApiError(422, 'invalid', 'http://api', '/p', 'harvest_total_weight_required'),
+      );
+    const invalid = await reconcile(partialInput, { idempotencyKey: 'harvest-key-422' } as never);
+    expect(invalid.outcome).toBe('rejected');
+    expect(invalid.response?.code).toBe('harvest_total_weight_required');
+  });
+});
+
+describe('harvest form workflow', () => {
+  const BATCH = 'batch-harvest-form';
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+  let stateValues: unknown[] = [];
+  let refs: Array<{ current: unknown }> = [];
+  let effects: Array<() => unknown> = [];
+  let stateIndex = 0;
+  let refIndex = 0;
+  let batchState = 'active';
+  let remaining = 100;
+  let lastKey = '';
+  let lastData: Record<string, unknown> = {};
+  let postFailure: unknown = null;
+
+  const textContent = (node: unknown): string => {
+    if (Array.isArray(node)) return node.map(textContent).join(' ');
+    if (typeof node === 'string' || typeof node === 'number') return String(node);
+    if (React.isValidElement(node)) {
+      return textContent((node as React.ReactElement<{ children?: unknown }>).props.children);
+    }
+    return '';
+  };
+  const configureMount = () => {
+    stateValues = [];
+    refs = [];
+    effects = [];
+    stateIndex = 0;
+    refIndex = 0;
+    (React.useState as unknown as jest.Mock).mockReset().mockImplementation((initial: unknown) => {
+      const index = stateIndex++;
+      if (stateValues.length <= index) {
+        stateValues.push(typeof initial === 'function' ? (initial as () => unknown)() : initial);
+      }
+      return [
+        stateValues[index],
+        (next: unknown) => {
+          stateValues[index] =
+            typeof next === 'function'
+              ? (next as (current: unknown) => unknown)(stateValues[index])
+              : next;
+        },
+      ];
+    });
+    (React.useRef as unknown as jest.Mock).mockReset().mockImplementation((initial: unknown) => {
+      const index = refIndex++;
+      if (refs.length <= index) refs.push({ current: initial });
+      return refs[index];
+    });
+    (React.useEffect as unknown as jest.Mock).mockReset().mockImplementation((e: () => unknown) => {
+      effects.push(e);
+    });
+  };
+  const render = (props: Partial<React.ComponentProps<typeof HarvestForm>> = {}) => {
+    stateIndex = 0;
+    refIndex = 0;
+    const tree = HarvestForm({
+      batchId: BATCH,
+      batchName: 'B-H',
+      farmName: 'North Farm',
+      siteName: 'Site 1',
+      unitName: 'Pond 1',
+      batchState,
+      currentEstimatedRemainingPopulation: remaining,
+      ...props,
+    });
+    const elements: React.ReactElement[] = [];
+    const visit = (node: unknown): void => {
+      if (Array.isArray(node)) node.forEach(visit);
+      else if (React.isValidElement(node)) {
+        const element = node as React.ReactElement<{ children?: unknown }>;
+        elements.push(element);
+        visit(element.props.children);
+      }
+    };
+    visit(tree);
+    return { elements, text: textContent(tree).replace(/\s+/g, ' ') };
+  };
+  type Pressed = React.ReactElement<{ onPress: () => unknown; disabled?: boolean }>;
+  const button = (elements: React.ReactElement[], text: string) =>
+    elements.find(
+      (element) =>
+        element.type === Pressable &&
+        textContent(
+          (element as React.ReactElement<{ children?: unknown }>).props.children,
+        ).includes(text),
+    ) as Pressed | undefined;
+  const inputs = (elements: React.ReactElement[]) =>
+    elements.filter((element) => element.type === TextInput) as Array<
+      React.ReactElement<{ onChangeText: (value: string) => void; editable?: boolean }>
+    >;
+  const api = productionApi as jest.Mocked<typeof productionApi>;
+  const installApi = () => {
+    mockSecureValues.clear();
+    mockSecureLog.length = 0;
+    Object.assign(mockSecureFaults, {
+      unavailable: false,
+      failSet: false,
+      corruptReadBack: false,
+      failDelete: false,
+    });
+    (getCurrentUser as jest.Mock).mockReset().mockResolvedValue({ id: 'user-1' });
+    mockSessionUserId = 'user-1';
+    batchState = 'active';
+    remaining = 100;
+    lastKey = '';
+    lastData = {};
+    postFailure = null;
+    api.createBatchEvent.mockReset().mockImplementation(async (_id, body, key) => {
+      if (postFailure) {
+        const failure = postFailure;
+        postFailure = null;
+        throw failure;
+      }
+      lastKey = key;
+      lastData = (body.data ?? {}) as Record<string, unknown>;
+      if (lastData.is_final === true) batchState = 'harvested';
+      return { id: 'event-h', event_type: 'HARVEST', idempotency_key: key };
+    });
+    api.getProductionBatch
+      .mockReset()
+      .mockImplementation(async (id) => ({ id, state: batchState }));
+    api.getBatchProjections.mockReset().mockImplementation(async (id) => ({
+      batch_id: id,
+      estimated_remaining_population: remaining,
+    }));
+    api.listBatchEvents.mockReset().mockImplementation(async () => ({
+      items: lastKey ? [{ event_type: 'HARVEST', idempotency_key: lastKey, data: lastData }] : [],
+      next_cursor: null,
+      limit: 25,
+    }));
+  };
+  const runEffects = async () => {
+    if (effects.length === 0) render();
+    const cleanups = effects.map((effect) => effect());
+    await flush();
+    return cleanups;
+  };
+  const enterFinal = async (props: Partial<React.ComponentProps<typeof HarvestForm>> = {}) => {
+    render(props);
+    await runEffects();
+    effects = [];
+    button(render(props).elements, 'Final harvest')!.props.onPress();
+    effects = [];
+    render(props);
+    await runEffects();
+    effects = [];
+    return render(props);
+  };
+  const fill = (
+    quantity: string,
+    props: Partial<React.ComponentProps<typeof HarvestForm>> = {},
+  ) => {
+    const fields = inputs(render(props).elements);
+    fields[0].props.onChangeText(quantity);
+    fields[1].props.onChangeText('25.5');
+    return render(props);
+  };
+  const confirmAll = (
+    steps: string[],
+    props: Partial<React.ComponentProps<typeof HarvestForm>> = {},
+  ) => {
+    let view = render(props);
+    for (const step of steps) {
+      button(view.elements, step)!.props.onPress();
+      view = render(props);
+    }
+    return view;
+  };
+  const FINAL_STEPS = [
+    'I confirm the observed physical count',
+    'I confirm this is an irreversible final harvest',
+    'Second confirmation',
+  ];
+
+  beforeEach(() => {
+    installApi();
+    configureMount();
+  });
+  afterEach(() => {
+    const leftover = getHarvestWriteRecovery(BATCH);
+    if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+    jest.restoreAllMocks();
+  });
+
+  test('shows the restart limitation and projection context for a partial harvest', () => {
+    const view = render();
+    expect(view.text).toContain("saved to this device's secure storage");
+    expect(view.text).toContain('does not prove that a duplicate cannot occur');
+    expect(view.text).toContain('Projected remaining population (context only): 100');
+  });
+
+  test('submits a confirmed partial harvest and reports verified success', async () => {
+    const onSaved = jest.fn();
+    await runEffects();
+    fill('40', { onSaved });
+    let view = render({ onSaved });
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    expect(render({ onSaved }).text).toContain('Explicitly confirm the recorded quantity');
+    view = confirmAll(['I confirm 40 individuals'], { onSaved });
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    await flush();
+    const [id, body] = api.createBatchEvent.mock.calls[0];
+    expect(id).toBe(BATCH);
+    expect(body.performed_at).toBe(body.data?.harvested_at);
+    expect(body.data).toMatchObject({
+      harvest_type: 'partial',
+      is_final: false,
+      quantity: 40,
+      total_weight: 25.5,
+      weight_unit: 'kg',
+    });
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    expect(render({ onSaved }).text).toContain('Partial harvest recorded and verified');
+  });
+
+  test('draft edits invalidate confirmations', async () => {
+    await runEffects();
+    fill('40');
+    confirmAll(['I confirm 40 individuals']);
+    inputs(render().elements)[0].props.onChangeText('41');
+    const view = render();
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    expect(view.text).not.toContain('Farm: North Farm Type');
+  });
+
+  test('final harvest loads a fresh projection and blocks a differing physical count', async () => {
+    remaining = 90;
+    await enterFinal();
+    fill('100');
+    const view = render();
+    expect(view.text).toContain('Projected remaining population (server, fresh): 90');
+    expect(view.text).toContain('Final harvest is blocked');
+    button(view.elements, FINAL_STEPS[0])!.props.onPress();
+    expect(render().text).toContain('differs from the server-projected remaining population (90)');
+    await button(render().elements, 'Submit final harvest')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+  });
+
+  test('final harvest requires all three confirmations in order and posts fresh quantity', async () => {
+    const onSaved = jest.fn();
+    await enterFinal({ onSaved });
+    fill('100', { onSaved });
+    let view = render({ onSaved });
+    expect(view.text).toContain('No correction or reversal endpoint currently exists');
+    button(view.elements, FINAL_STEPS[1])!.props.onPress();
+    button(render({ onSaved }).elements, FINAL_STEPS[2])!.props.onPress();
+    await button(render({ onSaved }).elements, 'Submit final harvest')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    view = confirmAll(FINAL_STEPS.slice(0, 2), { onSaved });
+    await button(view.elements, 'Submit final harvest')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    view = confirmAll(FINAL_STEPS.slice(2), { onSaved });
+    await button(view.elements, 'Submit final harvest')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    const [, body] = api.createBatchEvent.mock.calls[0];
+    expect(body.performed_at).toBe(body.data?.harvested_at);
+    expect(body.data).toMatchObject({ harvest_type: 'total', is_final: true, quantity: 100 });
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect((onSaved.mock.calls[0][1].batch as { state: string }).state).toBe('harvested');
+    expect(render({ onSaved }).text).toContain('The batch is HARVESTED');
+  });
+
+  test('a projection change after confirmation invalidates both confirmations and does not post', async () => {
+    await enterFinal();
+    fill('100');
+    const view = confirmAll(FINAL_STEPS);
+    remaining = 95;
+    await button(view.elements, 'Submit final harvest')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    const after = render();
+    expect(after.text).toContain('differs from the server-projected remaining population (95)');
+    expect(button(after.elements, FINAL_STEPS[1])).toBeTruthy();
+  });
+
+  test('final harvest is disabled for a non-ACTIVE batch', async () => {
+    batchState = 'suspended';
+    const view = await enterFinal();
+    expect(view.text).toContain('A final harvest requires an authoritative ACTIVE batch');
+    expect(button(view.elements, 'Submit final harvest')!.props.disabled).toBe(true);
+    await button(view.elements, 'Submit final harvest')!.props.onPress();
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['harvest_final_backdated', 'earlier than existing population-affecting events'],
+    ['harvest_final_quantity_mismatch', 'does not equal the server-projected remaining'],
+    ['harvest_final_requires_active', 'requires an ACTIVE batch'],
+    ['harvest_already_final', 'already been recorded'],
+    ['harvest_exceeds_population', 'exceeds the server-projected remaining population'],
+    ['idempotency_key_payload_conflict', 'conflicts with a different recorded harvest'],
+  ])('409 %s clears confirmations, refreshes and shows the conflict', async (code, text) => {
+    const onConflictRefreshed = jest.fn();
+    await runEffects();
+    fill('40', { onConflictRefreshed });
+    const view = confirmAll(['I confirm 40 individuals'], { onConflictRefreshed });
+    postFailure = new ApiError(409, 'conflict', 'http://api', '/p', code);
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    await flush();
+    expect(render({ onConflictRefreshed }).text).toContain(text);
+    expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
+    expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    await button(render({ onConflictRefreshed }).elements, 'Submit harvest')!.props.onPress();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+  });
+
+  test('permission denial is explained and not retried', async () => {
+    await runEffects();
+    fill('40');
+    const view = confirmAll(['I confirm 40 individuals']);
+    postFailure = new ApiError(403, 'forbidden', 'http://api', '/p');
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    await flush();
+    expect(render().text).toContain('do not have permission to harvest this batch');
+    expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+  });
+
+  test('ambiguous outcome retries with the same key and timestamps and survives remount', async () => {
+    const first = await runEffects();
+    fill('40');
+    const view = confirmAll(['I confirm 40 individuals']);
+    postFailure = new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'timeout');
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    await flush();
+    const retained = getHarvestWriteRecovery(BATCH)!.submission;
+    expect(render().text).toContain('outcome is uncertain');
+    first.forEach((cleanup) => typeof cleanup === 'function' && cleanup());
+
+    configureMount();
+    render();
+    await runEffects();
+    const remounted = render();
+    expect(inputs(remounted.elements).every((input) => input.props.editable === false)).toBe(true);
+    expect(button(remounted.elements, 'Submit harvest')).toBeUndefined();
+    await button(remounted.elements, 'Retry same harvest')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+    expect(lastKey).toBe(retained.idempotencyKey);
+    expect(lastData.harvested_at).toBe(retained.payload.harvested_at);
+    const [, body] = api.createBatchEvent.mock.calls[1];
+    expect(body.performed_at).toBe(retained.performedAt);
+  });
+
+  test('accepted but unreconciled harvest locks the form and never posts again', async () => {
+    await runEffects();
+    fill('40');
+    const view = confirmAll(['I confirm 40 individuals']);
+    api.listBatchEvents.mockImplementation(async () => ({
+      items: [],
+      next_cursor: null,
+      limit: 25,
+    }));
+    await button(view.elements, 'Submit harvest')!.props.onPress();
+    await flush();
+    const after = render();
+    expect(after.text).toContain('Harvest recorded — refresh to confirm');
+    expect(getHarvestWriteRecovery(BATCH)?.retryOutcome).toBe('reconciliation_failed');
+    expect(button(after.elements, 'Submit harvest')).toBeUndefined();
+    expect(button(after.elements, 'Reconcile previous harvest')).toBeTruthy();
+    api.listBatchEvents.mockImplementation(async () => ({
+      items: [{ event_type: 'HARVEST', idempotency_key: lastKey, data: lastData }],
+      next_cursor: null,
+      limit: 25,
+    }));
+    await button(after.elements, 'Reconcile previous harvest')!.props.onPress();
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(render().text).toContain('Partial harvest recorded and verified');
+  });
+  describe('durable recovery', () => {
+    const storeKey = `agrovix.harvest_recovery.${BATCH}`;
+    const stored = () => JSON.parse(mockSecureValues.get(storeKey) ?? 'null');
+    const postUnknown = () => {
+      postFailure = new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'lost');
+    };
+    const submitPartial = async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      await button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+    };
+    const restart = async () => {
+      const leftover = getHarvestWriteRecovery(BATCH);
+      if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+      configureMount();
+      render();
+      await runEffects();
+      return render();
+    };
+
+    test('persists and verifies the record before the POST', async () => {
+      api.createBatchEvent.mockImplementationOnce(async (_id, body, key) => {
+        expect(stored()?.idempotencyKey).toBe(key);
+        expect(stored()?.status).toBe('PREPARED');
+        expect(stored()?.userId).toBe('user-1');
+        expect(stored()?.performedAt).toBe(body.performed_at);
+        throw new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'lost');
+      });
+      await submitPartial();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(mockSecureLog[0]).toBe(`set:${storeKey}`);
+    });
+
+    test('a storage write failure blocks the POST and shows a recovery-storage error', async () => {
+      mockSecureFaults.failSet = true;
+      await submitPartial();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(render().text).toContain('Recovery storage error');
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    });
+
+    test('a read-back mismatch blocks the POST', async () => {
+      mockSecureFaults.corruptReadBack = true;
+      await submitPartial();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(render().text).toContain('could not be removed from secure storage');
+    });
+
+    test('termination before the POST restores the record and never auto-submits', async () => {
+      await runEffects();
+      fill('40');
+      const prepared = confirmAll(['I confirm 40 individuals']);
+      api.createBatchEvent.mockImplementationOnce(async () => {
+        throw new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'lost');
+      });
+      await button(prepared.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      const record = stored();
+      const view = await restart();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
+      expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(record.idempotencyKey);
+    });
+
+    test('termination during the POST: restart, explicit same-key retry, record deleted after reconciliation', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      expect(inputs(view.elements).every((input) => input.props.editable === false)).toBe(true);
+      expect(render().text).toContain('Its original identity is restored');
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+      expect(lastKey).toBe(record.idempotencyKey);
+      const [, body] = api.createBatchEvent.mock.calls[1];
+      expect(body.performed_at).toBe(record.performedAt);
+      expect(body.data).toEqual(record.payload);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      expect(render().text).toContain('Partial harvest recorded and verified');
+    });
+
+    test('accepted response lost then repeated restarts keep the same key', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      await restart();
+      await restart();
+      const view = await restart();
+      expect(stored()).toEqual(record);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+    });
+
+    test('accepted but unreconciled keeps the record and does not allow a new key', async () => {
+      api.listBatchEvents.mockImplementation(async () => ({
+        items: [],
+        next_cursor: null,
+        limit: 25,
+      }));
+      await submitPartial();
+      expect(stored()?.status).toBe('PREPARED');
+      const view = await restart();
+      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+    });
+
+    test('a definitive 409 rejection deletes the record', async () => {
+      postFailure = new ApiFailure('http', 'http://api', '/p', 409, 'ApiError', 'conflict');
+      await submitPartial();
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    });
+
+    test('a same-session definitive rejection still refreshes and calls the parent once', async () => {
+      postFailure = new ApiError(409, 'Rejected', 'http://api', '/p', 'harvest_exceeds_population');
+      const onConflictRefreshed = jest.fn();
+      await runEffects();
+      fill('40', { onConflictRefreshed });
+      const prepared = confirmAll(['I confirm 40 individuals'], { onConflictRefreshed });
+      await button(prepared.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      await flush();
+
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      expect(api.listBatchEvents).toHaveBeenCalled();
+      expect(onConflictRefreshed).toHaveBeenCalledTimes(1);
+      expect(
+        button(render({ onConflictRefreshed }).elements, 'Retry same harvest'),
+      ).toBeUndefined();
+    });
+
+    test('a failed delete after acceptance keeps the safety lock', async () => {
+      mockSecureFaults.failDelete = true;
+      await submitPartial();
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      expect(button(render().elements, 'Submit harvest')).toBeUndefined();
+    });
+
+    test('a corrupt record blocks new submissions without deleting it', async () => {
+      mockSecureValues.set(storeKey, '{not json');
+      await runEffects();
+      const view = render();
+      expect(view.text).toContain('is unreadable');
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBe(true);
+      expect(mockSecureValues.get(storeKey)).toBe('{not json');
+    });
+
+    test('unavailable storage fails closed', async () => {
+      mockSecureFaults.unavailable = true;
+      await runEffects();
+      const view = render();
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBe(true);
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+    });
+
+    test('a record of another user blocks and exposes no payload', async () => {
+      postUnknown();
+      await submitPartial();
+      (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-2' });
+      const leftover = getHarvestWriteRecovery(BATCH);
+      if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+      configureMount();
+      render();
+      await runEffects();
+      const view = render();
+      expect(view.text).toContain('supervisor');
+      expect(view.text).not.toContain('40');
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBe(true);
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    });
+
+    const retryFailures: Array<[string, () => unknown]> = [
+      ['401', () => new ApiError(401, 'expired', 'http://api', '/p')],
+      ['403', () => new ApiError(403, 'forbidden', 'http://api', '/p')],
+      ['404', () => new ApiError(404, 'missing', 'http://api', '/p')],
+      ['400', () => new ApiError(400, 'bad', 'http://api', '/p')],
+      ['408', () => new ApiError(408, 'timeout', 'http://api', '/p')],
+      ['429', () => new ApiError(429, 'slow down', 'http://api', '/p')],
+      ['503', () => new ApiFailure('http', 'http://api', '/p', 503, 'ApiError', 'down')],
+    ];
+
+    test.each(retryFailures)(
+      'ambiguous partial harvest then %s on retry keeps the original key and blocks a new submission',
+      async (_label, makeFailure) => {
+        postUnknown();
+        await submitPartial();
+        const record = stored();
+        let view = await restart();
+        postFailure = makeFailure();
+        await button(view.elements, 'Retry same harvest')!.props.onPress();
+        await flush();
+        expect(mockSecureValues.get(storeKey)).toBe(JSON.stringify(record));
+        expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(
+          record.idempotencyKey,
+        );
+        view = render();
+        expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+        expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
+        const posts = api.createBatchEvent.mock.calls.length;
+        expect(posts).toBe(2);
+        await button(view.elements, 'Retry same harvest')!.props.onPress();
+        await flush();
+        expect(api.createBatchEvent.mock.calls.length).toBe(3);
+        expect(
+          api.createBatchEvent.mock.calls.every((call) => call[2] === record.idempotencyKey),
+        ).toBe(true);
+      },
+    );
+
+    test('same-key replay after reauthentication succeeds and clears the record', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      postFailure = new ApiError(401, 'expired', 'http://api', '/p');
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      await button(render().elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(record.idempotencyKey);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    });
+
+    test.each([
+      [409, 'harvest_exceeds_population'],
+      [422, 'harvest_invalid_state'],
+    ])('a definitive %s domain rejection on retry deletes the record', async (status, code) => {
+      postUnknown();
+      await submitPartial();
+      const view = await restart();
+      postFailure = new ApiError(status, 'rejected', 'http://api', '/p', code);
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    });
+
+    test('a 422 without a domain code on retry is not definitive', async () => {
+      postUnknown();
+      await submitPartial();
+      const view = await restart();
+      postFailure = new ApiError(422, 'schema', 'http://api', '/p');
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+    });
+
+    test('foreign in-memory recovery without a durable record is blocked and not rendered', async () => {
+      postUnknown();
+      await submitPartial();
+      mockSecureValues.delete(storeKey);
+      configureMount();
+      render();
+      await runEffects();
+      const view = render();
+      expect(view.text).not.toContain('I confirm 40');
+      expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBe(true);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    });
+
+    test('foreign in-memory recovery with another users durable record is blocked and not rendered', async () => {
+      postUnknown();
+      await submitPartial();
+      (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-2' });
+      configureMount();
+      render();
+      await runEffects();
+      const view = render();
+      expect(view.text).not.toContain('I confirm 40');
+      expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBe(true);
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+    });
+
+    test('no recovered payload renders before hydration completes', async () => {
+      postUnknown();
+      await submitPartial();
+      configureMount();
+      const before = render();
+      expect(before.text).not.toContain('I confirm 40');
+      expect(button(before.elements, 'Retry same harvest')).toBeUndefined();
+      expect(button(before.elements, 'Submit harvest')?.props.disabled).not.toBe(false);
+    });
+
+    test('a /me failure during hydration keeps the form locked', async () => {
+      (getCurrentUser as jest.Mock).mockRejectedValue(new Error('offline'));
+      await runEffects();
+      const view = render();
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBe(true);
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+    });
+
+    test('the durable record is written once and never rewritten during an unresolved POST', async () => {
+      postUnknown();
+      await submitPartial();
+      const sets = mockSecureLog.filter((entry) => entry.startsWith('set:'));
+      expect(sets).toHaveLength(1);
+      expect(stored().status).toBe('PREPARED');
+    });
+
+    test('persistence succeeding but in-memory registration failing blocks the POST and keeps the record', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const other = createHarvestSubmission(
+        BATCH,
+        {
+          quantity: '7',
+          total_weight: '3',
+          weight_unit: 'kg',
+          average_weight: '',
+          notes: '',
+          is_final: false,
+        },
+        'other-key',
+      );
+      restoreHarvestWriteRecovery(other);
+      await button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      expect(button(render().elements, 'Submit harvest')?.props.disabled).not.toBe(false);
+    });
+
+    test('unmounting during an in-flight POST keeps the record for restart', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      let release: () => void = () => undefined;
+      api.createBatchEvent.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            release = () =>
+              reject(new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'lost'));
+          }),
+      );
+      const pending = button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      const record = stored();
+      release();
+      await pending;
+      await flush();
+      const restarted = await restart();
+      expect(stored()).toEqual(record);
+      expect(button(restarted.elements, 'Submit harvest')).toBeUndefined();
+      expect(button(restarted.elements, 'Retry same harvest')).toBeTruthy();
+    });
+
+    test('double submit sends a single POST', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const submit = button(view.elements, 'Submit harvest')!;
+      await Promise.all([submit.props.onPress(), submit.props.onPress()]);
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    });
+
+    test('a payload-conflict 409 on retry retains the record and escalates', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      postFailure = new ApiError(
+        409,
+        'conflict',
+        'http://api',
+        '/p',
+        'idempotency_key_payload_conflict',
+      );
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(stored()).toEqual(record);
+      expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(record.idempotencyKey);
+      const after = render();
+      expect(after.text).toContain('Escalate to a supervisor');
+      expect(button(after.elements, 'Submit harvest')).toBeUndefined();
+    });
+
+    test('a different batch mounted in place is locked until its own recovery check completes', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      configureMount();
+      const before = render({ batchId: 'batch-other', batchName: 'B-O' });
+      expect(button(before.elements, 'Submit harvest')?.props.disabled).not.toBe(false);
+      expect(before.text).not.toContain('I confirm 40');
+      await runEffects();
+      const after = render({ batchId: 'batch-other', batchName: 'B-O' });
+      expect(after.text).not.toContain('I confirm 40');
+      expect(button(after.elements, 'Retry same harvest')).toBeUndefined();
+      expect(stored()).toEqual(record);
+    });
+
+    test('an account switch while mounted blocks the submission and persists nothing', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-2' });
+      await button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureLog.some((entry) => entry.startsWith('set:'))).toBe(false);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      const after = render();
+      expect(after.text).toContain('account changed');
+      expect(button(after.elements, 'Submit harvest')!.props.disabled).toBe(true);
+    });
+
+    test('an unavailable identity at persist time fails closed', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      (getCurrentUser as jest.Mock).mockRejectedValue(new Error('offline'));
+      await button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test('an accepted but unreconciled write followed by an authentication failure keeps the record', async () => {
+      api.listBatchEvents.mockImplementation(async () => ({
+        items: [],
+        next_cursor: null,
+        limit: 25,
+      }));
+      await submitPartial();
+      const record = stored();
+      expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+      api.getProductionBatch.mockRejectedValue(new ApiError(401, 'expired', 'http://api', '/b'));
+      api.listBatchEvents.mockRejectedValue(new ApiError(401, 'expired', 'http://api', '/e'));
+      const view = await restart();
+      const retry = button(view.elements, 'Retry same harvest');
+      expect(retry).toBeTruthy();
+      await retry!.props.onPress();
+      await flush();
+      expect(stored()).toEqual(record);
+      expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(record.idempotencyKey);
+      expect(button(render().elements, 'Submit harvest')).toBeUndefined();
+      expect(
+        api.createBatchEvent.mock.calls.every((call) => call[2] === record.idempotencyKey),
+      ).toBe(true);
+    });
+
+    test('a failed delete followed by a HARVESTED state keeps the form reachable and locked', async () => {
+      mockSecureFaults.failDelete = true;
+      await submitPartial();
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      batchState = 'harvested';
+      const view = render({ batchState: 'harvested' });
+      expect(view.elements.length).toBeGreaterThan(0);
+      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+    });
+
+    test('a restored record stays reachable for reconciliation after a terminal-state transition', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      batchState = 'harvested';
+      configureMount();
+      render({ batchState: 'harvested' });
+      await runEffects();
+      const view = render({ batchState: 'harvested' });
+      expect(view.elements.length).toBeGreaterThan(0);
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(record.idempotencyKey);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test('a HARVESTED batch with no recovery record renders nothing', async () => {
+      configureMount();
+      render({ batchState: 'harvested' });
+      await runEffects();
+      expect(render({ batchState: 'harvested' }).elements).toHaveLength(0);
+    });
+
+    const switchUser = (id: string) => {
+      mockSessionUserId = id;
+      (getCurrentUser as jest.Mock).mockResolvedValue({ id });
+    };
+
+    test('a session switch while mounted hides user A payload and blocks B from posting A key', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      let view = await restart();
+      expect(view.text).toContain('40');
+      expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
+      switchUser('user-2');
+      view = render();
+      expect(view.text).not.toContain('40');
+      expect(view.text).not.toContain('Total harvest weight');
+      expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
+      await runEffects();
+      view = render();
+      expect(view.text).not.toContain('I confirm 40');
+      expect(view.text).toContain('supervisor');
+      expect(button(view.elements, 'Retry same harvest')?.props.disabled ?? true).toBe(true);
+      expect(button(view.elements, 'Submit harvest')?.props.disabled ?? true).toBe(true);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(stored()).toEqual(record);
+    });
+
+    test('sign-out while mounted hides the payload', async () => {
+      postUnknown();
+      await submitPartial();
+      await restart();
+      mockSessionUserId = null;
+      const view = render();
+      expect(view.text).not.toContain('40');
+      expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
+    });
+
+    test('a stale Retry handler captured before a session switch cannot post for user B', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      const retry = button(view.elements, 'Retry same harvest')!;
+      switchUser('user-2');
+      await retry.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(stored()).toEqual(record);
+      expect(render().text).not.toContain('40');
+    });
+
+    test('an owner change detected at retry time blocks without posting or deleting', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-2' });
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(stored()).toEqual(record);
+      const after = render();
+      expect(after.text).toContain('account changed');
+      expect(after.text).not.toContain('I confirm 40');
+      expect(button(after.elements, 'Retry same harvest')?.props.disabled ?? true).toBe(true);
+      expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(record.idempotencyKey);
+    });
+
+    test('a /me network failure at retry blocks the POST and preserves the record', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      (getCurrentUser as jest.Mock).mockRejectedValue(new Error('offline'));
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(stored()).toEqual(record);
+      expect(render().text).toContain('could not be verified');
+      (getCurrentUser as jest.Mock).mockResolvedValue({ id: 'user-1' });
+      await button(render().elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(record.idempotencyKey);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test.each([
+      ['missing', () => mockSecureValues.delete(storeKey)],
+      ['corrupt', () => mockSecureValues.set(storeKey, '{not json')],
+      [
+        'changed key',
+        () => {
+          const changed = { ...stored(), idempotencyKey: 'someone-elses-key' };
+          mockSecureValues.set(storeKey, JSON.stringify(changed));
+        },
+      ],
+      [
+        'changed payload',
+        () => {
+          const changed = stored();
+          changed.payload = { ...changed.payload, quantity: 41 };
+          mockSecureValues.set(storeKey, JSON.stringify(changed));
+        },
+      ],
+    ])('a %s durable record at retry time blocks the POST', async (_label, tamper) => {
+      postUnknown();
+      await submitPartial();
+      const view = await restart();
+      tamper();
+      const before = mockSecureValues.get(storeKey);
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(mockSecureValues.get(storeKey)).toBe(before);
+      expect(render().text).not.toContain('I confirm 40');
+      expect(button(render().elements, 'Retry same harvest')?.props.disabled ?? true).toBe(true);
+    });
+
+    const deferred = <T>() => {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    };
+    const noRetryFor = (view: ReturnType<typeof render>) =>
+      expect(button(view.elements, 'Retry same harvest')?.props.disabled ?? true).toBe(true);
+    const deferRecoveryDelete = () => {
+      const originalDelete = harvestRecoveryStore.deleteHarvestRecoveryRecord;
+      const gate = deferred<void>();
+      let started!: () => void;
+      const startedPromise = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      jest
+        .spyOn(harvestRecoveryStore, 'deleteHarvestRecoveryRecord')
+        .mockImplementationOnce(async (...args) => {
+          started();
+          await gate.promise;
+          return originalDelete(...args);
+        });
+      return { gate, startedPromise };
+    };
+
+    test('a first attempt suspended at /me cannot persist or POST after a session render changes', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const pendingMe = deferred<{ id: string }>();
+      (getCurrentUser as jest.Mock).mockImplementationOnce(() => pendingMe.promise);
+      const submit = button(view.elements, 'Submit harvest')!.props.onPress();
+      beginAuthOperation();
+      switchUser('user-2');
+      expect(render().text).not.toContain('40');
+      pendingMe.resolve({ id: 'user-1' });
+      await submit;
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+      expect(mockSecureLog).toEqual([]);
+    });
+
+    test('a first attempt persisted before a session switch keeps its exact PREPARED record without POST', async () => {
+      const persist = harvestRecoveryStore.persistHarvestRecoveryRecord;
+      const release = deferred<void>();
+      jest
+        .spyOn(harvestRecoveryStore, 'persistHarvestRecoveryRecord')
+        .mockImplementationOnce(async (record) => {
+          await persist(record);
+          await release.promise;
+        });
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const submit = button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      const record = stored();
+      expect(record.status).toBe('PREPARED');
+      expect(record.userId).toBe('user-1');
+      const bytes = mockSecureValues.get(storeKey);
+      beginAuthOperation();
+      switchUser('user-2');
+      expect(render().text).not.toContain('40');
+      release.resolve();
+      await submit;
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureValues.get(storeKey)).toBe(bytes);
+      expect(mockSecureLog).toEqual([`set:${storeKey}`]);
+      await runEffects();
+      noRetryFor(render());
+      switchUser('user-1');
+      const restored = await restart();
+      await button(restored.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(record.idempotencyKey);
+      const [, body] = api.createBatchEvent.mock.calls[0];
+      expect(body.performed_at).toBe(record.performedAt);
+      expect(body.data).toEqual(record.payload);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test('a persisted first attempt rejected by the bound transport retains intent and blocks a new key', async () => {
+      const operation = currentAuthOperation();
+      api.createBatchEvent.mockImplementationOnce(async (_id, body, key, captured) => {
+        expect(captured).toEqual(operation);
+        expect(stored().idempotencyKey).toBe(key);
+        expect(stored().payload).toEqual(body.data);
+        expect(stored().performedAt).toBe(body.performed_at);
+        beginAuthOperation();
+        throw new StaleAuthOperationError();
+      });
+      await submitPartial();
+      const record = stored();
+      expect(record.status).toBe('PREPARED');
+      expect(mockSecureLog).toEqual([`set:${storeKey}`]);
+      const view = render();
+      expect(view.text).toContain('original submission');
+      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+      expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(record.idempotencyKey);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test('a persistence error completing after a session switch cannot delete the PREPARED intent', async () => {
+      const persist = harvestRecoveryStore.persistHarvestRecoveryRecord;
+      const release = deferred<void>();
+      jest
+        .spyOn(harvestRecoveryStore, 'persistHarvestRecoveryRecord')
+        .mockImplementationOnce(async (record) => {
+          await persist(record);
+          await release.promise;
+          throw new Error('late read-back failure');
+        });
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const submit = button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      const bytes = mockSecureValues.get(storeKey);
+      expect(stored().status).toBe('PREPARED');
+      beginAuthOperation();
+      switchUser('user-2');
+      render();
+      release.resolve();
+      await submit;
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureValues.get(storeKey)).toBe(bytes);
+      expect(mockSecureLog).toEqual([`set:${storeKey}`]);
+      expect(render().text).not.toContain('40');
+    });
+
+    test('unmount during first-attempt persistence preserves the record without POST', async () => {
+      const persist = harvestRecoveryStore.persistHarvestRecoveryRecord;
+      const release = deferred<void>();
+      jest
+        .spyOn(harvestRecoveryStore, 'persistHarvestRecoveryRecord')
+        .mockImplementationOnce(async (record) => {
+          await persist(record);
+          await release.promise;
+        });
+      const cleanups = await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const submit = button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      const bytes = mockSecureValues.get(storeKey);
+      expect(stored().status).toBe('PREPARED');
+      cleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+      release.resolve();
+      await submit;
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureValues.get(storeKey)).toBe(bytes);
+      expect(mockSecureLog).toEqual([`set:${storeKey}`]);
+    });
+
+    test('a same-user first attempt passes its captured operation and reconciles the persisted payload', async () => {
+      const operation = currentAuthOperation();
+      const onSaved = jest.fn();
+      await runEffects();
+      fill('40', { onSaved });
+      const view = confirmAll(['I confirm 40 individuals'], { onSaved });
+      await button(view.elements, 'Submit harvest')!.props.onPress();
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      const [id, body, key, captured] = api.createBatchEvent.mock.calls[0];
+      expect(id).toBe(BATCH);
+      expect(captured).toEqual(operation);
+      expect(onSaved).toHaveBeenCalledTimes(1);
+      const [submission] = onSaved.mock.calls[0];
+      expect(key).toBe(submission.idempotencyKey);
+      expect(body.performed_at).toBe(submission.performedAt);
+      expect(body.data).toEqual(submission.payload);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test('accepted cleanup completing after an account switch cannot call the old parent or mutate B', async () => {
+      const onSaved = jest.fn();
+      const cleanup = deferRecoveryDelete();
+      await runEffects();
+      fill('40', { onSaved });
+      const prepared = confirmAll(['I confirm 40 individuals'], { onSaved });
+      const submit = button(prepared.elements, 'Submit harvest')!.props.onPress();
+      await cleanup.startedPromise;
+      const beforeSwitch = stored();
+      expect(beforeSwitch.status).toBe('PREPARED');
+
+      beginAuthOperation();
+      switchUser('user-2');
+      render();
+      await runEffects();
+      const newSessionText = render().text;
+      cleanup.gate.resolve();
+      await submit;
+      await flush();
+
+      expect(onSaved).not.toHaveBeenCalled();
+      expect(render().text).toBe(newSessionText);
+      expect(render().text).not.toContain('40');
+      expect(mockSecureValues.get(storeKey)).toBe(JSON.stringify(beforeSwitch));
+      expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+    });
+
+    test('definitive rejection cleanup completing after a session switch cannot change B', async () => {
+      postFailure = new ApiError(
+        422,
+        'Rejected',
+        'http://api',
+        '/p',
+        'harvest_total_weight_required',
+      );
+      const onConflictRefreshed = jest.fn();
+      const cleanup = deferRecoveryDelete();
+      await runEffects();
+      fill('40', { onConflictRefreshed });
+      const prepared = confirmAll(['I confirm 40 individuals'], { onConflictRefreshed });
+      const submit = button(prepared.elements, 'Submit harvest')!.props.onPress();
+      await cleanup.startedPromise;
+      expect(stored().status).toBe('PREPARED');
+
+      beginAuthOperation();
+      switchUser('user-2');
+      render();
+      await runEffects();
+      const newSessionText = render().text;
+      cleanup.gate.resolve();
+      await submit;
+      await flush();
+
+      expect(onConflictRefreshed).not.toHaveBeenCalled();
+      expect(render().text).toBe(newSessionText);
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    });
+
+    test('accepted cleanup during a batch change does not affect the newly selected batch', async () => {
+      const onSaved = jest.fn();
+      const cleanup = deferRecoveryDelete();
+      await runEffects();
+      fill('40', { onSaved });
+      const prepared = confirmAll(['I confirm 40 individuals'], { onSaved });
+      const submit = button(prepared.elements, 'Submit harvest')!.props.onPress();
+      await cleanup.startedPromise;
+
+      const otherBatchProps = { batchId: 'batch-next' };
+      render(otherBatchProps);
+      await runEffects();
+      const nextBatchText = render(otherBatchProps).text;
+      cleanup.gate.resolve();
+      await submit;
+      await flush();
+
+      expect(onSaved).not.toHaveBeenCalled();
+      expect(render(otherBatchProps).text).toBe(nextBatchText);
+      expect(mockSecureValues.has(storeKey)).toBe(true);
+    });
+
+    test('a new batch submit remains locked while previous accepted cleanup is pending', async () => {
+      const oldCleanup = deferRecoveryDelete();
+      await runEffects();
+      fill('40');
+      const oldView = confirmAll(['I confirm 40 individuals']);
+      const oldSubmit = button(oldView.elements, 'Submit harvest')!.props.onPress();
+      await oldCleanup.startedPromise;
+
+      const nextProps = { batchId: 'batch-next' };
+      render(nextProps);
+      await runEffects();
+      fill('12', nextProps);
+      const nextConfirmed = confirmAll(['I confirm 12 individuals'], nextProps);
+      const newSubmit = button(nextConfirmed.elements, 'Submit harvest')!.props.onPress();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+
+      oldCleanup.gate.resolve();
+      await oldSubmit;
+      await newSubmit;
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+      expect(api.createBatchEvent.mock.calls[1][0]).toBe('batch-next');
+      expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+    });
+
+    test('a first attempt suspended at /me cannot persist after the batch changes before effects', async () => {
+      await runEffects();
+      fill('40');
+      const view = confirmAll(['I confirm 40 individuals']);
+      const pendingMe = deferred<{ id: string }>();
+      (getCurrentUser as jest.Mock).mockImplementationOnce(() => pendingMe.promise);
+      const submit = button(view.elements, 'Submit harvest')!.props.onPress();
+      render({ batchId: 'other-batch' });
+      pendingMe.resolve({ id: 'user-1' });
+      await submit;
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+      expect(mockSecureLog).toEqual([]);
+    });
+
+    test('a /me that resolves for user A after the session switched to B sends no POST', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      const pendingMe = deferred<{ id: string }>();
+      (getCurrentUser as jest.Mock).mockImplementationOnce(() => pendingMe.promise);
+      const retry = button(view.elements, 'Retry same harvest')!.props.onPress();
+      switchUser('user-2');
+      render();
+      await runEffects();
+      pendingMe.resolve({ id: 'user-1' });
+      await retry;
+      await flush();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(stored()).toEqual(record);
+      const after = render();
+      expect(after.text).not.toContain('40');
+      noRetryFor(after);
+    });
+
+    test('the restored retry POST is bound to the auth operation current at retry start', async () => {
+      postUnknown();
+      await submitPartial();
+      const view = await restart();
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      const retryCall = api.createBatchEvent.mock.calls[1] as unknown[];
+      expect(retryCall[3]).toEqual(currentAuthOperation());
+      expect(retryCall[2]).toBe(lastKey);
+    });
+
+    test('a superseded auth operation at transport time keeps the record and the original key', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      api.createBatchEvent.mockImplementationOnce(async () => {
+        throw new StaleAuthOperationError();
+      });
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(stored()).toEqual(record);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+      const after = render();
+      expect(button(after.elements, 'Submit harvest')).toBeUndefined();
+      expect(button(after.elements, 'Retry same harvest')).toBeTruthy();
+    });
+
+    test('a POST response arriving after a session switch does not touch the new session', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      const pendingPost = deferred<Record<string, unknown>>();
+      api.createBatchEvent.mockImplementationOnce(() => pendingPost.promise);
+      const retry = button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      switchUser('user-2');
+      render();
+      await runEffects();
+      const before = render().text;
+      pendingPost.reject(
+        new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'lost'),
+      );
+      await retry;
+      await flush();
+      const after = render();
+      expect(after.text).toBe(before);
+      expect(after.text).not.toContain('40');
+      expect(stored()).toEqual(record);
+      noRetryFor(after);
+    });
+
+    test('an old retry that fails after B hydrated leaves B recovery state and flags intact', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      const pendingMe = deferred<{ id: string }>();
+      (getCurrentUser as jest.Mock).mockImplementationOnce(() => pendingMe.promise);
+      const retry = button(view.elements, 'Retry same harvest')!.props.onPress();
+      switchUser('user-2');
+      render();
+      await runEffects();
+      const before = render().text;
+      pendingMe.reject(new Error('offline'));
+      await retry;
+      await flush();
+      expect(render().text).toBe(before);
+      expect(render().text).not.toContain('could not be verified');
+      expect(stored()).toEqual(record);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    });
+
+    test('late hydration for user A cannot populate the form after the switch to B', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const leftover = getHarvestWriteRecovery(BATCH);
+      if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
+      configureMount();
+      render();
+      const pendingMe = deferred<{ id: string }>();
+      (getCurrentUser as jest.Mock).mockImplementationOnce(() => pendingMe.promise);
+      const cleanups = await runEffects();
+      switchUser('user-2');
+      cleanups.forEach((cleanup) => {
+        if (typeof cleanup === 'function') cleanup();
+      });
+      pendingMe.resolve({ id: 'user-1' });
+      await flush();
+      const view = render();
+      expect(view.text).not.toContain('40');
+      noRetryFor(view);
+      expect(button(view.elements, 'Submit harvest')?.props.disabled ?? true).toBe(true);
+      expect(stored()).toEqual(record);
+    });
+
+    test('sign-out then same-user re-login does not resurrect the unsent draft or old payload', async () => {
+      postUnknown();
+      await submitPartial();
+      await restart();
+      mockSessionUserId = null;
+      render();
+      await runEffects();
+      expect(render().text).not.toContain('40');
+      switchUser('user-1');
+      render();
+      await runEffects();
+      const view = render();
+      expect(view.text).toContain('40');
+      expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
+      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    });
+
+    test('same-user valid recovery still retries with the original key and payload', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const view = await restart();
+      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+      expect(lastKey).toBe(record.idempotencyKey);
+      const [, body] = api.createBatchEvent.mock.calls[1];
+      expect(body.performed_at).toBe(record.performedAt);
+      expect(body.data).toEqual(record.payload);
+      expect(mockSecureValues.has(storeKey)).toBe(false);
+    });
+
+    test('a record for another batch does not affect this batch', async () => {
+      mockSecureValues.set('agrovix.harvest_recovery.other-batch', '{not json');
+      await runEffects();
+      const view = render();
+      expect(button(view.elements, 'Submit harvest')!.props.disabled).toBeFalsy();
+    });
   });
 });
