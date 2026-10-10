@@ -7,6 +7,7 @@ jest.mock('react', () => {
   const React = jest.requireActual('react');
   return {
     ...React,
+    useCallback: jest.fn((callback: unknown) => callback),
     useEffect: jest.fn(),
     useRef: jest.fn(),
     useState: jest.fn(),
@@ -6029,6 +6030,112 @@ describe('harvest write workflow', () => {
     if (leftover) clearHarvestWriteRecovery(BATCH, leftover.submission.idempotencyKey);
   });
 
+  test('auth generation changes hide volatile harvest recovery until the current generation restores it', () => {
+    const originalOperation = currentAuthOperation();
+    const submission = createHarvestSubmission(
+      BATCH,
+      partialInput,
+      'harvest-auth-scope',
+      context,
+      new Date('2026-05-01T10:00:00.123Z'),
+    );
+
+    expect(restoreHarvestWriteRecovery(submission, 'outcome_unknown', originalOperation)).toBe(
+      true,
+    );
+    expect(getHarvestWriteRecovery(BATCH, originalOperation)?.submission.idempotencyKey).toBe(
+      submission.idempotencyKey,
+    );
+
+    const nextOperation = beginAuthOperation();
+
+    expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+    expect(getHarvestWriteRecovery(BATCH, originalOperation)?.submission.idempotencyKey).toBe(
+      submission.idempotencyKey,
+    );
+
+    expect(restoreHarvestWriteRecovery(submission, 'outcome_unknown', nextOperation)).toBe(true);
+    expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(
+      submission.idempotencyKey,
+    );
+    expect(getHarvestWriteRecovery(BATCH, originalOperation)).toBeNull();
+  });
+
+  test('a new auth generation does not adopt an old in-flight harvest promise', async () => {
+    const originalOperation = currentAuthOperation();
+    const submission = createHarvestSubmission(
+      BATCH,
+      partialInput,
+      'harvest-cross-session-pending',
+      context,
+      new Date('2026-05-01T10:00:00.123Z'),
+    );
+    let releasePost!: () => void;
+    const postGate = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    const post = jest.fn().mockImplementation(async () => {
+      await postGate;
+      return { id: 'event-h', event_type: 'HARVEST', idempotency_key: submission.idempotencyKey };
+    });
+    const readAll = jest
+      .fn()
+      .mockImplementation(async (_batchId: string, operation?: { epoch: number }) => {
+        expect(operation).toEqual(originalOperation);
+        return {
+          batch: { id: BATCH, state: 'active' },
+          projection: { batch_id: BATCH, estimated_remaining_population: 60 },
+          events: [
+            {
+              event_type: 'HARVEST',
+              idempotency_key: submission.idempotencyKey,
+              data: submission.payload,
+            },
+          ],
+        };
+      });
+
+    const first = reconcileHarvestWrite({
+      context,
+      payload: partialInput,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      authOperation: originalOperation,
+      post,
+      readAll,
+    });
+
+    expect(getHarvestWriteRecovery(BATCH, originalOperation)?.inFlight).toBe(true);
+
+    const nextOperation = beginAuthOperation();
+    expect(restoreHarvestWriteRecovery(submission, 'outcome_unknown', nextOperation)).toBe(true);
+
+    const second = await reconcileHarvestWrite({
+      context,
+      payload: partialInput,
+      idempotencyKey: submission.idempotencyKey,
+      submission,
+      authOperation: nextOperation,
+      post,
+      readAll,
+    });
+
+    expect(second.outcome).toBe('outcome_unknown');
+    expect(second.error?.message).toMatch(/different authentication session/i);
+    expect(getHarvestWriteRecovery(BATCH)?.inFlight).toBe(false);
+    expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(
+      submission.idempotencyKey,
+    );
+
+    releasePost();
+    const firstResult = await first;
+
+    expect(firstResult.outcome).toBe('accepted');
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(getHarvestWriteRecovery(BATCH)?.inFlight).toBe(false);
+    expect(getHarvestWriteRecovery(BATCH)?.retryOutcome).toBe('outcome_unknown');
+  });
+
   const verifyTimestamp = (
     sent: string,
     returned: unknown,
@@ -7260,6 +7367,22 @@ describe('harvest form workflow', () => {
       expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
     });
 
+    test('an auth-epoch invalidation hides mounted harvest recovery before the session identity changes', async () => {
+      postUnknown();
+      await submitPartial();
+      const before = await restart();
+
+      expect(before.text).toContain('40');
+      expect(button(before.elements, 'Retry same harvest')).toBeTruthy();
+
+      beginAuthOperation();
+
+      const view = render();
+      expect(view.text).not.toContain('40');
+      expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
+      expect(button(view.elements, 'Submit harvest')?.props.disabled ?? true).toBe(true);
+    });
+
     test('a stale Retry handler captured before a session switch cannot post for user B', async () => {
       postUnknown();
       await submitPartial();
@@ -7439,9 +7562,10 @@ describe('harvest form workflow', () => {
       const record = stored();
       expect(record.status).toBe('PREPARED');
       expect(mockSecureLog).toEqual([`set:${storeKey}`]);
+      await runEffects();
       const view = render();
       expect(view.text).toContain('original submission');
-      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
+      expect(button(view.elements, 'Submit harvest')?.props.disabled ?? true).toBe(true);
       expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
       await button(view.elements, 'Retry same harvest')!.props.onPress();
       await flush();
@@ -7547,7 +7671,7 @@ describe('harvest form workflow', () => {
       expect(render().text).toBe(newSessionText);
       expect(render().text).not.toContain('40');
       expect(mockSecureValues.get(storeKey)).toBe(JSON.stringify(beforeSwitch));
-      expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+      expect(getHarvestWriteRecovery(BATCH)).toBeNull();
     });
 
     test('definitive rejection cleanup completing after a session switch cannot change B', async () => {

@@ -1,4 +1,5 @@
 import { ApiError, ApiFailure } from '../../lib/api';
+import { currentAuthOperation, type AuthOperation } from '../../lib/auth-operations';
 
 export const WATER_QUALITY_CANONICAL_UNITS = {
   temperature: 'C',
@@ -1039,6 +1040,7 @@ export interface ProductionEventWriteRecovery {
   submission: ProductionSubmission<any>;
   inFlight: boolean;
   promise: Promise<ProductionWriteResult<any>> | null;
+  authOperation: AuthOperation;
   retryOutcome?: 'accepted' | 'outcome_unknown' | 'reconciliation_failed';
 }
 
@@ -1051,30 +1053,49 @@ export type HarvestWriteRecovery = ProductionEventWriteRecovery;
 const PRODUCTION_EVENT_WRITE_RECOVERY = new Map<string, ProductionEventWriteRecovery>();
 const PRODUCTION_WRITE_IN_FLIGHT = new Map<
   string,
-  { submission: ProductionSubmission<any>; promise: Promise<ProductionWriteResult<any>> }
+  {
+    submission: ProductionSubmission<any>;
+    promise: Promise<ProductionWriteResult<any>>;
+    authOperation: AuthOperation;
+  }
 >();
 
 function productionEventRecoveryKey(eventType: ProductionEventType, batchId: string): string {
   return JSON.stringify([eventType, batchId]);
 }
 
+function ownsRecoveryOperation(
+  recovery: Pick<ProductionEventWriteRecovery, 'authOperation'>,
+  operation: AuthOperation,
+): boolean {
+  return recovery.authOperation.epoch === operation.epoch;
+}
+
 export function getProductionEventWriteRecovery(
   eventType: ProductionEventType,
   batchId: string,
+  operation: AuthOperation = currentAuthOperation(),
 ): ProductionEventWriteRecovery | null {
-  return (
-    PRODUCTION_EVENT_WRITE_RECOVERY.get(productionEventRecoveryKey(eventType, batchId)) ?? null
+  const recovery = PRODUCTION_EVENT_WRITE_RECOVERY.get(
+    productionEventRecoveryKey(eventType, batchId),
   );
+  return recovery && ownsRecoveryOperation(recovery, operation) ? recovery : null;
 }
 
 export function clearProductionEventWriteRecovery(
   eventType: ProductionEventType,
   batchId: string,
   idempotencyKey: string,
+  operation: AuthOperation = currentAuthOperation(),
 ): void {
   const key = productionEventRecoveryKey(eventType, batchId);
   const recovery = PRODUCTION_EVENT_WRITE_RECOVERY.get(key);
-  if (recovery?.submission.idempotencyKey === idempotencyKey && !recovery.inFlight) {
+  if (
+    recovery &&
+    ownsRecoveryOperation(recovery, operation) &&
+    recovery.submission.idempotencyKey === idempotencyKey &&
+    !recovery.inFlight
+  ) {
     PRODUCTION_EVENT_WRITE_RECOVERY.delete(key);
   }
 }
@@ -1111,12 +1132,19 @@ export function clearTransferWriteRecovery(batchId: string, idempotencyKey: stri
   clearProductionEventWriteRecovery('TRANSFER', batchId, idempotencyKey);
 }
 
-export function getHarvestWriteRecovery(batchId: string): HarvestWriteRecovery | null {
-  return getProductionEventWriteRecovery('HARVEST', batchId);
+export function getHarvestWriteRecovery(
+  batchId: string,
+  operation: AuthOperation = currentAuthOperation(),
+): HarvestWriteRecovery | null {
+  return getProductionEventWriteRecovery('HARVEST', batchId, operation);
 }
 
-export function clearHarvestWriteRecovery(batchId: string, idempotencyKey: string): void {
-  clearProductionEventWriteRecovery('HARVEST', batchId, idempotencyKey);
+export function clearHarvestWriteRecovery(
+  batchId: string,
+  idempotencyKey: string,
+  operation: AuthOperation = currentAuthOperation(),
+): void {
+  clearProductionEventWriteRecovery('HARVEST', batchId, idempotencyKey, operation);
 }
 
 /**
@@ -1126,14 +1154,18 @@ export function clearHarvestWriteRecovery(batchId: string, idempotencyKey: strin
 export function restoreHarvestWriteRecovery(
   submission: HarvestSubmission,
   retryOutcome: 'outcome_unknown' | 'reconciliation_failed' = 'outcome_unknown',
+  operation: AuthOperation = currentAuthOperation(),
 ): boolean {
   const key = productionEventRecoveryKey('HARVEST', submission.batchId);
   const existing = PRODUCTION_EVENT_WRITE_RECOVERY.get(key);
-  if (existing) return isSameProductionSubmission(existing.submission, submission);
+  if (existing && ownsRecoveryOperation(existing, operation)) {
+    return isSameProductionSubmission(existing.submission, submission);
+  }
   PRODUCTION_EVENT_WRITE_RECOVERY.set(key, {
     submission,
     inFlight: false,
     promise: null,
+    authOperation: operation,
     retryOutcome,
   });
   return true;
@@ -1155,12 +1187,14 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
   context,
   eventType,
   submission,
+  operation = currentAuthOperation(),
   post,
   readAll,
 }: {
   context: WaterQualityWriteContext;
   eventType: ProductionEventType;
   submission: ProductionSubmission<TPayload>;
+  operation?: AuthOperation;
   post: (
     batchId: string,
     eventType: ProductionEventType,
@@ -1172,7 +1206,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
 }): Promise<ProductionWriteResult<TPayload>> {
   const recoveryKey = productionEventRecoveryKey(eventType, context.batchId);
   const existingRecovery = PRODUCTION_EVENT_WRITE_RECOVERY.get(recoveryKey);
-  if (existingRecovery) {
+  if (existingRecovery && ownsRecoveryOperation(existingRecovery, operation)) {
     if (
       existingRecovery.submission.idempotencyKey !== submission.idempotencyKey ||
       !isSameProductionSubmission(existingRecovery.submission, submission)
@@ -1190,6 +1224,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
     context,
     eventType,
     submission,
+    operation,
     post,
     readAll,
   });
@@ -1197,6 +1232,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
     submission,
     inFlight: true,
     promise: null,
+    authOperation: operation,
   };
   const trackedPromise = corePromise.then(
     (result) => {
@@ -1206,6 +1242,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
             submission: result.retrySubmission,
             inFlight: false,
             promise: null,
+            authOperation: recovery.authOperation,
             retryOutcome:
               result.outcome === 'reconciliation_failed'
                 ? 'reconciliation_failed'
@@ -1222,6 +1259,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
             submission,
             inFlight: false,
             promise: null,
+            authOperation: recovery.authOperation,
             retryOutcome: 'accepted',
           });
         } else {
@@ -1236,6 +1274,7 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
           submission,
           inFlight: false,
           promise: null,
+          authOperation: recovery.authOperation,
           retryOutcome: 'outcome_unknown',
         });
       }
@@ -1466,12 +1505,14 @@ export function reconcileProductionWrite<TPayload extends Record<string, unknown
   context,
   eventType,
   submission,
+  operation = currentAuthOperation(),
   post,
   readAll,
 }: {
   context: WaterQualityWriteContext;
   eventType: ProductionEventType;
   submission: ProductionSubmission<TPayload>;
+  operation?: AuthOperation;
   post: (
     batchId: string,
     eventType: ProductionEventType,
@@ -1484,6 +1525,19 @@ export function reconcileProductionWrite<TPayload extends Record<string, unknown
 
   if (pending) {
     if (isSameProductionSubmission(pending.submission, submission)) {
+      if (pending.authOperation.epoch !== operation.epoch) {
+        return Promise.resolve({
+          outcome: 'outcome_unknown',
+          submission,
+          retrySubmission: submission,
+          posted: false,
+          reconciled: false,
+          response: null,
+          error: new Error(
+            'The idempotency key is already in flight for a different authentication session.',
+          ),
+        });
+      }
       return pending.promise;
     }
 
@@ -1501,7 +1555,7 @@ export function reconcileProductionWrite<TPayload extends Record<string, unknown
   const promise = Promise.resolve().then(() =>
     performProductionWrite({ context, eventType, post, readAll }, submission),
   );
-  const reservation = { submission, promise };
+  const reservation = { submission, promise, authOperation: operation };
   PRODUCTION_WRITE_IN_FLIGHT.set(submission.idempotencyKey, reservation);
 
   const releaseReservation = () => {
@@ -1832,6 +1886,7 @@ export function reconcileHarvestWrite({
   payload,
   idempotencyKey,
   submission: preservedSubmission,
+  authOperation,
   post,
   readAll,
 }: {
@@ -1839,6 +1894,7 @@ export function reconcileHarvestWrite({
   payload: HarvestInput;
   idempotencyKey: string;
   submission?: HarvestSubmission;
+  authOperation?: AuthOperation;
   post: (
     batchId: string,
     eventType: ProductionEventType,
@@ -1846,7 +1902,7 @@ export function reconcileHarvestWrite({
     key: string,
     performedAt?: string,
   ) => Promise<Record<string, unknown>>;
-  readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+  readAll: (batchId: string, operation?: AuthOperation) => Promise<WaterQualityReconciliationData>;
 }): Promise<HarvestWriteResult> {
   const submission =
     preservedSubmission ??
@@ -1864,9 +1920,10 @@ export function reconcileHarvestWrite({
     context,
     eventType: 'HARVEST',
     submission,
+    operation: authOperation,
     post,
     readAll: async (batchId) => {
-      const reconciliation = await readAll(batchId);
+      const reconciliation = await readAll(batchId, authOperation);
       verifyHarvestReconciliation(reconciliation, submission);
       return reconciliation;
     },

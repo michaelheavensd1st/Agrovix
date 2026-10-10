@@ -11,6 +11,20 @@ export interface CredentialPair {
 
 let currentEpoch = 0;
 let credentialMutationQueue: Promise<void> = Promise.resolve();
+const authGenerationListeners = new Set<() => void>();
+
+export function subscribeToAuthOperationInvalidation(listener: () => void): () => void {
+  authGenerationListeners.add(listener);
+  return () => {
+    authGenerationListeners.delete(listener);
+  };
+}
+
+function notifyAuthOperationInvalidation(): void {
+  for (const listener of Array.from(authGenerationListeners)) {
+    listener();
+  }
+}
 
 export class SingleFlight {
   private pending: Promise<void> | null = null;
@@ -49,6 +63,7 @@ function withCredentialMutationLock<T>(operation: () => Promise<T>): Promise<T> 
 
 export function beginAuthOperation(): AuthOperation {
   currentEpoch += 1;
+  notifyAuthOperationInvalidation();
   return { epoch: currentEpoch };
 }
 
