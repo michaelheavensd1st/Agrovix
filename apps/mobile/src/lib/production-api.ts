@@ -312,9 +312,12 @@ export async function listProductionBatches(
   });
 }
 
-export async function getProductionBatch(batchId: string): Promise<Record<string, unknown>> {
+export async function getProductionBatch(
+  batchId: string,
+  operation?: AuthOperation,
+): Promise<Record<string, unknown>> {
   const path = `/v1/batches/${encodeURIComponent(batchId)}`;
-  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' }, operation);
   const record = assertRecord(body, path);
   if (!isProductionBatch(record)) {
     contractFailure(
@@ -344,6 +347,7 @@ export async function createProductionSite(
 export async function listBatchEvents(
   batchId: string,
   options: { limit?: number; cursor?: string; eventType?: string } = {},
+  operation?: AuthOperation,
 ): Promise<{ items: Record<string, unknown>[]; next_cursor: string | null; limit: number }> {
   const params = new URLSearchParams();
   if (typeof options.limit === 'number') params.set('limit', String(options.limit));
@@ -351,7 +355,7 @@ export async function listBatchEvents(
   if (options.eventType) params.set('event_type', options.eventType);
   const query = params.toString();
   const path = `/v1/batches/${encodeURIComponent(batchId)}/events${query ? `?${query}` : ''}`;
-  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' }, operation);
   const record = assertRecord(body, path);
   if (!isBatchEventListResponse(record)) {
     contractFailure(
@@ -405,9 +409,12 @@ export async function createBatchEvent(
   return record;
 }
 
-export async function getBatchProjections(batchId: string): Promise<Record<string, unknown>> {
+export async function getBatchProjections(
+  batchId: string,
+  operation?: AuthOperation,
+): Promise<Record<string, unknown>> {
   const path = `/v1/batches/${encodeURIComponent(batchId)}/projections`;
-  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' }, operation);
   const record = assertRecord(body, path);
   if (!isProjection(record)) {
     contractFailure(

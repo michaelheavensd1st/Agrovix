@@ -4,8 +4,10 @@ jest.mock('react', () => {
   const React = jest.requireActual('react');
   return {
     ...React,
+    useCallback: jest.fn((callback: unknown) => callback),
     useEffect: jest.fn(),
     useMemo: jest.fn(),
+    useRef: jest.fn(),
     useState: jest.fn(),
   };
 });

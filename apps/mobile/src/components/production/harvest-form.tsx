@@ -1,7 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useAuth } from '../../lib/auth-context';
-import { type AuthOperation, currentAuthOperation } from '../../lib/auth-operations';
+import {
+  type AuthOperation,
+  currentAuthOperation,
+  subscribeToAuthOperationInvalidation,
+} from '../../lib/auth-operations';
 import {
   createBatchEvent,
   getBatchProjections,
@@ -170,7 +174,7 @@ export function HarvestForm({
   onSaved,
   onConflictRefreshed,
 }: HarvestFormProps) {
-  const { session } = useAuth();
+  const { session, submitting: authSubmitting } = useAuth();
   const sessionUserId = session.status === 'authenticated' ? session.user.id : null;
   const [mode, setMode] = useState<HarvestMode>('partial');
   const [values, setValues] = useState<Record<string, string>>(() => getFormValues(null));
@@ -183,6 +187,7 @@ export function HarvestForm({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [recoveryRequired, setRecoveryRequired] = useState(false);
   const [hydration, setHydration] = useState<Hydration>({ status: 'loading' });
+  const [authInvalidationVersion, setAuthInvalidationVersion] = useState(0);
   const submissionInFlight = useRef(false);
   const retrySubmission = useRef<HarvestSubmission | null>(null);
   const freshRef = useRef<FreshState | null>(null);
@@ -218,11 +223,13 @@ export function HarvestForm({
       isFinal ? (state?.state ?? '') : ''
     }`;
 
-  const readSource = async (): Promise<WaterQualityReconciliationData> => {
+  const readSource = async (
+    authOperation?: AuthOperation,
+  ): Promise<WaterQualityReconciliationData> => {
     const [batch, projection, eventData] = await Promise.all([
-      getProductionBatch(batchId),
-      getBatchProjections(batchId),
-      listBatchEvents(batchId),
+      getProductionBatch(batchId, authOperation),
+      getBatchProjections(batchId, authOperation),
+      listBatchEvents(batchId, {}, authOperation),
     ]);
     return {
       batch,
@@ -231,10 +238,10 @@ export function HarvestForm({
     };
   };
 
-  const resetConfirmations = () => {
+  const resetConfirmations = useCallback(() => {
     setConfirmLevel(0);
     setConfirmedSnapshot(null);
-  };
+  }, []);
 
   const applyFresh = (next: FreshState): boolean => {
     const previous = freshRef.current;
@@ -249,11 +256,36 @@ export function HarvestForm({
     return changed;
   };
 
-  const refreshFresh = async (isCurrent = () => mounted.current): Promise<FreshState | null> => {
+  const invalidateVolatileState = useCallback(
+    (nextHydration: Hydration = { status: 'loading' }) => {
+      sessionEpoch.current += 1;
+      boundUserRef.current = null;
+      boundBatchRef.current = null;
+      userIdRef.current = null;
+      retrySubmission.current = null;
+      durableRecord.current = null;
+      draftRevision.current += 1;
+      submissionInFlight.current = false;
+      setBusy(false);
+      setMode('partial');
+      setValues(getFormValues(null));
+      setRecoveryRequired(false);
+      setError(null);
+      setStatusMessage(null);
+      resetConfirmations();
+      setHydration(nextHydration);
+    },
+    [resetConfirmations],
+  );
+
+  const refreshFresh = async (
+    authOperation?: AuthOperation,
+    isCurrent = () => mounted.current,
+  ): Promise<FreshState | null> => {
     try {
       const [batch, projection] = await Promise.all([
-        getProductionBatch(batchId),
-        getBatchProjections(batchId),
+        getProductionBatch(batchId, authOperation),
+        getBatchProjections(batchId, authOperation),
       ]);
       if (!isCurrent()) return null;
       const next = readFresh(batch, projection);
@@ -293,7 +325,19 @@ export function HarvestForm({
           key,
           authOperation,
         ),
-      readAll: readSource,
+      readAll: async (targetBatchId, operation) => {
+        const [batch, projection, eventData] = await Promise.all([
+          getProductionBatch(targetBatchId, operation),
+          getBatchProjections(targetBatchId, operation),
+          listBatchEvents(targetBatchId, {}, operation),
+        ]);
+        return {
+          batch,
+          projection,
+          events: Array.isArray(eventData.items) ? eventData.items : [],
+        };
+      },
+      authOperation,
     });
 
   const changeDraft = () => {
@@ -508,29 +552,30 @@ export function HarvestForm({
     };
   }, []);
 
+  useEffect(
+    () =>
+      subscribeToAuthOperationInvalidation(() => {
+        if (!mounted.current) return;
+        invalidateVolatileState();
+        setAuthInvalidationVersion((current) => current + 1);
+      }),
+    [invalidateVolatileState],
+  );
+
   useEffect(() => {
     let active = true;
+    if (authSubmitting || session.status === 'initializing') {
+      setHydration({ status: 'loading' });
+      return () => {
+        active = false;
+      };
+    }
     if (
       (boundUserRef.current !== null && boundUserRef.current !== sessionUserId) ||
       (boundBatchRef.current !== null && boundBatchRef.current !== batchId)
     ) {
       // The session changed while mounted: drop everything derived from the previous account.
-      sessionEpoch.current += 1;
-      boundUserRef.current = null;
-      boundBatchRef.current = null;
-      userIdRef.current = null;
-      retrySubmission.current = null;
-      durableRecord.current = null;
-      draftRevision.current += 1;
-      submissionInFlight.current = false;
-      setBusy(false);
-      setMode('partial');
-      setValues(getFormValues(null));
-      setRecoveryRequired(false);
-      setError(null);
-      setStatusMessage(null);
-      resetConfirmations();
-      setHydration({ status: 'loading' });
+      invalidateVolatileState();
     }
     const hydrationEpoch = sessionEpoch.current;
     const hydrate = async () => {
@@ -570,7 +615,7 @@ export function HarvestForm({
         ...harvestSubmissionFromRecord(loaded.record),
         context,
       };
-      if (!memory) restoreHarvestWriteRecovery(restored);
+      if (!memory) restoreHarvestWriteRecovery(restored, undefined, currentAuthOperation());
       retrySubmission.current = restored;
       setMode(restored.payload.is_final ? 'final' : 'partial');
       setValues(getFormValues(restored));
@@ -586,10 +631,17 @@ export function HarvestForm({
     return () => {
       active = false;
     };
-  }, [batchId, sessionUserId]);
+  }, [
+    authInvalidationVersion,
+    authSubmitting,
+    batchId,
+    invalidateVolatileState,
+    session.status,
+    sessionUserId,
+  ]);
 
   useEffect(() => {
-    if (isFinal && !getHarvestWriteRecovery(batchId)) void refreshFresh();
+    if (isFinal && !getHarvestWriteRecovery(batchId)) void refreshFresh(currentAuthOperation());
   }, [batchId, isFinal]);
 
   useEffect(() => {
@@ -624,7 +676,7 @@ export function HarvestForm({
         sessionEpoch.current === subscriptionEpoch &&
         currentContextRef.current.userId === sessionUserId &&
         currentContextRef.current.batchId === batchId;
-      void reconcileSubmission(recovery.submission as HarvestSubmission)
+      void reconcileSubmission(recovery.submission as HarvestSubmission, currentAuthOperation())
         .then((result) => {
           if (isCurrent()) {
             return handleWriteResultRef.current(result, draftRevision.current, resultContext);
@@ -837,7 +889,7 @@ export function HarvestForm({
         let latest = fresh;
         if (isFinal) {
           setBusy(true);
-          latest = await refreshFresh(() => !stale());
+          latest = await refreshFresh(authOperation, () => !stale());
           if (stale()) return;
           if (!latest) {
             resetConfirmations();
