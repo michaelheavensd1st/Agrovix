@@ -417,7 +417,17 @@ export function HarvestForm({
         : null;
     setRecoveryRequired(Boolean(result.retrySubmission) || Boolean(retainedAccepted));
 
-    if (result.outcome === 'accepted' && result.reconciliation) {
+    if (
+      result.outcome === 'reconciliation_failed' &&
+      !(result.error instanceof HarvestReconciliationError)
+    ) {
+      failRestoredRetry(BLOCK_MESSAGES.resource_access);
+      return;
+    }
+    if (
+      (result.outcome === 'accepted' && result.reconciliation) ||
+      result.outcome === 'reconciliation_failed'
+    ) {
       let accessAuthorized = false;
       try {
         accessAuthorized =
@@ -436,6 +446,8 @@ export function HarvestForm({
         failRestoredRetry(BLOCK_MESSAGES.resource_access);
         return;
       }
+    }
+    if (result.outcome === 'accepted' && result.reconciliation) {
       const cleaned = await clearDurable(
         result.submission.idempotencyKey,
         context.recoveryRecord,

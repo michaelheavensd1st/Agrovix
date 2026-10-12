@@ -7321,6 +7321,213 @@ describe('harvest form workflow', () => {
       },
     );
 
+    test.each(
+      [false, true].flatMap((isFinal) =>
+        [false, true].flatMap((previouslyPosted) =>
+          [401, 403, 404, 'network' as const].map((failure) => ({
+            isFinal,
+            previouslyPosted,
+            failure,
+          })),
+        ),
+      ),
+    )(
+      'reconciliation access failure hides retained recovery (final: $isFinal, previously posted: $previouslyPosted, failure: $failure)',
+      async ({ isFinal, previouslyPosted, failure }) => {
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        const denyRead = async () => {
+          throw failure === 'network'
+            ? new ApiFailure('network', 'http://api', '/events', undefined, 'TypeError', 'offline')
+            : new ApiError(failure, 'denied', 'http://api', '/events');
+        };
+        let retainedBytes: string | undefined;
+        if (previouslyPosted) {
+          api.listBatchEvents.mockResolvedValueOnce({ items: [], next_cursor: null, limit: 25 });
+        } else {
+          api.listBatchEvents.mockImplementationOnce(async () => {
+            retainedBytes = mockSecureValues.get(storeKey);
+            return denyRead();
+          });
+        }
+        await button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+        if (previouslyPosted) {
+          retainedBytes = mockSecureValues.get(storeKey);
+          api.listBatchEvents
+            .mockResolvedValueOnce({ items: [], next_cursor: null, limit: 1 })
+            .mockImplementationOnce(denyRead);
+          await button(render({ onSaved }).elements, 'Reconcile previous harvest')!.props.onPress();
+          await flush();
+        }
+
+        expect(retainedBytes).toBeDefined();
+        expect(mockSecureValues.get(storeKey)).toBe(retainedBytes);
+        const record = stored();
+        expect(getHarvestWriteRecovery(BATCH)?.submission).toMatchObject({
+          idempotencyKey: record.idempotencyKey,
+          payload: record.payload,
+          performedAt: record.performedAt,
+          createdAt: record.createdAt,
+        });
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+        expect(onSaved).not.toHaveBeenCalled();
+        expectAuthorizationBlockedPresentation(render({ onSaved }));
+      },
+    );
+
+    test.each(
+      [false, true].flatMap((isFinal) =>
+        ['missing', 'integrity'].map((discrepancy) => ({ isFinal, discrepancy })),
+      ),
+    )(
+      'authorized reconciliation discrepancy retains read-only recovery (final: $isFinal, discrepancy: $discrepancy)',
+      async ({ isFinal, discrepancy }) => {
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        api.listBatchEvents.mockImplementationOnce(async () => ({
+          items:
+            discrepancy === 'missing'
+              ? []
+              : [
+                  {
+                    event_type: 'HARVEST',
+                    idempotency_key: lastKey,
+                    data: { ...lastData, quantity: 999 },
+                  },
+                ],
+          next_cursor: null,
+          limit: 25,
+        }));
+        await button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+        const retainedBytes = mockSecureValues.get(storeKey);
+        const view = render({ onSaved });
+        expect(view.text).toContain('Harvest recorded — refresh to confirm');
+        expect(view.text).toContain(`Type: ${isFinal ? 'Final (total)' : 'Partial'}`);
+        expect(button(view.elements, 'Reconcile previous harvest')!.props.disabled).toBe(false);
+        expect(inputs(view.elements).every((input) => input.props.editable === false)).toBe(true);
+        expect(onSaved).not.toHaveBeenCalled();
+        expect(retainedBytes).toBeDefined();
+        await button(view.elements, 'Reconcile previous harvest')!.props.onPress();
+        await flush();
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+        expect(onSaved).toHaveBeenCalledTimes(1);
+        expect(stored()).toBeNull();
+      },
+    );
+
+    test.each([false, true])(
+      'delayed reconciliation denial after sign-out cannot restore disclosure (final: %s)',
+      async (isFinal) => {
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        let rejectRead!: (error: Error) => void;
+        api.listBatchEvents.mockImplementationOnce(
+          () => new Promise((_resolve, reject) => (rejectRead = reject)),
+        );
+        const pending = button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+        const retainedBytes = mockSecureValues.get(storeKey);
+        mockSessionUserId = null;
+        effects = [];
+        render({ onSaved });
+        await runEffects();
+        rejectRead(new ApiError(403, 'denied', 'http://api', '/events'));
+        await pending;
+        await flush();
+        const view = render({ onSaved });
+        expect(view.text).not.toContain('Type:');
+        expect(view.text).not.toContain('Quantity:');
+        expect(view.text).not.toContain('Harvest recorded');
+        expect(button(view.elements, 'Reconcile previous harvest')).toBeUndefined();
+        expect(mockSecureValues.get(storeKey)).toBe(retainedBytes);
+        expect(onSaved).not.toHaveBeenCalled();
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    test('a delayed projection response cannot reveal recovery after reconciliation access failure', async () => {
+      const onSaved = jest.fn();
+      await enterFinal({ onSaved });
+      fill('100', { onSaved });
+      let resolveProjection!: (projection: Record<string, unknown>) => void;
+      api.getBatchProjections.mockImplementationOnce(
+        () => new Promise((resolve) => (resolveProjection = resolve)),
+      );
+      button(render({ onSaved }).elements, 'Refresh projection')!.props.onPress();
+      await flush();
+      const prepared = confirmAll(FINAL_STEPS, { onSaved });
+      api.listBatchEvents.mockRejectedValueOnce(
+        new ApiError(403, 'denied', 'http://api', '/events'),
+      );
+      await button(prepared.elements, 'Submit final harvest')!.props.onPress();
+      await flush();
+      const retainedBytes = mockSecureValues.get(storeKey);
+      expectAuthorizationBlockedPresentation(render({ onSaved }));
+
+      resolveProjection({ batch_id: BATCH, estimated_remaining_population: 999 });
+      await flush();
+      expectAuthorizationBlockedPresentation(render({ onSaved }));
+      expect(mockSecureValues.get(storeKey)).toBe(retainedBytes);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      expect(onSaved).not.toHaveBeenCalled();
+    });
+
+    test.each([false, true])(
+      'an integrity discrepancy with revoked fresh access hides recovery (final: %s)',
+      async (isFinal) => {
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        let retainedBytes: string | undefined;
+        api.listBatchEvents
+          .mockImplementationOnce(async () => {
+            retainedBytes = mockSecureValues.get(storeKey);
+            return { items: [], next_cursor: null, limit: 25 };
+          })
+          .mockRejectedValueOnce(new ApiError(403, 'denied', 'http://api', '/events'));
+        await button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+        expectAuthorizationBlockedPresentation(render({ onSaved }));
+        expect(mockSecureValues.get(storeKey)).toBe(retainedBytes);
+        expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+        expect(onSaved).not.toHaveBeenCalled();
+      },
+    );
+
     test.each([
       [409, 'harvest_exceeds_population'],
       [422, 'harvest_invalid_state'],
