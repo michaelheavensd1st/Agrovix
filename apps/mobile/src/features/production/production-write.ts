@@ -972,6 +972,7 @@ export function isSameLogicalSubmission(
   return (
     left.batchId === right.batchId &&
     left.idempotencyKey === right.idempotencyKey &&
+    left.performedAt === right.performedAt &&
     JSON.stringify(left.payload) === JSON.stringify(right.payload)
   );
 }

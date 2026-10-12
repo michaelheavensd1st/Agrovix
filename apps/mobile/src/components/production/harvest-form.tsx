@@ -1,7 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useAuth } from '../../lib/auth-context';
-import { type AuthOperation, currentAuthOperation } from '../../lib/auth-operations';
+import {
+  type AuthOperation,
+  currentAuthOperation,
+  ownsAuthOperation,
+} from '../../lib/auth-operations';
 import {
   createBatchEvent,
   getBatchProjections,
@@ -78,6 +82,8 @@ const BLOCK_MESSAGES: Record<string, string> = {
     'The stored harvest recovery record does not match the unresolved submission held in memory. New harvests are blocked. Escalate to a supervisor.',
   identity_changed:
     'The signed-in account changed after this form loaded. The harvest was not sent or saved. Reopen the batch so recovery can be re-checked under the current account.',
+  resource_access:
+    'Current authorization could not be verified. The operation remains locked and no recovery details are shown. Reopen after access is restored or contact a supervisor.',
   missing:
     'The stored harvest recovery record could not be found or no longer matches the submission held on this screen. Retry is blocked and nothing was sent. Escalate to a supervisor; do not start a new harvest.',
   cleanup:
@@ -155,8 +161,37 @@ interface HarvestResultContext {
   epoch: number;
   userId: string;
   batchId: string;
+  authOperation: AuthOperation;
   submission: HarvestSubmission;
   recoveryRecord: HarvestRecoveryRecord | null;
+}
+
+async function authorizeRetainedRecoveryAccess(
+  record: HarvestRecoveryRecord,
+  userId: string,
+  authOperation: AuthOperation,
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  const isValid = () => isCurrent() && ownsAuthOperation(authOperation);
+  if (!isValid()) return false;
+
+  const authenticatedUserId = await resolveHarvestRecoveryUserId();
+  if (!isValid() || authenticatedUserId !== userId || record.userId !== userId) return false;
+
+  const batch = await getProductionBatch(record.batchId);
+  if (!isValid() || batch.id !== record.batchId) return false;
+
+  await listBatchEvents(record.batchId, { limit: 1 });
+  if (!isValid()) return false;
+
+  const current = await loadHarvestRecovery(record.batchId);
+  return (
+    isValid() &&
+    current.kind === 'record' &&
+    current.userId === userId &&
+    current.record.userId === userId &&
+    JSON.stringify(current.record) === JSON.stringify(record)
+  );
 }
 
 export function HarvestForm({
@@ -364,6 +399,13 @@ export function HarvestForm({
     const isCurrent = () =>
       isResultContextCurrent(context) && sameSubmission(result.submission, context.submission);
     if (!isCurrent()) return;
+    if (!ownsAuthOperation(context.authOperation)) {
+      keepSafetyLock(result.retrySubmission ?? context.submission);
+      setError(
+        'The authentication operation changed while this harvest was resolving. Its original identity is retained and locked; verify access before retrying it.',
+      );
+      return;
+    }
     const recovery = getHarvestWriteRecovery(context.batchId);
     const retainedAccepted =
       recovery?.retryOutcome === 'accepted' &&
@@ -376,6 +418,25 @@ export function HarvestForm({
     setRecoveryRequired(Boolean(result.retrySubmission) || Boolean(retainedAccepted));
 
     if (result.outcome === 'accepted' && result.reconciliation) {
+      let accessAuthorized = false;
+      try {
+        accessAuthorized =
+          context.recoveryRecord !== null &&
+          (await authorizeRetainedRecoveryAccess(
+            context.recoveryRecord,
+            context.userId,
+            context.authOperation,
+            isCurrent,
+          ));
+      } catch {
+        accessAuthorized = false;
+      }
+      if (!isCurrent()) return;
+      if (!accessAuthorized) {
+        failRestoredRetry(BLOCK_MESSAGES.resource_access);
+        setRecoveryRequired(true);
+        return;
+      }
       const cleaned = await clearDurable(
         result.submission.idempotencyKey,
         context.recoveryRecord,
@@ -533,24 +594,39 @@ export function HarvestForm({
       setHydration({ status: 'loading' });
     }
     const hydrationEpoch = sessionEpoch.current;
+    const hydrationAuthOperation = currentAuthOperation();
+    const isHydrationContextCurrent = () =>
+      active &&
+      mounted.current &&
+      sessionEpoch.current === hydrationEpoch &&
+      currentContextRef.current.userId === sessionUserId &&
+      currentContextRef.current.batchId === batchId;
+    const blockResourceAccess = () => {
+      retrySubmission.current = null;
+      durableRecord.current = null;
+      setValues(getFormValues(null));
+      setRecoveryRequired(false);
+      setHydration({ status: 'blocked', message: BLOCK_MESSAGES.resource_access });
+    };
     const hydrate = async () => {
       if (!sessionUserId) {
         setHydration({ status: 'blocked', message: BLOCK_MESSAGES.identity_unavailable });
         return;
       }
       const loaded = await loadHarvestRecovery(batchId);
-      if (!active || !mounted.current || sessionEpoch.current !== hydrationEpoch) return;
+      if (!isHydrationContextCurrent()) return;
+      if (!ownsAuthOperation(hydrationAuthOperation)) {
+        blockResourceAccess();
+        return;
+      }
       if ((loaded.kind === 'none' || loaded.kind === 'record') && loaded.userId !== sessionUserId) {
         setHydration({ status: 'blocked', message: BLOCK_MESSAGES.identity_changed });
         return;
       }
-      boundUserRef.current = sessionUserId;
-      boundBatchRef.current = batchId;
       if (loaded.kind === 'blocked' || loaded.kind === 'foreign') {
         setHydration({ status: 'blocked', message: blockMessageFor(loaded) });
         return;
       }
-      userIdRef.current = loaded.userId;
       const memory = getHarvestWriteRecovery(batchId);
       if (loaded.kind === 'none') {
         // An in-memory entry without an owned durable record cannot be attributed to this user.
@@ -558,18 +634,45 @@ export function HarvestForm({
           setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
           return;
         }
+        boundUserRef.current = sessionUserId;
+        boundBatchRef.current = batchId;
+        userIdRef.current = loaded.userId;
         setHydration({ status: 'ready' });
         return;
       }
-      if (memory && memory.submission.idempotencyKey !== loaded.record.idempotencyKey) {
-        setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
-        return;
-      }
-      durableRecord.current = loaded.record;
       const restored: HarvestSubmission = {
         ...harvestSubmissionFromRecord(loaded.record),
         context,
       };
+      if (
+        memory &&
+        !sameSubmission(memory.submission as HarvestSubmission, restored)
+      ) {
+        setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
+        return;
+      }
+      let accessAuthorized = false;
+      try {
+        accessAuthorized = await authorizeRetainedRecoveryAccess(
+          loaded.record,
+          sessionUserId,
+          hydrationAuthOperation,
+          isHydrationContextCurrent,
+        );
+      } catch {
+        if (!isHydrationContextCurrent()) return;
+        blockResourceAccess();
+        return;
+      }
+      if (!isHydrationContextCurrent()) return;
+      if (!ownsAuthOperation(hydrationAuthOperation) || !accessAuthorized) {
+        blockResourceAccess();
+        return;
+      }
+      boundUserRef.current = sessionUserId;
+      boundBatchRef.current = batchId;
+      userIdRef.current = loaded.userId;
+      durableRecord.current = loaded.record;
       if (!memory) restoreHarvestWriteRecovery(restored);
       retrySubmission.current = restored;
       setMode(restored.payload.is_final ? 'final' : 'partial');
@@ -579,9 +682,13 @@ export function HarvestForm({
       setHydration({ status: 'ready' });
     };
     void hydrate().catch(() => {
-      if (active && mounted.current) {
-        setHydration({ status: 'blocked', message: BLOCK_MESSAGES.storage_unavailable });
-      }
+      if (!isHydrationContextCurrent()) return;
+      setHydration({
+        status: 'blocked',
+        message: ownsAuthOperation(hydrationAuthOperation)
+          ? BLOCK_MESSAGES.storage_unavailable
+          : BLOCK_MESSAGES.resource_access,
+      });
     });
     return () => {
       active = false;
@@ -598,6 +705,7 @@ export function HarvestForm({
       return;
     }
     const subscriptionEpoch = sessionEpoch.current;
+    const authOperation = currentAuthOperation();
     const resultOwnerId = durableRecord.current?.userId ?? userIdRef.current;
     if (!resultOwnerId) return;
     const recovery = getHarvestWriteRecovery(batchId);
@@ -609,6 +717,7 @@ export function HarvestForm({
       epoch: subscriptionEpoch,
       userId: resultOwnerId,
       batchId,
+      authOperation,
       submission: recovery.submission as HarvestSubmission,
       recoveryRecord: durableRecord.current,
     };
@@ -624,7 +733,7 @@ export function HarvestForm({
         sessionEpoch.current === subscriptionEpoch &&
         currentContextRef.current.userId === sessionUserId &&
         currentContextRef.current.batchId === batchId;
-      void reconcileSubmission(recovery.submission as HarvestSubmission)
+      void reconcileSubmission(recovery.submission as HarvestSubmission, authOperation)
         .then((result) => {
           if (isCurrent()) {
             return handleWriteResultRef.current(result, draftRevision.current, resultContext);
@@ -740,6 +849,7 @@ export function HarvestForm({
     retrySubmission.current = null;
     durableRecord.current = null;
     setValues(getFormValues(null));
+    setRecoveryRequired(false);
     setError(null);
     setHydration({ status: 'blocked', message });
   };
@@ -795,6 +905,23 @@ export function HarvestForm({
           setHydration({ status: 'blocked', message: BLOCK_MESSAGES.missing });
           return;
         }
+        let accessAuthorized = false;
+        try {
+          accessAuthorized = await authorizeRetainedRecoveryAccess(
+            owner,
+            sessionUserId,
+            authOperation,
+            () => !stale(),
+          );
+        } catch {
+          if (!stale()) failRestoredRetry(BLOCK_MESSAGES.resource_access);
+          return;
+        }
+        if (stale()) return;
+        if (!accessAuthorized) {
+          failRestoredRetry(BLOCK_MESSAGES.resource_access);
+          return;
+        }
         let stored: HarvestRecoveryLoad;
         try {
           stored = await loadHarvestRecovery(batchId);
@@ -824,6 +951,7 @@ export function HarvestForm({
         if (
           stored.userId !== sessionUserId ||
           stored.record.userId !== owner.userId ||
+          JSON.stringify(stored.record) !== JSON.stringify(owner) ||
           original.batchId !== retained.batchId ||
           original.idempotencyKey !== retained.idempotencyKey ||
           original.performedAt !== retained.performedAt ||
@@ -923,6 +1051,7 @@ export function HarvestForm({
         epoch,
         userId: sessionUserId,
         batchId,
+        authOperation,
         submission,
         recoveryRecord:
           durableRecord.current?.idempotencyKey === submission.idempotencyKey
