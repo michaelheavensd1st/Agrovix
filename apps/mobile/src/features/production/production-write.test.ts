@@ -7179,6 +7179,155 @@ describe('harvest form workflow', () => {
       },
     );
 
+    test.each([false, true])(
+      'retained POST denial revalidates read access before recovery actions (final: %s)',
+      async (isFinal) => {
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        postUnknown();
+        await button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+        const record = stored();
+        const restored = await restart();
+        api.getProductionBatch.mockClear();
+        api.listBatchEvents.mockClear();
+        postFailure = new ApiError(403, 'create denied', 'http://api', '/events');
+        api.listBatchEvents
+          .mockResolvedValueOnce({ items: [], next_cursor: null, limit: 1 })
+          .mockRejectedValueOnce(new ApiError(403, 'read revoked', 'http://api', '/events'));
+
+        await button(restored.elements, 'Retry same harvest')!.props.onPress();
+        await flush();
+
+        expect(api.getProductionBatch).toHaveBeenCalledWith(BATCH);
+        expect(api.listBatchEvents).toHaveBeenCalledWith(BATCH, { limit: 1 });
+        expect(stored()).toEqual(record);
+        expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(
+          record.idempotencyKey,
+        );
+        expect(render().text).toContain('no recovery details are shown');
+        expect(button(render().elements, 'Retry same harvest')).toBeUndefined();
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    test('create denial with current read access preserves inspection without a new POST', async () => {
+      postUnknown();
+      await submitPartial();
+      const record = stored();
+      const restored = await restart();
+      postFailure = new ApiError(403, 'create denied', 'http://api', '/events');
+      await button(restored.elements, 'Retry same harvest')!.props.onPress();
+      await flush();
+
+      expect(render().text).toContain('Quantity: 40');
+      expect(stored()).toEqual(record);
+      expect(getHarvestWriteRecovery(BATCH)?.submission.idempotencyKey).toBe(record.idempotencyKey);
+      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+    });
+
+    test.each([false, true])(
+      'same-user auth generation change hides and reauthorizes retained recovery (final: %s)',
+      async (isFinal) => {
+        postUnknown();
+        if (isFinal) {
+          await enterFinal();
+          fill('100');
+          const prepared = confirmAll(FINAL_STEPS);
+          await button(prepared.elements, 'Submit final harvest')!.props.onPress();
+          await flush();
+        } else {
+          await submitPartial();
+        }
+        const record = stored();
+        const view = await restart();
+        expect(view.text).toContain(isFinal ? 'Quantity: 100' : 'Quantity: 40');
+        api.getProductionBatch.mockClear();
+        api.listBatchEvents.mockClear();
+        beginAuthOperation();
+
+        let afterGenerationChange = render();
+        expect(afterGenerationChange.text).not.toContain(
+          isFinal ? 'Quantity: 100' : 'Quantity: 40',
+        );
+        expect(button(afterGenerationChange.elements, 'Retry same harvest')).toBeUndefined();
+        await runEffects();
+        afterGenerationChange = render();
+
+        expect(api.getProductionBatch).toHaveBeenCalledWith(BATCH);
+        expect(api.listBatchEvents).toHaveBeenCalledWith(BATCH, { limit: 1 });
+        expect(afterGenerationChange.text).toContain(isFinal ? 'Quantity: 100' : 'Quantity: 40');
+        expect(stored()).toEqual(record);
+      },
+    );
+
+    test.each([false, true])(
+      'auth generation change during accepted cleanup preserves record and suppresses callback (final: %s)',
+      async (isFinal) => {
+        const onSaved = jest.fn();
+        const originalDelete = harvestRecoveryStore.deleteHarvestRecoveryRecord;
+        let allowDelete!: () => void;
+        const deleteGate = new Promise<void>((resolve) => (allowDelete = resolve));
+        let deleteStarted!: () => void;
+        const started = new Promise<void>((resolve) => (deleteStarted = resolve));
+        jest
+          .spyOn(harvestRecoveryStore, 'deleteHarvestRecoveryRecord')
+          .mockImplementationOnce(async (...args) => {
+            deleteStarted();
+            await deleteGate;
+            return originalDelete(...args);
+          });
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        const submit = button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await started;
+        const record = stored();
+        beginAuthOperation();
+        render({ onSaved });
+        allowDelete();
+        await submit;
+        await flush();
+
+        expect(stored()).toEqual(record);
+        expect(onSaved).not.toHaveBeenCalled();
+        expect(render({ onSaved }).text).not.toContain('harvest recorded and verified');
+      },
+    );
+
+    test('a stale projection refresh after same-user generation change is ignored', async () => {
+      await enterFinal();
+      fill('100');
+      let resolveProjection!: (projection: Record<string, unknown>) => void;
+      api.getBatchProjections.mockImplementationOnce(
+        () => new Promise((resolve) => (resolveProjection = resolve)),
+      );
+      button(render().elements, 'Refresh projection')!.props.onPress();
+      await flush();
+      beginAuthOperation();
+      render();
+      await runEffects();
+      resolveProjection({ batch_id: BATCH, estimated_remaining_population: 777 });
+      await flush();
+
+      expect(render().text).not.toContain('777');
+      expect(render().text).toContain('Projected remaining population (context only): 100');
+    });
+
     test('same-key replay after reauthentication succeeds and clears the record', async () => {
       postUnknown();
       await submitPartial();
@@ -7350,10 +7499,12 @@ describe('harvest form workflow', () => {
         if (previouslyPosted) {
           api.listBatchEvents.mockResolvedValueOnce({ items: [], next_cursor: null, limit: 25 });
         } else {
-          api.listBatchEvents.mockImplementationOnce(async () => {
-            retainedBytes = mockSecureValues.get(storeKey);
-            return denyRead();
-          });
+          api.listBatchEvents
+            .mockImplementationOnce(async () => {
+              retainedBytes = mockSecureValues.get(storeKey);
+              return denyRead();
+            })
+            .mockImplementationOnce(denyRead);
         }
         await button(
           prepared.elements,
@@ -7364,6 +7515,7 @@ describe('harvest form workflow', () => {
           retainedBytes = mockSecureValues.get(storeKey);
           api.listBatchEvents
             .mockResolvedValueOnce({ items: [], next_cursor: null, limit: 1 })
+            .mockImplementationOnce(denyRead)
             .mockImplementationOnce(denyRead);
           await button(render({ onSaved }).elements, 'Reconcile previous harvest')!.props.onPress();
           await flush();
@@ -7380,6 +7532,7 @@ describe('harvest form workflow', () => {
         });
         expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
         expect(onSaved).not.toHaveBeenCalled();
+        expect(api.listBatchEvents.mock.calls.length).toBeGreaterThanOrEqual(2);
         expectAuthorizationBlockedPresentation(render({ onSaved }));
       },
     );
@@ -7482,9 +7635,9 @@ describe('harvest form workflow', () => {
       button(render({ onSaved }).elements, 'Refresh projection')!.props.onPress();
       await flush();
       const prepared = confirmAll(FINAL_STEPS, { onSaved });
-      api.listBatchEvents.mockRejectedValueOnce(
-        new ApiError(403, 'denied', 'http://api', '/events'),
-      );
+      api.listBatchEvents
+        .mockRejectedValueOnce(new ApiError(403, 'denied', 'http://api', '/events'))
+        .mockRejectedValueOnce(new ApiError(403, 'denied', 'http://api', '/events'));
       await button(prepared.elements, 'Submit final harvest')!.props.onPress();
       await flush();
       const retainedBytes = mockSecureValues.get(storeKey);
@@ -8000,10 +8153,13 @@ describe('harvest form workflow', () => {
       expect(record.status).toBe('PREPARED');
       expect(mockSecureLog).toEqual([`set:${storeKey}`]);
       const view = render();
-      expect(view.text).toContain('original submission');
-      expect(button(view.elements, 'Submit harvest')).toBeUndefined();
-      expect(button(view.elements, 'Retry same harvest')).toBeTruthy();
-      await button(view.elements, 'Retry same harvest')!.props.onPress();
+      expectAuthorizationBlockedPresentation(view);
+      expect(stored()).toEqual(record);
+      beginAuthOperation();
+      await runEffects();
+      const reauthorized = render();
+      expect(reauthorized.text).toContain('Original submission identity is retained');
+      await button(reauthorized.elements, 'Retry same harvest')!.props.onPress();
       await flush();
       expect(lastKey).toBe(record.idempotencyKey);
       expect(mockSecureValues.has(storeKey)).toBe(false);
