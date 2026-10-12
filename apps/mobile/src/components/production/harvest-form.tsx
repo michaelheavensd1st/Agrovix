@@ -644,10 +644,7 @@ export function HarvestForm({
         ...harvestSubmissionFromRecord(loaded.record),
         context,
       };
-      if (
-        memory &&
-        !sameSubmission(memory.submission as HarvestSubmission, restored)
-      ) {
+      if (memory && !sameSubmission(memory.submission as HarvestSubmission, restored)) {
         setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
         return;
       }
