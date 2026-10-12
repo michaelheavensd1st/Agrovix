@@ -7192,27 +7192,54 @@ describe('harvest form workflow', () => {
       expectRecoveryDetailsHidden(after);
     });
 
-    test('permission revoked before accepted recovery consumption retains the durable record', async () => {
-      const onSaved = jest.fn();
-      api.listBatchEvents
-        .mockImplementationOnce(async () => ({
-          items: [{ event_type: 'HARVEST', idempotency_key: lastKey, data: lastData }],
-          next_cursor: null,
-          limit: 25,
-        }))
-        .mockRejectedValueOnce(new ApiError(403, 'revoked', 'http://api', '/events'));
-      await runEffects();
-      fill('40', { onSaved });
-      const view = confirmAll(['I confirm 40 individuals'], { onSaved });
+    test.each([false, true])(
+      'permission revoked before accepted recovery consumption hides details and retains the durable record (final: %s)',
+      async (isFinal) => {
+        const onSaved = jest.fn();
+        let retainedRecord: unknown;
+        api.listBatchEvents
+          .mockImplementationOnce(async () => ({
+            items: [{ event_type: 'HARVEST', idempotency_key: lastKey, data: lastData }],
+            next_cursor: null,
+            limit: 25,
+          }))
+          .mockImplementationOnce(async () => {
+            retainedRecord = stored();
+            throw new ApiError(403, 'revoked', 'http://api', '/events');
+          });
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const view = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], { onSaved });
 
-      await button(view.elements, 'Submit harvest')!.props.onPress();
-      await flush();
+        await button(
+          view.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
 
-      expect(stored()).not.toBeNull();
-      expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
-      expect(onSaved).not.toHaveBeenCalled();
-      expect(render({ onSaved }).text).toContain('no recovery details are shown');
-    });
+        expect(stored()).not.toBeNull();
+        expect(stored()).toEqual(retainedRecord);
+        expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
+        expect(onSaved).not.toHaveBeenCalled();
+        const blocked = render({ onSaved });
+        expect(blocked.text).toContain('no recovery details are shown');
+        expect(blocked.text).not.toContain('Harvest recorded — refresh to confirm');
+        expect(blocked.text).not.toContain('Type:');
+        expect(blocked.text).not.toContain('Quantity:');
+        expect(blocked.text).not.toContain('Total weight:');
+        expect(button(blocked.elements, 'Reconcile previous harvest')).toBeUndefined();
+        expect(button(blocked.elements, 'Retry same harvest')).toBeUndefined();
+        expect(
+          button(blocked.elements, isFinal ? 'Submit final harvest' : 'Submit harvest')!.props
+            .disabled,
+        ).toBe(true);
+        expect(inputs(blocked.elements).every((input) => input.props.editable === false)).toBe(
+          true,
+        );
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      },
+    );
 
     test.each([
       [409, 'harvest_exceeds_population'],

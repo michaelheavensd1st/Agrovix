@@ -434,7 +434,6 @@ export function HarvestForm({
       if (!isCurrent()) return;
       if (!accessAuthorized) {
         failRestoredRetry(BLOCK_MESSAGES.resource_access);
-        setRecoveryRequired(true);
         return;
       }
       const cleaned = await clearDurable(
