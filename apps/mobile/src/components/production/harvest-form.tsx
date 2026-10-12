@@ -1131,6 +1131,17 @@ export function HarvestForm({
     );
   }
 
+  if (hydration.status === 'blocked' && hydration.message === BLOCK_MESSAGES.resource_access) {
+    return (
+      <View style={styles.card}>
+        <Text style={styles.error}>{hydration.message}</Text>
+        <Pressable disabled style={styles.secondaryButton}>
+          <Text style={styles.secondaryButtonText}>Submit harvest</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
   // A terminal batch only keeps the form visible while recovery or a result needs the operator.
   if (
     batchState === 'harvested' &&

@@ -6774,6 +6774,30 @@ describe('harvest form workflow', () => {
       expect(view.text).not.toContain('Original submission identity is retained');
       expect(view.text).not.toContain('Quantity: 40');
     };
+    const expectAuthorizationBlockedPresentation = (view: ReturnType<typeof render>) => {
+      expect(view.text).toContain('no recovery details are shown');
+      const disclosures = [
+        'Harvest type',
+        'Partial harvest',
+        'Final harvest',
+        'Projected remaining population',
+        'Observed physical count',
+        'I confirm',
+        'Second confirmation',
+        'HARVESTED',
+        'Harvest recorded — refresh to confirm',
+        'Type:',
+        'Quantity:',
+        'Total weight:',
+      ];
+      expect(disclosures.filter((text) => view.text.includes(text))).toEqual([]);
+      expect(inputs(view.elements)).toHaveLength(0);
+      expect(button(view.elements, 'Reconcile previous harvest')).toBeUndefined();
+      expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
+      expect(button(view.elements, 'Submit harvest')?.props.disabled).toBe(true);
+      const actions = view.elements.filter((element) => element.type === Pressable) as Pressed[];
+      expect(actions.every((action) => action.props.disabled === true)).toBe(true);
+    };
     const postUnknown = () => {
       postFailure = new ApiFailure('network', 'http://api', '/p', undefined, 'TypeError', 'lost');
     };
@@ -6808,6 +6832,7 @@ describe('harvest form workflow', () => {
         expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
         expect(button(view.elements, 'Submit harvest')?.props.disabled).toBe(true);
         expectRecoveryDetailsHidden(view);
+        expectAuthorizationBlockedPresentation(view);
         expect(stored()).toEqual(record);
         expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
       },
@@ -6826,6 +6851,7 @@ describe('harvest form workflow', () => {
       expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
       expect(button(view.elements, 'Submit harvest')?.props.disabled).toBe(true);
       expectRecoveryDetailsHidden(view);
+      expectAuthorizationBlockedPresentation(view);
       expect(stored()).toEqual(record);
       expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
     });
@@ -6843,6 +6869,7 @@ describe('harvest form workflow', () => {
       expect(button(view.elements, 'Retry same harvest')).toBeUndefined();
       expect(button(view.elements, 'Submit harvest')?.props.disabled).toBe(true);
       expectRecoveryDetailsHidden(view);
+      expectAuthorizationBlockedPresentation(view);
       expect(stored()).toEqual(record);
       expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
     });
@@ -7192,11 +7219,16 @@ describe('harvest form workflow', () => {
       expectRecoveryDetailsHidden(after);
     });
 
-    test.each([false, true])(
-      'permission revoked before accepted recovery consumption hides details and retains the durable record (final: %s)',
-      async (isFinal) => {
+    test.each(
+      [false, true].flatMap((isFinal) =>
+        [401, 403, 404, 'network' as const].map((failure) => ({ isFinal, failure })),
+      ),
+    )(
+      'permission revoked before accepted recovery consumption hides details and retains the durable record (final: $isFinal, failure: $failure)',
+      async ({ isFinal, failure }) => {
         const onSaved = jest.fn();
         let retainedRecord: unknown;
+        let retainedBytes: string | undefined;
         api.listBatchEvents
           .mockImplementationOnce(async () => ({
             items: [{ event_type: 'HARVEST', idempotency_key: lastKey, data: lastData }],
@@ -7205,7 +7237,17 @@ describe('harvest form workflow', () => {
           }))
           .mockImplementationOnce(async () => {
             retainedRecord = stored();
-            throw new ApiError(403, 'revoked', 'http://api', '/events');
+            retainedBytes = mockSecureValues.get(storeKey);
+            throw failure === 'network'
+              ? new ApiFailure(
+                  'network',
+                  'http://api',
+                  '/events',
+                  undefined,
+                  'TypeError',
+                  'offline',
+                )
+              : new ApiError(failure, 'revoked', 'http://api', '/events');
           });
         if (isFinal) await enterFinal({ onSaved });
         else await runEffects();
@@ -7220,6 +7262,7 @@ describe('harvest form workflow', () => {
 
         expect(stored()).not.toBeNull();
         expect(stored()).toEqual(retainedRecord);
+        expect(mockSecureValues.get(storeKey)).toBe(retainedBytes);
         expect(getHarvestWriteRecovery(BATCH)).not.toBeNull();
         expect(onSaved).not.toHaveBeenCalled();
         const blocked = render({ onSaved });
@@ -7230,14 +7273,51 @@ describe('harvest form workflow', () => {
         expect(blocked.text).not.toContain('Total weight:');
         expect(button(blocked.elements, 'Reconcile previous harvest')).toBeUndefined();
         expect(button(blocked.elements, 'Retry same harvest')).toBeUndefined();
-        expect(
-          button(blocked.elements, isFinal ? 'Submit final harvest' : 'Submit harvest')!.props
-            .disabled,
-        ).toBe(true);
+        expectAuthorizationBlockedPresentation(blocked);
         expect(inputs(blocked.elements).every((input) => input.props.editable === false)).toBe(
           true,
         );
         expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    test.each([false, true])(
+      'freshly authorized accepted recovery is consumed without another POST (final: %s)',
+      async (isFinal) => {
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        api.listBatchEvents.mockResolvedValueOnce({ items: [], next_cursor: null, limit: 25 });
+        await button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+
+        const retained = getHarvestWriteRecovery(BATCH)!.submission;
+        expect(stored()).not.toBeNull();
+        expect(onSaved).not.toHaveBeenCalled();
+        const authorized = render({ onSaved });
+        expect(authorized.text).toContain(`Type: ${isFinal ? 'Final (total)' : 'Partial'}`);
+        api.getProductionBatch.mockClear();
+        api.listBatchEvents.mockClear();
+        await button(authorized.elements, 'Reconcile previous harvest')!.props.onPress();
+        await flush();
+
+        expect(api.getProductionBatch).toHaveBeenCalledWith(BATCH);
+        expect(api.listBatchEvents).toHaveBeenCalledWith(BATCH, { limit: 1 });
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+        expect(onSaved).toHaveBeenCalledTimes(1);
+        expect(onSaved.mock.calls[0][0]).toEqual(retained);
+        expect(stored()).toBeNull();
+        expect(getHarvestWriteRecovery(BATCH)).toBeNull();
+        expect(render({ onSaved }).text).toContain(
+          isFinal ? 'Final harvest recorded and verified' : 'Partial harvest recorded and verified',
+        );
       },
     );
 
