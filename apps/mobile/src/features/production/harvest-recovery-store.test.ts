@@ -45,6 +45,8 @@ import {
   HarvestRecoveryStorageError,
   loadHarvestRecovery,
   persistHarvestRecoveryRecord,
+  harvestRecoveryPhase,
+  transitionHarvestRecoveryRecord,
 } from './harvest-recovery-store';
 import { createHarvestSubmission } from './production-write';
 
@@ -84,6 +86,54 @@ const kindOf = async (action: Promise<unknown>) => {
 };
 
 describe('harvest recovery store', () => {
+  test('FC legacy PREPARED remains possibly sent and is not rewritten on load', async () => {
+    const legacy = { ...record(), version: 1, status: 'PREPARED' };
+    mockValues.set(KEY, JSON.stringify(legacy));
+    const loaded = await loadHarvestRecovery(BATCH);
+    expect(loaded.kind === 'record' && harvestRecoveryPhase(loaded.record)).toBe('OUTCOME_UNKNOWN');
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(legacy));
+  });
+
+  test('FC transitions preserve immutable identity and cold restart phases', async () => {
+    let current = record();
+    await persistHarvestRecoveryRecord(current);
+    for (const status of [
+      'POSTING',
+      'OUTCOME_UNKNOWN',
+      'POSTING',
+      'ACCEPTED_UNRECONCILED',
+      'RECONCILED',
+    ] as const) {
+      const next = await transitionHarvestRecoveryRecord(current, status, () => true);
+      expect({ ...next, status: current.status, updatedAt: current.updatedAt }).toEqual(current);
+      const loaded = await loadHarvestRecovery(BATCH);
+      expect(loaded).toEqual({ kind: 'record', userId: 'user-1', record: next });
+      current = next;
+    }
+    await expect(transitionHarvestRecoveryRecord(current, 'POSTING', () => true)).rejects.toThrow();
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(current));
+  });
+
+  test('FC failed or stale conditional transitions retain the original record', async () => {
+    const original = record();
+    await persistHarvestRecoveryRecord(original);
+    mockFaults.failSet = true;
+    await expect(
+      transitionHarvestRecoveryRecord(original, 'POSTING', () => true),
+    ).rejects.toThrow();
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(original));
+    mockFaults.failSet = false;
+    await expect(
+      transitionHarvestRecoveryRecord(original, 'POSTING', () => false),
+    ).rejects.toThrow();
+    const replacement = { ...original, userId: 'other' };
+    mockValues.set(KEY, JSON.stringify(replacement));
+    await expect(
+      transitionHarvestRecoveryRecord(original, 'POSTING', () => true),
+    ).rejects.toThrow();
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(replacement));
+  });
+
   test('builds a scoped storage key and rejects unsafe batch ids', () => {
     expect(harvestRecoveryStorageKey(BATCH)).toBe(KEY);
     expect(harvestRecoveryStorageKey('a/b')).toBeNull();
@@ -166,7 +216,7 @@ describe('harvest recovery store', () => {
       ['array', '[]', 'corrupt'],
       ['version', JSON.stringify({ ...good, version: 99 }), 'incompatible'],
       ['batch', JSON.stringify({ ...good, batchId: 'other' }), 'corrupt'],
-      ['status', JSON.stringify({ ...good, status: 'RECONCILED' }), 'corrupt'],
+      ['status', JSON.stringify({ ...good, status: 'INVALID' }), 'corrupt'],
       [
         'harvested_at',
         JSON.stringify({

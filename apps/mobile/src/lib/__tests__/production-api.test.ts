@@ -16,7 +16,10 @@ jest.mock('../secure-storage', () => ({
 }));
 
 import { ApiFailure } from '../api';
+import { beginAuthOperation, currentAuthOperation } from '../auth-operations';
 import {
+  BatchEventScanIncompleteError,
+  listAllBatchEvents,
   createBatchEvent,
   createProductionSite,
   getBatchProjections,
@@ -35,8 +38,123 @@ describe('production-api client contract', () => {
   let fetchMock: jest.Mock;
 
   beforeEach(() => {
+    beginAuthOperation();
     fetchMock = jest.fn();
     globalThis.fetch = fetchMock as unknown as typeof fetch;
+  });
+
+  const event = (id: string, batchId = 'batch-123') => ({
+    id,
+    batch_id: batchId,
+    event_type: 'HARVEST',
+    event_type_version: 1,
+    performed_at: '2026-10-01T00:00:00Z',
+    created_at: '2026-10-01T00:00:00Z',
+    attachments: null,
+    data: { quantity: 1 },
+  });
+  const page = (items: ReturnType<typeof event>[], next_cursor: string | null) =>
+    new Response(JSON.stringify({ items, next_cursor, limit: 100 }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  test('FC scans beyond the first 50 events and deduplicates identical overlap in server order', async () => {
+    const first = Array.from({ length: 100 }, (_, index) => event(`event-${index}`));
+    fetchMock
+      .mockResolvedValueOnce(page(first, 'opaque+cursor'))
+      .mockResolvedValueOnce(page([first[99], event('accepted-event')], null));
+    const result = await listAllBatchEvents('batch-123', currentAuthOperation());
+    expect(result).toHaveLength(101);
+    expect(result[100].id).toBe('accepted-event');
+    expect(fetchMock.mock.calls[1][0]).toContain('cursor=opaque%2Bcursor');
+  });
+
+  test.each(['', 'same'])(
+    'FC rejects an empty or repeated cursor %p without establishing absence',
+    async (cursor) => {
+      fetchMock.mockImplementation(async () => page([], cursor));
+      await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+        BatchEventScanIncompleteError,
+      );
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(2);
+    },
+  );
+
+  test('FC rejects cyclic cursors', async () => {
+    fetchMock
+      .mockResolvedValueOnce(page([], 'a'))
+      .mockResolvedValueOnce(page([], 'b'))
+      .mockResolvedValueOnce(page([], 'a'));
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+      BatchEventScanIncompleteError,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  test('FC only cursor exhaustion completes an empty search', async () => {
+    fetchMock.mockResolvedValue(page([], null));
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).resolves.toEqual([]);
+  });
+
+  test('FC request failure and permission revocation never return partial results', async () => {
+    fetchMock
+      .mockResolvedValueOnce(page([event('first')], 'next'))
+      .mockResolvedValueOnce(
+        new Response('{}', { status: 403, headers: { 'Content-Type': 'application/json' } }),
+      );
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+      ApiFailure,
+    );
+  });
+
+  test('FC distinguishes incomplete event pages from connectivity failures', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ invalid: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+      BatchEventScanIncompleteError,
+    );
+
+    fetchMock.mockRejectedValueOnce(new TypeError('offline'));
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toMatchObject({
+      phase: 'network',
+    });
+  });
+
+  test('FC bounds requests and refuses to complete at the page cap', async () => {
+    let index = 0;
+    fetchMock.mockImplementation(async () => page([], `next-${++index}`));
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+      BatchEventScanIncompleteError,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(20);
+  });
+
+  test('FC rejects conflicting duplicate IDs and wrong-batch events', async () => {
+    fetchMock.mockResolvedValue(
+      page([event('same'), { ...event('same'), data: { quantity: 2 } }], null),
+    );
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+      BatchEventScanIncompleteError,
+    );
+    fetchMock.mockResolvedValue(page([event('foreign', 'other-batch')], null));
+    await expect(listAllBatchEvents('batch-123', currentAuthOperation())).rejects.toBeInstanceOf(
+      BatchEventScanIncompleteError,
+    );
+  });
+
+  test('FC stops after auth generation invalidation without requesting the next page', async () => {
+    const operation = currentAuthOperation();
+    fetchMock.mockImplementationOnce(async () => {
+      beginAuthOperation();
+      return page([event('old')], 'next');
+    });
+    await expect(listAllBatchEvents('batch-123', operation)).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   test('rejects malformed 2xx success payloads as application contract failures', async () => {

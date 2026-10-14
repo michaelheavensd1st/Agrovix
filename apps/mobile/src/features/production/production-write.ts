@@ -1158,6 +1158,8 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
   submission,
   post,
   readAll,
+  readOnly = false,
+  onAccepted,
 }: {
   context: WaterQualityWriteContext;
   eventType: ProductionEventType;
@@ -1170,6 +1172,8 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
     performedAt?: string,
   ) => Promise<Record<string, unknown>>;
   readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+  readOnly?: boolean;
+  onAccepted?: () => Promise<void>;
 }): Promise<ProductionWriteResult<TPayload>> {
   const recoveryKey = productionEventRecoveryKey(eventType, context.batchId);
   const existingRecovery = PRODUCTION_EVENT_WRITE_RECOVERY.get(recoveryKey);
@@ -1193,6 +1197,8 @@ function reconcileProductionEventWrite<TPayload extends Record<string, unknown>>
     submission,
     post,
     readAll,
+    readOnly,
+    onAccepted,
   });
   const recovery: ProductionEventWriteRecovery = {
     submission,
@@ -1341,6 +1347,8 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
     eventType,
     post,
     readAll,
+    readOnly = false,
+    onAccepted,
   }: {
     context: WaterQualityWriteContext;
     eventType: ProductionEventType;
@@ -1352,6 +1360,8 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
       performedAt?: string,
     ) => Promise<Record<string, unknown>>;
     readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+    readOnly?: boolean;
+    onAccepted?: () => Promise<void>;
   },
   submission: ProductionSubmission<TPayload>,
 ): Promise<ProductionWriteResult<TPayload>> {
@@ -1369,19 +1379,24 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
       ),
     };
   }
-  if (prior && prior.posted && prior.outcome !== 'rejected' && prior.outcome !== 'write_failed') {
+  if (
+    readOnly ||
+    (prior && prior.posted && prior.outcome !== 'rejected' && prior.outcome !== 'write_failed')
+  ) {
     try {
+      await onAccepted?.();
       const reconciliation = await readAll(context.batchId);
       const replay: ProductionWriteResult<TPayload> = {
         ...prior,
+        submission,
         outcome: 'accepted',
         retrySubmission: null,
         posted: true,
         reconciled: true,
         reconciliation,
-        response: prior.response ?? null,
+        response: prior?.response ?? null,
         error: null,
-      } satisfies WaterQualityWriteResult;
+      };
       PRODUCTION_WRITE_LEDGER.set(submission.idempotencyKey, replay);
       return replay;
     } catch (error) {
@@ -1392,7 +1407,7 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
         retrySubmission: submission,
         posted: true,
         reconciled: false,
-        response: prior.response ?? null,
+        response: prior?.response ?? null,
         error: error instanceof Error ? error : new Error('Reconciliation failed.'),
       };
       PRODUCTION_WRITE_LEDGER.set(submission.idempotencyKey, replayFailed);
@@ -1431,6 +1446,7 @@ async function performProductionWrite<TPayload extends Record<string, unknown>>(
     }
 
     try {
+      await onAccepted?.();
       const reconciliation = await readAll(context.batchId);
       const result: ProductionWriteResult<TPayload> = {
         outcome: 'accepted',
@@ -1469,6 +1485,8 @@ export function reconcileProductionWrite<TPayload extends Record<string, unknown
   submission,
   post,
   readAll,
+  readOnly = false,
+  onAccepted,
 }: {
   context: WaterQualityWriteContext;
   eventType: ProductionEventType;
@@ -1480,6 +1498,8 @@ export function reconcileProductionWrite<TPayload extends Record<string, unknown
     key: string,
   ) => Promise<Record<string, unknown>>;
   readAll: (batchId: string) => Promise<WaterQualityReconciliationData>;
+  readOnly?: boolean;
+  onAccepted?: () => Promise<void>;
 }): Promise<ProductionWriteResult<TPayload>> {
   const pending = PRODUCTION_WRITE_IN_FLIGHT.get(submission.idempotencyKey);
 
@@ -1500,7 +1520,7 @@ export function reconcileProductionWrite<TPayload extends Record<string, unknown
   }
 
   const promise = Promise.resolve().then(() =>
-    performProductionWrite({ context, eventType, post, readAll }, submission),
+    performProductionWrite({ context, eventType, post, readAll, readOnly, onAccepted }, submission),
   );
   const reservation = { submission, promise };
   PRODUCTION_WRITE_IN_FLIGHT.set(submission.idempotencyKey, reservation);
@@ -1732,7 +1752,10 @@ export function reconcileStockingWrite({
 }
 
 export class HarvestReconciliationError extends Error {
-  constructor(message: string) {
+  constructor(
+    public readonly kind: 'missing_event' | 'contradictory_evidence',
+    message: string,
+  ) {
     super(message);
     this.name = 'HarvestReconciliationError';
   }
@@ -1798,10 +1821,15 @@ export function verifyHarvestReconciliation(
   const events = Array.isArray(reconciliation.events) ? reconciliation.events : [];
   const accepted = events.find((event) => {
     const record = event as Record<string, unknown>;
-    return record.event_type === 'HARVEST' && record.idempotency_key === submission.idempotencyKey;
+    return (
+      record.event_type === 'HARVEST' &&
+      record.batch_id === submission.batchId &&
+      record.idempotency_key === submission.idempotencyKey
+    );
   }) as Record<string, unknown> | undefined;
   if (!accepted) {
     throw new HarvestReconciliationError(
+      'missing_event',
       'The accepted HARVEST event was not found in the refreshed timeline.',
     );
   }
@@ -1812,9 +1840,17 @@ export function verifyHarvestReconciliation(
   if (
     data.quantity !== submission.payload.quantity ||
     data.is_final !== submission.payload.is_final ||
-    !equivalentReconciliationInstants(data.harvested_at, submission.payload.harvested_at)
+    data.total_weight !== submission.payload.total_weight ||
+    data.weight_unit !== submission.payload.weight_unit ||
+    (data.average_weight ?? null) !== (submission.payload.average_weight ?? null) ||
+    (data.notes ?? null) !== (submission.payload.notes ?? null) ||
+    data.harvest_type !== submission.payload.harvest_type ||
+    reconciliation.batch.id !== submission.batchId ||
+    !equivalentReconciliationInstants(data.harvested_at, submission.payload.harvested_at) ||
+    !equivalentReconciliationInstants(accepted.performed_at, submission.performedAt)
   ) {
     throw new HarvestReconciliationError(
+      'contradictory_evidence',
       'The accepted HARVEST event does not match the submitted harvest.',
     );
   }
@@ -1822,6 +1858,7 @@ export function verifyHarvestReconciliation(
     const state = (reconciliation.batch as Record<string, unknown> | null)?.state;
     if (typeof state !== 'string' || state.toLowerCase() !== 'harvested') {
       throw new HarvestReconciliationError(
+        'contradictory_evidence',
         'The final HARVEST was accepted but the batch is not yet HARVESTED in the refreshed state.',
       );
     }
@@ -1835,11 +1872,15 @@ export function reconcileHarvestWrite({
   submission: preservedSubmission,
   post,
   readAll,
+  readOnly = false,
+  onAccepted,
 }: {
   context: WaterQualityWriteContext;
   payload: HarvestInput;
   idempotencyKey: string;
   submission?: HarvestSubmission;
+  readOnly?: boolean;
+  onAccepted?: () => Promise<void>;
   post: (
     batchId: string,
     eventType: ProductionEventType,
@@ -1865,6 +1906,8 @@ export function reconcileHarvestWrite({
     context,
     eventType: 'HARVEST',
     submission,
+    readOnly,
+    onAccepted,
     post,
     readAll: async (batchId) => {
       const reconciliation = await readAll(batchId);

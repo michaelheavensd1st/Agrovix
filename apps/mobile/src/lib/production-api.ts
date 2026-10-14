@@ -1,5 +1,5 @@
 import { ApiFailure, authenticatedRequest } from './api';
-import type { AuthOperation } from './auth-operations';
+import { currentAuthOperation, ownsAuthOperation, type AuthOperation } from './auth-operations';
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -22,6 +22,13 @@ function contractFailure(path: string, reason: string, status?: number): never {
     'ApiContractError',
     reason,
   );
+}
+
+export class BatchEventScanIncompleteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BatchEventScanIncompleteError';
+  }
 }
 
 function assertRecord(value: unknown, path: string): Record<string, unknown> {
@@ -312,9 +319,12 @@ export async function listProductionBatches(
   });
 }
 
-export async function getProductionBatch(batchId: string): Promise<Record<string, unknown>> {
+export async function getProductionBatch(
+  batchId: string,
+  operation?: AuthOperation,
+): Promise<Record<string, unknown>> {
   const path = `/v1/batches/${encodeURIComponent(batchId)}`;
-  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' }, operation);
   const record = assertRecord(body, path);
   if (!isProductionBatch(record)) {
     contractFailure(
@@ -344,6 +354,7 @@ export async function createProductionSite(
 export async function listBatchEvents(
   batchId: string,
   options: { limit?: number; cursor?: string; eventType?: string } = {},
+  operation?: AuthOperation,
 ): Promise<{ items: Record<string, unknown>[]; next_cursor: string | null; limit: number }> {
   const params = new URLSearchParams();
   if (typeof options.limit === 'number') params.set('limit', String(options.limit));
@@ -351,7 +362,7 @@ export async function listBatchEvents(
   if (options.eventType) params.set('event_type', options.eventType);
   const query = params.toString();
   const path = `/v1/batches/${encodeURIComponent(batchId)}/events${query ? `?${query}` : ''}`;
-  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' }, operation);
   const record = assertRecord(body, path);
   if (!isBatchEventListResponse(record)) {
     contractFailure(
@@ -370,6 +381,72 @@ export async function listBatchEvents(
     return item;
   });
   return { items, next_cursor: record.next_cursor, limit: record.limit };
+}
+
+export async function listAllBatchEvents(
+  batchId: string,
+  operation: AuthOperation = currentAuthOperation(),
+  isCurrent: () => boolean = () => true,
+): Promise<Record<string, unknown>[]> {
+  const cursors = new Set<string>();
+  const events = new Map<string, Record<string, unknown>>();
+  let cursor: string | undefined;
+  const assertCurrent = () => {
+    if (!ownsAuthOperation(operation) || !isCurrent()) {
+      throw new BatchEventScanIncompleteError(
+        'The event scan is incomplete because its authorization context changed.',
+      );
+    }
+  };
+  for (let page = 0; page < 20; page += 1) {
+    assertCurrent();
+    let result: Awaited<ReturnType<typeof listBatchEvents>>;
+    try {
+      result = await listBatchEvents(
+        batchId,
+        { limit: 100, ...(cursor ? { cursor } : {}) },
+        operation,
+      );
+    } catch (error) {
+      if (
+        error instanceof ApiFailure &&
+        (error.phase === 'parse' || error.phase === 'application')
+      ) {
+        throw new BatchEventScanIncompleteError(
+          'The event history could not be completely checked because an event page was invalid.',
+        );
+      }
+      throw error;
+    }
+    assertCurrent();
+    if (result.items.length > 100)
+      throw new BatchEventScanIncompleteError('The event page exceeded the requested limit.');
+    for (const event of result.items) {
+      if (event.batch_id !== batchId || typeof event.id !== 'string') {
+        throw new BatchEventScanIncompleteError(
+          'The event scan returned an unexpected batch or event identity.',
+        );
+      }
+      const existing = events.get(event.id);
+      if (existing && JSON.stringify(existing) !== JSON.stringify(event)) {
+        throw new BatchEventScanIncompleteError(
+          'The event scan returned inconsistent copies of an event.',
+        );
+      }
+      if (!existing) events.set(event.id, event);
+    }
+    if (result.next_cursor === null) return [...events.values()];
+    if (!result.next_cursor.trim() || cursors.has(result.next_cursor)) {
+      throw new BatchEventScanIncompleteError(
+        'The event scan is incomplete because its cursor did not advance.',
+      );
+    }
+    cursors.add(result.next_cursor);
+    cursor = result.next_cursor;
+  }
+  throw new BatchEventScanIncompleteError(
+    'The event scan reached its safety limit and remains incomplete. Contact a supervisor; do not start another harvest.',
+  );
 }
 
 export async function createBatchEvent(
@@ -405,9 +482,12 @@ export async function createBatchEvent(
   return record;
 }
 
-export async function getBatchProjections(batchId: string): Promise<Record<string, unknown>> {
+export async function getBatchProjections(
+  batchId: string,
+  operation?: AuthOperation,
+): Promise<Record<string, unknown>> {
   const path = `/v1/batches/${encodeURIComponent(batchId)}/projections`;
-  const body = await authenticatedRequest<unknown>(path, { method: 'GET' });
+  const body = await authenticatedRequest<unknown>(path, { method: 'GET' }, operation);
   const record = assertRecord(body, path);
   if (!isProjection(record)) {
     contractFailure(

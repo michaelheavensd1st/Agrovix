@@ -12,26 +12,32 @@ import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import { getCurrentUser } from '../../lib/api';
 import {
+  currentAuthOperation,
+  ownsAuthOperation,
+  type AuthOperation,
+} from '../../lib/auth-operations';
+import {
   buildHarvestPayload,
   type HarvestPayload,
   type HarvestSubmission,
 } from './production-write';
 
-export const HARVEST_RECOVERY_VERSION = 1;
+export const HARVEST_RECOVERY_VERSION = 2;
 export const HARVEST_RECOVERY_MAX_BYTES = 2048;
 
 export type HarvestRecoveryStatus =
-  'PREPARED' | 'POSTING' | 'OUTCOME_UNKNOWN' | 'ACCEPTED_UNRECONCILED';
+  'PREPARED' | 'POSTING' | 'OUTCOME_UNKNOWN' | 'ACCEPTED_UNRECONCILED' | 'RECONCILED';
 
 const UNRESOLVED_STATUSES: readonly HarvestRecoveryStatus[] = [
   'PREPARED',
   'POSTING',
   'OUTCOME_UNKNOWN',
   'ACCEPTED_UNRECONCILED',
+  'RECONCILED',
 ];
 
 export interface HarvestRecoveryRecord {
-  version: typeof HARVEST_RECOVERY_VERSION;
+  version: 1 | typeof HARVEST_RECOVERY_VERSION;
   userId: string;
   batchId: string;
   idempotencyKey: string;
@@ -145,7 +151,7 @@ function parseRecord(raw: string, batchId: string, userId: string): ParsedRecord
     return { kind: 'blocked', reason: 'corrupt' };
   }
   if (!isRecordObject(parsed)) return { kind: 'blocked', reason: 'corrupt' };
-  if (parsed.version !== HARVEST_RECOVERY_VERSION) {
+  if (parsed.version !== 1 && parsed.version !== HARVEST_RECOVERY_VERSION) {
     return { kind: 'blocked', reason: 'incompatible' };
   }
   if (!isNonEmptyString(parsed.userId)) return { kind: 'blocked', reason: 'corrupt' };
@@ -159,6 +165,7 @@ function parseRecord(raw: string, batchId: string, userId: string): ParsedRecord
     !isCanonicalTimestamp(parsed.createdAt) ||
     !isCanonicalTimestamp(parsed.updatedAt) ||
     !UNRESOLVED_STATUSES.includes(parsed.status as HarvestRecoveryStatus) ||
+    (parsed.version === 1 && parsed.status === 'RECONCILED') ||
     !isRecordObject(payload) ||
     payload.harvested_at !== parsed.performedAt
   ) {
@@ -187,7 +194,7 @@ function parseRecord(raw: string, batchId: string, userId: string): ParsedRecord
   return {
     kind: 'ok',
     record: {
-      version: HARVEST_RECOVERY_VERSION,
+      version: parsed.version,
       userId: parsed.userId,
       batchId,
       idempotencyKey: parsed.idempotencyKey,
@@ -200,15 +207,18 @@ function parseRecord(raw: string, batchId: string, userId: string): ParsedRecord
   };
 }
 
-export async function resolveHarvestRecoveryUserId(): Promise<string> {
-  const user = await getCurrentUser();
+export async function resolveHarvestRecoveryUserId(operation?: AuthOperation): Promise<string> {
+  const user = await getCurrentUser(operation);
   if (!isNonEmptyString(user?.id)) {
     throw new Error('The authenticated user could not be determined.');
   }
   return user.id;
 }
 
-export async function loadHarvestRecovery(batchId: string): Promise<HarvestRecoveryLoad> {
+export async function loadHarvestRecovery(
+  batchId: string,
+  operation?: AuthOperation,
+): Promise<HarvestRecoveryLoad> {
   if (!isHarvestRecoveryStorageSupported()) {
     return { kind: 'blocked', reason: 'storage_unavailable' };
   }
@@ -217,7 +227,7 @@ export async function loadHarvestRecovery(batchId: string): Promise<HarvestRecov
 
   let userId: string;
   try {
-    userId = await resolveHarvestRecoveryUserId();
+    userId = await resolveHarvestRecoveryUserId(operation);
   } catch {
     return { kind: 'blocked', reason: 'identity_unavailable' };
   }
@@ -331,6 +341,67 @@ async function persistHarvestRecoveryRecordUnlocked(record: HarvestRecoveryRecor
 
 export function persistHarvestRecoveryRecord(record: HarvestRecoveryRecord): Promise<void> {
   return serializeRecoveryMutation(() => persistHarvestRecoveryRecordUnlocked(record));
+}
+
+export function harvestRecoveryPhase(record: HarvestRecoveryRecord): HarvestRecoveryStatus {
+  return record.version === 1 && record.status === 'PREPARED' ? 'OUTCOME_UNKNOWN' : record.status;
+}
+
+export function transitionHarvestRecoveryRecord(
+  expected: HarvestRecoveryRecord,
+  status: HarvestRecoveryStatus,
+  isCurrent: () => boolean,
+  operation: AuthOperation = currentAuthOperation(),
+): Promise<HarvestRecoveryRecord> {
+  return serializeRecoveryMutation(async () => {
+    const key = storageKeyOrThrow(expected.batchId);
+    const assertCurrent = () => {
+      if (!isCurrent() || !ownsAuthOperation(operation)) {
+        throw new HarvestRecoveryStorageError(
+          'write_failed',
+          'The recovery owner is no longer active.',
+        );
+      }
+    };
+    assertCurrent();
+    const userId = await resolveHarvestRecoveryUserId(operation);
+    assertCurrent();
+    if (userId !== expected.userId || (await readRaw(key)) !== JSON.stringify(expected)) {
+      throw new HarvestRecoveryStorageError(
+        'unresolved_record_exists',
+        'The recovery record changed or belongs to another owner.',
+      );
+    }
+    assertCurrent();
+    const phase = harvestRecoveryPhase(expected);
+    const allowed: Record<HarvestRecoveryStatus, readonly HarvestRecoveryStatus[]> = {
+      PREPARED: ['POSTING'],
+      POSTING: ['OUTCOME_UNKNOWN', 'ACCEPTED_UNRECONCILED'],
+      OUTCOME_UNKNOWN: ['POSTING', 'ACCEPTED_UNRECONCILED'],
+      ACCEPTED_UNRECONCILED: ['RECONCILED'],
+      RECONCILED: [],
+    };
+    if (phase !== status && !allowed[phase].includes(status)) {
+      throw new HarvestRecoveryStorageError(
+        'write_failed',
+        'The recovery phase cannot move backwards.',
+      );
+    }
+    if (expected.version === HARVEST_RECOVERY_VERSION && expected.status === status)
+      return expected;
+    const next: HarvestRecoveryRecord = {
+      ...expected,
+      version: HARVEST_RECOVERY_VERSION,
+      status,
+      updatedAt: new Date().toISOString(),
+    };
+    if (parseRecord(JSON.stringify(next), next.batchId, next.userId).kind !== 'ok') {
+      throw new HarvestRecoveryStorageError('write_failed', 'The recovery transition is invalid.');
+    }
+    await persistHarvestRecoveryRecordUnlocked(next);
+    assertCurrent();
+    return next;
+  });
 }
 
 /**
