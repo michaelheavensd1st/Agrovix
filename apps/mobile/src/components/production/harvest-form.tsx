@@ -7,10 +7,12 @@ import {
   ownsAuthOperation,
 } from '../../lib/auth-operations';
 import {
+  BatchEventScanIncompleteError,
   createBatchEvent,
   getBatchProjections,
   getProductionBatch,
   listBatchEvents,
+  listAllBatchEvents,
 } from '../../lib/production-api';
 import {
   buildHarvestPayload,
@@ -30,10 +32,12 @@ import {
   createHarvestRecoveryRecord,
   deleteHarvestRecoveryRecord,
   harvestSubmissionFromRecord,
+  harvestRecoveryPhase,
   HarvestRecoveryStorageError,
   loadHarvestRecovery,
   persistHarvestRecoveryRecord,
   resolveHarvestRecoveryUserId,
+  transitionHarvestRecoveryRecord,
   type HarvestRecoveryLoad,
   type HarvestRecoveryRecord,
   type HarvestRecoveryStatus,
@@ -98,7 +102,9 @@ const RESTORED_MESSAGES: Record<HarvestRecoveryStatus, string> = {
   OUTCOME_UNKNOWN:
     'A previous harvest has an uncertain outcome. Its original identity is restored. Retry the same harvest to resolve it; do not start a new one.',
   ACCEPTED_UNRECONCILED:
-    'A previous harvest was accepted but not yet verified. Its original identity is restored. Retry the same harvest to verify it; do not start a new one.',
+    'A previous HARVEST response was accepted, but its event and refreshed state are not yet verified. Its original identity remains locked; reconcile using authenticated reads only and do not start a new one.',
+  RECONCILED:
+    'A previous harvest was verified but local cleanup is pending. Reauthorize and reconcile before cleanup; do not start a new one.',
 };
 
 type Hydration =
@@ -182,16 +188,16 @@ async function authorizeRetainedRecoveryAccess(
   const isValid = () => isCurrent() && ownsAuthOperation(authOperation);
   if (!isValid()) return false;
 
-  const authenticatedUserId = await resolveHarvestRecoveryUserId();
+  const authenticatedUserId = await resolveHarvestRecoveryUserId(authOperation);
   if (!isValid() || authenticatedUserId !== userId || record.userId !== userId) return false;
 
-  const batch = await getProductionBatch(record.batchId);
+  const batch = await getProductionBatch(record.batchId, authOperation);
   if (!isValid() || batch.id !== record.batchId) return false;
 
-  await listBatchEvents(record.batchId, { limit: 1 });
+  await listBatchEvents(record.batchId, { limit: 1 }, authOperation);
   if (!isValid()) return false;
 
-  const current = await loadHarvestRecovery(record.batchId);
+  const current = await loadHarvestRecovery(record.batchId, authOperation);
   return (
     isValid() &&
     current.kind === 'record' &&
@@ -278,16 +284,26 @@ export function HarvestForm({
       isFinal ? (state?.state ?? '') : ''
     }`;
 
-  const readSource = async (): Promise<WaterQualityReconciliationData> => {
+  const readSource = async (
+    operation: AuthOperation = currentAuthOperation(),
+  ): Promise<WaterQualityReconciliationData> => {
+    const owner: HarvestContextOwner = {
+      epoch: sessionEpoch.current,
+      userId: sessionUserId ?? '',
+      batchId,
+      authOperation: operation,
+    };
+    const isCurrent = () => isContextOwnerCurrent(owner);
     const [batch, projection, eventData] = await Promise.all([
-      getProductionBatch(batchId),
-      getBatchProjections(batchId),
-      listBatchEvents(batchId),
+      getProductionBatch(batchId, operation),
+      getBatchProjections(batchId, operation),
+      listAllBatchEvents(batchId, operation, isCurrent),
     ]);
+    if (!isCurrent()) throw new Error('The harvest reconciliation context is no longer active.');
     return {
       batch,
       projection,
-      events: Array.isArray(eventData.items) ? eventData.items : [],
+      events: eventData,
     };
   };
 
@@ -329,8 +345,8 @@ export function HarvestForm({
     const ownsRequest = () => isContextOwnerCurrent(owner) && isCurrent();
     try {
       const [batch, projection] = await Promise.all([
-        getProductionBatch(batchId),
-        getBatchProjections(batchId),
+        getProductionBatch(batchId, owner.authOperation),
+        getBatchProjections(batchId, owner.authOperation),
       ]);
       if (!ownsRequest()) return null;
       const next = readFresh(batch, projection);
@@ -346,8 +362,34 @@ export function HarvestForm({
     }
   };
 
-  const reconcileSubmission = (submission: HarvestSubmission, authOperation?: AuthOperation) =>
-    reconcileHarvestWrite({
+  const reconcileSubmission = (
+    submission: HarvestSubmission,
+    authOperation = currentAuthOperation(),
+  ) => {
+    const owner: HarvestContextOwner = {
+      epoch: sessionEpoch.current,
+      userId: sessionUserId ?? '',
+      batchId: submission.batchId,
+      authOperation,
+    };
+    const isCurrent = () => isContextOwnerCurrent(owner);
+    const advance = async (status: HarvestRecoveryStatus) => {
+      const record = durableRecord.current;
+      if (
+        !isCurrent() ||
+        !record ||
+        !sameSubmission(harvestSubmissionFromRecord(record), submission)
+      ) {
+        throw new Error(
+          'The harvest recovery identity changed. Contact a supervisor; do not start another harvest.',
+        );
+      }
+      const next = await transitionHarvestRecoveryRecord(record, status, isCurrent, authOperation);
+      if (!isCurrent()) throw new Error('The harvest recovery context is no longer active.');
+      durableRecord.current = next;
+    };
+    const phase = durableRecord.current && harvestRecoveryPhase(durableRecord.current);
+    return reconcileHarvestWrite({
       context,
       payload: {
         quantity: submission.payload.quantity,
@@ -359,8 +401,14 @@ export function HarvestForm({
       },
       idempotencyKey: submission.idempotencyKey,
       submission,
-      post: async (targetBatchId, eventType, data, key, performedAt) =>
-        createBatchEvent(
+      readOnly: phase === 'ACCEPTED_UNRECONCILED' || phase === 'RECONCILED',
+      onAccepted: async () => {
+        if (durableRecord.current?.status !== 'RECONCILED') await advance('ACCEPTED_UNRECONCILED');
+      },
+      post: async (targetBatchId, eventType, data, key, performedAt) => {
+        await advance('POSTING');
+        if (!isCurrent()) throw new Error('Authentication changed before harvest dispatch.');
+        return createBatchEvent(
           targetBatchId,
           {
             event_type: eventType,
@@ -369,9 +417,11 @@ export function HarvestForm({
           },
           key,
           authOperation,
-        ),
-      readAll: readSource,
+        );
+      },
+      readAll: () => readSource(authOperation),
     });
+  };
 
   const changeDraft = () => {
     draftRevision.current += 1;
@@ -443,6 +493,19 @@ export function HarvestForm({
     const isCurrent = () =>
       isResultContextCurrent(context) && sameSubmission(result.submission, context.submission);
     if (!isCurrent()) return;
+    const latest = await loadHarvestRecovery(context.batchId, context.authOperation);
+    if (!isCurrent()) return;
+    if (
+      latest.kind !== 'record' ||
+      latest.record.userId !== context.userId ||
+      !sameSubmission(harvestSubmissionFromRecord(latest.record), context.submission)
+    ) {
+      keepSafetyLock(context.submission);
+      setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
+      return;
+    }
+    context.recoveryRecord = latest.record;
+    durableRecord.current = latest.record;
     if (!ownsAuthOperation(context.authOperation)) {
       keepSafetyLock(result.retrySubmission ?? context.submission);
       setError(
@@ -467,11 +530,54 @@ export function HarvestForm({
       result.outcome === 'reconciliation_failed' ||
       (result.outcome === 'accepted' && result.reconciliation !== undefined) ||
       (!firstAttempt && context.recoveryRecord !== null);
+    if (
+      retainedOutcome &&
+      (result.outcome === 'rejected' || result.outcome === 'write_failed') &&
+      context.recoveryRecord?.status === 'POSTING'
+    ) {
+      try {
+        context.recoveryRecord = await transitionHarvestRecoveryRecord(
+          context.recoveryRecord,
+          'OUTCOME_UNKNOWN',
+          isCurrent,
+          context.authOperation,
+        );
+        if (!isCurrent()) return;
+        durableRecord.current = context.recoveryRecord;
+      } catch {
+        if (!isCurrent()) return;
+        keepSafetyLock(result.submission);
+        setError(
+          'The harvest outcome is uncertain and its recovery phase could not be secured. Contact a supervisor; do not start another harvest.',
+        );
+        return;
+      }
+    }
     if (retainedOutcome) {
       const authorized = await reauthorizeRetainedRecovery(context, isCurrent);
       if (!isCurrent() || !authorized) return;
     }
     if (result.outcome === 'accepted' && result.reconciliation) {
+      try {
+        const record = context.recoveryRecord;
+        if (record.status !== 'RECONCILED') {
+          context.recoveryRecord = await transitionHarvestRecoveryRecord(
+            record,
+            'RECONCILED',
+            isCurrent,
+            context.authOperation,
+          );
+          if (!isCurrent()) return;
+          durableRecord.current = context.recoveryRecord;
+        }
+      } catch {
+        if (!isCurrent()) return;
+        keepSafetyLock(result.submission);
+        setError(
+          'The harvest was verified but its recovery phase could not be secured. Contact a supervisor; do not start another harvest.',
+        );
+        return;
+      }
       const cleaned = await clearDurable(
         result.submission.idempotencyKey,
         context.recoveryRecord,
@@ -548,7 +654,7 @@ export function HarvestForm({
       }
       if (status === 409) {
         const message = (code ? CONFLICT_MESSAGES[code] : undefined) ?? GENERIC_CONFLICT_MESSAGE;
-        void readSource()
+        void readSource(context.authOperation)
           .then((reconciliation) => {
             if (!isCurrent()) return;
             applyFresh(readFresh(reconciliation.batch, reconciliation.projection), context);
@@ -581,10 +687,44 @@ export function HarvestForm({
       return;
     }
     if (result.outcome === 'reconciliation_failed') {
+      const error = result.error;
+      const networkFailure =
+        error instanceof Error && 'phase' in error && error.phase === 'network';
+      const message =
+        error instanceof BatchEventScanIncompleteError
+          ? 'The full event history could not be checked. The accepted HARVEST request remains unverified and its original recovery record stays locked. Contact a supervisor or retry read-only reconciliation; do not start a new harvest.'
+          : networkFailure
+            ? 'Verification is temporarily unavailable because of a network/connectivity failure. The accepted HARVEST request remains unverified and its original recovery record stays locked. Restore connectivity and retry read-only reconciliation or contact a supervisor; do not start a new harvest.'
+            : error instanceof HarvestReconciliationError && error.kind === 'missing_event'
+              ? 'A complete authorized event-history scan did not find the expected HARVEST event. The accepted response remains unverified; this does not prove rejection. Its original recovery record stays locked. Retry read-only reconciliation or contact a supervisor; do not start a new harvest.'
+              : error instanceof HarvestReconciliationError &&
+                  error.kind === 'contradictory_evidence'
+                ? `Authoritative HARVEST evidence conflicts with the original submission. ${error.message} The original recovery record stays locked. Escalate to a supervisor; do not start a new harvest.`
+                : 'The server accepted the HARVEST request, but refreshed state could not be verified. The original recovery record stays locked. Retry read-only reconciliation or contact a supervisor; do not start a new harvest.';
+      setError(message);
+      return;
+    }
+    try {
+      if (
+        context.recoveryRecord &&
+        !['ACCEPTED_UNRECONCILED', 'RECONCILED'].includes(
+          harvestRecoveryPhase(context.recoveryRecord),
+        )
+      ) {
+        context.recoveryRecord = await transitionHarvestRecoveryRecord(
+          context.recoveryRecord,
+          'OUTCOME_UNKNOWN',
+          isCurrent,
+          context.authOperation,
+        );
+        if (!isCurrent()) return;
+        durableRecord.current = context.recoveryRecord;
+      }
+    } catch {
+      if (!isCurrent()) return;
+      keepSafetyLock(result.submission);
       setError(
-        result.error instanceof HarvestReconciliationError
-          ? `Harvest recorded — refresh to confirm. ${result.error.message} Use the read-only reconciliation retry; do not start a new harvest.`
-          : 'Harvest recorded — refresh to confirm. The server accepted it but the refreshed state could not be verified. Use the read-only reconciliation retry; do not start a new harvest.',
+        'The harvest outcome is uncertain and its recovery phase could not be secured. Contact a supervisor; do not start another harvest.',
       );
       return;
     }
@@ -670,7 +810,7 @@ export function HarvestForm({
         setHydration({ status: 'blocked', message: BLOCK_MESSAGES.identity_unavailable });
         return;
       }
-      const loaded = await loadHarvestRecovery(batchId);
+      const loaded = await loadHarvestRecovery(batchId, hydrationAuthOperation);
       if (!isHydrationContextCurrent()) return;
       if (!ownsAuthOperation(hydrationAuthOperation)) {
         blockResourceAccess();
@@ -729,12 +869,18 @@ export function HarvestForm({
       boundAuthOperationRef.current = hydrationAuthOperation;
       userIdRef.current = loaded.userId;
       durableRecord.current = loaded.record;
-      if (!memory) restoreHarvestWriteRecovery(restored);
+      if (!memory)
+        restoreHarvestWriteRecovery(
+          restored,
+          ['ACCEPTED_UNRECONCILED', 'RECONCILED'].includes(harvestRecoveryPhase(loaded.record))
+            ? 'reconciliation_failed'
+            : 'outcome_unknown',
+        );
       retrySubmission.current = restored;
       setMode(restored.payload.is_final ? 'final' : 'partial');
       setValues(getFormValues(restored));
       setRecoveryRequired(true);
-      setError(RESTORED_MESSAGES[loaded.record.status]);
+      setError(RESTORED_MESSAGES[harvestRecoveryPhase(loaded.record)]);
       setHydration({ status: 'ready' });
     };
     void hydrate().catch(() => {
@@ -945,7 +1091,7 @@ export function HarvestForm({
     setMode(context.submission.payload.is_final ? 'final' : 'partial');
     setValues(getFormValues(context.submission));
     setRecoveryRequired(true);
-    setError(RESTORED_MESSAGES[record.status]);
+    setError(RESTORED_MESSAGES[harvestRecoveryPhase(record)]);
     setHydration({ status: 'ready' });
     return true;
   };
@@ -1021,7 +1167,7 @@ export function HarvestForm({
         }
         let stored: HarvestRecoveryLoad;
         try {
-          stored = await loadHarvestRecovery(batchId);
+          stored = await loadHarvestRecovery(batchId, authOperation);
         } catch {
           if (!stale()) setError(BLOCK_MESSAGES.identity_unavailable);
           return;
@@ -1093,7 +1239,7 @@ export function HarvestForm({
         }
         let userId: string;
         try {
-          userId = await resolveHarvestRecoveryUserId();
+          userId = await resolveHarvestRecoveryUserId(authOperation);
         } catch {
           if (stale()) return;
           resetConfirmations();
@@ -1210,7 +1356,10 @@ export function HarvestForm({
     quantityNumber > remainingShown;
   const recoveryOutcome = getHarvestWriteRecovery(batchId)?.retryOutcome;
   const reconcileOnly =
-    recoveryOutcome === 'accepted' || recoveryOutcome === 'reconciliation_failed';
+    recoveryOutcome === 'accepted' ||
+    recoveryOutcome === 'reconciliation_failed' ||
+    durableRecord.current?.status === 'ACCEPTED_UNRECONCILED' ||
+    durableRecord.current?.status === 'RECONCILED';
   const confirmationTexts = isFinal
     ? [
         `I confirm the observed physical count (${values.quantity || 'not entered'}) equals the projected remaining population (${remainingShown ?? 'unknown'}).`,
@@ -1300,7 +1449,7 @@ export function HarvestForm({
           {busy
             ? 'This harvest is still resolving. Editing and additional writes are locked.'
             : reconcileOnly
-              ? 'Harvest recorded — refresh to confirm. Editing is locked until the refreshed state is verified. Never resubmit as a new harvest.'
+              ? 'Harvest outcome unresolved — refresh to verify. Editing is locked until authoritative reconciliation. Never resubmit as a new harvest.'
               : 'The harvest outcome is uncertain. Original submission identity is retained; retry explicitly.'}
         </Text>
       ) : null}
