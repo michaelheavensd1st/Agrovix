@@ -29,6 +29,7 @@ import {
   type WaterQualityWriteContext,
 } from '../../features/production/production-write';
 import {
+  corruptDisposableHarvestRecovery,
   createHarvestRecoveryRecord,
   deleteHarvestRecoveryRecord,
   harvestSubmissionFromRecord,
@@ -42,6 +43,75 @@ import {
   type HarvestRecoveryRecord,
   type HarvestRecoveryStatus,
 } from '../../features/production/harvest-recovery-store';
+
+import {
+  armHarvestRecoveryFault,
+  getHarvestRecoveryFaultSnapshot,
+  isHarvestRecoveryFaultInjectionEnabled,
+  releaseHarvestRecoveryCheckpoint,
+  subscribeHarvestRecoveryFaults,
+  type HarvestRecoveryFault,
+} from '../../features/production/harvest-recovery-fault-injection';
+
+export function HarvestRecoveryQaControls() {
+  const [snapshot, setSnapshot] = useState(getHarvestRecoveryFaultSnapshot);
+  const [message, setMessage] = useState('');
+  useEffect(
+    () => subscribeHarvestRecoveryFaults(() => setSnapshot(getHarvestRecoveryFaultSnapshot())),
+    [],
+  );
+  if (!isHarvestRecoveryFaultInjectionEnabled()) return null;
+  const controls: { label: string; fault: HarvestRecoveryFault }[] = [
+    ...(['after_prepared', 'after_posting', 'after_accepted', 'after_reconciled'] as const).map(
+      (point) => ({
+        label: `Arm pause: ${point}`,
+        fault: { kind: 'checkpoint' as const, point },
+      }),
+    ),
+    ...(['read', 'write', 'verification_read', 'delete'] as const).map((operation) => ({
+      label: `Arm storage failure: ${operation}`,
+      fault: { kind: 'storage_failure' as const, operation },
+    })),
+  ];
+  return (
+    <View>
+      <Text>F-D QA recovery controls — one shot</Text>
+      <Text>{snapshot.pausedAt ?? (snapshot.armed ? 'Fault armed' : 'No fault armed')}</Text>
+      {controls.map(({ label, fault }) => (
+        <Pressable
+          key={label}
+          accessibilityRole="button"
+          disabled={Boolean(snapshot.armed || snapshot.pausedAt)}
+          onPress={() => armHarvestRecoveryFault(fault)}
+        >
+          <Text>{label}</Text>
+        </Pressable>
+      ))}
+      <Pressable accessibilityRole="button" onPress={() => releaseHarvestRecoveryCheckpoint()}>
+        <Text>Release QA pause</Text>
+      </Pressable>
+      <Pressable
+        accessibilityRole="button"
+        disabled={Boolean(snapshot.armed || snapshot.pausedAt)}
+        onPress={async () => {
+          if (!armHarvestRecoveryFault({ kind: 'corrupt_empty_record' })) return;
+          try {
+            setMessage(
+              (await corruptDisposableHarvestRecovery())
+                ? 'Disposable QA slot corrupted'
+                : 'Disposable QA slot retained',
+            );
+          } catch {
+            setMessage('Disposable QA storage unavailable');
+          }
+        }}
+      >
+        <Text>Corrupt empty disposable QA slot</Text>
+      </Pressable>
+      <Text>{message}</Text>
+    </View>
+  );
+}
 
 const CONFLICT_MESSAGES: Record<string, string> = {
   harvest_final_backdated:
@@ -1410,6 +1480,7 @@ export function HarvestForm({
 
   return (
     <View style={styles.card}>
+      <HarvestRecoveryQaControls />
       <Text style={styles.cardTitle}>Record a harvest</Text>
       <Text style={styles.subtitle}>
         {`${batchLabel} · ${farmName ?? 'Farm'} · ${siteName ?? 'Site'} · ${unitName ?? 'Unit'}`}

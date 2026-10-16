@@ -3,6 +3,47 @@
     "version": ">= 24.3.0"
   },
   "build": {
+    "fd-qa-android": {
+      "environment": "preview",
+      "distribution": "internal",
+      "node": "22.23.1",
+      "pnpm": "9.12.0",
+      "env": {
+        "APP_VARIANT": "fdqa",
+        "EXPO_PUBLIC_FD_QA_FAULT_INJECTION": "true"
+      },
+      "android": {
+        "image": "ubuntu-26.04-jdk-17-ndk-r27b-sdk-57",
+        "buildType": "apk"
+      }
+    },
+    "fd-qa-ios": {
+      "environment": "preview",
+      "distribution": "internal",
+      "node": "22.23.1",
+      "pnpm": "9.12.0",
+      "env": {
+        "APP_VARIANT": "fdqa",
+        "EXPO_PUBLIC_FD_QA_FAULT_INJECTION": "true"
+      },
+      "ios": {
+        "image": "macos-tahoe-26.5-xcode-26.6"
+      }
+    },
+    "fd-qa-ios-simulator": {
+      "environment": "preview",
+      "distribution": "internal",
+      "node": "22.23.1",
+      "pnpm": "9.12.0",
+      "env": {
+        "APP_VARIANT": "fdqa",
+        "EXPO_PUBLIC_FD_QA_FAULT_INJECTION": "true"
+      },
+      "ios": {
+        "image": "macos-tahoe-26.5-xcode-26.6",
+        "simulator": true
+      }
+    },
     "sdk56-validation": {
       "env": {
         "EXPO_PUBLIC_API_URL": "https://agrovix-api-amused-ambition-release-uat.up.railway.app/api",

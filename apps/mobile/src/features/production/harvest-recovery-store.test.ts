@@ -1,3 +1,18 @@
+const mockQaConfig = {
+  extra: { appVariant: 'fdqa', fdQaFaultInjection: true },
+  ios: { bundleIdentifier: 'com.agrovix.agos.fdqa' },
+  android: { package: 'com.agrovix.agos.fdqa' },
+};
+jest.mock('expo-constants', () => ({
+  get expoConfig() {
+    return mockQaConfig;
+  },
+}));
+import {
+  armHarvestRecoveryFault,
+  getHarvestRecoveryFaultSnapshot,
+  releaseHarvestRecoveryCheckpoint,
+} from './harvest-recovery-fault-injection';
 const mockValues = new Map<string, string>();
 const mockFaults = {
   failGet: false,
@@ -38,6 +53,7 @@ jest.mock('../../lib/api', () => ({ getCurrentUser: jest.fn() }));
 
 import { getCurrentUser } from '../../lib/api';
 import {
+  corruptDisposableHarvestRecovery,
   createHarvestRecoveryRecord,
   deleteHarvestRecoveryRecord,
   harvestRecoveryStorageKey,
@@ -347,5 +363,73 @@ describe('harvest recovery store', () => {
       'delete_failed',
     );
     expect(mockValues.has(KEY)).toBe(true);
+  });
+});
+
+describe('F-D integrated storage controls', () => {
+  const originalFlag = process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
+  beforeEach(() => {
+    process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = 'true';
+  });
+  afterEach(() => {
+    if (originalFlag === undefined) delete process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
+    else process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = originalFlag;
+  });
+  test.each(['PREPARED', 'POSTING', 'ACCEPTED_UNRECONCILED', 'RECONCILED'] as const)(
+    'pauses after verified %s bytes while preserving identity and mutation lock',
+    async (status) => {
+      const points = {
+        PREPARED: 'after_prepared',
+        POSTING: 'after_posting',
+        ACCEPTED_UNRECONCILED: 'after_accepted',
+        RECONCILED: 'after_reconciled',
+      } as const;
+      const value = { ...record(), status };
+      expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: points[status] })).toBe(true);
+      let completed = false;
+      const pending = persistHarvestRecoveryRecord(value).then(() => {
+        completed = true;
+      });
+      for (let i = 0; i < 30 && !getHarvestRecoveryFaultSnapshot().pausedAt; i++)
+        await Promise.resolve();
+      expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe(points[status]);
+      expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+      expect(completed).toBe(false);
+      const deletion = deleteHarvestRecoveryRecord(BATCH, value.idempotencyKey, value);
+      await Promise.resolve();
+      expect(mockValues.has(KEY)).toBe(true);
+      expect(releaseHarvestRecoveryCheckpoint()).toBe(true);
+      await pending;
+      await deletion;
+      expect(mockValues.has(KEY)).toBe(false);
+    },
+  );
+  test.each(['read', 'write', 'verification_read', 'delete'] as const)(
+    'injects one %s failure and retains fail-closed semantics',
+    async (operation) => {
+      const value = record();
+      if (operation === 'delete') await persistHarvestRecoveryRecord(value);
+      expect(armHarvestRecoveryFault({ kind: 'storage_failure', operation })).toBe(true);
+      const action =
+        operation === 'delete'
+          ? deleteHarvestRecoveryRecord(BATCH, value.idempotencyKey, value)
+          : persistHarvestRecoveryRecord(value);
+      expect(await kindOf(action)).not.toBe('none');
+      expect(getHarvestRecoveryFaultSnapshot().armed).toBeNull();
+      if (operation === 'delete' || operation === 'verification_read')
+        expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+      await persistHarvestRecoveryRecord(value);
+      expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+    },
+  );
+  test('corrupts only an empty disposable namespace and never replaces an occupied slot', async () => {
+    const value = record();
+    await persistHarvestRecoveryRecord(value);
+    expect(armHarvestRecoveryFault({ kind: 'corrupt_empty_record' })).toBe(true);
+    expect(await corruptDisposableHarvestRecovery()).toBe(true);
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+    expect(mockValues.get('agrovix.fdqa.disposable.harvest_recovery')).toBe('{');
+    expect(armHarvestRecoveryFault({ kind: 'corrupt_empty_record' })).toBe(true);
+    expect(await corruptDisposableHarvestRecovery()).toBe(false);
   });
 });
