@@ -72,15 +72,21 @@ jest.mock('expo-router', () => ({
 import { Pressable, TextInput } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import * as productionApi from '../../lib/production-api';
-import { ApiFailure, getCurrentUser } from '../../lib/api';
+import { ApiError, ApiFailure, getCurrentUser } from '../../lib/api';
 import { beginAuthOperation } from '../../lib/auth-operations';
 import {
   harvestRecoveryStorageKey,
+  createHarvestRecoveryRecord,
+  persistHarvestRecoveryRecord,
   type HarvestRecoveryRecord,
 } from '../../features/production/harvest-recovery-store';
 import Constants from 'expo-constants';
 import {
   armHarvestRecoveryFault,
+  beginHarvestRecoveryFaultAttempt,
+  captureHarvestRecoveryFaultAttempt,
+  type HarvestRecoveryFaultAttempt,
+  disarmHarvestRecoveryFault,
   consumeHarvestRecoveryStorageFailure,
   getHarvestRecoveryFaultSnapshot,
   releaseHarvestRecoveryCheckpoint,
@@ -98,6 +104,7 @@ import {
   getTransferWriteRecovery,
   reconcileTransferWrite,
   reconcileHarvestWrite,
+  createHarvestSubmission,
   getHarvestWriteRecovery,
   clearHarvestWriteRecovery,
 } from '../../features/production/production-write';
@@ -699,7 +706,7 @@ test('production identity cannot render QA recovery controls even with the publi
   }
 });
 
-test('QA controls explicitly arm one fault and release a persisted-boundary pause', async () => {
+test('QA controls disarm unused faults separately from releasing a persisted-boundary pause', async () => {
   const originalConfig = Constants.expoConfig;
   const originalFlag = process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
   Constants.expoConfig = {
@@ -714,14 +721,21 @@ test('QA controls explicitly arm one fault and release a persisted-boundary paus
     typeof value === 'function' ? value() : value,
     jest.fn(),
   ]);
+  const checkpointOwner = captureHarvestRecoveryFaultAttempt();
   try {
     const tree = HarvestRecoveryQaControls();
     const button = (label: string) =>
-      flattenNodes(tree).find(
+      flattenNodes(HarvestRecoveryQaControls()).find(
         (node) =>
           React.isValidElement(node) && node.type === Pressable && textValues(node).includes(label),
       ) as React.ReactElement<any>;
     expect(textValues(tree)).toContain('No fault armed');
+    expect(button('Disarm unused QA fault').props.disabled).toBe(true);
+    button('Arm storage failure: write').props.onPress();
+    expect(button('Disarm unused QA fault').props.disabled).toBe(false);
+    button('Disarm unused QA fault').props.onPress();
+    expect(getHarvestRecoveryFaultSnapshot().armed).toBeNull();
+    expect(consumeHarvestRecoveryStorageFailure('write')).toBe(false);
     button('Arm storage failure: write').props.onPress();
     expect(getHarvestRecoveryFaultSnapshot().armed).toEqual({
       kind: 'storage_failure',
@@ -732,12 +746,15 @@ test('QA controls explicitly arm one fault and release a persisted-boundary paus
     button('Arm pause: after_posting').props.onPress();
     const pending = runHarvestRecoveryFaultCheckpoint('after_posting');
     expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe('after_posting');
+    expect(button('Disarm unused QA fault').props.disabled).toBe(true);
+    button('Disarm unused QA fault').props.onPress();
+    expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe('after_posting');
     expect(armHarvestRecoveryFault({ kind: 'storage_failure', operation: 'read' })).toBe(false);
     button('Release QA pause').props.onPress();
     await pending;
     expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
   } finally {
-    releaseHarvestRecoveryCheckpoint();
+    releaseHarvestRecoveryCheckpoint(checkpointOwner);
     Constants.expoConfig = originalConfig;
     if (originalFlag === undefined) delete process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
     else process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = originalFlag;
@@ -763,6 +780,7 @@ describe('F-D HARVEST form recovery integration', () => {
   let pending: Promise<unknown>[];
   let failDelete: boolean;
   let writes: string[];
+  let checkpointOwner: HarvestRecoveryFaultAttempt;
   let accepted: { key: string; body: any } | null;
   const onSaved = jest.fn();
   const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -873,6 +891,9 @@ describe('F-D HARVEST form recovery integration', () => {
     for (let i = 0; i < 10 && getHarvestRecoveryFaultSnapshot().pausedAt !== point; i++)
       await flush();
     expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe(point);
+    checkpointOwner = render().elements.find(
+      (element) => element.type === HarvestRecoveryQaControls,
+    )!.props.attempt;
   };
   const unknownPost = () =>
     api.createBatchEvent.mockRejectedValueOnce(
@@ -890,6 +911,7 @@ describe('F-D HARVEST form recovery integration', () => {
     beginAuthOperation();
     store.clear();
     pending = [];
+    checkpointOwner = null;
     writes = [];
     failDelete = false;
     accepted = null;
@@ -949,7 +971,7 @@ describe('F-D HARVEST form recovery integration', () => {
     mount();
   });
   afterEach(async () => {
-    releaseHarvestRecoveryCheckpoint();
+    releaseHarvestRecoveryCheckpoint(checkpointOwner);
     await Promise.allSettled(pending);
     await flush();
     unmount();
@@ -981,7 +1003,7 @@ describe('F-D HARVEST form recovery integration', () => {
       await flush();
       expect(store.get(KEY)).toBe(JSON.stringify(record));
       expect(api.createBatchEvent).not.toHaveBeenCalled();
-      expect(releaseHarvestRecoveryCheckpoint()).toBe(true);
+      expect(releaseHarvestRecoveryCheckpoint(checkpointOwner)).toBe(true);
       await submission;
       await flush();
       expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
@@ -1013,7 +1035,7 @@ describe('F-D HARVEST form recovery integration', () => {
       await flush();
       expect(store.get(KEY)).toBe(JSON.stringify(record));
       expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
-      expect(releaseHarvestRecoveryCheckpoint()).toBe(true);
+      expect(releaseHarvestRecoveryCheckpoint(checkpointOwner)).toBe(true);
       await submission;
       await flush();
       expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
@@ -1098,7 +1120,7 @@ describe('F-D HARVEST form recovery integration', () => {
       beginAuthOperation();
       if (invalidation === 'signout') mockHarvestSessionUserId = null;
       // No rerender is needed for the auth-operation guard to stop the pending dispatch.
-      expect(releaseHarvestRecoveryCheckpoint()).toBe(true);
+      expect(releaseHarvestRecoveryCheckpoint(checkpointOwner)).toBe(true);
       await submission;
       await flush();
       expect(api.createBatchEvent).not.toHaveBeenCalled();
@@ -1123,7 +1145,7 @@ describe('F-D HARVEST form recovery integration', () => {
     const submission = press('Submit harvest');
     await waitForPause('after_prepared');
     const prepared = stored();
-    releaseHarvestRecoveryCheckpoint();
+    releaseHarvestRecoveryCheckpoint(checkpointOwner);
     await Promise.resolve(); // release consumes the checkpoint before arming the next one-shot fault
     expect(
       armHarvestRecoveryFault({ kind: 'storage_failure', operation: 'verification_read' }),
@@ -1209,5 +1231,342 @@ describe('F-D HARVEST form recovery integration', () => {
     expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
     expect(onSaved).not.toHaveBeenCalled();
     expect(store.get(KEY)).toBe(raw);
+  });
+  test('unused acceptance fault expires after backend rejection and cannot affect a subsequent submission', async () => {
+    await prepare();
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_accepted' })).toBe(true);
+    api.createBatchEvent.mockRejectedValueOnce(
+      new ApiError(403, 'forbidden', 'https://qa.invalid', '/events'),
+    );
+    await press('Submit harvest');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(store.has(KEY)).toBe(false);
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+    expect(render().text).toContain('do not have permission');
+    await press('I confirm 40 individuals');
+    await press('Submit harvest');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+    expect(store.has(KEY)).toBe(false);
+  });
+
+  test('validation rejection cancels an unused fault before a later valid submission', async () => {
+    await runMountEffects();
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' })).toBe(true);
+    await press('Submit harvest');
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+    const fields = render().elements.filter((element) => element.type === TextInput);
+    fields[0].props.onChangeText('40');
+    fields[1].props.onChangeText('25.5');
+    await press('I confirm 40 individuals');
+    await press('Submit harvest');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  test('explicit disarming during PREPARED leaves the paused mutation locked until release', async () => {
+    await prepare();
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' })).toBe(true);
+    const submission = press('Submit harvest');
+    await waitForPause('after_prepared');
+    const raw = store.get(KEY);
+    expect(disarmHarvestRecoveryFault()).toBe(false);
+    const repeated = button('Submit harvest');
+    if (repeated) repeated.props.onPress();
+    await flush();
+    expect(store.get(KEY)).toBe(raw);
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    expect(releaseHarvestRecoveryCheckpoint(checkpointOwner)).toBe(true);
+    await submission;
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expectDispatchIdentity(0, JSON.parse(raw!));
+  });
+
+  test('leaving the form cancels an unused selection before the next submission', async () => {
+    await runMountEffects();
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' })).toBe(true);
+    await restart();
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    const fields = render().elements.filter((element) => element.type === TextInput);
+    fields[0].props.onChangeText('40');
+    fields[1].props.onChangeText('25.5');
+    await press('I confirm 40 individuals');
+    await press('Submit harvest');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  test('a recovery-blocked submission cancels the unused fault without touching corrupt data', async () => {
+    const raw = '{corrupt';
+    store.set(KEY, raw);
+    await runMountEffects();
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' })).toBe(true);
+    button('Submit harvest')!.props.onPress();
+    await flush();
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    expect(store.get(KEY)).toBe(raw);
+    expect(writes).toEqual([]);
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
+  });
+  test('auth-generation change cancels an idle selection before another submission in the mounted form', async () => {
+    await runMountEffects();
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' })).toBe(true);
+    beginAuthOperation();
+    await runMountEffects();
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+    expect(api.createBatchEvent).not.toHaveBeenCalled();
+    const fields = render().elements.filter((element) => element.type === TextInput);
+    fields[0].props.onChangeText('40');
+    fields[1].props.onChangeText('25.5');
+    await press('I confirm 40 individuals');
+    await press('Submit harvest');
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+  test.each(['unmount', 'auth'] as const)(
+    'stale form A %s cleanup cannot cancel replacement B selection',
+    async (cleanup) => {
+      await runMountEffects();
+      const finishA = beginHarvestRecoveryFaultAttempt();
+      const finishB = beginHarvestRecoveryFaultAttempt();
+      const fault = { kind: 'storage_failure', operation: 'write' } as const;
+      expect(armHarvestRecoveryFault(fault)).toBe(true);
+      if (cleanup === 'unmount') unmount();
+      else {
+        beginAuthOperation();
+        await runMountEffects();
+      }
+      const remaining = getHarvestRecoveryFaultSnapshot();
+      finishA();
+      const b = createHarvestRecoveryRecord(
+        'user-1',
+        createHarvestSubmission('cleanup-b', {
+          quantity: 40,
+          total_weight: 25.5,
+          weight_unit: 'kg',
+          is_final: false,
+        }),
+      );
+      await expect(persistHarvestRecoveryRecord(b, finishB.identity)).rejects.toMatchObject({
+        kind: 'write_failed',
+      });
+      await persistHarvestRecoveryRecord(b, finishB.identity);
+      expect(store.get(harvestRecoveryStorageKey(b.batchId)!)).toBe(JSON.stringify(b));
+      finishB();
+      expect(remaining).toEqual({ armed: fault, pausedAt: null });
+    },
+  );
+  test('a subsequent form submission can arm its fresh generation without accepting the completed owner', async () => {
+    await prepare();
+    const controls = () =>
+      render().elements.find((element) => element.type === HarvestRecoveryQaControls)!;
+    const oldOwner = controls().props.attempt;
+    await press('Submit harvest');
+    const nextOwner = controls().props.attempt;
+    expect(nextOwner).not.toBe(oldOwner);
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_posting' }, oldOwner)).toBe(
+      false,
+    );
+    expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_posting' }, nextOwner)).toBe(
+      true,
+    );
+    const fields = render().elements.filter((element) => element.type === TextInput);
+    fields[0].props.onChangeText('40');
+    fields[1].props.onChangeText('25.5');
+    await press('I confirm 40 individuals');
+    const submission = press('Submit harvest');
+    await waitForPause('after_posting');
+    const current = stored();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(1);
+    expect(disarmHarvestRecoveryFault(oldOwner)).toBe(false);
+    releaseHarvestRecoveryCheckpoint(checkpointOwner);
+    await submission;
+    await flush();
+    expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+    expectDispatchIdentity(1, current);
+    expect(onSaved).toHaveBeenCalledTimes(2);
+  });
+  const actualFormRelease = () => {
+    const controls = render().elements.find(
+      (element) => element.type === HarvestRecoveryQaControls,
+    )!;
+    const tree = HarvestRecoveryQaControls(controls.props);
+    return (
+      flattenNodes(tree).find(
+        (node) =>
+          React.isValidElement(node) &&
+          node.type === Pressable &&
+          textValues(node).includes('Release QA pause'),
+      ) as React.ReactElement<any>
+    ).props.onPress as () => boolean;
+  };
+
+  test('stale actual form release cannot resume a newer checkpoint; owner releases exactly once', async () => {
+    await runMountEffects();
+    const finishA = beginHarvestRecoveryFaultAttempt();
+    const releaseA = actualFormRelease();
+    const finishB = beginHarvestRecoveryFaultAttempt();
+    await restart();
+    const releaseB = actualFormRelease();
+    expect(
+      armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' }, finishB.identity),
+    ).toBe(true);
+    const b = createHarvestRecoveryRecord(
+      'user-1',
+      createHarvestSubmission(BATCH, {
+        quantity: 40,
+        total_weight: 25.5,
+        weight_unit: 'kg',
+        is_final: false,
+      }),
+    );
+    let resumed = 0;
+    const persistence = persistHarvestRecoveryRecord(b, finishB.identity).then(() => {
+      resumed += 1;
+    });
+    pending.push(persistence);
+    try {
+      await waitForPause('after_prepared');
+      expect(releaseA()).toBe(false);
+      await flush();
+      expect(resumed).toBe(0);
+      expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe('after_prepared');
+      expect(store.get(KEY)).toBe(JSON.stringify(b));
+      expect(releaseB()).toBe(true);
+      expect(releaseB()).toBe(false);
+      await persistence;
+      expect(resumed).toBe(1);
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+    } finally {
+      releaseB();
+      await persistence;
+      finishA();
+      finishB();
+    }
+  });
+
+  test.each(['completion', 'unmount', 'auth'] as const)(
+    'stale A %s cleanup cannot release B checkpoint',
+    async (cleanup) => {
+      await runMountEffects();
+      const finishA = beginHarvestRecoveryFaultAttempt();
+      const oldCleanups = [...cleanups];
+      beginAuthOperation();
+      effects = [];
+      render();
+      const oldAuthEffect = effects[1];
+      effects = [];
+      const finishB = beginHarvestRecoveryFaultAttempt();
+      await restart();
+      const releaseB = actualFormRelease();
+      expect(
+        armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' }, finishB.identity),
+      ).toBe(true);
+      const b = createHarvestRecoveryRecord(
+        'user-1',
+        createHarvestSubmission(BATCH, {
+          quantity: 40,
+          total_weight: 25.5,
+          weight_unit: 'kg',
+          is_final: false,
+        }),
+      );
+      let resumed = false;
+      const persistence = persistHarvestRecoveryRecord(b, finishB.identity).then(() => {
+        resumed = true;
+      });
+      pending.push(persistence);
+      try {
+        await waitForPause('after_prepared');
+        if (cleanup === 'completion') finishA();
+        else if (cleanup === 'unmount')
+          oldCleanups.forEach((fn) => {
+            if (typeof fn === 'function') fn();
+          });
+        else oldAuthEffect();
+        await flush();
+        expect(resumed).toBe(false);
+        expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe('after_prepared');
+        expect(store.get(KEY)).toBe(JSON.stringify(b));
+        expect(disarmHarvestRecoveryFault(finishA.identity)).toBe(false);
+        expect(releaseB()).toBe(true);
+        await persistence;
+        expect(resumed).toBe(true);
+        expect(api.createBatchEvent).not.toHaveBeenCalled();
+      } finally {
+        releaseB();
+        await persistence;
+        finishA();
+        finishB();
+      }
+    },
+  );
+
+  test('retained older form handler releases its own pause after supersession without bypassing the mutation queue', async () => {
+    await runMountEffects();
+    const finishA = beginHarvestRecoveryFaultAttempt();
+    const releaseA = actualFormRelease();
+    expect(
+      armHarvestRecoveryFault({ kind: 'checkpoint', point: 'after_prepared' }, finishA.identity),
+    ).toBe(true);
+    const a = createHarvestRecoveryRecord(
+      'user-1',
+      createHarvestSubmission(BATCH, {
+        quantity: 40,
+        total_weight: 25.5,
+        weight_unit: 'kg',
+        is_final: false,
+      }),
+    );
+    const persistenceA = persistHarvestRecoveryRecord(a, finishA.identity);
+    pending.push(persistenceA);
+    await waitForPause('after_prepared');
+    const finishB = beginHarvestRecoveryFaultAttempt();
+    await restart();
+    const releaseB = actualFormRelease();
+    const b = createHarvestRecoveryRecord(
+      'user-1',
+      createHarvestSubmission('older-pause-b', {
+        quantity: 20,
+        total_weight: 12,
+        weight_unit: 'kg',
+        is_final: false,
+      }),
+    );
+    let queuedResumed = false;
+    const persistenceB = persistHarvestRecoveryRecord(b, finishB.identity).then(() => {
+      queuedResumed = true;
+    });
+    pending.push(persistenceB);
+    try {
+      expect(releaseB()).toBe(false);
+      finishA(); // stale completion must not release the older pause either
+      expect(disarmHarvestRecoveryFault(finishA.identity)).toBe(false);
+      await flush();
+      expect(queuedResumed).toBe(false);
+      expect(store.has(harvestRecoveryStorageKey(b.batchId)!)).toBe(false);
+      expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe('after_prepared');
+      expect(releaseA()).toBe(true);
+      expect(releaseA()).toBe(false);
+      await persistenceA;
+      await persistenceB;
+      expect(queuedResumed).toBe(true);
+      expect(store.get(KEY)).toBe(JSON.stringify(a));
+      expect(store.get(harvestRecoveryStorageKey(b.batchId)!)).toBe(JSON.stringify(b));
+      expect(api.createBatchEvent).not.toHaveBeenCalled();
+    } finally {
+      releaseA();
+      await persistenceA;
+      await persistenceB;
+      finishA();
+      finishB();
+    }
   });
 });

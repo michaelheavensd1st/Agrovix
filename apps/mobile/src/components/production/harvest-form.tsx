@@ -46,6 +46,10 @@ import {
 
 import {
   armHarvestRecoveryFault,
+  beginHarvestRecoveryFaultAttempt,
+  captureHarvestRecoveryFaultAttempt,
+  type HarvestRecoveryFaultAttempt,
+  disarmHarvestRecoveryFault,
   getHarvestRecoveryFaultSnapshot,
   isHarvestRecoveryFaultInjectionEnabled,
   releaseHarvestRecoveryCheckpoint,
@@ -53,7 +57,9 @@ import {
   type HarvestRecoveryFault,
 } from '../../features/production/harvest-recovery-fault-injection';
 
-export function HarvestRecoveryQaControls() {
+export function HarvestRecoveryQaControls({
+  attempt = captureHarvestRecoveryFaultAttempt(),
+}: { attempt?: HarvestRecoveryFaultAttempt } = {}) {
   const [snapshot, setSnapshot] = useState(getHarvestRecoveryFaultSnapshot);
   const [message, setMessage] = useState('');
   useEffect(
@@ -61,6 +67,7 @@ export function HarvestRecoveryQaControls() {
     [],
   );
   if (!isHarvestRecoveryFaultInjectionEnabled()) return null;
+  const arm = (fault: HarvestRecoveryFault) => armHarvestRecoveryFault(fault, attempt);
   const controls: { label: string; fault: HarvestRecoveryFault }[] = [
     ...(['after_prepared', 'after_posting', 'after_accepted', 'after_reconciled'] as const).map(
       (point) => ({
@@ -82,22 +89,32 @@ export function HarvestRecoveryQaControls() {
           key={label}
           accessibilityRole="button"
           disabled={Boolean(snapshot.armed || snapshot.pausedAt)}
-          onPress={() => armHarvestRecoveryFault(fault)}
+          onPress={() => arm(fault)}
         >
           <Text>{label}</Text>
         </Pressable>
       ))}
-      <Pressable accessibilityRole="button" onPress={() => releaseHarvestRecoveryCheckpoint()}>
+      <Pressable
+        accessibilityRole="button"
+        disabled={!snapshot.armed || Boolean(snapshot.pausedAt)}
+        onPress={() => disarmHarvestRecoveryFault(attempt)}
+      >
+        <Text>Disarm unused QA fault</Text>
+      </Pressable>
+      <Pressable
+        accessibilityRole="button"
+        onPress={() => releaseHarvestRecoveryCheckpoint(attempt)}
+      >
         <Text>Release QA pause</Text>
       </Pressable>
       <Pressable
         accessibilityRole="button"
         disabled={Boolean(snapshot.armed || snapshot.pausedAt)}
         onPress={async () => {
-          if (!armHarvestRecoveryFault({ kind: 'corrupt_empty_record' })) return;
+          if (!arm({ kind: 'corrupt_empty_record' })) return;
           try {
             setMessage(
-              (await corruptDisposableHarvestRecovery())
+              (await corruptDisposableHarvestRecovery(attempt))
                 ? 'Disposable QA slot corrupted'
                 : 'Disposable QA slot retained',
             );
@@ -240,6 +257,7 @@ interface HarvestResultContext {
   authOperation: AuthOperation;
   submission: HarvestSubmission;
   recoveryRecord: HarvestRecoveryRecord | null;
+  faultAttempt: HarvestRecoveryFaultAttempt;
 }
 
 interface HarvestContextOwner {
@@ -254,6 +272,7 @@ async function authorizeRetainedRecoveryAccess(
   userId: string,
   authOperation: AuthOperation,
   isCurrent: () => boolean,
+  faultAttempt: HarvestRecoveryFaultAttempt,
 ): Promise<boolean> {
   const isValid = () => isCurrent() && ownsAuthOperation(authOperation);
   if (!isValid()) return false;
@@ -267,7 +286,7 @@ async function authorizeRetainedRecoveryAccess(
   await listBatchEvents(record.batchId, { limit: 1 }, authOperation);
   if (!isValid()) return false;
 
-  const current = await loadHarvestRecovery(record.batchId, authOperation);
+  const current = await loadHarvestRecovery(record.batchId, authOperation, faultAttempt);
   return (
     isValid() &&
     current.kind === 'record' &&
@@ -302,6 +321,13 @@ export function HarvestForm({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [recoveryRequired, setRecoveryRequired] = useState(false);
   const [hydration, setHydration] = useState<Hydration>({ status: 'loading' });
+  const qaFaultAttemptRef = useRef(captureHarvestRecoveryFaultAttempt());
+  const completeQaFaultAttempt = (finish: ReturnType<typeof beginHarvestRecoveryFaultAttempt>) => {
+    const next = finish();
+    if (next !== null && qaFaultAttemptRef.current === finish.identity) {
+      qaFaultAttemptRef.current = next;
+    }
+  };
   const submissionInFlight = useRef(false);
   const retrySubmission = useRef<HarvestSubmission | null>(null);
   const freshRef = useRef<FreshState | null>(null);
@@ -435,6 +461,7 @@ export function HarvestForm({
   const reconcileSubmission = (
     submission: HarvestSubmission,
     authOperation = currentAuthOperation(),
+    faultAttempt = qaFaultAttemptRef.current,
   ) => {
     const owner: HarvestContextOwner = {
       epoch: sessionEpoch.current,
@@ -454,7 +481,13 @@ export function HarvestForm({
           'The harvest recovery identity changed. Contact a supervisor; do not start another harvest.',
         );
       }
-      const next = await transitionHarvestRecoveryRecord(record, status, isCurrent, authOperation);
+      const next = await transitionHarvestRecoveryRecord(
+        record,
+        status,
+        isCurrent,
+        authOperation,
+        faultAttempt,
+      );
       if (!isCurrent()) throw new Error('The harvest recovery context is no longer active.');
       durableRecord.current = next;
     };
@@ -516,10 +549,17 @@ export function HarvestForm({
     idempotencyKey: string,
     expectedRecord: HarvestRecoveryRecord | null,
     isCurrent = () => mounted.current,
+    faultAttempt = qaFaultAttemptRef.current,
   ): Promise<boolean> => {
     if (!isCurrent() || !expectedRecord) return false;
     try {
-      await deleteHarvestRecoveryRecord(batchId, idempotencyKey, expectedRecord, isCurrent);
+      await deleteHarvestRecoveryRecord(
+        batchId,
+        idempotencyKey,
+        expectedRecord,
+        isCurrent,
+        faultAttempt,
+      );
       if (isCurrent()) durableRecord.current = null;
       return true;
     } catch {
@@ -563,7 +603,11 @@ export function HarvestForm({
     const isCurrent = () =>
       isResultContextCurrent(context) && sameSubmission(result.submission, context.submission);
     if (!isCurrent()) return;
-    const latest = await loadHarvestRecovery(context.batchId, context.authOperation);
+    const latest = await loadHarvestRecovery(
+      context.batchId,
+      context.authOperation,
+      context.faultAttempt,
+    );
     if (!isCurrent()) return;
     if (
       latest.kind !== 'record' ||
@@ -611,6 +655,7 @@ export function HarvestForm({
           'OUTCOME_UNKNOWN',
           isCurrent,
           context.authOperation,
+          context.faultAttempt,
         );
         if (!isCurrent()) return;
         durableRecord.current = context.recoveryRecord;
@@ -636,6 +681,7 @@ export function HarvestForm({
             'RECONCILED',
             isCurrent,
             context.authOperation,
+            context.faultAttempt,
           );
           if (!isCurrent()) return;
           durableRecord.current = context.recoveryRecord;
@@ -652,6 +698,7 @@ export function HarvestForm({
         result.submission.idempotencyKey,
         context.recoveryRecord,
         isCurrent,
+        context.faultAttempt,
       );
       if (cleaned) clearHarvestWriteRecovery(context.batchId, result.submission.idempotencyKey);
       if (!isCurrent()) return;
@@ -712,6 +759,7 @@ export function HarvestForm({
         result.submission.idempotencyKey,
         context.recoveryRecord,
         isCurrent,
+        context.faultAttempt,
       );
       if (cleaned) clearHarvestWriteRecovery(context.batchId, result.submission.idempotencyKey);
       if (!isCurrent()) return;
@@ -786,6 +834,7 @@ export function HarvestForm({
           'OUTCOME_UNKNOWN',
           isCurrent,
           context.authOperation,
+          context.faultAttempt,
         );
         if (!isCurrent()) return;
         durableRecord.current = context.recoveryRecord;
@@ -810,6 +859,7 @@ export function HarvestForm({
     mounted.current = true;
     return () => {
       mounted.current = false;
+      disarmHarvestRecoveryFault(qaFaultAttemptRef.current);
     };
   }, []);
 
@@ -834,6 +884,7 @@ export function HarvestForm({
         boundAuthOperationRef.current.epoch !== authOperation.epoch)
     ) {
       // The session changed while mounted: drop everything derived from the previous account.
+      disarmHarvestRecoveryFault(qaFaultAttemptRef.current);
       sessionEpoch.current += 1;
       boundUserRef.current = null;
       boundBatchRef.current = null;
@@ -858,6 +909,7 @@ export function HarvestForm({
     }
     const hydrationEpoch = sessionEpoch.current;
     const hydrationAuthOperation = currentAuthOperation();
+    const hydrationFaultAttempt = qaFaultAttemptRef.current;
     const isHydrationContextCurrent = () =>
       active &&
       mounted.current &&
@@ -880,7 +932,11 @@ export function HarvestForm({
         setHydration({ status: 'blocked', message: BLOCK_MESSAGES.identity_unavailable });
         return;
       }
-      const loaded = await loadHarvestRecovery(batchId, hydrationAuthOperation);
+      const loaded = await loadHarvestRecovery(
+        batchId,
+        hydrationAuthOperation,
+        hydrationFaultAttempt,
+      );
       if (!isHydrationContextCurrent()) return;
       if (!ownsAuthOperation(hydrationAuthOperation)) {
         blockResourceAccess();
@@ -923,6 +979,7 @@ export function HarvestForm({
           sessionUserId,
           hydrationAuthOperation,
           isHydrationContextCurrent,
+          hydrationFaultAttempt,
         );
       } catch {
         if (!isHydrationContextCurrent()) return;
@@ -992,6 +1049,7 @@ export function HarvestForm({
       authOperation,
       submission: recovery.submission as HarvestSubmission,
       recoveryRecord: durableRecord.current,
+      faultAttempt: qaFaultAttemptRef.current,
     };
     retrySubmission.current = recovery.submission as HarvestSubmission;
     if (recovery.retryOutcome === 'accepted' || recovery.retryOutcome === 'reconciliation_failed') {
@@ -1007,7 +1065,14 @@ export function HarvestForm({
         ownsAuthOperation(authOperation) &&
         currentContextRef.current.userId === sessionUserId &&
         currentContextRef.current.batchId === batchId;
-      void reconcileSubmission(recovery.submission as HarvestSubmission, authOperation)
+      const finishQaFaultAttempt = beginHarvestRecoveryFaultAttempt();
+      qaFaultAttemptRef.current = finishQaFaultAttempt.identity;
+      resultContext.faultAttempt = finishQaFaultAttempt.identity;
+      void reconcileSubmission(
+        recovery.submission as HarvestSubmission,
+        authOperation,
+        finishQaFaultAttempt.identity,
+      )
         .then((result) => {
           if (isCurrent()) {
             return handleWriteResultRef.current(result, draftRevision.current, resultContext);
@@ -1020,6 +1085,7 @@ export function HarvestForm({
           }
         })
         .finally(() => {
+          completeQaFaultAttempt(finishQaFaultAttempt);
           if (isCurrent()) {
             setBusy(false);
             submissionInFlight.current = false;
@@ -1146,6 +1212,7 @@ export function HarvestForm({
         context.userId,
         context.authOperation,
         isCurrent,
+        context.faultAttempt,
       );
     } catch {
       accessAuthorized = false;
@@ -1167,13 +1234,18 @@ export function HarvestForm({
   };
 
   const handleSubmit = async () => {
+    // A duplicate press must not cancel the fault owned by the active attempt.
+    if (submissionInFlight.current) return;
+    const finishQaFaultAttempt = beginHarvestRecoveryFaultAttempt();
+    const faultAttempt = finishQaFaultAttempt.identity;
+    qaFaultAttemptRef.current = faultAttempt;
     if (
-      submissionInFlight.current ||
       !hydrated ||
       !sessionUserId ||
       currentContextRef.current.userId !== sessionUserId ||
       currentContextRef.current.batchId !== batchId
     ) {
+      completeQaFaultAttempt(finishQaFaultAttempt);
       return;
     }
     submissionInFlight.current = true;
@@ -1225,6 +1297,7 @@ export function HarvestForm({
             sessionUserId,
             authOperation,
             () => !stale(),
+            faultAttempt,
           );
         } catch {
           if (!stale()) failRestoredRetry(BLOCK_MESSAGES.resource_access);
@@ -1237,7 +1310,7 @@ export function HarvestForm({
         }
         let stored: HarvestRecoveryLoad;
         try {
-          stored = await loadHarvestRecovery(batchId, authOperation);
+          stored = await loadHarvestRecovery(batchId, authOperation, faultAttempt);
         } catch {
           if (!stale()) setError(BLOCK_MESSAGES.identity_unavailable);
           return;
@@ -1326,7 +1399,7 @@ export function HarvestForm({
         }
         const record = createHarvestRecoveryRecord(userId, submission);
         try {
-          await persistHarvestRecoveryRecord(record);
+          await persistHarvestRecoveryRecord(record, faultAttempt);
         } catch (storageError) {
           if (stale()) return;
           resetConfirmations();
@@ -1337,7 +1410,12 @@ export function HarvestForm({
             setHydration({ status: 'blocked', message: BLOCK_MESSAGES.mismatch });
             return;
           }
-          const cleaned = await clearDurable(submission.idempotencyKey, record, () => !stale());
+          const cleaned = await clearDurable(
+            submission.idempotencyKey,
+            record,
+            () => !stale(),
+            faultAttempt,
+          );
           if (stale()) return;
           if (!cleaned) {
             setHydration({ status: 'blocked', message: BLOCK_MESSAGES.cleanup });
@@ -1366,12 +1444,13 @@ export function HarvestForm({
         batchId,
         authOperation,
         submission,
+        faultAttempt,
         recoveryRecord:
           durableRecord.current?.idempotencyKey === submission.idempotencyKey
             ? durableRecord.current
             : null,
       };
-      const outcome = await reconcileSubmission(submission, authOperation);
+      const outcome = await reconcileSubmission(submission, authOperation, faultAttempt);
       if (stale()) return;
       await handleWriteResultRef.current(
         outcome,
@@ -1391,6 +1470,7 @@ export function HarvestForm({
         );
       }
     } finally {
+      completeQaFaultAttempt(finishQaFaultAttempt);
       if (!stale()) {
         setBusy(false);
         submissionInFlight.current = false;
@@ -1480,7 +1560,7 @@ export function HarvestForm({
 
   return (
     <View style={styles.card}>
-      <HarvestRecoveryQaControls />
+      <HarvestRecoveryQaControls attempt={qaFaultAttemptRef.current} />
       <Text style={styles.cardTitle}>Record a harvest</Text>
       <Text style={styles.subtitle}>
         {`${batchLabel} · ${farmName ?? 'Farm'} · ${siteName ?? 'Site'} · ${unitName ?? 'Unit'}`}
