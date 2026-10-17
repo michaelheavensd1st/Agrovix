@@ -1,3 +1,21 @@
+const mockQaConfig = {
+  extra: { appVariant: 'fdqa', fdQaFaultInjection: true },
+  ios: { bundleIdentifier: 'com.agrovix.agos.fdqa' },
+  android: { package: 'com.agrovix.agos.fdqa' },
+};
+jest.mock('expo-constants', () => ({
+  get expoConfig() {
+    return mockQaConfig;
+  },
+}));
+import {
+  armHarvestRecoveryFault,
+  beginHarvestRecoveryFaultAttempt,
+  captureHarvestRecoveryFaultAttempt,
+  disarmHarvestRecoveryFault,
+  getHarvestRecoveryFaultSnapshot,
+  releaseHarvestRecoveryCheckpoint,
+} from './harvest-recovery-fault-injection';
 const mockValues = new Map<string, string>();
 const mockFaults = {
   failGet: false,
@@ -7,6 +25,10 @@ const mockFaults = {
   skipDelete: false,
 };
 let mockPlatform = 'android';
+let mockReadCount = 0;
+let mockReadGateAt = 0;
+let mockReadGate: Promise<void> | null = null;
+let mockReadStarted: (() => void) | null = null;
 let mockDeleteGate: Promise<void> | null = null;
 let mockNotifyDeleteStarted: (() => void) | null = null;
 
@@ -24,6 +46,11 @@ jest.mock('expo-secure-store', () => ({
     mockValues.set(key, mockFaults.mangleSet ? `${value} ` : value);
   },
   getItemAsync: async (key: string) => {
+    mockReadCount += 1;
+    if (mockReadCount === mockReadGateAt) {
+      mockReadStarted?.();
+      await mockReadGate;
+    }
     if (mockFaults.failGet) throw new Error('get failed');
     return mockValues.get(key) ?? null;
   },
@@ -38,6 +65,7 @@ jest.mock('../../lib/api', () => ({ getCurrentUser: jest.fn() }));
 
 import { getCurrentUser } from '../../lib/api';
 import {
+  corruptDisposableHarvestRecovery,
   createHarvestRecoveryRecord,
   deleteHarvestRecoveryRecord,
   harvestRecoveryStorageKey,
@@ -63,6 +91,10 @@ const record = (batchId = BATCH, key?: string) =>
 
 beforeEach(() => {
   mockValues.clear();
+  mockReadCount = 0;
+  mockReadGateAt = 0;
+  mockReadGate = null;
+  mockReadStarted = null;
   Object.assign(mockFaults, {
     failGet: false,
     failSet: false,
@@ -347,5 +379,194 @@ describe('harvest recovery store', () => {
       'delete_failed',
     );
     expect(mockValues.has(KEY)).toBe(true);
+  });
+});
+
+describe('F-D integrated storage controls', () => {
+  const originalFlag = process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
+  beforeEach(() => {
+    process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = 'true';
+  });
+  afterEach(() => {
+    if (originalFlag === undefined) delete process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
+    else process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = originalFlag;
+  });
+  test.each(['PREPARED', 'POSTING', 'ACCEPTED_UNRECONCILED', 'RECONCILED'] as const)(
+    'pauses after verified %s bytes while preserving identity and mutation lock',
+    async (status) => {
+      const points = {
+        PREPARED: 'after_prepared',
+        POSTING: 'after_posting',
+        ACCEPTED_UNRECONCILED: 'after_accepted',
+        RECONCILED: 'after_reconciled',
+      } as const;
+      const value = { ...record(), status };
+      const checkpointOwner = captureHarvestRecoveryFaultAttempt();
+      expect(armHarvestRecoveryFault({ kind: 'checkpoint', point: points[status] })).toBe(true);
+      let completed = false;
+      const pending = persistHarvestRecoveryRecord(value).then(() => {
+        completed = true;
+      });
+      for (let i = 0; i < 30 && !getHarvestRecoveryFaultSnapshot().pausedAt; i++)
+        await Promise.resolve();
+      expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe(points[status]);
+      expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+      expect(completed).toBe(false);
+      const deletion = deleteHarvestRecoveryRecord(BATCH, value.idempotencyKey, value);
+      await Promise.resolve();
+      expect(mockValues.has(KEY)).toBe(true);
+      expect(releaseHarvestRecoveryCheckpoint(checkpointOwner)).toBe(true);
+      await pending;
+      await deletion;
+      expect(mockValues.has(KEY)).toBe(false);
+    },
+  );
+  test.each(['read', 'write', 'verification_read', 'delete'] as const)(
+    'injects one %s failure and retains fail-closed semantics',
+    async (operation) => {
+      const value = record();
+      if (operation === 'delete') await persistHarvestRecoveryRecord(value);
+      expect(armHarvestRecoveryFault({ kind: 'storage_failure', operation })).toBe(true);
+      const action =
+        operation === 'delete'
+          ? deleteHarvestRecoveryRecord(BATCH, value.idempotencyKey, value)
+          : persistHarvestRecoveryRecord(value);
+      expect(await kindOf(action)).not.toBe('none');
+      expect(getHarvestRecoveryFaultSnapshot().armed).toBeNull();
+      if (operation === 'delete' || operation === 'verification_read')
+        expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+      await persistHarvestRecoveryRecord(value);
+      expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+    },
+  );
+  test('corrupts only an empty disposable namespace and never replaces an occupied slot', async () => {
+    const value = record();
+    await persistHarvestRecoveryRecord(value);
+    expect(armHarvestRecoveryFault({ kind: 'corrupt_empty_record' })).toBe(true);
+    expect(await corruptDisposableHarvestRecovery()).toBe(true);
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(value));
+    expect(mockValues.get('agrovix.fdqa.disposable.harvest_recovery')).toBe('{');
+    expect(armHarvestRecoveryFault({ kind: 'corrupt_empty_record' })).toBe(true);
+    expect(await corruptDisposableHarvestRecovery()).toBe(false);
+  });
+});
+
+describe('cross-attempt fault consumption with deferred real store operations', () => {
+  const flag = process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+  beforeEach(() => {
+    process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = 'true';
+  });
+  afterEach(() => {
+    disarmHarvestRecoveryFault();
+    if (flag === undefined) delete process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION;
+    else process.env.EXPO_PUBLIC_FD_QA_FAULT_INJECTION = flag;
+  });
+  const deferRead = (at: number) => {
+    mockReadGateAt = at;
+    let resume!: () => void;
+    let announce!: () => void;
+    mockReadGate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      announce = resolve;
+    });
+    mockReadStarted = announce;
+    return { started, resume };
+  };
+
+  test('A delayed existing-record read cannot consume B write fault; B consumes it once', async () => {
+    const finishA = beginHarvestRecoveryFaultAttempt();
+    const gate = deferRead(1);
+    const a = record('attempt-a');
+    const pendingA = kindOf(persistHarvestRecoveryRecord(a));
+    await gate.started;
+    const queuedA = record('queued-a');
+    const pendingQueuedA = kindOf(persistHarvestRecoveryRecord(queuedA));
+    const finishB = beginHarvestRecoveryFaultAttempt();
+    const fault = { kind: 'storage_failure', operation: 'write' } as const;
+    expect(armHarvestRecoveryFault(fault)).toBe(true);
+    gate.resume();
+    const outcomeA = await pendingA;
+    const outcomeQueuedA = await pendingQueuedA;
+    const remaining = getHarvestRecoveryFaultSnapshot();
+    finishA();
+    const b = record('attempt-b');
+    const outcomeB = await kindOf(persistHarvestRecoveryRecord(b));
+    await persistHarvestRecoveryRecord(b);
+    finishB();
+    expect(outcomeA).toBe('none');
+    expect(outcomeQueuedA).toBe('none');
+    expect(mockValues.get(harvestRecoveryStorageKey(queuedA.batchId)!)).toBe(
+      JSON.stringify(queuedA),
+    );
+    expect(remaining).toEqual({ armed: fault, pausedAt: null });
+    expect(mockValues.get(harvestRecoveryStorageKey('attempt-a')!)).toBe(JSON.stringify(a));
+    expect(outcomeB).toBe('write_failed');
+    expect(mockValues.get(harvestRecoveryStorageKey('attempt-b')!)).toBe(JSON.stringify(b));
+  });
+
+  test('A delayed verification cannot consume or pause B checkpoint; B pauses once with the mutation lock', async () => {
+    const finishA = beginHarvestRecoveryFaultAttempt();
+    const gate = deferRead(2);
+    const a = record('checkpoint-a');
+    const pendingA = persistHarvestRecoveryRecord(a);
+    await gate.started;
+    const finishB = beginHarvestRecoveryFaultAttempt();
+    const fault = { kind: 'checkpoint', point: 'after_prepared' } as const;
+    expect(armHarvestRecoveryFault(fault)).toBe(true);
+    gate.resume();
+    await flush();
+    const afterA = getHarvestRecoveryFaultSnapshot();
+    if (afterA.pausedAt) releaseHarvestRecoveryCheckpoint(finishA.identity);
+    await pendingA;
+    finishA();
+    expect(afterA).toEqual({ armed: fault, pausedAt: null });
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: fault, pausedAt: null });
+    const b = record('checkpoint-b');
+    const pendingB = persistHarvestRecoveryRecord(b);
+    await flush();
+    expect(getHarvestRecoveryFaultSnapshot().pausedAt).toBe('after_prepared');
+    const deletion = deleteHarvestRecoveryRecord(b.batchId, b.idempotencyKey, b);
+    await flush();
+    const lockedBytes = mockValues.get(harvestRecoveryStorageKey(b.batchId)!);
+    releaseHarvestRecoveryCheckpoint(finishB.identity);
+    await pendingB;
+    await deletion;
+    await persistHarvestRecoveryRecord(b); // consumed once; no second pause
+    finishB();
+    expect(lockedBytes).toBe(JSON.stringify(b));
+    expect(mockValues.get(harvestRecoveryStorageKey(a.batchId)!)).toBe(JSON.stringify(a));
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: null, pausedAt: null });
+  });
+  test('a new QA generation cannot bypass submission ownership or deletion authority', async () => {
+    const finishA = beginHarvestRecoveryFaultAttempt();
+    const original = record();
+    await persistHarvestRecoveryRecord(original, finishA.identity);
+    const finishB = beginHarvestRecoveryFaultAttempt();
+    const fault = { kind: 'storage_failure', operation: 'write' } as const;
+    expect(armHarvestRecoveryFault(fault, finishB.identity)).toBe(true);
+    const replacement = record(BATCH, 'different-submission');
+    expect(await kindOf(persistHarvestRecoveryRecord(replacement, finishB.identity))).toBe(
+      'unresolved_record_exists',
+    );
+    finishA();
+    expect(getHarvestRecoveryFaultSnapshot()).toEqual({ armed: fault, pausedAt: null });
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(original));
+    expect(disarmHarvestRecoveryFault(finishB.identity)).toBe(true);
+    expect(
+      await kindOf(
+        deleteHarvestRecoveryRecord(
+          BATCH,
+          original.idempotencyKey,
+          original,
+          () => false,
+          finishB.identity,
+        ),
+      ),
+    ).toBe('delete_failed');
+    expect(mockValues.get(KEY)).toBe(JSON.stringify(original));
+    finishB();
   });
 });

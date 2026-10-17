@@ -8,6 +8,13 @@
  * deleted silently.
  */
 
+import {
+  captureHarvestRecoveryFaultAttempt,
+  type HarvestRecoveryFaultAttempt,
+  consumeHarvestRecoveryStorageFailure,
+  consumeHarvestRecoveryCorruptionFault,
+  runHarvestRecoveryFaultCheckpoint,
+} from './harvest-recovery-fault-injection';
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 import { getCurrentUser } from '../../lib/api';
@@ -218,6 +225,7 @@ export async function resolveHarvestRecoveryUserId(operation?: AuthOperation): P
 export async function loadHarvestRecovery(
   batchId: string,
   operation?: AuthOperation,
+  faultAttempt = captureHarvestRecoveryFaultAttempt(),
 ): Promise<HarvestRecoveryLoad> {
   if (!isHarvestRecoveryStorageSupported()) {
     return { kind: 'blocked', reason: 'storage_unavailable' };
@@ -234,7 +242,7 @@ export async function loadHarvestRecovery(
 
   let raw: string | null;
   try {
-    raw = await SecureStore.getItemAsync(key);
+    raw = await readRaw(key, false, faultAttempt);
   } catch {
     return { kind: 'blocked', reason: 'storage_unavailable' };
   }
@@ -277,8 +285,20 @@ export function harvestSubmissionFromRecord(record: HarvestRecoveryRecord): Harv
   };
 }
 
-async function readRaw(key: string): Promise<string | null> {
+async function readRaw(
+  key: string,
+  verification: boolean,
+  faultAttempt: HarvestRecoveryFaultAttempt,
+): Promise<string | null> {
   try {
+    if (
+      consumeHarvestRecoveryStorageFailure(
+        verification ? 'verification_read' : 'read',
+        faultAttempt,
+      )
+    ) {
+      throw new Error('QA storage read failure');
+    }
     return (await SecureStore.getItemAsync(key)) ?? null;
   } catch {
     throw new HarvestRecoveryStorageError(
@@ -304,7 +324,10 @@ function existingKeyOf(raw: string): string | null {
  * are identical, so the caller may then POST. Never overwrites a record that
  * belongs to a different idempotency key.
  */
-async function persistHarvestRecoveryRecordUnlocked(record: HarvestRecoveryRecord): Promise<void> {
+async function persistHarvestRecoveryRecordUnlocked(
+  record: HarvestRecoveryRecord,
+  faultAttempt: HarvestRecoveryFaultAttempt,
+): Promise<void> {
   const key = storageKeyOrThrow(record.batchId);
   const serialized = JSON.stringify(record);
   if (utf8Length(serialized) > HARVEST_RECOVERY_MAX_BYTES) {
@@ -313,7 +336,7 @@ async function persistHarvestRecoveryRecordUnlocked(record: HarvestRecoveryRecor
       'The harvest record is too large to secure for recovery. Shorten the notes.',
     );
   }
-  const existing = await readRaw(key);
+  const existing = await readRaw(key, false, faultAttempt);
   if (existing !== null && existingKeyOf(existing) !== record.idempotencyKey) {
     throw new HarvestRecoveryStorageError(
       'unresolved_record_exists',
@@ -321,6 +344,8 @@ async function persistHarvestRecoveryRecordUnlocked(record: HarvestRecoveryRecor
     );
   }
   try {
+    if (consumeHarvestRecoveryStorageFailure('write', faultAttempt))
+      throw new Error('QA storage write failure');
     await SecureStore.setItemAsync(key, serialized, {
       keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
     });
@@ -330,17 +355,31 @@ async function persistHarvestRecoveryRecordUnlocked(record: HarvestRecoveryRecor
       'The recovery record could not be saved to secure storage.',
     );
   }
-  const readBack = await readRaw(key);
+  const readBack = await readRaw(key, true, faultAttempt);
   if (readBack !== serialized) {
     throw new HarvestRecoveryStorageError(
       'verify_failed',
       'The saved recovery record could not be verified.',
     );
   }
+  const checkpoint = {
+    PREPARED: 'after_prepared',
+    POSTING: 'after_posting',
+    ACCEPTED_UNRECONCILED: 'after_accepted',
+    RECONCILED: 'after_reconciled',
+  } as const;
+  if (record.status !== 'OUTCOME_UNKNOWN') {
+    await runHarvestRecoveryFaultCheckpoint(checkpoint[record.status], undefined, faultAttempt);
+  }
 }
 
-export function persistHarvestRecoveryRecord(record: HarvestRecoveryRecord): Promise<void> {
-  return serializeRecoveryMutation(() => persistHarvestRecoveryRecordUnlocked(record));
+export function persistHarvestRecoveryRecord(
+  record: HarvestRecoveryRecord,
+  faultAttempt = captureHarvestRecoveryFaultAttempt(),
+): Promise<void> {
+  return serializeRecoveryMutation(() =>
+    persistHarvestRecoveryRecordUnlocked(record, faultAttempt),
+  );
 }
 
 export function harvestRecoveryPhase(record: HarvestRecoveryRecord): HarvestRecoveryStatus {
@@ -352,6 +391,7 @@ export function transitionHarvestRecoveryRecord(
   status: HarvestRecoveryStatus,
   isCurrent: () => boolean,
   operation: AuthOperation = currentAuthOperation(),
+  faultAttempt = captureHarvestRecoveryFaultAttempt(),
 ): Promise<HarvestRecoveryRecord> {
   return serializeRecoveryMutation(async () => {
     const key = storageKeyOrThrow(expected.batchId);
@@ -366,7 +406,10 @@ export function transitionHarvestRecoveryRecord(
     assertCurrent();
     const userId = await resolveHarvestRecoveryUserId(operation);
     assertCurrent();
-    if (userId !== expected.userId || (await readRaw(key)) !== JSON.stringify(expected)) {
+    if (
+      userId !== expected.userId ||
+      (await readRaw(key, false, faultAttempt)) !== JSON.stringify(expected)
+    ) {
       throw new HarvestRecoveryStorageError(
         'unresolved_record_exists',
         'The recovery record changed or belongs to another owner.',
@@ -398,7 +441,7 @@ export function transitionHarvestRecoveryRecord(
     if (parseRecord(JSON.stringify(next), next.batchId, next.userId).kind !== 'ok') {
       throw new HarvestRecoveryStorageError('write_failed', 'The recovery transition is invalid.');
     }
-    await persistHarvestRecoveryRecordUnlocked(next);
+    await persistHarvestRecoveryRecordUnlocked(next, faultAttempt);
     assertCurrent();
     return next;
   });
@@ -413,6 +456,7 @@ async function deleteHarvestRecoveryRecordUnlocked(
   idempotencyKey: string,
   expectedRecord?: HarvestRecoveryRecord,
   canDelete: () => boolean = () => true,
+  faultAttempt = captureHarvestRecoveryFaultAttempt(),
 ): Promise<void> {
   const key = storageKeyOrThrow(batchId);
   if (!canDelete()) {
@@ -421,7 +465,7 @@ async function deleteHarvestRecoveryRecordUnlocked(
       'The recovery owner is no longer active.',
     );
   }
-  const existing = await readRaw(key);
+  const existing = await readRaw(key, false, faultAttempt);
   if (existing === null) return;
   if (existingKeyOf(existing) !== idempotencyKey) {
     throw new HarvestRecoveryStorageError(
@@ -442,6 +486,8 @@ async function deleteHarvestRecoveryRecordUnlocked(
     );
   }
   try {
+    if (consumeHarvestRecoveryStorageFailure('delete', faultAttempt))
+      throw new Error('QA storage delete failure');
     await SecureStore.deleteItemAsync(key);
   } catch {
     throw new HarvestRecoveryStorageError(
@@ -449,7 +495,7 @@ async function deleteHarvestRecoveryRecordUnlocked(
       'The recovery record could not be deleted from secure storage.',
     );
   }
-  if ((await readRaw(key)) !== null) {
+  if ((await readRaw(key, true, faultAttempt)) !== null) {
     throw new HarvestRecoveryStorageError(
       'delete_failed',
       'The recovery record is still present after deletion.',
@@ -462,8 +508,34 @@ export function deleteHarvestRecoveryRecord(
   idempotencyKey: string,
   expectedRecord?: HarvestRecoveryRecord,
   canDelete: () => boolean = () => true,
+  faultAttempt = captureHarvestRecoveryFaultAttempt(),
 ): Promise<void> {
   return serializeRecoveryMutation(() =>
-    deleteHarvestRecoveryRecordUnlocked(batchId, idempotencyKey, expectedRecord, canDelete),
+    deleteHarvestRecoveryRecordUnlocked(
+      batchId,
+      idempotencyKey,
+      expectedRecord,
+      canDelete,
+      faultAttempt,
+    ),
   );
+}
+
+/** Only a separate disposable QA slot can be corrupted; no real batch key is accepted. */
+export function corruptDisposableHarvestRecovery(
+  faultAttempt = captureHarvestRecoveryFaultAttempt(),
+): Promise<boolean> {
+  return serializeRecoveryMutation(async () => {
+    if (!consumeHarvestRecoveryCorruptionFault(faultAttempt)) return false;
+    if (!isHarvestRecoveryStorageSupported()) return false;
+    const key = 'agrovix.fdqa.disposable.harvest_recovery';
+    if ((await readRaw(key, false, faultAttempt)) !== null) return false;
+    await SecureStore.setItemAsync(key, '{', {
+      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    });
+    const raw = await readRaw(key, true, faultAttempt);
+    if (raw !== '{') return false;
+    const parsed = parseRecord(raw, 'fdqa-disposable', 'fdqa-disposable');
+    return parsed.kind === 'blocked' && parsed.reason === 'corrupt';
+  });
 }
