@@ -8193,21 +8193,36 @@ describe('harvest form workflow', () => {
           if (body.data.is_final) batchState = 'harvested';
           throw new TypeError('Synthetic response lost after acceptance');
         }
-        return new Response(JSON.stringify(conflict ? {
-          detail: { code: 'idempotency_key_payload_conflict', message: 'Synthetic conflict' },
-        } : originalEvent), {
-          status: conflict ? 409 : 200,
-          headers: { 'Content-Type': 'application/json', 'X-Idempotent-Replay': 'true' },
-        });
+        return new Response(
+          JSON.stringify(
+            conflict
+              ? {
+                  detail: {
+                    code: 'idempotency_key_payload_conflict',
+                    message: 'Synthetic conflict',
+                  },
+                }
+              : originalEvent,
+          ),
+          {
+            status: conflict ? 409 : 200,
+            headers: { 'Content-Type': 'application/json', 'X-Idempotent-Replay': 'true' },
+          },
+        );
       });
       api.createBatchEvent.mockImplementation(actual.createBatchEvent);
       api.listBatchEvents.mockImplementation(async () => ({
-        items: originalEvent ? [originalEvent] : [], next_cursor: null, limit: 25,
+        items: originalEvent ? [originalEvent] : [],
+        next_cursor: null,
+        limit: 25,
       }));
       return fetch;
     };
 
-    const expectIdenticalHttpRetry = (fetch: jest.SpyInstance, record: ReturnType<typeof stored>) => {
+    const expectIdenticalHttpRetry = (
+      fetch: jest.SpyInstance,
+      record: ReturnType<typeof stored>,
+    ) => {
       expect(fetch).toHaveBeenCalledTimes(2);
       const [original, restored] = fetch.mock.calls.map(([, init]) => init as RequestInit);
       expect(restored.body).toBe(original.body);
@@ -8216,7 +8231,9 @@ describe('harvest form workflow', () => {
         expect(headers.get('Idempotency-Key')).toBe(record.idempotencyKey);
         expect(headers.get('Content-Type')).toBe('application/json');
         expect(JSON.parse(String(request.body))).toEqual({
-          event_type: 'HARVEST', performed_at: record.performedAt, data: record.payload,
+          event_type: 'HARVEST',
+          performed_at: record.performedAt,
+          data: record.payload,
         });
         expect(record.payload.harvested_at).toBe(record.performedAt);
         expect(JSON.parse(String(request.body))).not.toHaveProperty('notes');
@@ -8224,56 +8241,77 @@ describe('harvest form workflow', () => {
       }
     };
 
-    test.each([false, true].flatMap((isFinal) =>
-      ['omitted', 'blank', 'populated'].map((optional) => ({ isFinal, optional })),
-    ))('HTTP HARVEST restored serialization and 200 replay (final: $isFinal, optional: $optional)', async ({ isFinal, optional }) => {
-      const fetch = installHarvestHttp();
-      const onSaved = jest.fn();
-      if (isFinal) await enterFinal({ onSaved });
-      else await runEffects();
-      fill(isFinal ? '100' : '40', { onSaved });
-      if (optional !== 'omitted') {
-        const fields = inputs(render({ onSaved }).elements);
-        fields[2].props.onChangeText(optional === 'populated' ? '0.5' : '  ');
-        fields[3].props.onChangeText(optional === 'populated' ? '  synthetic notes  ' : '  ');
-      }
-      const cleanups = await runEffects();
-      const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], { onSaved });
-      await button(prepared.elements, isFinal ? 'Submit final harvest' : 'Submit harvest')!.props.onPress();
-      await flush();
-      const record = stored();
-      expect(record.status).toBe('OUTCOME_UNKNOWN');
-      expect(onSaved).not.toHaveBeenCalled();
-      expect(record.payload.weight_unit).toBe('kg');
-      if (optional === 'populated') {
-        expect(record.payload).toMatchObject({ average_weight: 0.5, notes: 'synthetic notes' });
-      } else {
-        expect(record.payload).not.toHaveProperty('average_weight');
-        expect(record.payload).not.toHaveProperty('notes');
-        expect(buildHarvestPayload({ ...record.payload, average_weight: null, notes: null }, record.performedAt))
-          .toEqual(record.payload);
-      }
-      cleanups.forEach((cleanup) => { if (typeof cleanup === 'function') cleanup(); });
-      const restored = await restart({ onSaved });
-      expect(fetch).toHaveBeenCalledTimes(1);
-      expectSameRecoveryIdentity(stored(), record);
-      await button(restored.elements, 'Retry same harvest')!.props.onPress();
-      await flush();
-      expectIdenticalHttpRetry(fetch, record);
-      expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
-      expect(onSaved).toHaveBeenCalledTimes(1);
-      expect(onSaved.mock.calls[0][0]).toMatchObject({
-        idempotencyKey: record.idempotencyKey, payload: record.payload,
-        performedAt: record.performedAt, createdAt: record.createdAt,
-      });
-      expect(onSaved.mock.calls[0][1].events).toEqual([expect.objectContaining({
-        id: 'synthetic-original-harvest', idempotency_key: record.idempotencyKey,
-      })]);
-      expect(stored()).toBeNull();
-      render();
-      await flush();
-      expect(fetch).toHaveBeenCalledTimes(2);
-    });
+    test.each(
+      [false, true].flatMap((isFinal) =>
+        ['omitted', 'blank', 'populated'].map((optional) => ({ isFinal, optional })),
+      ),
+    )(
+      'HTTP HARVEST restored serialization and 200 replay (final: $isFinal, optional: $optional)',
+      async ({ isFinal, optional }) => {
+        const fetch = installHarvestHttp();
+        const onSaved = jest.fn();
+        if (isFinal) await enterFinal({ onSaved });
+        else await runEffects();
+        fill(isFinal ? '100' : '40', { onSaved });
+        if (optional !== 'omitted') {
+          const fields = inputs(render({ onSaved }).elements);
+          fields[2].props.onChangeText(optional === 'populated' ? '0.5' : '  ');
+          fields[3].props.onChangeText(optional === 'populated' ? '  synthetic notes  ' : '  ');
+        }
+        const cleanups = await runEffects();
+        const prepared = confirmAll(isFinal ? FINAL_STEPS : ['I confirm 40 individuals'], {
+          onSaved,
+        });
+        await button(
+          prepared.elements,
+          isFinal ? 'Submit final harvest' : 'Submit harvest',
+        )!.props.onPress();
+        await flush();
+        const record = stored();
+        expect(record.status).toBe('OUTCOME_UNKNOWN');
+        expect(onSaved).not.toHaveBeenCalled();
+        expect(record.payload.weight_unit).toBe('kg');
+        if (optional === 'populated') {
+          expect(record.payload).toMatchObject({ average_weight: 0.5, notes: 'synthetic notes' });
+        } else {
+          expect(record.payload).not.toHaveProperty('average_weight');
+          expect(record.payload).not.toHaveProperty('notes');
+          expect(
+            buildHarvestPayload(
+              { ...record.payload, average_weight: null, notes: null },
+              record.performedAt,
+            ),
+          ).toEqual(record.payload);
+        }
+        cleanups.forEach((cleanup) => {
+          if (typeof cleanup === 'function') cleanup();
+        });
+        const restored = await restart({ onSaved });
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expectSameRecoveryIdentity(stored(), record);
+        await button(restored.elements, 'Retry same harvest')!.props.onPress();
+        await flush();
+        expectIdenticalHttpRetry(fetch, record);
+        expect(api.createBatchEvent).toHaveBeenCalledTimes(2);
+        expect(onSaved).toHaveBeenCalledTimes(1);
+        expect(onSaved.mock.calls[0][0]).toMatchObject({
+          idempotencyKey: record.idempotencyKey,
+          payload: record.payload,
+          performedAt: record.performedAt,
+          createdAt: record.createdAt,
+        });
+        expect(onSaved.mock.calls[0][1].events).toEqual([
+          expect.objectContaining({
+            id: 'synthetic-original-harvest',
+            idempotency_key: record.idempotencyKey,
+          }),
+        ]);
+        expect(stored()).toBeNull();
+        render();
+        await flush();
+        expect(fetch).toHaveBeenCalledTimes(2);
+      },
+    );
 
     test('a payload-conflict 409 on retry retains the record and escalates', async () => {
       const fetch = installHarvestHttp(true);
